@@ -2610,6 +2610,8 @@ fn describe_stmt(s: &Statement) -> &'static str {
         Statement::ForInStatement(_) => "for-in",
         Statement::ForOfStatement(_) => "for-of",
         Statement::FunctionDeclaration(_) => "nested function",
+        Statement::DebuggerStatement(_) => "debugger",
+        Statement::WithStatement(_) => "with",
         Statement::ClassDeclaration(_) => "class",
         _ => "this statement kind",
     }

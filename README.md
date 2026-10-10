@@ -1,11 +1,15 @@
 # typescript-aot
 
 An ahead-of-time compiler for strict TypeScript, built on
-[QuickJS-NG](https://github.com/quickjs-ng/quickjs). Functions whose types
-fully determine their behaviour are compiled to machine code with
-[Cranelift](https://cranelift.dev). Everything else (dynamic code, objects,
-strings, `eval`, ...) keeps running in the QuickJS interpreter, linked into the
-same executable.
+[QuickJS-NG](https://github.com/quickjs-ng/quickjs). Functions are compiled to
+machine code with [Cranelift](https://cranelift.dev):
+- numbers, booleans and typed arrays use unboxed machine representations;
+- all other values (objects, strings, arrays, closures, class instances,
+  promises) are QuickJS values, with exact JS semantics.
+
+Whatever the compiler does not handle (`eval`, generators, private fields, and
+every function it cannot compile) keeps running in the QuickJS interpreter,
+linked into the same executable.
 
 ```console
 $ tsaot report bench/primes.ts
@@ -13,7 +17,7 @@ bench/primes.ts:1: native       isPrime
 bench/primes.ts:10: native       countPrimes
 $ tsaot build bench/primes.ts -o primes && ./primes
 primes below 2e6: 148933
-elapsed: 905 ms         # 4.5x faster than the same program interpreted
+elapsed: 905 ms         # 4.4x faster than the same program interpreted
 ```
 
 ## How it works
@@ -21,7 +25,7 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
 ```
              ┌──────────── oxc parser + semantic analysis
  foo.ts ─────┤
-             ├─ strict-subset checker ── typed IR ── Cranelift ── native.o ─────┐
+             ├─ checker ── typed IR ── Cranelift ── native.o ───────────────────┐
              │   (per function; rejects anything it cannot prove)               │
              │                                                                  ├─ cc ─> foo
              └─ rewrite + type erasure ── foo.js ── qjsc ── bytecode + main.c ──┤
@@ -29,90 +33,132 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
                      generated C glue + runtime ────────────────────────────────┘
 ```
 
-1. **Selection.** Every top-level `function` declaration, and every top-level
-   `const` bound to an arrow function or function expression, is a candidate. The
-   checker (`crates/tsaot-front/src/check.rs`) lowers it to a typed IR only if
-   every construct in its body has exact, statically known JS semantics.
-   Otherwise it records why and leaves the function to the interpreter.
-   A fixpoint removes functions that call non-native ones.
-2. **Native code.** `crates/tsaot-codegen` lowers the IR with Cranelift to
-   functions over unboxed `double`s and `bool`s. Calls between native functions
-   are direct machine calls.
-3. **Interpreted code.** The whole module is type-erased (oxc transformer) and
-   compiled by `qjsc` to bytecode. Each native declaration `f` is renamed to a
-   fallback `__tsaot_fb_f` and its binding is re-pointed at a function object
-   whose entry is native code;
-   native `const` initializers are wrapped in place:
+1. **Selection.** The candidates are:
+   - top-level `function` declarations;
+   - top-level `const` bindings of arrow functions and function expressions;
+   - class methods.
+
+   The checker (`crates/tsaot-front/src/check.rs`) lowers each one to a typed
+   IR, together with the functions nested in it, which become native closures.
+   It does this only if every construct has exact, known JS semantics; otherwise
+   it records why and leaves the function to the interpreter.
+2. **Types.** TypeScript types are hints, not facts. A value is unboxed only
+   where its type is proven:
+   - parameters annotated `number`, `boolean` or a typed array are checked on
+     entry;
+   - locals are typed by their initializers (with a retry that widens a local
+     to a JS value when it is later assigned something else);
+   - typed arrays also come from `new Float64Array(…)`.
+
+   Everything else is a `JSValue`, and operations on it go through inline fast
+   paths and then the engine's own implementation.
+3. **Native code.** `crates/tsaot-codegen` lowers the IR with Cranelift. Calls
+   between native functions are direct machine calls. Exceptions propagate
+   through native frames, freeing their temporaries.
+4. **Interpreted code.** The whole module is type-erased (oxc transformer) and
+   compiled by `qjsc` to bytecode. Each native function's binding is
+   re-pointed at a function object whose entry is native code. The original
+   function is kept as its *fallback*:
    ```js
-   import { __tsaot_bind } from "tsaot:native";
+   import { __tsaot_bind, __tsaot_method, ... } from "tsaot:native";
    const f = __tsaot_bind(0, __tsaot_fb_f);    // first statement of the module
    const g = __tsaot_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
+   class P { norm() { … } };__tsaot_method(2, P, 0, "norm");
    ```
-4. **JS entries (the "deopt" point).** TypeScript types are unsound at
-   runtime: interpreted code can pass a string where `number` is declared. Each
-   native function has a Cranelift-generated entry that checks the argument
-   tags. On a match it unboxes and runs native code; on a mismatch it declines,
-   and the engine calls the interpreted fallback, which has exactly the
-   original JS semantics. Native code therefore never sees a value outside its
-   declared type.
+5. **JS entries (the "deopt" point).** Interpreted code can pass a string
+   where `number` is declared. Each native function has a generated entry that
+   checks its typed arguments. On a match it runs native code. On a mismatch it
+   declines, and the engine calls the interpreted fallback, which has exactly
+   the original semantics.
+6. **Shared state.** Module-level bindings that native code uses live in
+   *cells*, which both sides access. Interpreted references to reassigned
+   bindings are rewritten to go through an accessor object (`__tsaot_m.count`).
+   Variables captured by native closures live in GC-visible boxes. Every
+   reference in native code is counted exactly like the interpreter's. The
+   test suite runs on an engine built with assertions, which aborts if any
+   object leaks.
 
 ### Crossing from interpreted to native code
 
-Calls from the interpreter into native code are close to free. The whole
-boundary is machine code, with nothing in C:
+Calls from the interpreter into native code are cheap. The whole boundary is
+machine code:
 
-- **An engine hook.** `patches/0001-fast-entry-for-c-function-data.patch` adds
-  `JSCFunctionFast` to QuickJS-NG: an optional fast entry on C function
-  objects. The interpreter's `OP_call`/`OP_call_method` call it directly on
-  their stack slots, without recursing into `JS_CallInternal` and without
-  pushing a stack frame. Other callers (`f.call`, `Array.prototype.map`, …)
-  reach it from the generic C-function path.
+- **An engine hook.** The engine patch adds `JSCFunctionFast`, an optional
+  fast entry on C function objects. The interpreter's `OP_call` /
+  `OP_call_method` call it directly on their stack slots, without recursing
+  into `JS_CallInternal` and without pushing a stack frame. Other callers
+  (`f.call`, `Array.prototype.map`, …) reach it from the generic
+  C-function path.
 - **Inline guard and unboxing.** `tsaot_fast_<i>` reads the argument tags and
-  payloads straight from the interpreter's `JSValue` slots. The layout is
-  `_Static_assert`ed in the generated glue.
+  payloads straight from the interpreter's `JSValue` slots.
 - **Inlined body.** Unless a function is large, its body is compiled straight
-  into its JS entry, so there is no second call, prologue or stack check.
-- **Boxing without float round-trips.** Results are normalized to int32 the
-  way the interpreter's `js_number()` does, using integer ops on the bit
-  pattern instead of a chain of dependent float conversions.
+  into its JS entry.
 - **Result in registers.** The `JSValue` comes back in `rax:rdx` (`x0:x1` on
-  AArch64). A result written to memory as two 8-byte halves and reloaded by
-  the interpreter as one 16-byte value defeats store forwarding, and that
-  stall alone used to be the single largest cost of a call.
+  AArch64). Writing it to memory as two halves and reloading it as one 16-byte
+  value would defeat store forwarding. That stall used to be the largest cost
+  of a call.
 
-`bench/micro/crossing.ts` measures the cost of one call from an interpreted
-loop:
+`bench/micro/crossing.ts` measures one call from an interpreted loop:
 
 | callee | interpreted callee | native callee |
 |---|---:|---:|
-| `id(x)` (pure crossing) | 61 ns | **17 ns** |
-| `lerp(a, b, t)` (cost beyond doing the same math inline) | 65 ns | **2 ns** |
+| `id(x)` (pure crossing) | 38 ns | **22 ns** |
+| `lerp(a, b, t)` (cost beyond doing the same math inline) | 36 ns | **6 ns** |
 
-The hook is the only engine change. QuickJS-NG's interpreter loop is very
-sensitive to code layout: in A/B runs, even a never-taken branch in `OP_call`
-moved unrelated benchmarks by −23% to +9%. The hook is therefore an
-out-of-line `unlikely` jump that leaves the regular call path's generated code
-alone. With it, purely interpreted code measured between −12% (`fib`) and
-+8% (`boundary`'s interpreted baseline) against the unpatched engine, inside
-that same layout-noise band.
+QuickJS-NG's interpreter loop is very sensitive to code layout. In A/B runs,
+even a never-taken branch in `OP_call` moved unrelated benchmarks by −23% to
++9%. The hook is therefore an out-of-line `unlikely` jump that leaves the
+regular call path's generated code alone.
 
-## The native subset (phase 1)
+### The engine patch
 
-- Parameters annotated `number` or `boolean`; return type `number`, `boolean`,
-  `void`, or inferred (as `tsc` would, without recursion through unannotated
-  functions).
-- `let` / `const` locals with initializers, assignment and compound assignment,
-  `++` / `--`.
-- All arithmetic, comparison, bitwise, logical (`&&`, `||` with JS truthiness),
-  conditional and comma operators on numbers and booleans.
-- `if`, `while`, `do`/`while`, `for`, labelled `break` / `continue`, `return`.
-- Calls to other native functions; `Math.*` (all pure functions and constants),
-  `Number.isNaN` / `isFinite` / `isInteger` / `isSafeInteger`, `Number.*`
-  constants, `NaN`, `Infinity`.
-- Module-level `const`s with literal values, folded at compile time.
+`vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
+`patches/0001-tsaot-engine-support.patch`, which only *adds* API:
 
-`tsaot report file.ts` says, for every function, whether it is native and, if
-not, which construct stopped it.
+- `JSCFunctionFast` and `JS_NewCFunctionDataFast`, the call hook above;
+- `JS_BinaryOperator` / `JS_UnaryOperator`: every JS operator, with exactly
+  the interpreter's semantics, for the slow paths of native code;
+- `JS_GetGlobalVariable` / `JS_SetGlobalVariable`: strict-mode global access;
+- `JS_AwaitValue`: resume a native async function when a value settles;
+- `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
+  counts, array elements, typed array storage, string length). It is
+  statically asserted in the engine, and again in the generated glue.
+
+## What compiles natively
+
+- **Numbers and booleans**, unboxed: all operators, `Math.*`, the
+  `Number.is*` predicates and constants, and module-level literal `const`s
+  (folded).
+- **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
+  `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
+- **JS values**: `let` / `const` / `var` holding anything, plus:
+  - string, template, object and array literals;
+  - property and element access, assignment and `delete`;
+  - `typeof`, `in`, `instanceof`, `new`;
+  - calls to any function: native functions directly, interpreted ones
+    through the engine;
+  - globals.
+
+  Unboxed values are boxed where they meet JS values.
+- **Arrays and typed arrays**, with inline element access and `.length`.
+  Typed array elements are unboxed numbers: `s += a[i] * b[i]` over two
+  `Float64Array`s is plain floating-point code. An out-of-bounds read is
+  `undefined`, encoded as a reserved NaN inside native code.
+- **Closures**: nested functions and arrows, including ones that outlive
+  their creator and capture loop variables (one binding per iteration, as in
+  JS). Side effects on module-level bindings (`count++`) are shared with
+  interpreted code.
+- **Class methods** (`this` included; static methods too).
+- **`async` functions and arrows**: `await` anywhere in an expression. Awaits
+  are hoisted into statements while keeping JS evaluation order, so microtask
+  ordering matches the interpreter exactly.
+
+Not yet: `for`-`of` and `for`-`in`, generators, destructuring, spread and
+rest, optional chaining,
+private fields, `super`, getters and setters and methods in object literals,
+`arguments`, and `await` inside `finally` or in a `for` update. A function
+using one of these stays interpreted. `tsaot report file.ts` says, for every
+function, whether it is native and, if not, which construct stopped it.
 
 ### Forcing native compilation: `aot`
 
@@ -120,9 +166,16 @@ Unmarked functions are compiled on a best-effort basis. A function marked
 `aot` **must** compile natively, or the build fails with the reason:
 
 ```ts
-aot function fib(n: number): number { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
-const sq = aot (x: number): number => x * x;
-const cube = aot function (x: number): number { return x * x * x; };
+let count: number = 0;
+aot function withSideEffects() { count++; }
+
+aot function debounced(delay: number, callback: () => void): () => void {
+  let timeoutId: number;
+  return aot (): void => {
+    clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => callback(), delay);
+  };
+}
 
 // Equivalent directive form, which keeps the file valid TypeScript for tsc,
 // editors and formatters:
@@ -140,50 +193,56 @@ function clamp(x: number, lo: number, hi: number): number {
    ·                                                 ╰── calls `mid`, which is not compiled natively
    ╰────
   help: `mid` is interpreted: calls `helper`, which is not compiled natively
-        `helper` is interpreted: property access is not supported
+        `helper` is interpreted: unsupported statement: debugger
 ```
 
 `aot` is a contextual keyword, like `async`. It marks a function only when it
 directly precedes one on the same line (`aot function`, `aot async function`,
-`aot (…) => …`). Everywhere else `aot` is an ordinary
-identifier: `aot(x)` is still a call. The keyword is not TypeScript syntax,
-so `tsc`, editors and formatters reject it. Use `"use aot"` where that matters.
-For now, `aot` can mark top-level function declarations and top-level `const`
-function bindings. On async functions, generators, methods or nested
-functions it is a compile error that says so.
+`aot (…) => …`). Everywhere else `aot` is an ordinary identifier: `aot(x)` is
+still a call. The keyword is not TypeScript syntax, so `tsc`, editors and
+formatters reject it. Use `"use aot"` where that matters.
+
+A nested function can be marked when its enclosing function is compiled. A
+callback written in top-level code (`xs.map(aot (x) => …)`) cannot be marked
+yet. `"use no aot"` keeps a function interpreted.
 
 ### Semantics and soundness
 
 The goal is to be **observably identical to the interpreter**. The
-differential test suite (`tests/cases`) builds every case both natively and
-interpreted-only and requires byte-identical output. It covers `-0`, NaN,
-ToInt32 at every boundary, `%`, `**`, `Math.round` half-cases, `Math.min`/`max`
-with `-0`/NaN, fallbacks on ill-typed calls, and stack overflow.
+differential test suite (`tests/cases`) builds every case natively and
+interpreted-only and requires byte-identical output. It covers, among
+others:
+- `-0`, NaN, ToInt32 at every boundary;
+- typed array conversions, detached and resizable buffers;
+- array holes and accessors;
+- exceptions through native frames;
+- async interleavings.
 
 - Functions are compiled only if their binding is never reassigned. Direct
   `eval` anywhere in the module disables native compilation for the module,
   because it could rebind anything.
-- Reading a block-scoped variable before its declaration (TDZ) is rejected
-  statically.
 - Native recursion is bounded. Stack overflow unwinds the native frames and
-  throws the same `RangeError` the interpreter would. Native frames are much
-  smaller than interpreter frames, so native code can recurse deeper before
-  hitting the limit. Stack depth is implementation-defined in ECMAScript.
-- **`Math` and `Number` are locked.** Before any JS runs (in native and
-  `--no-native` builds alike), every own property of `Math`, the
-  `Number.is*` predicates, and the global `Math` / `Number` bindings are made
-  non-writable and non-configurable. Patching them throws a `TypeError`, and
-  patches visible in the source (`Math.sqrt = …`, `delete Number.isNaN`,
-  `Object.defineProperty(Math, …)`) are compile errors. New properties can
-  still be added.
-- A top-level `const` function declared *after* other top-level code may
-  still be in its TDZ when native code runs. It is compiled, but other
-  native functions do not call it directly.
+  throws the same `RangeError` the interpreter would.
+- **Some builtins are locked.** Before any JS runs (in native and
+  `--no-native` builds alike), the following are made non-writable and
+  non-configurable:
+  - every own property of `Math`;
+  - the `Number.is*` predicates;
+  - the global `Math`, `Number` and typed array constructor bindings.
+
+  Patching them throws a `TypeError`, and patches visible in the source are
+  compile errors. Each typed array prototype also gets the intrinsic `length`
+  getter as a locked own property. With that, the `length` of a typed array
+  with no own properties and its original prototype is always its element
+  count, which native code reads inline.
 
 Known observable differences:
 - `f.toString()` of a native function returns native code instead of the
   source.
 - A native function is not a constructor (`new f()` throws).
+- Native frames do not appear in `Error.stack`.
+- `Object.getOwnPropertyNames(Float64Array.prototype)` includes `length` (see
+  above).
 
 ## Getting started
 
@@ -201,54 +260,53 @@ cargo build --release
 ./target/release/tsaot report tests/cases/rejected.ts
 ./target/release/tsaot emit-js bench/fib.ts       # what the interpreter runs
 ./target/release/tsaot ir bench/fib.ts            # typed IR of native functions
-cargo test                                        # differential tests
+cargo test                                        # differential tests (leak-checking engine)
 bench/run.sh                                      # hyperfine: native vs interpreted
 ```
 
-The compiled executable targets the host CPU (like `-march=native`).
+`scripts/build-quickjs.sh` also builds `build/quickjs-check`, an engine with
+assertions enabled, which the tests link against. The compiled executable
+targets the host CPU (like `-march=native`).
 
 ## Benchmarks
 
 Mean wall time for the whole program, measured with hyperfine. "Interpreted" is
 the same program built with `--no-native`, i.e. plain QuickJS-NG bytecode.
 
-| benchmark    | what it stresses                             | interpreted | native  | speedup |
-|--------------|----------------------------------------------|------------:|--------:|--------:|
-| mandelbrot   | float loops                                  |      878 ms |   35 ms |   25.3× |
-| fib          | recursive calls                              |      466 ms |   33 ms |   14.1× |
-| integrate    | libm calls (`sin`, `exp`, `sqrt`)            |     4.25 s  |  475 ms |    8.9× |
-| primes       | `%`, loops                                   |     4.05 s  |  0.91 s |    4.5× |
-| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)         |     3.63 s  |  1.12 s |    3.2× |
-| boundary     | 5M tiny native calls *from interpreted code* |      605 ms |  367 ms |    1.65× |
+| benchmark    | what it stresses                                   | interpreted | native  | speedup |
+|--------------|----------------------------------------------------|------------:|--------:|--------:|
+| mandelbrot   | float loops                                        |      858 ms |   35 ms |   24.4× |
+| fib          | recursive calls                                    |      415 ms |   35 ms |   12.0× |
+| integrate    | libm calls (`sin`, `exp`, `sqrt`)                  |     4.13 s  |  476 ms |    8.7× |
+| arrays       | `Uint8Array` sieve, `Float64Array` dot, `number[]` |     3.74 s  |  669 ms |    5.6× |
+| primes       | `%`, loops                                         |     3.97 s  |  911 ms |    4.4× |
+| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)               |     3.53 s  |  1.12 s |    3.2× |
+| boundary     | 5M tiny native calls *from interpreted code*       |      510 ms |  359 ms |    1.4× |
 
-In `boundary` the interpreted loop around the calls dominates; the calls
-themselves cost about 2 ns each (see the crossing section above).
+In `boundary`, the interpreted loop around the calls dominates.
 
 ## Roadmap
 
 - **Int32 representation selection**: keep integer-valued locals in machine
-  integers (loop counters, bitwise code). This is the biggest remaining win
-  for `primes` and `xorshift`.
-- **Objects and arrays**: `Float64Array` / `number[]` with bounds-checked
-  native access, then class instances with known shapes, through the QuickJS
-  C API (safe because QuickJS uses refcounting and does not move objects).
-- **Strings**, and calls from native code back into interpreted code (with
-  exception propagation through the existing unwind mechanism).
+  integers (loop counters, indices, bitwise code). This is the biggest
+  remaining win for `primes`, `xorshift` and array indexing.
+- Shapes for class instances (inline property access), and calls to methods
+  of known classes without the engine.
+- `for`-`of` (with a fast path for arrays), generators, destructuring, spread
+  and rest, optional chaining, private fields.
 - **Multi-module programs** (`import` between `.ts` files).
 - **Position-preserving type stripping**, so interpreter stack traces point
   at the original `.ts` lines.
-- Optional full strict type check with `tsc --strict --noEmit` (available in
-  the dev shell).
 
 ## Layout
 
 ```
-crates/tsaot-front    oxc front end, strict-subset checker, typed IR, type erasure
+crates/tsaot-front    oxc front end, checker, typed IR, type erasure, `aot` marker
 crates/tsaot-codegen  Cranelift backend (IR -> object file)
 crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + cc driver; differential tests
-runtime/              C runtime linked into every program (pow, round, ToInt32, stack guard)
+runtime/              C runtime linked into every program (helpers, boxes, async frames, cells)
 vendor/quickjs        QuickJS-NG (git submodule, kept pristine)
-patches/              engine patches applied by scripts/build-quickjs.sh
+patches/              engine patch applied by scripts/build-quickjs.sh
 tests/cases           differential test programs
 tests/errors          programs that must fail to compile, with expected diagnostics
 bench/                benchmarks + bench/run.sh; bench/micro/ for microbenchmarks
