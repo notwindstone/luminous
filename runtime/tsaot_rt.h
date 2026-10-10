@@ -60,7 +60,10 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define TSAOT_PIN_ARRAY_ITERATOR_PROTO 15
 #define TSAOT_PIN_ARRAY_ITERATOR_NEXT 16
 #define TSAOT_PIN_SYMBOL_ITERATOR 17
-#define TSAOT_PINS 18
+#define TSAOT_PIN_ASYNC_FUNCTION_PROTO 18
+#define TSAOT_PIN_GENERATOR_FUNCTION_PROTO 19
+#define TSAOT_PINS 20
+JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
 int tsaot_array_iter_ok(JSContext *ctx);
 extern JSValue tsaot_pins[];
 extern void *tsaot_shapes[];
@@ -88,6 +91,9 @@ JSValue tsaot_object_rest(JSContext *ctx, JSValue *v, int nkeys);
 int tsaot_define_computed(JSContext *ctx, JSValue *v, JSValue val);
 int tsaot_object_spread(JSContext *ctx, JSValue obj, JSValue source);
 int tsaot_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_throw);
+JSValue tsaot_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots);
+JSValue tsaot_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data);
+JSValue tsaot_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind);
 
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);

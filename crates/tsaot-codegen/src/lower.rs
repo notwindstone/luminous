@@ -253,9 +253,9 @@ impl<'a> Lower<'a> {
                 _ if f.boxed[i] => LVar::Boxed {
                     obj: (b.declare_var(I64), b.declare_var(I64)),
                     slot: b.declare_var(I64),
-                    // Async functions own every box (captures are dup'ed
+                    // Step functions own every box (captures are dup'ed
                     // into their frame).
-                    owned: f.is_async || !f.captures.contains(&i),
+                    owned: f.is_async || f.is_generator || !f.captures.contains(&i),
                 },
                 Ty::Any | Ty::Arr(_) => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
@@ -688,6 +688,7 @@ impl<'a> Lower<'a> {
             Stmt::Expr(e) => self.effect(e),
             Stmt::NewBoxes(ls) => self.new_boxes(ls, false),
             Stmt::Await { value, target } => self.await_stmt(value, *target),
+            Stmt::Yield { value, kind, target } => self.yield_stmt(value, *kind, *target),
             Stmt::Block(b) => self.stmts(b),
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
@@ -3191,6 +3192,156 @@ impl Lower<'_> {
         }
     }
 
+    /// Suspend the generator: spill the locals and return to the runtime
+    /// what it yields (`kind` 0: a value, 1: an iterator result as is). It
+    /// continues at the returned block, with the resumption in the step
+    /// function's parameters.
+    fn suspend(&mut self, value: Option<(Value, Value)>, kind: i64) -> Block {
+        let resume = self.b.create_block();
+        let (state, vptr) = {
+            let cx = self.async_cx.as_mut().expect("yield in a generator");
+            cx.resumes.push(resume);
+            (cx.resumes.len() - 1, cx.value)
+        };
+        debug_assert!(self.temps.is_empty(), "values held across a yield");
+        self.spill_locals();
+        if let Some((p, t)) = value {
+            self.b.ins().store(Self::mem(), p, vptr, 0);
+            self.b.ins().store(Self::mem(), t, vptr, TAG_OFFSET);
+        }
+        let payload = self.b.ins().iconst(I64, 2 * state as i64 + kind);
+        let suspended = self.b.ins().iconst(I64, TAG_UNINITIALIZED);
+        self.b.ins().return_(&[payload, suspended]);
+        self.b.switch_to_block(resume);
+        resume
+    }
+
+    /// The value the generator was resumed with (a new reference), and how
+    /// (next / return / throw: 0 / 1 / 2).
+    fn resumption(&mut self) -> ((Value, Value), Value) {
+        let (vptr, mode) = {
+            let cx = self.async_cx.as_ref().unwrap();
+            (cx.value, cx.is_throw)
+        };
+        let vp = self.b.ins().load(I64, Self::mem(), vptr, 0);
+        let vt = self.b.ins().load(I64, Self::mem(), vptr, TAG_OFFSET);
+        self.dup((vp, vt));
+        ((vp, vt), mode)
+    }
+
+    fn yield_stmt(&mut self, value: &Expr, kind: ir::YieldKind, target: ir::AwaitTarget) {
+        match kind {
+            ir::YieldKind::Initial => {
+                self.suspend(None, 0);
+            }
+            ir::YieldKind::Value => {
+                let v = self.expr(value).any();
+                self.suspend(Some(v), 0);
+                let (v, mode) = self.resumption();
+                self.resumed(v, mode, target);
+            }
+            ir::YieldKind::Delegate { iter, next, next_atom } => self.yield_star(value, iter, next, next_atom, target),
+        }
+    }
+
+    /// After a suspension: throw or return the value delivered, or deliver
+    /// it to `target`.
+    fn resumed(&mut self, (vp, vt): (Value, Value), mode: Value, target: ir::AwaitTarget) {
+        let throw = self.b.create_block();
+        let not_throw = self.b.create_block();
+        let ret = self.b.create_block();
+        let next = self.b.create_block();
+        self.b.set_cold_block(throw);
+        let is_throw = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 2);
+        self.b.ins().brif(is_throw, throw, &[], not_throw, &[]);
+        self.b.switch_to_block(throw);
+        let ctx = self.ctx;
+        self.helper("JS_Throw", &[ctx, vp, vt]);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(not_throw);
+        let is_return = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 1);
+        self.b.ins().brif(is_return, ret, &[], next, &[]);
+        // `return(v)`: as a `return v` here (running `finally` blocks).
+        self.b.switch_to_block(ret);
+        self.return_value(V::Any(vp, vt));
+        self.b.switch_to_block(next);
+        let v = V::Any(vp, vt);
+        match target {
+            ir::AwaitTarget::Discard => self.free((vp, vt)),
+            ir::AwaitTarget::Set(l) => self.set_local(l, v),
+            ir::AwaitTarget::Init(l) => self.init_local(l, v),
+            ir::AwaitTarget::Return => unreachable!("`return yield` is hoisted"),
+        }
+    }
+
+    /// `yield* value`: resume the inner iterator as the generator is
+    /// resumed, yielding its results, until it is done.
+    fn yield_star(
+        &mut self,
+        value: &Expr,
+        iter: ir::LocalId,
+        next: ir::LocalId,
+        next_atom: ir::AtomId,
+        target: ir::AwaitTarget,
+    ) {
+        let (p, t) = self.expr(value).any();
+        let v = V::Any(p, t);
+        self.hold(v);
+        let ctx = self.ctx;
+        let sync = self.b.ins().iconst(I32, 0);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, sync]);
+        self.check_value(it[1]);
+        self.release(v);
+        self.free_v(v);
+        self.set_local(iter, V::Any(it[0], it[1]));
+        let a = self.atom(next_atom);
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
+        self.check_value(m[1]);
+        self.set_local(next, V::Any(m[0], m[1]));
+        // The loop: (mode, received value).
+        let head = self.b.create_block();
+        let mode = self.b.append_block_param(head, I32);
+        let rp = self.b.append_block_param(head, I64);
+        let rt = self.b.append_block_param(head, I64);
+        let zero = self.b.ins().iconst(I32, 0);
+        let u = self.konst(0, TAG_UNDEFINED);
+        let (up, ut) = u.any();
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(up), BlockArg::Value(ut)]);
+        self.b.switch_to_block(head);
+        let (ip, itag) = self.use_local(iter).any();
+        let (np, nt) = self.use_local(next).any();
+        let slot = self.values_slot(&[(ip, itag), (np, nt), (rp, rt)]);
+        let kind_addr = self.done_slot();
+        let r = self.helper("tsaot_yield_star", &[ctx, slot, mode, kind_addr]);
+        self.check_value(r[1]);
+        let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
+        let yield_blk = self.b.create_block();
+        let finished = self.b.create_block();
+        let ret = self.b.create_block();
+        let deliver = self.b.create_block();
+        let not_yield = self.b.ins().icmp_imm_s(IntCC::NotEqual, kind, 0);
+        self.b.ins().brif(not_yield, finished, &[], yield_blk, &[]);
+        // An inner result: yielded as is, then resumed with the next mode.
+        self.b.switch_to_block(yield_blk);
+        self.suspend(Some((r[0], r[1])), 1);
+        let ((vp, vt), mode) = self.resumption();
+        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.b.switch_to_block(finished);
+        let is_return = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 2);
+        self.b.ins().brif(is_return, ret, &[], deliver, &[]);
+        self.b.switch_to_block(ret);
+        self.return_value(V::Any(r[0], r[1]));
+        // Done: the value of the `yield*`.
+        self.b.switch_to_block(deliver);
+        let v = V::Any(r[0], r[1]);
+        match target {
+            ir::AwaitTarget::Discard => self.free((r[0], r[1])),
+            ir::AwaitTarget::Set(l) => self.set_local(l, v),
+            ir::AwaitTarget::Init(l) => self.init_local(l, v),
+            ir::AwaitTarget::Return => unreachable!("`return yield*` is hoisted"),
+        }
+    }
     /// The dispatch on the resume state.
     fn emit_dispatch(&mut self) {
         let Some(cx) = self.async_cx.take() else { return };

@@ -75,21 +75,25 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     let n = m.funcs.len();
     let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
-    c.push_str("\nstatic const struct { JSCFunctionFast *fast; const char *name; int length; } tsaot_table[] = {\n");
+    // kind: 0 plain, 1 async, 2 generator (see tsaot_function_kind).
+    c.push_str(
+        "\nstatic const struct { JSCFunctionFast *fast; const char *name; int length, kind; } tsaot_table[] = {\n",
+    );
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        writeln!(c, "    {{ tsaot_fast_{i}, {}, {} }},", c_str(&f.name), f.js_length).unwrap();
+        let kind = if f.is_generator { 2 } else { f.is_async as u8 };
+        writeln!(c, "    {{ tsaot_fast_{i}, {}, {}, {kind} }},", c_str(&f.name), f.js_length).unwrap();
     }
-    c.push_str("    { NULL, NULL, 0 },\n};\n\n");
+    c.push_str("    { NULL, NULL, 0, 0 },\n};\n\n");
 
-    // Step functions of async functions.
+    // Step functions of async functions and generators.
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        if f.is_async {
+        if f.is_async || f.is_generator {
             writeln!(c, "extern TsaotStep tsaot_fn_{i};").unwrap();
         }
     }
     c.push_str("TsaotStep *const tsaot_steps[] = {\n");
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        if f.is_async {
+        if f.is_async || f.is_generator {
             writeln!(c, "    tsaot_fn_{i},").unwrap();
         } else {
             c.push_str("    NULL,\n");
@@ -150,8 +154,10 @@ static JSValue tsaot_bind(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     i = JS_VALUE_GET_INT(argv[0]);
     if (i < 0 || i >= {n})
         return JS_ThrowRangeError(ctx, "{BIND_FN}: bad index");
-    return JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback, tsaot_table[i].name,
-                                   tsaot_table[i].length, 0, 1, &argv[1]);
+    return tsaot_function_kind(ctx, JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback,
+                                                            tsaot_table[i].name, tsaot_table[i].length, 0,
+                                                            1, &argv[1]),
+                               argv[1], tsaot_table[i].kind);
 }}
 
 /* Closures never decline (all their parameters are JS values), but if the
@@ -165,8 +171,10 @@ static JSValue tsaot_closure_slow(JSContext *ctx, JSValueConst this_val, int arg
 /* A closure of native function `fn` over `data` (borrowed). */
 JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
 {{
-    return JS_NewCFunctionDataFast(ctx, tsaot_table[fn].fast, tsaot_closure_slow, tsaot_table[fn].name,
-                                   tsaot_table[fn].length, fn, n, data);
+    return tsaot_function_kind(ctx, JS_NewCFunctionDataFast(ctx, tsaot_table[fn].fast, tsaot_closure_slow,
+                                                            tsaot_table[fn].name, tsaot_table[fn].length,
+                                                            fn, n, data),
+                               JS_UNDEFINED, tsaot_table[fn].kind);
 }}
 
 /* {METHOD_FN}(i, Class, is_static, key): replace a class method with native
@@ -196,8 +204,10 @@ static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSV
         JS_FreeAtom(ctx, key);
         return JS_ThrowTypeError(ctx, "{METHOD_FN}: not a method");
     }}
-    stub = JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback, tsaot_table[i].name,
-                                   tsaot_table[i].length, 0, 1, &fallback);
+    stub = tsaot_function_kind(ctx, JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback,
+                                                            tsaot_table[i].name, tsaot_table[i].length, 0,
+                                                            1, &fallback),
+                               fallback, tsaot_table[i].kind);
     JS_FreeValue(ctx, fallback);
     r = JS_IsException(stub) ? -1
         : JS_DefinePropertyValue(ctx, holder, key, stub, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW);

@@ -157,6 +157,9 @@ pub struct Func {
     pub is_async: bool,
     /// The last parameter collects the remaining arguments in an array.
     pub rest: bool,
+    /// `function*`: compiled as a resumable step function over a heap
+    /// frame, as async functions are.
+    pub is_generator: bool,
     /// In functions that suspend: holds the return value while `finally`
     /// blocks run on the way out (`Any`).
     pub ret_slot: Option<LocalId>,
@@ -192,6 +195,14 @@ pub enum Stmt {
     /// `await value` (`Any`) at statement level, then deliver the result.
     Await {
         value: Expr,
+        target: AwaitTarget,
+    },
+    /// In a generator: `yield value` / `yield* value`, then deliver what
+    /// the generator is resumed with (`target`: not `Return`); or the
+    /// initial suspension, after the parameters are bound.
+    Yield {
+        value: Expr,
+        kind: YieldKind,
         target: AwaitTarget,
     },
     Break(LoopId),
@@ -343,6 +354,21 @@ pub enum ExprKind {
     Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).
     Void(Box<Expr>),
+}
+
+/// What a `Stmt::Yield` does.
+#[derive(Debug, Clone, Copy)]
+pub enum YieldKind {
+    Value,
+    /// `yield*`: the iterator of the value and its `next` method go to
+    /// these locals.
+    Delegate {
+        iter: LocalId,
+        next: LocalId,
+        next_atom: AtomId,
+    },
+    /// Suspends when the generator is created; resumed by the first `next`.
+    Initial,
 }
 
 /// Where an awaited value goes.

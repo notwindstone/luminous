@@ -107,7 +107,7 @@
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1435,10 @@
+@@ -1342,6 +1435,13 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -115,6 +115,9 @@
 +                                          JSCFunctionData *func, const char *name,
 +                                          int length, int magic, int data_len,
 +                                          JSValueConst *data);
++/* The function object of a C function data object, from the data that its
++   JSCFunctionFast entry receives (borrowed). */
++JS_EXTERN JSValueConst JS_GetFunctionOfData(JSValueConst *func_data);
  JS_EXTERN JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
                                         const char *name,
                                         int length, int magic, int data_len,
@@ -146,15 +149,16 @@
  typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
-@@ -6560,6 +6579,7 @@
+@@ -6560,6 +6579,8 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
 +    JSCFunctionFast *fast; /* optional, see JSCFunctionFast */
++    JSObject *self; /* the function object (not a counted reference) */
      uint8_t length;
      uint8_t data_len;
      uint16_t magic;
-@@ -6608,6 +6628,11 @@
+@@ -6608,6 +6629,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -166,15 +170,16 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6678,7 @@
+@@ -6653,6 +6679,8 @@
          return JS_EXCEPTION;
      }
      s->func = func;
 +    s->fast = NULL;
++    s->self = JS_VALUE_GET_OBJ(func_obj);
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6698,18 @@
+@@ -6672,6 +6700,25 @@
      return func_obj;
  }
  
@@ -190,10 +195,17 @@
 +    return func_obj;
 +}
 +
++JSValueConst JS_GetFunctionOfData(JSValueConst *func_data)
++{
++    JSCFunctionDataRecord *s = (JSCFunctionDataRecord *)((uint8_t *)func_data -
++                                                         offsetof(JSCFunctionDataRecord, data));
++    return JS_MKPTR(JS_TAG_OBJECT, s->self);
++}
++
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -16550,6 +16588,119 @@
+@@ -16550,6 +16597,119 @@
      return atom;
  }
  
@@ -313,7 +325,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -18047,6 +18198,29 @@
+@@ -18047,6 +18207,29 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -343,7 +355,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18722,12 @@
+@@ -18548,9 +18731,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -356,7 +368,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +18762,12 @@
+@@ -18585,9 +18771,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -369,7 +381,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +18778,21 @@
+@@ -18598,6 +18787,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -391,7 +403,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -21274,13 +21469,21 @@
+@@ -21274,13 +21478,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -414,7 +426,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21510,10 @@
+@@ -21307,7 +21519,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -426,7 +438,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21521,56 @@
+@@ -21315,6 +21530,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -483,7 +495,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21582,8 @@
+@@ -21326,6 +21591,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -492,7 +504,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +21698,30 @@
+@@ -21440,6 +21707,30 @@
      return JS_EXCEPTION;
  }
  
@@ -523,7 +535,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -44978,6 +45260,15 @@
+@@ -44978,6 +45269,15 @@
      return JS_EXCEPTION;
  }
  
@@ -539,7 +551,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56106,6 +56397,173 @@
+@@ -56106,6 +56406,173 @@
      return result_promise;
  }
  

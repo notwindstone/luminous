@@ -63,6 +63,10 @@ impl FnNode<'_> {
             FnNode::Arrow(a) => a.span,
         }
     }
+
+    pub fn is_generator(&self) -> bool {
+        matches!(self, FnNode::Function(f) if f.generator)
+    }
 }
 
 /// Where a candidate is bound, which decides how the source is rewritten.
@@ -510,9 +514,8 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
         FnNode::Function(f) => (f.span, f.r#async, f.generator, f.this_param.is_some(), &f.params, &f.return_type),
         FnNode::Arrow(a) => (a.span, a.r#async, false, false, &a.params, &a.return_type),
     };
-    if generator {
-        let what = if is_async { "async generators" } else { "generators" };
-        return reject(span, format!("{what} are not supported yet"));
+    if generator && is_async {
+        return reject(span, "async generators are not supported yet");
     }
     if this_param {
         return reject(span, "`this` parameters are not supported");
@@ -921,6 +924,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             FnNode::Function(f) => f.r#async,
             FnNode::Arrow(a) => a.r#async,
         };
+        self.is_generator = matches!(node, FnNode::Function(f) if f.generator);
         let mut abi = Vec::new();
         let mut prologue = Vec::new();
         let mut boxed_params = Vec::new();
@@ -989,6 +993,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
         }
         let body = match node {
+            FnNode::Function(f) if f.generator => {
+                // Parameters and declarations are set up when the generator
+                // is created; the body runs from the first `next`.
+                let body = f.body.as_ref().unwrap();
+                prologue.extend(self.hoist_vars(&body.statements)?);
+                prologue.extend(self.block_prologue(&body.statements)?);
+                prologue.push(Stmt::Yield {
+                    value: undefined(),
+                    kind: ir::YieldKind::Initial,
+                    target: ir::AwaitTarget::Discard,
+                });
+                self.stmts(&body.statements)?
+            }
             FnNode::Function(f) => {
                 let body = f.body.as_ref().unwrap();
                 prologue.extend(self.hoist_vars(&body.statements)?);
@@ -1017,8 +1034,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if completes_list(&body) {
             ret = Some(ret.map_or(Ty::Void, |r| join(r, Ty::Void)));
         }
-        // `undefined` is only encoded within a function.
+        // `undefined` is only encoded within a function; generators return
+        // iterator results.
         let ret = match ret.unwrap_or(Ty::Void) {
+            _ if self.is_generator => Ty::Any,
             Ty::MaybeF64 => Ty::Any,
             t => t,
         };
@@ -1040,6 +1059,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_closure: self.is_closure,
             has_this: self.has_this,
             is_async: self.is_async,
+            is_generator: self.is_generator,
             rest: self.rest,
             ret_slot: self.ret_slot,
             body: prologue,
@@ -1371,6 +1391,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let value = any(self.expr(&aw.argument)?);
                 Ok(Stmt::Await { value, target: ir::AwaitTarget::Discard })
             }
+            Expression::YieldExpression(y) => self.yield_stmt(y, ir::AwaitTarget::Discard),
             Expression::AssignmentExpression(a)
                 if a.operator == AssignmentOperator::Assign
                     && matches!(a.right.without_parentheses(), Expression::AwaitExpression(_)) =>
@@ -1397,6 +1418,25 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             other => Ok(Stmt::Expr(self.expr(other)?)),
         }
+    }
+
+    /// `yield` / `yield*`, delivering what the generator is resumed with to
+    /// `target`.
+    fn yield_stmt(&mut self, y: &'a YieldExpression<'a>, target: ir::AwaitTarget) -> R<Stmt> {
+        let value = match &y.argument {
+            Some(a) => any(self.expr(a)?),
+            None => undefined(),
+        };
+        let kind = if y.delegate {
+            ir::YieldKind::Delegate {
+                iter: self.temp(Ty::Any),
+                next: self.temp(Ty::Any),
+                next_atom: self.m.atom("next"),
+            }
+        } else {
+            ir::YieldKind::Value
+        };
+        Ok(Stmt::Yield { value, kind, target })
     }
 
     /// A loop condition. One that awaits is evaluated at the start of the
@@ -2058,6 +2098,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let value = any(self.expr(&aw.argument)?);
                 let t = self.temp(Ty::Any);
                 self.pre.push(Stmt::Await { value, target: ir::AwaitTarget::Set(t) });
+                self.local(t)
+            }
+            Expression::YieldExpression(y) => {
+                // Hoisted as `await` is.
+                let t = self.temp(Ty::Any);
+                let st = self.yield_stmt(y, ir::AwaitTarget::Set(t))?;
+                self.pre.push(st);
                 self.local(t)
             }
             Expression::BooleanLiteral(b) => Expr::new(Ty::Bool, ExprKind::Bool(b.value)),
@@ -3119,9 +3166,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// its parameters exactly (otherwise the call goes through its JS entry,
     /// which guards the types and may fall back to the interpreter).
     fn direct_call(&mut self, i: usize, args: &'a [Argument<'a>], span: Span) -> R<Option<Expr>> {
-        // Async functions are called through their JS entry (which returns
-        // a promise).
-        if !self.m.cands[i].direct_callable || self.m.cands[i].node.is_async() {
+        // Async functions and generators are called through their JS entry
+        // (which returns a promise or a generator object).
+        let node = self.m.cands[i].node;
+        if !self.m.cands[i].direct_callable || node.is_async() || node.is_generator() {
             return Ok(None);
         }
         let (params, ret) = self.m.signature(i, span)?;
@@ -3425,6 +3473,7 @@ fn completes(s: &Stmt) -> bool {
     match s {
         Stmt::Expr(_) | Stmt::NewBoxes(_) => true,
         Stmt::Await { target, .. } => !matches!(target, ir::AwaitTarget::Return),
+        Stmt::Yield { .. } => true,
         Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Throw(_) => false,
         Stmt::Block(b) => completes_list(b),
         Stmt::IterGuard { body, .. } => completes_list(body),

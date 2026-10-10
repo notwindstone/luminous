@@ -178,6 +178,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_object_spread", &[P, W, W, W, W], &[Int]),
         ("tsaot_array_iter_close", &[P, W, W, Int, Int], &[Int]),
         ("tsaot_array_iter_ok", &[P], &[Int]),
+        ("tsaot_gen_start", &[P, Int, Int, P], &[W, W]),
+        ("tsaot_gen_new", &[P, W, W, P], &[W, W]),
+        ("tsaot_yield_star", &[P, P, Int, P], &[W, W]),
         ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
@@ -316,7 +319,7 @@ impl<'m> Codegen<'m> {
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
     fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        if f.is_async {
+        if f.is_async || f.is_generator {
             return self.define_step(index, f);
         }
         let ptr = self.module.target_config().pointer_type();
@@ -427,7 +430,11 @@ impl<'m> Codegen<'m> {
         let slots_addr = b.ins().stack_addr(ptr, out, 16);
         let fi = b.ins().iconst(I32, index as i64);
         let ns = b.ins().iconst(I32, nslots as i64);
-        let start = b.ins().call(env.helpers["tsaot_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr]);
+        let start = if f.is_generator {
+            b.ins().call(env.helpers["tsaot_gen_start"], &[js_ctx, fi, ns, slots_addr])
+        } else {
+            b.ins().call(env.helpers["tsaot_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr])
+        };
         let frame = b.inst_results(start).to_vec();
         let failed = b.ins().icmp_imm_s(IntCC::Equal, frame[1], jsvalue::TAG_EXCEPTION);
         let exception = b.create_block();
@@ -501,24 +508,32 @@ impl<'m> Codegen<'m> {
             dup_value(&mut b, this_val.0, this_val.1);
             store(&mut b, s, this_val.0, this_val.1);
         }
-        // First step, then drop this entry's reference to the frame.
-        let undef_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            16,
-            4,
-        ));
-        let zero = b.ins().iconst(I64, 0);
-        let undef = b.ins().iconst(I64, jsvalue::TAG_UNDEFINED);
-        b.ins().stack_store(ptr, zero, undef_slot, 0);
-        b.ins().stack_store(ptr, undef, undef_slot, jsvalue::TAG_OFFSET);
-        let vaddr = b.ins().stack_addr(ptr, undef_slot, 0);
-        let st0 = b.ins().iconst(I32, 0);
-        let no = b.ins().iconst(I32, 0);
-        b.ins().call(env.helpers["tsaot_async_step"], &[js_ctx, slots, st0, vaddr, no]);
-        b.ins().call(env.helpers["JS_FreeValue"], &[js_ctx, frame[0], frame[1]]);
-        let pp = b.ins().load(I64, mem, promise_addr, 0);
-        let pt = b.ins().load(I64, mem, promise_addr, jsvalue::TAG_OFFSET);
-        b.ins().return_(&[pp, pt]);
+        if f.is_generator {
+            // The generator object, which takes the frame (after binding
+            // the parameters).
+            let call = b.ins().call(env.helpers["tsaot_gen_new"], &[js_ctx, frame[0], frame[1], data]);
+            let r = b.inst_results(call).to_vec();
+            b.ins().return_(&r);
+        } else {
+            // First step, then drop this entry's reference to the frame.
+            let undef_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                16,
+                4,
+            ));
+            let zero = b.ins().iconst(I64, 0);
+            let undef = b.ins().iconst(I64, jsvalue::TAG_UNDEFINED);
+            b.ins().stack_store(ptr, zero, undef_slot, 0);
+            b.ins().stack_store(ptr, undef, undef_slot, jsvalue::TAG_OFFSET);
+            let vaddr = b.ins().stack_addr(ptr, undef_slot, 0);
+            let st0 = b.ins().iconst(I32, 0);
+            let no = b.ins().iconst(I32, 0);
+            b.ins().call(env.helpers["tsaot_async_step"], &[js_ctx, slots, st0, vaddr, no]);
+            b.ins().call(env.helpers["JS_FreeValue"], &[js_ctx, frame[0], frame[1]]);
+            let pp = b.ins().load(I64, mem, promise_addr, 0);
+            let pt = b.ins().load(I64, mem, promise_addr, jsvalue::TAG_OFFSET);
+            b.ins().return_(&[pp, pt]);
+        }
 
         b.switch_to_block(exception);
         let z = b.ins().iconst(I64, 0);
@@ -553,7 +568,7 @@ impl<'m> Codegen<'m> {
     /// `JS_UNINITIALIZED`, which makes the engine call the interpreted
     /// fallback instead; an exception returns `JS_EXCEPTION`.
     fn define_fast(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        if f.is_async {
+        if f.is_async || f.is_generator {
             return self.define_async_entry(index, f);
         }
         let ptr = self.module.target_config().pointer_type();
@@ -683,7 +698,7 @@ impl<'m> Codegen<'m> {
 fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
     let ptr = module.target_config().pointer_type();
     let mut sig = module.make_signature();
-    if f.is_async {
+    if f.is_async || f.is_generator {
         // The step function: (ctx, frame slots, state, value delivered on
         // resumption, whether to throw it) -> completion value, or
         // JS_UNINITIALIZED (suspended), or JS_EXCEPTION.
@@ -858,7 +873,9 @@ pub(crate) use tsaot_front::ir::visit as walk_expr;
 fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
     for st in body {
         match st {
-            Stmt::Expr(x) | Stmt::Throw(x) | Stmt::Await { value: x, .. } => walk_expr(x, f),
+            Stmt::Expr(x) | Stmt::Throw(x) | Stmt::Await { value: x, .. } | Stmt::Yield { value: x, .. } => {
+                walk_expr(x, f)
+            }
             Stmt::Return(x) => x.iter().for_each(|x| walk_expr(x, f)),
             Stmt::If(c, a, b) => {
                 walk_expr(c, f);

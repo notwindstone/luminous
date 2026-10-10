@@ -1,6 +1,7 @@
 // @error `aot` function `gen` cannot be compiled natively
-// @error generators are not supported yet
-function* gen(n: number) {
+// @error async generators are not supported yet
+async function* gen(n: number) {
   "use aot";
   yield n;
 }
+console.log(gen(1));
