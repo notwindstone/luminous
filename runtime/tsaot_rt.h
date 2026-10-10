@@ -51,6 +51,11 @@ JSValue tsaot_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, 
 void tsaot_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
 int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 
+/* Pristine typed arrays, by JSTypedArrayEnum, and their shapes. */
+#define TSAOT_TYPED_ARRAYS 12
+extern JSValue tsaot_ta_pins[];
+extern void *tsaot_ta_shapes[];
+
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);
 int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *cells_obj);

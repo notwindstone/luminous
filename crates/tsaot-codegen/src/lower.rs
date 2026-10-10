@@ -21,10 +21,15 @@ use cranelift_codegen::ir::{
 };
 use cranelift_frontend::{FunctionBuilder, Variable};
 use tsaot_front::ir::{
-    self, AnyBinOp, AnyCmpOp, AnyUnOp, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MathFn, Stmt, Ty, UnOp,
+    self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MAYBE_F64_UNDEFINED,
+    MathFn, Stmt, Ty, UnOp,
 };
 
 use crate::jsvalue::*;
+use crate::layout;
+
+/// Typed array kinds (`JSTypedArrayEnum`), each with a pristine shape.
+const TYPED_ARRAYS: i64 = 12;
 
 /// `JSBinaryOperatorEnum` / `JSUnaryOperatorEnum` of the engine patch.
 mod op {
@@ -103,19 +108,24 @@ impl V {
 /// Cranelift types of a value of type `t`.
 pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
     match t {
-        Ty::F64 => vec![F64],
+        Ty::F64 | Ty::MaybeF64 => vec![F64],
         Ty::Bool => vec![I8],
-        Ty::Any => vec![I64, I64],
+        Ty::Any | Ty::Arr(_) => vec![I64, I64],
         Ty::Void => vec![],
     }
+}
+
+/// Whether values of type `t` are `JSValue`s.
+pub(crate) fn is_js(t: Ty) -> bool {
+    matches!(t, Ty::Any | Ty::Arr(_))
 }
 
 /// Rebuild a `V` of type `t` from Cranelift values.
 pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
     match t {
-        Ty::F64 => V::Num(vs[0]),
+        Ty::F64 | Ty::MaybeF64 => V::Num(vs[0]),
         Ty::Bool => V::Bool(vs[0]),
-        Ty::Any => V::Any(vs[0], vs[1]),
+        Ty::Any | Ty::Arr(_) => V::Any(vs[0], vs[1]),
         Ty::Void => V::Void,
     }
 }
@@ -159,6 +169,8 @@ pub(crate) struct Env {
     pub cells: GlobalValue,
     pub strings: GlobalValue,
     pub atoms: GlobalValue,
+    /// `tsaot_ta_shapes`: the shape of a pristine typed array, by kind.
+    pub ta_shapes: GlobalValue,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
 }
@@ -230,7 +242,7 @@ impl<'a> Lower<'a> {
                     // into their frame).
                     owned: f.is_async || !f.captures.contains(&i),
                 },
-                Ty::Any => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
+                Ty::Any | Ty::Arr(_) => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
             .collect();
@@ -319,9 +331,9 @@ impl<'a> Lower<'a> {
 
     fn zero(&mut self, t: Ty) -> V {
         match t {
-            Ty::F64 => V::Num(self.b.ins().f64const(0.0)),
+            Ty::F64 | Ty::MaybeF64 => V::Num(self.b.ins().f64const(0.0)),
             Ty::Bool => V::Bool(self.b.ins().iconst(I8, 0)),
-            Ty::Any => self.konst(0, TAG_UNDEFINED),
+            Ty::Any | Ty::Arr(_) => self.konst(0, TAG_UNDEFINED),
             Ty::Void => V::Void,
         }
     }
@@ -358,7 +370,7 @@ impl<'a> Lower<'a> {
     /// The local's value, borrowed. Boxed locals are checked for their TDZ.
     fn use_local(&mut self, l: ir::LocalId) -> V {
         match (self.vars[l], self.locals[l]) {
-            (LVar::One(v), Ty::F64) => V::Num(self.b.use_var(v)),
+            (LVar::One(v), Ty::F64 | Ty::MaybeF64) => V::Num(self.b.use_var(v)),
             (LVar::One(v), Ty::Bool) => V::Bool(self.b.use_var(v)),
             (LVar::Two(p, t), _) => V::Any(self.b.use_var(p), self.b.use_var(t)),
             (LVar::Boxed { .. }, _) => {
@@ -438,7 +450,7 @@ impl<'a> Lower<'a> {
                     self.free(obj);
                 }
                 LVar::Boxed { .. } => {}
-                _ if self.locals[l] == Ty::Any => {
+                _ if is_js(self.locals[l]) => {
                     let (p, t) = self.use_local(l).any();
                     self.free((p, t));
                 }
@@ -452,31 +464,45 @@ impl<'a> Lower<'a> {
         self.b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0)
     }
 
-    /// A new reference to `v` (borrowed).
+    /// A new reference to `v` (borrowed): the reference count, in the
+    /// allocator header before the pointer, is incremented inline.
     fn dup(&mut self, (p, t): (Value, Value)) {
         let rc = self.is_refcounted(t);
         let yes = self.b.create_block();
         let join = self.b.create_block();
         self.b.ins().brif(rc, yes, &[], join, &[]);
         self.b.switch_to_block(yes);
-        let ctx = self.ctx;
-        self.helper("JS_DupValue", &[ctx, p, t]);
+        let n = self.b.ins().load(I32, Self::mem(), p, layout::REF_COUNT);
+        let n = self.b.ins().iadd_imm_s(n, 1);
+        self.b.ins().store(Self::mem(), n, p, layout::REF_COUNT);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
     }
 
+    /// Release a reference: decremented inline unless it is the last one,
+    /// which the engine frees.
     fn free(&mut self, (p, t): (Value, Value)) {
         let rc = self.is_refcounted(t);
         let yes = self.b.create_block();
+        let dec = self.b.create_block();
+        let last = self.b.create_block();
         let join = self.b.create_block();
+        self.b.set_cold_block(last);
         self.b.ins().brif(rc, yes, &[], join, &[]);
         self.b.switch_to_block(yes);
+        let n = self.b.ins().load(I32, Self::mem(), p, layout::REF_COUNT);
+        let shared = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, n, 1);
+        self.b.ins().brif(shared, dec, &[], last, &[]);
+        self.b.switch_to_block(dec);
+        let n = self.b.ins().iadd_imm_s(n, -1);
+        self.b.ins().store(Self::mem(), n, p, layout::REF_COUNT);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(last);
         let ctx = self.ctx;
         self.helper("JS_FreeValue", &[ctx, p, t]);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
     }
-
     fn free_v(&mut self, v: V) {
         if let V::Any(p, t) = v {
             self.free((p, t));
@@ -937,7 +963,7 @@ impl<'a> Lower<'a> {
             self.release(v);
             self.store_box(l, v.any());
             self.free(old);
-        } else if self.locals[l] == Ty::Any {
+        } else if is_js(self.locals[l]) {
             let old = self.use_local(l).any();
             self.def_local(l, v);
             self.free(old);
@@ -1136,6 +1162,10 @@ impl<'a> Lower<'a> {
                 V::Any(p, t)
             }
             ExprKind::Box(x) => match self.expr(x) {
+                V::Num(d) if x.ty == Ty::MaybeF64 => {
+                    let (p, t) = self.box_maybe(d);
+                    V::Any(p, t)
+                }
                 V::Num(d) => {
                     let (p, t) = self.box_number(d);
                     V::Any(p, t)
@@ -1163,11 +1193,12 @@ impl<'a> Lower<'a> {
                 V::Any(p, t)
             }
             ExprKind::AnyCompare(op, x, y) => {
-                let a = self.expr(x);
+                // Boxed numbers are compared unboxed (boxed only to go slow).
+                let a = self.unboxed_operand(x);
                 self.hold(a);
-                let c = self.expr(y);
+                let c = self.unboxed_operand(y);
                 self.hold(c);
-                let r = self.compare_any(*op, a.any(), c.any());
+                let r = self.compare_mixed(*op, a, c);
                 self.release(c);
                 self.release(a);
                 self.free_v(c);
@@ -1220,15 +1251,13 @@ impl<'a> Lower<'a> {
                 v
             }
             ExprKind::GetProp(o, a) => {
-                let obj = self.expr(o);
-                self.hold(obj);
+                let (obj, owned) = self.operand(o, &[]);
                 let atom = self.atom(*a);
                 let (p, t) = obj.any();
                 let ctx = self.ctx;
                 let r = self.helper("JS_GetProperty", &[ctx, p, t, atom]);
                 self.check_value(r[1]);
-                self.release(obj);
-                self.free_v(obj);
+                self.drop_operand(obj, owned);
                 V::Any(r[0], r[1])
             }
             ExprKind::SetProp(o, a, x) => {
@@ -1250,40 +1279,201 @@ impl<'a> Lower<'a> {
                 v
             }
             ExprKind::GetElem(o, k) => {
-                let obj = self.expr(o);
-                self.hold(obj);
+                let (obj, owned) = self.operand(o, &[k]);
                 let key = self.expr(k);
-                // The key is passed on (JS_GetPropertyValue frees it).
                 let (op_, ot) = obj.any();
-                let (kp, kt) = key.any();
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                // A fast array element.
+                let (ok, idx) = self.elem_index(key);
+                let count = self.array_part(op_, ot, ok, slow);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+                let hit = self.b.create_block();
+                self.b.ins().brif(inb, hit, &[], slow, &[]);
+                self.b.switch_to_block(hit);
+                let at = self.array_slot(op_, idx);
+                let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+                let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.dup((vp, vt));
+                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                // Anything else. The key is passed on (JS_GetPropertyValue
+                // frees it).
+                self.b.switch_to_block(slow);
+                let (kp, kt) = self.boxed(key);
                 let ctx = self.ctx;
                 let r = self.helper("JS_GetPropertyValue", &[ctx, op_, ot, kp, kt]);
                 self.check_value(r[1]);
-                self.release(obj);
-                self.free_v(obj);
-                V::Any(r[0], r[1])
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                self.drop_operand(obj, owned);
+                V::Any(rp, rt)
             }
             ExprKind::SetElem(o, k, x) => {
-                let obj = self.expr(o);
-                self.hold(obj);
+                let (obj, owned) = self.operand(o, &[k, x]);
                 let key = self.expr(k);
                 self.hold(key);
                 let v = self.expr(x);
                 self.hold(v);
                 let (vp, vt) = v.any();
+                // One reference for the property, one for the expression.
                 self.dup((vp, vt));
-                let slot = self.values_slot(&[obj.any(), key.any(), (vp, vt)]);
-                // tsaot_set_elem takes the key and one reference to the value.
+                let (op_, ot) = obj.any();
+                let join = self.b.create_block();
+                let slow = self.b.create_block();
+                // Overwrite a fast array element (always a writable data
+                // property).
+                let (ok, idx) = self.elem_index(key);
+                let count = self.array_part(op_, ot, ok, slow);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+                let hit = self.b.create_block();
+                self.b.ins().brif(inb, hit, &[], slow, &[]);
+                self.b.switch_to_block(hit);
+                let at = self.array_slot(op_, idx);
+                let old_p = self.b.ins().load(I64, Self::mem(), at, 0);
+                let old_t = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.b.ins().store(Self::mem(), vp, at, 0);
+                self.b.ins().store(Self::mem(), vt, at, TAG_OFFSET);
+                self.free((old_p, old_t));
+                self.b.ins().jump(join, &[]);
+                // Anything else: tsaot_set_elem takes the key and one
+                // reference to the value.
+                self.b.switch_to_block(slow);
+                let kv = self.boxed(key);
+                let slot = self.values_slot(&[(op_, ot), kv, (vp, vt)]);
                 self.release(v);
                 self.release(key);
                 self.hold(v);
                 let ctx = self.ctx;
                 let r = self.helper("tsaot_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
                 self.release(v);
-                self.release(obj);
-                self.free_v(obj);
+                self.drop_operand(obj, owned);
                 v
+            }
+            ExprKind::Length(o, atom) => {
+                let (obj, owned) = self.operand(o, &[]);
+                let (op_, ot) = obj.any();
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                let not_obj = self.b.create_block();
+                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ot, TAG_OBJECT);
+                let obj_blk = self.b.create_block();
+                self.b.ins().brif(is_obj, obj_blk, &[], not_obj, &[]);
+                // Arrays: `length` is always own property 0, a number.
+                self.b.switch_to_block(obj_blk);
+                let class = self.b.ins().uload16(I32, Self::mem(), op_, layout::OBJ_CLASS_ID);
+                let is_array = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_ARRAY);
+                let array = self.b.create_block();
+                let other = self.b.create_block();
+                self.b.ins().brif(is_array, array, &[], other, &[]);
+                self.b.switch_to_block(array);
+                let prop = self.b.ins().load(I64, Self::mem(), op_, layout::OBJ_PROP);
+                let lp = self.b.ins().load(I64, Self::mem(), prop, 0);
+                let lt = self.b.ins().load(I64, Self::mem(), prop, TAG_OFFSET);
+                self.b.ins().jump(join, &[BlockArg::Value(lp), BlockArg::Value(lt)]);
+                // Typed arrays with a pristine shape: the element count.
+                self.b.switch_to_block(other);
+                let kind = self.b.ins().iadd_imm_s(class, -layout::CLASS_TYPED_ARRAY);
+                let is_ta = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, kind, TYPED_ARRAYS);
+                let ta = self.b.create_block();
+                self.b.ins().brif(is_ta, ta, &[], slow, &[]);
+                self.b.switch_to_block(ta);
+                let pristine = self.pristine_shape(op_, kind);
+                let ta_len = self.b.create_block();
+                self.b.ins().brif(pristine, ta_len, &[], slow, &[]);
+                self.b.switch_to_block(ta_len);
+                let count = self.b.ins().uload32(Self::mem(), op_, layout::OBJ_ARRAY_COUNT);
+                let int = self.b.ins().iconst(I64, TAG_INT);
+                self.b.ins().jump(join, &[BlockArg::Value(count), BlockArg::Value(int)]);
+                // Strings: the length in the header.
+                self.b.switch_to_block(not_obj);
+                let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, ot, TAG_STRING);
+                let string = self.b.create_block();
+                self.b.ins().brif(is_str, string, &[], slow, &[]);
+                self.b.switch_to_block(string);
+                let w = self.b.ins().uload32(Self::mem(), op_, layout::STRING_LEN);
+                let len = self.b.ins().band_imm_u(w, 0x7fff_ffff);
+                let int = self.b.ins().iconst(I64, TAG_INT);
+                self.b.ins().jump(join, &[BlockArg::Value(len), BlockArg::Value(int)]);
+                self.b.switch_to_block(slow);
+                let a = self.atom(*atom);
+                let ctx = self.ctx;
+                let r = self.helper("JS_GetProperty", &[ctx, op_, ot, a]);
+                self.check_value(r[1]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                self.drop_operand(obj, owned);
+                V::Any(rp, rt)
+            }
+            ExprKind::TypedGet(kind, a, i) => {
+                let (arr, owned) = self.operand(a, &[i]);
+                let index = self.expr(i);
+                let (p, _) = arr.any();
+                let join = self.b.create_block();
+                let r = self.b.append_block_param(join, F64);
+                let (ok, idx) = self.elem_index(index);
+                let count = self.b.ins().uload32(Self::mem(), p, layout::OBJ_ARRAY_COUNT);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+                let inb = self.b.ins().band(ok, inb);
+                let hit = self.b.create_block();
+                let undef = self.b.ins().f64const(f64::from_bits(MAYBE_F64_UNDEFINED));
+                self.b.ins().brif(inb, hit, &[], join, &[BlockArg::Value(undef)]);
+                self.b.switch_to_block(hit);
+                let base = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_ARRAY_VALUES);
+                let at = self.b.ins().imul_imm_s(idx, kind.size() as i64);
+                let at = self.b.ins().iadd(base, at);
+                let d = self.load_element(*kind, at);
+                self.b.ins().jump(join, &[BlockArg::Value(d)]);
+                self.b.switch_to_block(join);
+                self.drop_operand(arr, owned);
+                V::Num(r)
+            }
+            ExprKind::TypedSet(kind, a, i, x) => {
+                let (arr, owned) = self.operand(a, &[i, x]);
+                let index = self.expr(i);
+                let V::Num(d) = self.expr(x) else { unreachable!("TypedSet value") };
+                let (p, t) = arr.any();
+                let join = self.b.create_block();
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                // In bounds, and the buffer is not immutable.
+                let (ok, idx) = self.elem_index(index);
+                let count = self.b.ins().uload32(Self::mem(), p, layout::OBJ_ARRAY_COUNT);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+                let inb = self.b.ins().band(ok, inb);
+                let check = self.b.create_block();
+                self.b.ins().brif(inb, check, &[], slow, &[]);
+                self.b.switch_to_block(check);
+                let ta = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_TYPED_ARRAY);
+                let buf = self.b.ins().load(I64, Self::mem(), ta, layout::TA_BUFFER);
+                let abuf = self.b.ins().load(I64, Self::mem(), buf, layout::OBJ_ARRAY_BUFFER);
+                let immutable = self.b.ins().uload8(I32, Self::mem(), abuf, layout::ABUF_IMMUTABLE);
+                let hit = self.b.create_block();
+                self.b.ins().brif(immutable, slow, &[], hit, &[]);
+                self.b.switch_to_block(hit);
+                let base = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_ARRAY_VALUES);
+                let at = self.b.ins().imul_imm_s(idx, kind.size() as i64);
+                let at = self.b.ins().iadd(base, at);
+                self.store_element(*kind, at, d);
+                self.b.ins().jump(join, &[]);
+                // Out of bounds or immutable: whatever the engine does.
+                self.b.switch_to_block(slow);
+                let kv = self.boxed(index);
+                let vv = self.box_number(d);
+                let slot = self.values_slot(&[(p, t), kv, vv]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_set_elem", &[ctx, slot]);
+                self.check_int(r[0]);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
+                self.drop_operand(arr, owned);
+                V::Num(d)
             }
             ExprKind::DeleteProp(o, a) => {
                 let obj = self.expr(o);
@@ -1331,8 +1521,11 @@ impl<'a> Lower<'a> {
             }
             ExprKind::CallMethod(o, key, args) => {
                 // The method is read before the arguments are evaluated.
-                let obj = self.expr(o);
-                self.hold(obj);
+                let mut later: Vec<&Expr> = args.iter().collect();
+                if let Key::Value(k) = key {
+                    later.push(k);
+                }
+                let (obj, owned) = self.operand(o, &later);
                 let (op_, ot) = obj.any();
                 let ctx = self.ctx;
                 let m = match key {
@@ -1349,8 +1542,7 @@ impl<'a> Lower<'a> {
                 let fv = V::Any(m[0], m[1]);
                 self.hold(fv);
                 let r = self.call_values(fv, obj, args);
-                self.release(obj);
-                self.free_v(obj);
+                self.drop_operand(obj, owned);
                 r
             }
             ExprKind::New(f, args) => {
@@ -1645,7 +1837,28 @@ impl<'a> Lower<'a> {
     }
 
     /// Comparison of borrowed values. Fast path for two numbers.
+    /// A number from a number, or from a JS value known to be one.
+    fn num_value(&mut self, v: V) -> Value {
+        match v {
+            V::Num(d) => d,
+            other => self.number_of(other.any()),
+        }
+    }
+
+    /// `x`, but a number for a boxed number.
+    fn unboxed_operand(&mut self, x: &Expr) -> V {
+        match &x.kind {
+            ExprKind::Box(inner) if inner.ty == Ty::F64 => self.expr(inner),
+            _ => self.expr(x),
+        }
+    }
+
     fn compare_any(&mut self, op: AnyCmpOp, a: (Value, Value), c: (Value, Value)) -> Value {
+        self.compare_mixed(op, V::Any(a.0, a.1), V::Any(c.0, c.1))
+    }
+
+    /// A comparison of JS values or numbers (borrowed).
+    fn compare_mixed(&mut self, op: AnyCmpOp, a: V, c: V) -> Value {
         let code = match op {
             AnyCmpOp::Lt => op::LT,
             AnyCmpOp::Le => op::LTE,
@@ -1663,14 +1876,25 @@ impl<'a> Lower<'a> {
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         if !matches!(op, AnyCmpOp::In | AnyCmpOp::InstanceOf) {
-            let na = self.is_number(a.1);
-            let nc = self.is_number(c.1);
-            let both = self.b.ins().band(na, nc);
             let fast = self.b.create_block();
-            self.b.ins().brif(both, fast, &[], slow, &[]);
+            match (a, c) {
+                (V::Any(_, at), V::Any(_, ct)) => {
+                    let na = self.is_number(at);
+                    let nc = self.is_number(ct);
+                    let both = self.b.ins().band(na, nc);
+                    self.b.ins().brif(both, fast, &[], slow, &[]);
+                }
+                (V::Any(_, t), _) | (_, V::Any(_, t)) => {
+                    let n = self.is_number(t);
+                    self.b.ins().brif(n, fast, &[], slow, &[]);
+                }
+                _ => {
+                    self.b.ins().jump(fast, &[]);
+                }
+            }
             self.b.switch_to_block(fast);
-            let x = self.number_of(a);
-            let y = self.number_of(c);
+            let x = self.num_value(a);
+            let y = self.num_value(c);
             let cc = match op {
                 AnyCmpOp::Lt => FloatCC::LessThan,
                 AnyCmpOp::Le => FloatCC::LessThanOrEqual,
@@ -1687,7 +1911,9 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(slow);
         let code = self.b.ins().iconst(I32, code);
         let ctx = self.ctx;
-        let r = self.helper("JS_BinaryOperator", &[ctx, code, a.0, a.1, c.0, c.1]);
+        let (ap, at) = self.boxed(a);
+        let (cp, ct) = self.boxed(c);
+        let r = self.helper("JS_BinaryOperator", &[ctx, code, ap, at, cp, ct]);
         self.check_value(r[1]);
         let r = self.b.ins().ireduce(I8, r[0]);
         let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
@@ -1783,6 +2009,18 @@ impl<'a> Lower<'a> {
     /// sits right on the latency path back into the interpreter; here the
     /// conversion that produces the int payload runs in parallel instead.
     /// Returns `(payload, tag)`.
+    /// Box a `MaybeF64`: its reserved NaN is `undefined`.
+    fn box_maybe(&mut self, d: Value) -> (Value, Value) {
+        let (p, t) = self.box_number(d);
+        let u = self.b.ins().bitcast(I64, MemFlagsData::new(), d);
+        let undef = self.b.ins().icmp_imm_s(IntCC::Equal, u, MAYBE_F64_UNDEFINED as i64);
+        let zero = self.b.ins().iconst(I64, 0);
+        let undef_tag = self.b.ins().iconst(I64, TAG_UNDEFINED);
+        let p = self.b.ins().select(undef, zero, p);
+        let t = self.b.ins().select(undef, undef_tag, t);
+        (p, t)
+    }
+
     pub(crate) fn box_number(&mut self, d: Value) -> (Value, Value) {
         let b = &mut self.b;
         let u = b.ins().bitcast(I64, MemFlagsData::new(), d);
@@ -1881,6 +2119,183 @@ impl<'a> Lower<'a> {
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
         res
+    }
+
+    /// An object operand, read while the `later` operands are evaluated. A
+    /// plain JS-valued local is borrowed instead of referenced when none of
+    /// them assigns it (nothing else can: it is not captured). Returns the
+    /// value and whether it is owned (then also held).
+    fn operand(&mut self, e: &Expr, later: &[&Expr]) -> (V, bool) {
+        if let ExprKind::Local(l) = e.kind
+            && let LVar::Two(..) = self.vars[l]
+            && !later.iter().any(|x| assigns(x, l))
+        {
+            return (self.use_local(l), false);
+        }
+        let v = self.expr(e);
+        self.hold(v);
+        (v, true)
+    }
+
+    /// Done with an `operand`.
+    fn drop_operand(&mut self, v: V, owned: bool) {
+        if owned {
+            self.release(v);
+            self.free_v(v);
+        }
+    }
+
+    // ---- arrays ----
+
+    /// An element index from a key: whether it is an integer (`I8`) and, if
+    /// so, its value (`I64`; negative ones fail unsigned bounds checks).
+    fn elem_index(&mut self, key: V) -> (Value, Value) {
+        match key {
+            V::Num(d) => {
+                let i = self.b.ins().fcvt_to_sint_sat(I64, d);
+                let back = self.b.ins().fcvt_from_sint(F64, i);
+                (self.b.ins().fcmp(FloatCC::Equal, back, d), i)
+            }
+            V::Any(p, t) => {
+                let ok = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
+                let i = self.b.ins().ireduce(I32, p);
+                (ok, self.b.ins().sextend(I64, i))
+            }
+            _ => {
+                let zero = self.b.ins().iconst(I64, 0);
+                (self.b.ins().iconst(I8, 0), zero)
+            }
+        }
+    }
+
+    /// Continue only if `ok` and `(p, t)` is an array, else go to `slow`.
+    /// Returns its fast element count (0 unless a fast array).
+    fn array_part(&mut self, p: Value, t: Value, ok: Value, slow: Block) -> Value {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let go = self.b.ins().band(is_obj, ok);
+        let obj = self.b.create_block();
+        self.b.ins().brif(go, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let class = self.b.ins().uload16(I32, Self::mem(), p, layout::OBJ_CLASS_ID);
+        let is_array = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_ARRAY);
+        let array = self.b.create_block();
+        self.b.ins().brif(is_array, array, &[], slow, &[]);
+        self.b.switch_to_block(array);
+        self.b.ins().uload32(Self::mem(), p, layout::OBJ_ARRAY_COUNT)
+    }
+
+    /// Address of fast array element `idx`.
+    fn array_slot(&mut self, p: Value, idx: Value) -> Value {
+        let values = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_ARRAY_VALUES);
+        let off = self.b.ins().imul_imm_s(idx, SIZE as i64);
+        self.b.ins().iadd(values, off)
+    }
+
+    /// Whether typed array `p` (of `JSTypedArrayEnum` `kind`, an `I32`) has
+    /// the shape of a fresh one, so its `length` is its element count.
+    fn pristine_shape(&mut self, p: Value, kind: Value) -> Value {
+        let shape = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_SHAPE);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.ta_shapes);
+        let k = self.b.ins().uextend(I64, kind);
+        let off = self.b.ins().imul_imm_s(k, 8);
+        let at = self.b.ins().iadd(table, off);
+        let want = self.b.ins().load(I64, Self::mem(), at, 0);
+        self.b.ins().icmp(IntCC::Equal, shape, want)
+    }
+
+    /// Read the element at `at` as a number.
+    fn load_element(&mut self, kind: ArrKind, at: Value) -> Value {
+        let m = Self::mem();
+        match kind {
+            ArrKind::Uint8Clamped | ArrKind::Uint8 => {
+                let x = self.b.ins().uload8(I32, m, at, 0);
+                self.b.ins().fcvt_from_uint(F64, x)
+            }
+            ArrKind::Int8 => {
+                let x = self.b.ins().sload8(I32, m, at, 0);
+                self.b.ins().fcvt_from_sint(F64, x)
+            }
+            ArrKind::Uint16 => {
+                let x = self.b.ins().uload16(I32, m, at, 0);
+                self.b.ins().fcvt_from_uint(F64, x)
+            }
+            ArrKind::Int16 => {
+                let x = self.b.ins().sload16(I32, m, at, 0);
+                self.b.ins().fcvt_from_sint(F64, x)
+            }
+            ArrKind::Uint32 => {
+                let x = self.b.ins().load(I32, m, at, 0);
+                self.b.ins().fcvt_from_uint(F64, x)
+            }
+            ArrKind::Int32 => {
+                let x = self.b.ins().load(I32, m, at, 0);
+                self.b.ins().fcvt_from_sint(F64, x)
+            }
+            // A promoted float32 NaN never has the low bits of the reserved
+            // `undefined` NaN.
+            ArrKind::Float32 => {
+                let x = self.b.ins().load(F32, m, at, 0);
+                self.b.ins().fpromote(F64, x)
+            }
+            ArrKind::Float64 => {
+                // Any NaN may be stored; never the reserved one.
+                let bits = self.b.ins().load(I64, m, at, 0);
+                let reserved = self.b.ins().icmp_imm_s(IntCC::Equal, bits, MAYBE_F64_UNDEFINED as i64);
+                let nan = self.b.ins().iconst(I64, f64::NAN.to_bits() as i64);
+                let bits = self.b.ins().select(reserved, nan, bits);
+                self.b.ins().bitcast(F64, MemFlagsData::new(), bits)
+            }
+        }
+    }
+
+    /// Store number `d` at `at`, converted as the engine does.
+    fn store_element(&mut self, kind: ArrKind, at: Value, d: Value) {
+        let m = Self::mem();
+        match kind {
+            ArrKind::Float64 => {
+                self.b.ins().store(m, d, at, 0);
+            }
+            ArrKind::Float32 => {
+                let x = self.b.ins().fdemote(F32, d);
+                self.b.ins().store(m, x, at, 0);
+            }
+            ArrKind::Uint8Clamped => {
+                // NaN -> 0, clamped to [0, 255], rounded half to even.
+                let lo = self.b.ins().f64const(0.0);
+                let hi = self.b.ins().f64const(255.0);
+                let x = self.b.ins().fmax(d, lo);
+                let x = self.b.ins().fmin(x, hi);
+                let x = self.b.ins().nearest(x);
+                let is_nan = self.b.ins().fcmp(FloatCC::Unordered, d, d);
+                let x = self.b.ins().select(is_nan, lo, x);
+                let x = self.b.ins().fcvt_to_uint_sat(I32, x);
+                self.b.ins().istore8(m, x, at, 0);
+            }
+            _ => {
+                let x = self.toint32(d);
+                match kind.size() {
+                    1 => self.b.ins().istore8(m, x, at, 0),
+                    2 => self.b.ins().istore16(m, x, at, 0),
+                    _ => self.b.ins().store(m, x, at, 0),
+                };
+            }
+        }
+    }
+
+    /// `v` as a JS value (a new reference only if it is a number or boolean).
+    fn boxed(&mut self, v: V) -> (Value, Value) {
+        match v {
+            V::Num(d) => self.box_number(d),
+            V::Bool(x) => {
+                let p = self.b.ins().uextend(I64, x);
+                (p, self.b.ins().iconst(I64, TAG_BOOL))
+            }
+            V::Any(p, t) => (p, t),
+            V::Void => {
+                let V::Any(p, t) = self.konst(0, TAG_UNDEFINED) else { unreachable!() };
+                (p, t)
+            }
+        }
     }
 
     /// JS ToInt32. Exact for |x| < 2^63 via a saturating i64 conversion and
@@ -2039,7 +2454,7 @@ impl Lower<'_> {
                 }
                 LVar::One(v) => {
                     let x = match self.locals[l] {
-                        Ty::F64 => self.b.ins().bitcast(F64, MemFlagsData::new(), p),
+                        Ty::F64 | Ty::MaybeF64 => self.b.ins().bitcast(F64, MemFlagsData::new(), p),
                         _ => self.b.ins().ireduce(I8, p),
                     };
                     self.b.def_var(v, x);
@@ -2083,7 +2498,7 @@ impl Lower<'_> {
                 LVar::One(v) => {
                     let x = self.b.use_var(v);
                     match self.locals[l] {
-                        Ty::F64 => {
+                        Ty::F64 | Ty::MaybeF64 => {
                             let p = self.b.ins().bitcast(I64, MemFlagsData::new(), x);
                             (p, self.b.ins().iconst(I64, TAG_FLOAT64))
                         }
@@ -2176,4 +2591,17 @@ impl Lower<'_> {
         }
         self.b.ins().jump(cx.resumes[0], &[]);
     }
+}
+
+/// Whether evaluating `x` may assign local `l`.
+fn assigns(x: &Expr, l: ir::LocalId) -> bool {
+    let mut found = false;
+    crate::walk_expr(x, &mut |e| {
+        if let ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } = e.kind
+            && m == l
+        {
+            found = true;
+        }
+    });
+    found
 }

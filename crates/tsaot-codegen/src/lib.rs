@@ -62,6 +62,41 @@ pub mod jsvalue {
     pub const TAG_FLOAT64: i64 = 8;
 }
 
+/// Engine memory layout read by inline fast paths: the `JS_LAYOUT_*`
+/// constants of the engine patch, which the generated C glue
+/// `_Static_assert`s against these values.
+pub mod layout {
+    pub const REF_COUNT: i32 = -4;
+    pub const STRING_LEN: i32 = 0;
+    pub const OBJ_CLASS_ID: i32 = 18;
+    pub const OBJ_SHAPE: i32 = 24;
+    pub const OBJ_PROP: i32 = 32;
+    pub const OBJ_TYPED_ARRAY: i32 = 48;
+    pub const OBJ_ARRAY_BUFFER: i32 = 48;
+    pub const OBJ_ARRAY_VALUES: i32 = 56;
+    pub const OBJ_ARRAY_COUNT: i32 = 64;
+    pub const TA_BUFFER: i32 = 24;
+    pub const ABUF_IMMUTABLE: i32 = 9;
+    pub const CLASS_ARRAY: i64 = 2;
+    pub const CLASS_TYPED_ARRAY: i64 = 22;
+
+    pub const ALL: &[(&str, i64)] = &[
+        ("REF_COUNT", REF_COUNT as i64),
+        ("STRING_LEN", STRING_LEN as i64),
+        ("OBJ_CLASS_ID", OBJ_CLASS_ID as i64),
+        ("OBJ_SHAPE", OBJ_SHAPE as i64),
+        ("OBJ_PROP", OBJ_PROP as i64),
+        ("OBJ_TYPED_ARRAY", OBJ_TYPED_ARRAY as i64),
+        ("OBJ_ARRAY_BUFFER", OBJ_ARRAY_BUFFER as i64),
+        ("OBJ_ARRAY_VALUES", OBJ_ARRAY_VALUES as i64),
+        ("OBJ_ARRAY_COUNT", OBJ_ARRAY_COUNT as i64),
+        ("TA_BUFFER", TA_BUFFER as i64),
+        ("ABUF_IMMUTABLE", ABUF_IMMUTABLE as i64),
+        ("CLASS_ARRAY", CLASS_ARRAY),
+        ("CLASS_TYPED_ARRAY", CLASS_TYPED_ARRAY),
+    ];
+}
+
 pub struct Options {
     /// Cranelift `opt_level`: "none", "speed" or "speed_and_size".
     pub opt_level: String,
@@ -158,7 +193,7 @@ struct Codegen<'m> {
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 5],
+    data: [DataId; 6],
     closure_base: usize,
     fctx: FunctionBuilderContext,
 }
@@ -201,7 +236,9 @@ impl<'m> Codegen<'m> {
             }
         }
         let mut data = Vec::new();
-        for name in ["tsaot_stack_limit", "tsaot_unwinding", "tsaot_cells", "tsaot_strings", "tsaot_atoms"] {
+        for name in
+            ["tsaot_stack_limit", "tsaot_unwinding", "tsaot_cells", "tsaot_strings", "tsaot_atoms", "tsaot_ta_shapes"]
+        {
             data.push(module.declare_data(name, Linkage::Import, true, false)?);
         }
         Ok(Codegen {
@@ -218,9 +255,19 @@ impl<'m> Codegen<'m> {
     fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
         let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
-        let [stack_limit, unwinding, cells, strings, atoms] =
+        let [stack_limit, unwinding, cells, strings, atoms, ta_shapes] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
-        Env { helpers, funcs, stack_limit, unwinding, cells, strings, atoms, closure_base: self.closure_base }
+        Env {
+            helpers,
+            funcs,
+            stack_limit,
+            unwinding,
+            cells,
+            strings,
+            atoms,
+            ta_shapes,
+            closure_base: self.closure_base,
+        }
     }
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
@@ -365,7 +412,7 @@ impl<'m> Codegen<'m> {
             let s = layout[k];
             let local_ty = f.locals[k];
             let (p, tag) = match (t, params[k]) {
-                (Ty::Any, _) => {
+                (Ty::Any | Ty::Arr(_), _) => {
                     let (p, tag) = load_arg(&mut b, argc, argv, k);
                     dup_value(&mut b, p, tag);
                     (p, tag)
@@ -494,7 +541,7 @@ impl<'m> Codegen<'m> {
         }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {
-            if t == Ty::Any {
+            if matches!(t, Ty::Any | Ty::Arr(_)) {
                 let (p, tag) = load_arg(&mut b, argc, argv, k);
                 let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, tag, 0);
                 let dup = b.create_block();
@@ -539,7 +586,9 @@ impl<'m> Codegen<'m> {
             Ty::Void => (b.ins().iconst(I64, 0), b.ins().iconst(I64, jsvalue::TAG_UNDEFINED)),
             Ty::Bool => (b.ins().uextend(I64, rv[0]), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
             Ty::F64 => box_number(&mut b, rv[0]),
-            Ty::Any => (rv[0], rv[1]),
+            Ty::Any | Ty::Arr(_) => (rv[0], rv[1]),
+            // The checker boxes these returns.
+            Ty::MaybeF64 => unreachable!("MaybeF64 return type"),
         };
         // Returned in registers: the result never touches memory on its way
         // back into the interpreter.
@@ -675,6 +724,21 @@ fn unbox_arg(b: &mut FunctionBuilder, t: Ty, argv: Value, k: usize, decline: Blo
             let i = b.ins().load(I32, mem, argv, at);
             V::Bool(b.ins().icmp_imm_s(IntCC::NotEqual, i, 0))
         }
+        Ty::Arr(kind) => {
+            // Only checked: the entry passes it on as a JS value.
+            let is_obj = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_OBJECT);
+            let obj = b.create_block();
+            let ok = b.create_block();
+            b.ins().brif(is_obj, obj, &[], decline, &[]);
+            b.switch_to_block(obj);
+            let p = b.ins().load(I64, mem, argv, at);
+            let class = b.ins().uload16(I32, mem, p, layout::OBJ_CLASS_ID);
+            let want = layout::CLASS_TYPED_ARRAY + kind as i64;
+            let is_kind = b.ins().icmp_imm_s(IntCC::Equal, class, want);
+            b.ins().brif(is_kind, ok, &[], decline, &[]);
+            b.switch_to_block(ok);
+            V::Void
+        }
         _ => unreachable!(),
     }
 }
@@ -724,87 +788,99 @@ fn all_math(m: &ir::Module) -> Vec<MathFn> {
     out
 }
 
+/// Visit `x` and every expression in it.
+pub(crate) fn walk_expr(x: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(x);
+    use ExprKind::*;
+    match &x.kind {
+        Num(_)
+        | Bool(_)
+        | Local(_)
+        | Update { .. }
+        | Undefined
+        | Null
+        | Str(_)
+        | Cell(_)
+        | Global(_)
+        | GlobalOrUndefined(_)
+        | This
+        | Closure(..) => {}
+        SetLocal(_, a)
+        | InitLocal(_, a)
+        | Unary(_, a)
+        | Truthy(a)
+        | Box(a)
+        | AnyUnary(_, a)
+        | SetCell(_, a)
+        | SetGlobal(_, a)
+        | GetProp(a, _)
+        | Length(a, _)
+        | DeleteProp(a, _)
+        | Void(a) => walk_expr(a, f),
+        TypedGet(_, a, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        TypedSet(_, a, b, c) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+            walk_expr(c, f);
+        }
+        Binary(_, a, b)
+        | Compare(_, a, b)
+        | Logical(_, a, b)
+        | AnyBinary(_, a, b)
+        | AnyCompare(_, a, b)
+        | SetProp(a, _, b)
+        | GetElem(a, b)
+        | DeleteElem(a, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        Cond(a, b, c) | SetElem(a, b, c) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+            walk_expr(c, f);
+        }
+        Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => xs.iter().for_each(|x| walk_expr(x, f)),
+        CallValue(a, xs) | New(a, xs) => {
+            walk_expr(a, f);
+            xs.iter().for_each(|x| walk_expr(x, f));
+        }
+        CallThis(a, b, xs) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+            xs.iter().for_each(|x| walk_expr(x, f));
+        }
+        CallMethod(a, k, xs) => {
+            walk_expr(a, f);
+            if let ir::Key::Value(k) = k {
+                walk_expr(k, f);
+            }
+            xs.iter().for_each(|x| walk_expr(x, f));
+        }
+        Object(props) => props.iter().for_each(|(_, x)| walk_expr(x, f)),
+    }
+}
+
 /// Visit every expression in `body`.
 fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
-    fn e(x: &Expr, f: &mut impl FnMut(&Expr)) {
-        f(x);
-        use ExprKind::*;
-        match &x.kind {
-            Num(_)
-            | Bool(_)
-            | Local(_)
-            | Update { .. }
-            | Undefined
-            | Null
-            | Str(_)
-            | Cell(_)
-            | Global(_)
-            | GlobalOrUndefined(_)
-            | This
-            | Closure(..) => {}
-            SetLocal(_, a)
-            | InitLocal(_, a)
-            | Unary(_, a)
-            | Truthy(a)
-            | Box(a)
-            | AnyUnary(_, a)
-            | SetCell(_, a)
-            | SetGlobal(_, a)
-            | GetProp(a, _)
-            | DeleteProp(a, _)
-            | Void(a) => e(a, f),
-            Binary(_, a, b)
-            | Compare(_, a, b)
-            | Logical(_, a, b)
-            | AnyBinary(_, a, b)
-            | AnyCompare(_, a, b)
-            | SetProp(a, _, b)
-            | GetElem(a, b)
-            | DeleteElem(a, b) => {
-                e(a, f);
-                e(b, f);
-            }
-            Cond(a, b, c) | SetElem(a, b, c) => {
-                e(a, f);
-                e(b, f);
-                e(c, f);
-            }
-            Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => xs.iter().for_each(|x| e(x, f)),
-            CallValue(a, xs) | New(a, xs) => {
-                e(a, f);
-                xs.iter().for_each(|x| e(x, f));
-            }
-            CallThis(a, b, xs) => {
-                e(a, f);
-                e(b, f);
-                xs.iter().for_each(|x| e(x, f));
-            }
-            CallMethod(a, k, xs) => {
-                e(a, f);
-                if let ir::Key::Value(k) = k {
-                    e(k, f);
-                }
-                xs.iter().for_each(|x| e(x, f));
-            }
-            Object(props) => props.iter().for_each(|(_, x)| e(x, f)),
-        }
-    }
     for st in body {
         match st {
-            Stmt::Expr(x) | Stmt::Throw(x) | Stmt::Await { value: x, .. } => e(x, f),
-            Stmt::Return(x) => x.iter().for_each(|x| e(x, f)),
+            Stmt::Expr(x) | Stmt::Throw(x) | Stmt::Await { value: x, .. } => walk_expr(x, f),
+            Stmt::Return(x) => x.iter().for_each(|x| walk_expr(x, f)),
             Stmt::If(c, a, b) => {
-                e(c, f);
+                walk_expr(c, f);
                 walk(a, f);
                 walk(b, f);
             }
             Stmt::Loop { test, body, update, .. } => {
-                test.iter().chain(update).for_each(|x| e(x, f));
+                test.iter().chain(update).for_each(|x| walk_expr(x, f));
                 walk(body, f);
             }
             Stmt::Switch { cases, .. } => {
                 for (t, b) in cases {
-                    t.iter().for_each(|x| e(x, f));
+                    t.iter().for_each(|x| walk_expr(x, f));
                     walk(b, f);
                 }
             }

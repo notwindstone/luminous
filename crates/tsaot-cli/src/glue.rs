@@ -9,7 +9,7 @@
 
 use std::fmt::Write;
 
-use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue};
+use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue, layout};
 use tsaot_front::erase::{BIND_FN, CELLS_OBJ, INIT_FN, METHOD_FN, NATIVE_MODULE};
 use tsaot_front::ir;
 
@@ -63,6 +63,10 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
         budget = NATIVE_STACK_BUDGET,
     )
     .unwrap();
+    for (name, v) in layout::ALL {
+        writeln!(c, "_Static_assert(JS_LAYOUT_{name} == {v}, \"engine layout mismatch\");").unwrap();
+    }
+    c.push('\n');
 
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
         writeln!(c, "extern JSCFunctionFast tsaot_fast_{i}; /* {} */", f.name.replace("*/", "* /")).unwrap();

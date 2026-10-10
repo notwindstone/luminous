@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,28 @@
+@@ -1052,6 +1059,45 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -40,10 +40,27 @@
 +JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, JSAtom prop, JSValue val);
 +JS_EXTERN int JS_AwaitValue(JSContext *ctx, JSValueConst value,
 +                            JSValueConst on_fulfilled, JSValueConst on_rejected);
++
++/* Memory layout that natively compiled code reads directly, as byte offsets
++   on 64-bit targets (checked by static assertions in quickjs.c). Offsets are
++   from the pointer of a JSValue with a reference count. */
++#define JS_LAYOUT_REF_COUNT         (-4) /* int */
++#define JS_LAYOUT_STRING_LEN        0    /* uint32_t: length in the low 31 bits */
++#define JS_LAYOUT_OBJ_CLASS_ID      18   /* uint16_t */
++#define JS_LAYOUT_OBJ_SHAPE         24   /* own properties and prototype */
++#define JS_LAYOUT_OBJ_PROP          32   /* JSProperty *: an array's length is prop[0] */
++#define JS_LAYOUT_OBJ_TYPED_ARRAY   48   /* JSTypedArray *, for typed arrays */
++#define JS_LAYOUT_OBJ_ARRAY_BUFFER  48   /* JSArrayBuffer *, for array buffers */
++#define JS_LAYOUT_OBJ_ARRAY_VALUES  56   /* JSValue * (arrays), element pointer (typed arrays) */
++#define JS_LAYOUT_OBJ_ARRAY_COUNT   64   /* uint32_t: 0 unless a fast array */
++#define JS_LAYOUT_TA_BUFFER         24   /* JSObject * of the array buffer */
++#define JS_LAYOUT_ABUF_IMMUTABLE    9    /* uint8_t */
++#define JS_LAYOUT_CLASS_ARRAY       2
++#define JS_LAYOUT_CLASS_TYPED_ARRAY 22   /* + JSTypedArrayEnum */
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1371,10 @@
+@@ -1342,6 +1388,10 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -56,7 +73,33 @@
                                         int length, int magic, int data_len,
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -6560,6 +6560,7 @@
+@@ -1207,6 +1207,25 @@
+     /* byte sizes: 40/48/72 */
+ };
+ 
++#if INTPTR_MAX == INT64_MAX
++/* JS_LAYOUT_* in quickjs.h */
++static_assert((int)offsetof(JSMallocBlockHeader, ref_count) - (int)offsetof(JSMallocBlockHeader, user_data) == JS_LAYOUT_REF_COUNT, "");
++static_assert(offsetof(JSObject, class_id) == JS_LAYOUT_OBJ_CLASS_ID, "");
++static_assert(offsetof(JSObject, shape) == JS_LAYOUT_OBJ_SHAPE, "");
++static_assert(offsetof(JSObject, prop) == JS_LAYOUT_OBJ_PROP, "");
++static_assert(offsetof(JSObject, u.array.u1.typed_array) == JS_LAYOUT_OBJ_TYPED_ARRAY, "");
++static_assert(offsetof(JSObject, u.array_buffer) == JS_LAYOUT_OBJ_ARRAY_BUFFER, "");
++static_assert(offsetof(JSObject, u.array.u.values) == JS_LAYOUT_OBJ_ARRAY_VALUES, "");
++static_assert(offsetof(JSObject, u.array.count) == JS_LAYOUT_OBJ_ARRAY_COUNT, "");
++static_assert(offsetof(JSProperty, u.value) == 0, "");
++static_assert(offsetof(JSTypedArray, buffer) == JS_LAYOUT_TA_BUFFER, "");
++static_assert(offsetof(JSArrayBuffer, immutable) == JS_LAYOUT_ABUF_IMMUTABLE, "");
++static_assert(JS_CLASS_ARRAY == JS_LAYOUT_CLASS_ARRAY, "");
++static_assert(JS_CLASS_UINT8C_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_UINT8C, "");
++static_assert(JS_CLASS_FLOAT64_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_FLOAT64, "");
++/* JSString.len is the low 31 bits of the first word (JS_LAYOUT_STRING_LEN). */
++#endif
++
+ typedef struct JSCallSiteData {
+     JSValue filename;
+     JSValue func;
+@@ -6560,6 +6579,7 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
@@ -64,7 +107,7 @@
      uint8_t length;
      uint8_t data_len;
      uint16_t magic;
-@@ -6608,6 +6609,11 @@
+@@ -6608,6 +6628,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -76,7 +119,7 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6659,7 @@
+@@ -6653,6 +6678,7 @@
          return JS_EXCEPTION;
      }
      s->func = func;
@@ -84,7 +127,7 @@
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6679,18 @@
+@@ -6672,6 +6698,18 @@
      return func_obj;
  }
  
@@ -103,7 +146,7 @@
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -16550,6 +16569,119 @@
+@@ -16550,6 +16588,119 @@
      return atom;
  }
  
@@ -223,7 +266,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -18047,6 +18179,29 @@
+@@ -18047,6 +18198,29 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -253,7 +296,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18703,12 @@
+@@ -18548,9 +18722,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -266,7 +309,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +18743,12 @@
+@@ -18585,9 +18762,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -279,7 +322,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +18759,21 @@
+@@ -18598,6 +18778,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -301,7 +344,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -56106,6 +56282,26 @@
+@@ -56106,6 +56301,26 @@
      return result_promise;
  }
  

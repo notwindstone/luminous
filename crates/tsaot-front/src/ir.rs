@@ -20,6 +20,73 @@ pub enum Ty {
     Void,
     /// Any JS value (a reference-counted `JSValue`).
     Any,
+    /// A `JSValue` known to be a typed array of this kind (represented like
+    /// `Any`).
+    Arr(ArrKind),
+    /// A number or `undefined`, as an `f64`: `undefined` is the reserved NaN
+    /// `MAYBE_F64_UNDEFINED`, which no other value of this type has. Both
+    /// are NaN in arithmetic, as JS converts `undefined` to.
+    MaybeF64,
+}
+
+/// The bit pattern of `undefined` as a `Ty::MaybeF64`.
+pub const MAYBE_F64_UNDEFINED: u64 = 0x7ff8_0000_0000_0001;
+
+/// Typed arrays with `number` elements, numbered as `JSTypedArrayEnum`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArrKind {
+    Uint8Clamped = 0,
+    Int8 = 1,
+    Uint8 = 2,
+    Int16 = 3,
+    Uint16 = 4,
+    Int32 = 5,
+    Uint32 = 6,
+    Float32 = 10,
+    Float64 = 11,
+}
+
+impl ArrKind {
+    pub const ALL: [ArrKind; 9] = [
+        ArrKind::Uint8Clamped,
+        ArrKind::Int8,
+        ArrKind::Uint8,
+        ArrKind::Int16,
+        ArrKind::Uint16,
+        ArrKind::Int32,
+        ArrKind::Uint32,
+        ArrKind::Float32,
+        ArrKind::Float64,
+    ];
+
+    /// The global constructor's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            ArrKind::Uint8Clamped => "Uint8ClampedArray",
+            ArrKind::Int8 => "Int8Array",
+            ArrKind::Uint8 => "Uint8Array",
+            ArrKind::Int16 => "Int16Array",
+            ArrKind::Uint16 => "Uint16Array",
+            ArrKind::Int32 => "Int32Array",
+            ArrKind::Uint32 => "Uint32Array",
+            ArrKind::Float32 => "Float32Array",
+            ArrKind::Float64 => "Float64Array",
+        }
+    }
+
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            ArrKind::Uint8Clamped | ArrKind::Int8 | ArrKind::Uint8 => 1,
+            ArrKind::Int16 | ArrKind::Uint16 => 2,
+            ArrKind::Int32 | ArrKind::Uint32 | ArrKind::Float32 => 4,
+            ArrKind::Float64 => 8,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<ArrKind> {
+        ArrKind::ALL.into_iter().find(|k| k.name() == name)
+    }
 }
 
 impl fmt::Display for Ty {
@@ -29,10 +96,11 @@ impl fmt::Display for Ty {
             Ty::Bool => "boolean",
             Ty::Void => "void",
             Ty::Any => "any",
+            Ty::Arr(k) => k.name(),
+            Ty::MaybeF64 => "number | undefined",
         })
     }
 }
-
 pub type FuncId = usize;
 pub type LocalId = usize;
 /// Target of `break` / `continue`: a loop, a `switch`, or a labeled block.
@@ -195,6 +263,12 @@ pub enum ExprKind {
     SetProp(Box<Expr>, AtomId, Box<Expr>),
     GetElem(Box<Expr>, Box<Expr>),
     SetElem(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `obj.length`, with inline paths for arrays, typed arrays and strings.
+    Length(Box<Expr>, AtomId),
+    /// `arr[index]` on an `Arr` with an `F64` index (`MaybeF64`).
+    TypedGet(ArrKind, Box<Expr>, Box<Expr>),
+    /// `arr[index] = value` on an `Arr`, `F64` index and value (`F64`).
+    TypedSet(ArrKind, Box<Expr>, Box<Expr>, Box<Expr>),
     /// `delete obj.prop` / `delete obj[key]` (`Bool`; TypeError if it fails).
     DeleteProp(Box<Expr>, AtomId),
     DeleteElem(Box<Expr>, Box<Expr>),

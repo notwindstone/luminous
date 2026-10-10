@@ -16,7 +16,7 @@ use oxc::semantic::{Scoping, SymbolId};
 use oxc::span::{GetSpan, Span};
 
 use crate::ir::{
-    self, AnyBinOp, AnyCmpOp, AnyUnOp, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MathFn, Stmt, Ty, UnOp,
+    self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MathFn, Stmt, Ty, UnOp,
 };
 
 /// Why a function stays interpreted.
@@ -464,6 +464,12 @@ fn ts_type(t: &TSType) -> Option<Ty> {
         TSType::TSBooleanKeyword(_) => Some(Ty::Bool),
         TSType::TSVoidKeyword(_) => Some(Ty::Void),
         TSType::TSParenthesizedType(p) => ts_type(&p.type_annotation),
+        // Typed arrays (or a user type of the same name: either way, the
+        // entry checks the class).
+        TSType::TSTypeReference(r) => match &r.type_name {
+            TSTypeName::IdentifierReference(id) => ArrKind::from_name(id.name.as_str()).map(Ty::Arr),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -493,7 +499,7 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
         };
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::Bool)) if p.initializer.is_none() && !p.optional => t,
+            Some(t @ (Ty::F64 | Ty::Bool | Ty::Arr(_))) if p.initializer.is_none() && !p.optional => t,
             _ => Ty::Any,
         };
         out.push(Param { symbol: id.symbol_id.get().unwrap(), ty, default: p.initializer.as_deref() });
@@ -787,7 +793,9 @@ fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
 fn any(e: Expr) -> Expr {
     match e.ty {
         Ty::Any => e,
-        Ty::F64 | Ty::Bool => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
+        Ty::F64 | Ty::Bool | Ty::MaybeF64 => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
+        // Already a JSValue.
+        Ty::Arr(_) => Expr { ty: Ty::Any, ..e },
         Ty::Void => Expr::new(Ty::Any, ExprKind::Void(Box::new(e))),
     }
 }
@@ -931,7 +939,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     let e = body.as_expression().expect("concise arrow body is an expression");
                     let x = self.expr(e)?;
                     self.returns.push(x.ty);
-                    vec![Stmt::Return(Some(x))]
+                    let mut body = std::mem::take(&mut self.pre);
+                    body.push(Stmt::Return(Some(x)));
+                    body
                 }
             },
         };
@@ -942,7 +952,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if completes_list(&body) {
             ret = Some(ret.map_or(Ty::Void, |r| join(r, Ty::Void)));
         }
-        let ret = ret.unwrap_or(Ty::Void);
+        // `undefined` is only encoded within a function.
+        let ret = match ret.unwrap_or(Ty::Void) {
+            Ty::MaybeF64 => Ty::Any,
+            t => t,
+        };
         // Values returned from a function of type `Any` must be boxed.
         let body = if ret == Ty::Any { box_returns(body) } else { body };
         prologue.extend(body);
@@ -1556,22 +1570,23 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     }
                     let obj = any(self.expr(&m.object)?);
                     let atom = self.m.atom(m.property.name.as_str());
-                    Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), atom))
+                    if m.property.name == "length" {
+                        Expr::new(Ty::Any, ExprKind::Length(Box::new(obj), atom))
+                    } else {
+                        Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), atom))
+                    }
                 }
             },
             Expression::ComputedMemberExpression(m) => {
                 if m.optional {
                     return reject(span, "optional chaining is not supported yet");
                 }
-                let mut obj = [any(self.expr(&m.object)?)];
+                let mut obj = [self.expr(&m.object)?];
                 let mark = self.pre.len();
-                let key = self.key(&m.expression)?;
+                let key = self.elem_key(&m.expression)?;
                 self.order(&mut obj, mark);
                 let [obj] = obj;
-                match key {
-                    Key::Atom(a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), a)),
-                    Key::Value(k) => Expr::new(Ty::Any, ExprKind::GetElem(Box::new(obj), k)),
-                }
+                get_elem(obj, key)
             }
             Expression::UnaryExpression(u) => self.unary(u)?,
             Expression::BinaryExpression(b) => self.binary(b)?,
@@ -1583,7 +1598,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     LogicalOperator::And => LogicalOp::And,
                     LogicalOperator::Or => LogicalOp::Or,
                     // A number or boolean is never nullish.
-                    LogicalOperator::Coalesce if a.ty != Ty::Any => {
+                    LogicalOperator::Coalesce if !matches!(a.ty, Ty::Any | Ty::MaybeF64) => {
                         self.pre.truncate(mark);
                         return Ok(a);
                     }
@@ -1648,7 +1663,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let mut v = vec![any(self.expr(&n.callee)?)];
                 self.push_args(&mut v, &n.arguments)?;
                 let callee = v.remove(0);
-                Expr::new(Ty::Any, ExprKind::New(Box::new(callee), v))
+                // The typed array constructors are locked globals: these
+                // always create one of their kind.
+                let ty = match n.callee.without_parentheses() {
+                    Expression::Identifier(id) if self.resolve(id).is_none() => {
+                        ArrKind::from_name(id.name.as_str()).map_or(Ty::Any, Ty::Arr)
+                    }
+                    _ => Ty::Any,
+                };
+                Expr::new(ty, ExprKind::New(Box::new(callee), v))
             }
             Expression::ObjectExpression(o) => self.object(o)?,
             Expression::ArrayExpression(a) => {
@@ -1736,6 +1759,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         Ok(match e.without_parentheses() {
             Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
             other => Key::Value(Box::new(any(self.expr(other)?))),
+        })
+    }
+
+    /// A key of element access: numbers stay unboxed.
+    fn elem_key(&mut self, e: &'a Expression<'a>) -> R<Key> {
+        Ok(match e.without_parentheses() {
+            Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
+            other => {
+                let k = self.expr(other)?;
+                Key::Value(Box::new(if k.ty == Ty::F64 { k } else { any(k) }))
+            }
         })
     }
 
@@ -1880,16 +1914,18 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 (vec![set(t, obj)], Place::Prop(t, atom), None)
             }
             SimpleAssignmentTarget::ComputedMemberExpression(m) => {
-                let obj = any(self.expr(&m.object)?);
-                let t = self.temp(Ty::Any);
+                // Typed arrays keep their type.
+                let obj = self.expr(&m.object)?;
+                let obj = if matches!(obj.ty, Ty::Arr(_)) { obj } else { any(obj) };
+                let t = self.temp(obj.ty);
                 let mut setup = vec![set(t, obj)];
                 let mark = self.pre.len();
-                let key = self.key(&m.expression)?;
+                let key = self.elem_key(&m.expression)?;
                 self.flush_setup(&mut setup, mark);
                 match key {
                     Key::Atom(a) => (setup, Place::Prop(t, a), None),
                     Key::Value(k) => {
-                        let tk = self.temp(Ty::Any);
+                        let tk = self.temp(k.ty);
                         setup.push(set(tk, *k));
                         (setup, Place::Elem(t, tk), None)
                     }
@@ -1957,10 +1993,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Place::Local(l) => self.local(l),
             Place::Cell(c) => Expr::new(Ty::Any, ExprKind::Cell(c)),
             Place::Global(a) => Expr::new(Ty::Any, ExprKind::Global(a)),
-            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(o)), a)),
-            Place::Elem(o, k) => {
-                Expr::new(Ty::Any, ExprKind::GetElem(Box::new(self.local(o)), Box::new(self.local(k))))
-            }
+            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(self.local(o))), a)),
+            Place::Elem(o, k) => get_elem(self.local(o), Key::Value(Box::new(self.local(k)))),
         }
     }
 
@@ -1970,11 +2004,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Place::Local(l) => return self.set_local(sym, l, v, span),
             Place::Cell(c) => Expr::new(Ty::Any, ExprKind::SetCell(c, Box::new(any(v)))),
             Place::Global(a) => Expr::new(Ty::Any, ExprKind::SetGlobal(a, Box::new(any(v)))),
-            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::SetProp(Box::new(self.local(o)), a, Box::new(any(v)))),
-            Place::Elem(o, k) => Expr::new(
-                Ty::Any,
-                ExprKind::SetElem(Box::new(self.local(o)), Box::new(self.local(k)), Box::new(any(v))),
-            ),
+            Place::Prop(o, a) => {
+                Expr::new(Ty::Any, ExprKind::SetProp(Box::new(any(self.local(o))), a, Box::new(any(v))))
+            }
+            Place::Elem(o, k) => set_elem(self.local(o), self.local(k), v),
         })
     }
 
@@ -2034,9 +2067,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.widen_request = sym;
             return Err(Reject { span: u.span, msg: "retry".into(), retry: true });
         }
+        let cur = self.read(&place);
+        if num(cur.ty) {
+            // A typed array element: number arithmetic.
+            let old = self.temp(Ty::F64);
+            setup.push(set(old, to_f64(cur)));
+            let delta = Expr::num(if inc { 1.0 } else { -1.0 });
+            let new = Expr::new(Ty::F64, ExprKind::Binary(BinOp::Add, Box::new(self.local(old)), Box::new(delta)));
+            setup.push(self.write(&place, sym, new, u.span)?);
+            if !u.prefix {
+                setup.push(self.local(old));
+            }
+            return Ok(seq(setup));
+        }
         // old = ToNumeric(current); place = old ± 1; value: old or new.
         let old = self.temp(Ty::Any);
-        let cur = self.read(&place);
         setup.push(set(old, Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::ToNumeric, Box::new(cur)))));
         let op = if inc { AnyUnOp::Inc } else { AnyUnOp::Dec };
         let new = Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(self.local(old))));
@@ -2085,11 +2130,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let x = self.expr(&u.argument)?;
         let dynamic = |op: AnyUnOp, x: Expr| Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(any(x))));
         Ok(match (u.operator, x.ty) {
-            (UnaryOperator::UnaryNegation, Ty::F64) => Expr::new(Ty::F64, ExprKind::Unary(UnOp::Neg, Box::new(x))),
+            (UnaryOperator::UnaryNegation, Ty::F64 | Ty::MaybeF64) => {
+                Expr::new(Ty::F64, ExprKind::Unary(UnOp::Neg, Box::new(to_f64(x))))
+            }
             (UnaryOperator::UnaryNegation, _) => dynamic(AnyUnOp::Neg, x),
-            (UnaryOperator::UnaryPlus, Ty::F64) => x,
+            (UnaryOperator::UnaryPlus, Ty::F64 | Ty::MaybeF64) => to_f64(x),
             (UnaryOperator::UnaryPlus, _) => dynamic(AnyUnOp::Plus, x),
-            (UnaryOperator::BitwiseNot, Ty::F64) => Expr::new(Ty::F64, ExprKind::Unary(UnOp::BitNot, Box::new(x))),
+            (UnaryOperator::BitwiseNot, Ty::F64 | Ty::MaybeF64) => {
+                Expr::new(Ty::F64, ExprKind::Unary(UnOp::BitNot, Box::new(to_f64(x))))
+            }
             (UnaryOperator::BitwiseNot, _) => dynamic(AnyUnOp::BitNot, x),
             (UnaryOperator::LogicalNot, _) => Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(truthy(x)))),
             (UnaryOperator::Typeof, Ty::F64 | Ty::Bool) => {
@@ -2125,14 +2174,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             _ => None,
         };
         if let Some((op, any_op)) = cmp {
+            let equality = matches!(op, CmpOp::Eq | CmpOp::Ne);
             let unboxed = !matches!(any_op, AnyCmpOp::In | AnyCmpOp::InstanceOf)
-                && x.ty == y.ty
-                && match x.ty {
-                    Ty::F64 => true,
-                    Ty::Bool => matches!(op, CmpOp::Eq | CmpOp::Ne),
+                && match (x.ty, y.ty) {
+                    (Ty::Bool, Ty::Bool) => equality,
+                    // `undefined` compares like NaN, except that it equals
+                    // itself (and `null`, loosely): never against a number.
+                    (a, b) if num(a) && num(b) => !equality || a == Ty::F64 || b == Ty::F64,
                     _ => false,
                 };
             if unboxed {
+                let (x, y) = (to_f64(x), to_f64(y));
                 return Ok(Expr::new(Ty::Bool, ExprKind::Compare(op, Box::new(x), Box::new(y))));
             }
             return Ok(Expr::new(Ty::Bool, ExprKind::AnyCompare(any_op, Box::new(any(x)), Box::new(any(y)))));
@@ -2182,8 +2234,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                             self.order(&mut args, mark);
                             args.push(x);
                         }
-                        if args.iter().all(|a| a.ty == Ty::F64) {
-                            return math_call(f, args, c.span);
+                        if args.iter().all(|a| num(a.ty)) {
+                            return math_call(f, args.into_iter().map(to_f64).collect(), c.span);
                         }
                         // Generic call with the already-checked arguments.
                         let obj = Expr::new(
@@ -2311,13 +2363,35 @@ impl LoopTest {
     }
 }
 
+/// `obj[key]`: on a typed array with a number key, its element.
+fn get_elem(obj: Expr, key: Key) -> Expr {
+    match (obj.ty, key) {
+        (Ty::Arr(kind), Key::Value(k)) if k.ty == Ty::F64 => {
+            Expr::new(Ty::MaybeF64, ExprKind::TypedGet(kind, Box::new(obj), k))
+        }
+        (_, Key::Atom(a)) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), a)),
+        (_, Key::Value(k)) => Expr::new(Ty::Any, ExprKind::GetElem(Box::new(any(obj)), k)),
+    }
+}
+
+/// `obj[key] = v` (evaluates to `v`).
+fn set_elem(obj: Expr, key: Expr, v: Expr) -> Expr {
+    match obj.ty {
+        Ty::Arr(kind) if key.ty == Ty::F64 && num(v.ty) => {
+            Expr::new(v.ty, ExprKind::TypedSet(kind, Box::new(obj), Box::new(key), Box::new(v)))
+        }
+        _ => Expr::new(Ty::Any, ExprKind::SetElem(Box::new(any(obj)), Box::new(key), Box::new(any(v)))),
+    }
+}
+
 fn set(l: ir::LocalId, v: Expr) -> Expr {
-    Expr::new(Ty::Any, ExprKind::SetLocal(l, Box::new(v)))
+    Expr::new(v.ty, ExprKind::SetLocal(l, Box::new(v)))
 }
 
 /// Arithmetic: unboxed when both operands are numbers, generic otherwise.
 fn arith(op: AnyBinOp, x: Expr, y: Expr) -> Expr {
-    if x.ty == Ty::F64 && y.ty == Ty::F64 {
+    if num(x.ty) && num(y.ty) {
+        let (x, y) = (to_f64(x), to_f64(y));
         let op = match op {
             AnyBinOp::Add => BinOp::Add,
             AnyBinOp::Sub => BinOp::Sub,
@@ -2346,7 +2420,18 @@ fn truthy(x: Expr) -> Expr {
 }
 
 fn any_or_num(x: Expr) -> Expr {
-    if x.ty == Ty::F64 { x } else { any(x) }
+    if num(x.ty) { x } else { any(x) }
+}
+
+/// Whether values of type `t` are numbers in arithmetic (`MaybeF64`'s
+/// `undefined` converts to NaN, which it is).
+fn num(t: Ty) -> bool {
+    matches!(t, Ty::F64 | Ty::MaybeF64)
+}
+
+/// A `num` value converted with ToNumber: the same bits.
+fn to_f64(x: Expr) -> Expr {
+    if x.ty == Ty::MaybeF64 { Expr { ty: Ty::F64, ..x } } else { x }
 }
 
 /// In a function returning `Any`, box every returned value.

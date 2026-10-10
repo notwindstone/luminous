@@ -312,6 +312,10 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     }
     for (i = 0; i < tsaot_natoms; i++)
         JS_FreeAtomRT(rt, tsaot_atoms[i]);
+    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++) {
+        JS_FreeValueRT(rt, tsaot_ta_pins[i]);
+        tsaot_ta_pins[i] = JS_UNDEFINED;
+    }
 }
 
 /* The cells are reachable from native code at any time, so they are roots
@@ -323,6 +327,8 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     int i;
     for (i = 0; i < tsaot_ncells; i++)
         JS_MarkValue(rt, tsaot_cells[i], mark_func);
+    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++)
+        JS_MarkValue(rt, tsaot_ta_pins[i], mark_func);
 }
 
 static JSValue tsaot_cell_get(JSContext *ctx, JSValueConst this_val, int argc,
@@ -422,9 +428,17 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
 
 /* Make the builtins that native code relies on immutable, before any user
  * code runs: every own property of Math, the Number predicates, and the
- * global Math / Number bindings become non-writable and non-configurable, so
- * patching them throws a TypeError (all tsaot modules are strict). Adding new
- * properties stays possible. */
+ * global Math / Number / typed array constructor bindings become
+ * non-writable and non-configurable, so patching them throws a TypeError
+ * (all tsaot modules are strict). Adding new properties stays possible.
+ *
+ * Each typed array prototype also gets the inherited `length` getter as a
+ * locked own property. Then the `length` of a typed array whose shape is
+ * that of a fresh instance (no own properties, original prototype) is
+ * always its element count, which native code reads inline. */
+JSValue tsaot_ta_pins[TSAOT_TYPED_ARRAYS];
+void *tsaot_ta_shapes[TSAOT_TYPED_ARRAYS];
+
 int tsaot_lock_builtins(JSContext *ctx)
 {
     static const char src[] =
@@ -437,10 +451,29 @@ int tsaot_lock_builtins(JSContext *ctx)
         "  lock(g.Math, Reflect.ownKeys(g.Math));\n"
         "  lock(g.Number, ['isNaN', 'isFinite', 'isInteger', 'isSafeInteger']);\n"
         "  lock(g, ['Math', 'Number']);\n"
+        "  var names = ['Uint8ClampedArray', 'Int8Array', 'Uint8Array', 'Int16Array', 'Uint16Array',\n"
+        "    'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array', 'Float16Array',\n"
+        "    'Float32Array', 'Float64Array'];\n"
+        "  var length = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(g.Int8Array.prototype), 'length');\n"
+        "  var fresh = [];\n"
+        "  for (var i = 0; i < names.length; i++) {\n"
+        "    var C = g[names[i]];\n"
+        "    Object.defineProperty(C.prototype, 'length', { get: length.get, enumerable: false, configurable: false });\n"
+        "    lock(g, [names[i]]);\n"
+        "    fresh.push(new C(0));\n"
+        "  }\n"
+        "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
+    int i;
     if (JS_IsException(r))
         return -1;
+    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++) {
+        tsaot_ta_pins[i] = JS_GetPropertyUint32(ctx, r, i);
+        if (JS_IsException(tsaot_ta_pins[i]))
+            return JS_FreeValue(ctx, r), -1;
+        tsaot_ta_shapes[i] = *(void **)((char *)JS_VALUE_GET_PTR(tsaot_ta_pins[i]) + JS_LAYOUT_OBJ_SHAPE);
+    }
     JS_FreeValue(ctx, r);
     return 0;
 }
