@@ -65,3 +65,28 @@ void tsaot_stack_overflow(void)
 {
     tsaot_unwinding = 1;
 }
+
+/* Make the builtins that native code relies on immutable, before any user
+ * code runs: every own property of Math, the Number predicates, and the
+ * global Math / Number bindings become non-writable and non-configurable, so
+ * patching them throws a TypeError (all tsaot modules are strict). Adding new
+ * properties stays possible. */
+int tsaot_lock_builtins(JSContext *ctx)
+{
+    static const char src[] =
+        "(function (g) {\n"
+        "  'use strict';\n"
+        "  var lock = function (o, keys) {\n"
+        "    for (var i = 0; i < keys.length; i++)\n"
+        "      Object.defineProperty(o, keys[i], { writable: false, configurable: false });\n"
+        "  };\n"
+        "  lock(g.Math, Reflect.ownKeys(g.Math));\n"
+        "  lock(g.Number, ['isNaN', 'isFinite', 'isInteger', 'isSafeInteger']);\n"
+        "  lock(g, ['Math', 'Number']);\n"
+        "})(globalThis);\n";
+    JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r))
+        return -1;
+    JS_FreeValue(ctx, r);
+    return 0;
+}

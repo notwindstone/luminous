@@ -70,7 +70,13 @@ struct BuildOpts {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("tsaot: {e:#}");
+        let msg = format!("{e:#}");
+        // Rendered diagnostics are self-describing; prefix plain messages only.
+        if msg.contains('\n') {
+            eprintln!("{msg}")
+        } else {
+            eprintln!("tsaot: {msg}")
+        }
         std::process::exit(1);
     }
 }
@@ -97,11 +103,11 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::EmitJs { input, no_native } => {
-            let (src, mut analysis) = analyze(&input)?;
+            let (_, mut analysis) = analyze(&input)?;
             if no_native {
                 disable_native(&mut analysis);
             }
-            print!("{}", tsaot_front::erased_js(&src, &input, &analysis).map_err(anyhow::Error::msg)?);
+            print!("{}", tsaot_front::erased_js(&input, &analysis).map_err(anyhow::Error::msg)?);
             Ok(())
         }
         Cmd::Ir { input } => {
@@ -186,14 +192,14 @@ fn run(cmd: &mut Command) -> Result<()> {
 
 fn build(input: &Path, output: &Path, opts: &BuildOpts) -> Result<()> {
     let q = quickjs(opts)?;
-    let (src, mut analysis) = analyze(input)?;
+    let (_, mut analysis) = analyze(input)?;
     if opts.no_native {
         disable_native(&mut analysis);
     }
     if opts.verbose {
         print_report(input, &analysis);
     }
-    let js = tsaot_front::erased_js(&src, input, &analysis).map_err(anyhow::Error::msg)?;
+    let js = tsaot_front::erased_js(input, &analysis).map_err(anyhow::Error::msg)?;
 
     let tmp = match &opts.keep {
         Some(d) => {
@@ -208,23 +214,24 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts) -> Result<()> {
         std::fs::write(&js_path, &js)?;
 
         let has_native = !analysis.module.funcs.is_empty();
+        // The tsaot:native module is always linked: its initialization locks
+        // the Math and Number builtins, in native and --no-native builds alike.
         let mut qjsc = Command::new(q.build.join("qjsc"));
         qjsc.arg("-e").arg("-m").arg("-n").arg(&script_name).arg("-o").arg(tmp.join("main.c"));
-        if has_native {
-            qjsc.arg("-M").arg(format!("{NATIVE_MODULE},{}", glue::MODULE_CNAME));
-        }
+        qjsc.arg("-M").arg(format!("{NATIVE_MODULE},{}", glue::MODULE_CNAME));
         run(qjsc.arg(&js_path))?;
 
+        std::fs::write(tmp.join("glue.c"), glue::generate(&analysis.module))?;
+        std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
+        std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
         let mut link = Command::new(cc);
-        link.args(["-O2", "-w"]).arg("-I").arg(&q.src).arg("-I").arg(&tmp).arg(tmp.join("main.c"));
+        link.args(["-O2", "-w"]).arg("-I").arg(&q.src).arg("-I").arg(&tmp);
+        link.arg(tmp.join("main.c")).arg(tmp.join("glue.c")).arg(tmp.join("tsaot_rt.c"));
         if has_native {
             let obj = tsaot_codegen::compile(&analysis.module, &Default::default())?;
             std::fs::write(tmp.join("native.o"), obj)?;
-            std::fs::write(tmp.join("glue.c"), glue::generate(&analysis.module))?;
-            std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
-            std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;
-            link.arg(tmp.join("glue.c")).arg(tmp.join("tsaot_rt.c")).arg(tmp.join("native.o"));
+            link.arg(tmp.join("native.o"));
         }
         link.arg(q.build.join("libqjs-libc.a")).arg(q.build.join("libqjs.a"));
         link.args(["-lm", "-lpthread", "-ldl", "-o"]).arg(output);

@@ -29,7 +29,8 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
                      generated C glue (entry stubs) + runtime ──────────────────┘
 ```
 
-1. **Selection.** Every top-level `function` declaration is a candidate. The
+1. **Selection.** Every top-level `function` declaration, and every top-level
+   `const` bound to an arrow function or function expression, is a candidate. The
    checker (`crates/tsaot-front/src/check.rs`) lowers it to a typed IR only if
    every construct in its body has exact, statically known JS semantics.
    Otherwise it records why and leaves the function to the interpreter.
@@ -38,11 +39,13 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
    functions over unboxed `double`s and `bool`s. Calls between native functions
    are direct machine calls.
 3. **Interpreted code.** The whole module is type-erased (oxc transformer) and
-   compiled by `qjsc` to bytecode. Each native function `f` is renamed to a
-   fallback `__tsaot_fb_f`, and the binding `f` is re-pointed at its entry stub:
+   compiled by `qjsc` to bytecode. Each native declaration `f` is renamed to a
+   fallback `__tsaot_fb_f` and its binding is re-pointed at its entry stub;
+   native `const` initializers are wrapped in place:
    ```js
    import { __tsaot_bind } from "tsaot:native";
-   const [f] = __tsaot_bind(__tsaot_fb_f);   // first statement of the module
+   const f = __tsaot_bind(0, __tsaot_fb_f);    // first statement of the module
+   const g = __tsaot_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
    ```
 4. **Entry stubs (the "deopt" point).** TypeScript types are unsound at
    runtime: interpreted code can pass a string where `number` is declared. Each
@@ -69,6 +72,44 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
 `tsaot report file.ts` says, for every function, whether it is native and, if
 not, which construct stopped it.
 
+### Forcing native compilation: `aot`
+
+Unmarked functions are compiled on a best-effort basis. A function marked
+`aot` **must** compile natively, or the build fails with the reason:
+
+```ts
+aot function fib(n: number): number { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+const sq = aot (x: number): number => x * x;
+const cube = aot function (x: number): number { return x * x * x; };
+
+// Equivalent directive form, which keeps the file valid TypeScript for tsc,
+// editors and formatters:
+function clamp(x: number, lo: number, hi: number): number {
+  "use aot";
+  return Math.min(Math.max(x, lo), hi);
+}
+```
+
+```
+  × `aot` function `top` cannot be compiled natively
+   ╭─[example.ts:6:46]
+ 6 │ aot function top(x: number): number { return mid(x) * 2; }
+   ·                                              ───┬──
+   ·                                                 ╰── calls `mid`, which is not compiled natively
+   ╰────
+  help: `mid` is interpreted: calls `helper`, which is not compiled natively
+        `helper` is interpreted: property access is not supported
+```
+
+`aot` is a contextual keyword, like `async`. It marks a function only when it
+directly precedes one on the same line (`aot function`, `aot async function`,
+`aot (…) => …`). Everywhere else `aot` is an ordinary
+identifier: `aot(x)` is still a call. The keyword is not TypeScript syntax,
+so `tsc`, editors and formatters reject it. Use `"use aot"` where that matters.
+For now, `aot` can mark top-level function declarations and top-level `const`
+function bindings. On async functions, generators, methods or nested
+functions it is a compile error that says so.
+
 ### Semantics and soundness
 
 The goal is to be **observably identical to the interpreter**. The
@@ -86,7 +127,16 @@ with `-0`/NaN, fallbacks on ill-typed calls, and stack overflow.
   throws the same `RangeError` the interpreter would. Native frames are much
   smaller than interpreter frames, so native code can recurse deeper before
   hitting the limit. Stack depth is implementation-defined in ECMAScript.
-- **Assumption:** the `Math` and `Number` builtins are not monkey-patched.
+- **`Math` and `Number` are locked.** Before any JS runs (in native and
+  `--no-native` builds alike), every own property of `Math`, the
+  `Number.is*` predicates, and the global `Math` / `Number` bindings are made
+  non-writable and non-configurable. Patching them throws a `TypeError`, and
+  patches visible in the source (`Math.sqrt = …`, `delete Number.isNaN`,
+  `Object.defineProperty(Math, …)`) are compile errors. New properties can
+  still be added.
+- A top-level `const` function declared *after* other top-level code may
+  still be in its TDZ when native code runs. It is compiled, but other
+  native functions do not call it directly.
 
 Known observable differences:
 - `f.toString()` of a native function returns native code instead of the
@@ -157,5 +207,6 @@ crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + cc driver; differe
 runtime/              C runtime linked into every program (pow, round, ToInt32, stack guard)
 vendor/quickjs        QuickJS-NG (git submodule)
 tests/cases           differential test programs
+tests/errors          programs that must fail to compile, with expected diagnostics
 bench/                benchmarks + bench/run.sh
 ```

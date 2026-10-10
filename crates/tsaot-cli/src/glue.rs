@@ -82,44 +82,42 @@ pub fn generate(m: &ir::Module) -> String {
     }
 
     let n = m.funcs.len();
+    // A trailing sentinel keeps the array non-empty when nothing is native.
     c.push_str("static const struct { JSCFunctionData *fn; const char *name; int length; } tsaot_table[] = {\n");
     for (i, f) in m.funcs.iter().enumerate() {
         writeln!(c, "    {{ tsaot_entry_{i}, {}, {} }},", c_str(&f.name), f.params.len()).unwrap();
     }
-    c.push_str("};\n\n");
+    c.push_str("    { NULL, NULL, 0 },\n};\n\n");
 
     write!(
         c,
-        r#"static JSValue tsaot_bind(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+        r#"/* {BIND_FN}(i, fallback): the entry stub of native function i. */
+static JSValue tsaot_bind(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {{
-    JSValue arr = JS_NewArray(ctx);
-    if (JS_IsException(arr))
-        return arr;
-    for (int i = 0; i < {n}; i++) {{
-        if (i >= argc || !JS_IsFunction(ctx, argv[i])) {{
-            JS_FreeValue(ctx, arr);
-            return JS_ThrowTypeError(ctx, "{BIND_FN}: expected fallback function");
-        }}
-        JSValue f = JS_NewCFunctionData2(ctx, tsaot_table[i].fn, tsaot_table[i].name,
-                                         tsaot_table[i].length, 0, 1, &argv[i]);
-        if (JS_IsException(f) || JS_SetPropertyUint32(ctx, arr, i, f) < 0) {{
-            JS_FreeValue(ctx, arr);
-            return JS_EXCEPTION;
-        }}
-    }}
-    return arr;
+    int32_t i;
+    if (argc < 2 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_INT || !JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "{BIND_FN}: expected (index, fallback)");
+    i = JS_VALUE_GET_INT(argv[0]);
+    if (i < 0 || i >= {n})
+        return JS_ThrowRangeError(ctx, "{BIND_FN}: bad index");
+    return JS_NewCFunctionData2(ctx, tsaot_table[i].fn, tsaot_table[i].name,
+                                tsaot_table[i].length, 0, 1, &argv[1]);
 }}
 
 static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 {{
     return JS_SetModuleExport(ctx, m, "{BIND_FN}",
-                              JS_NewCFunction(ctx, tsaot_bind, "{BIND_FN}", {n}));
+                              JS_NewCFunction(ctx, tsaot_bind, "{BIND_FN}", 2));
 }}
 
-/* Registered as "{NATIVE_MODULE}". */
+/* Registered as "{NATIVE_MODULE}"; called while the context is created,
+ * before any JS runs. */
 JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
 {{
-    JSModuleDef *m = JS_NewCModule(ctx, name, tsaot_module_init);
+    JSModuleDef *m;
+    if (tsaot_lock_builtins(ctx) < 0)
+        return NULL;
+    m = JS_NewCModule(ctx, name, tsaot_module_init);
     if (!m)
         return NULL;
     JS_AddModuleExport(ctx, m, "{BIND_FN}");

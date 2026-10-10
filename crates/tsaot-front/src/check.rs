@@ -28,13 +28,40 @@ fn reject<T>(span: Span, msg: impl Into<String>) -> R<T> {
     Err(Reject { span, msg: msg.into() })
 }
 
-/// A module-level function declaration that might be compiled natively.
+/// The syntax of a candidate function.
+#[derive(Clone, Copy)]
+pub enum FnNode<'a> {
+    Function(&'a Function<'a>),
+    Arrow(&'a ArrowFunctionExpression<'a>),
+}
+
+impl FnNode<'_> {
+    pub fn span(&self) -> Span {
+        match self {
+            FnNode::Function(f) => f.span,
+            FnNode::Arrow(a) => a.span,
+        }
+    }
+}
+
+/// Where a candidate is bound, which decides how the source is rewritten.
+#[derive(Clone, Copy)]
+pub enum Site {
+    /// `function f() {}`; `export_prefix` spans `export ` if present.
+    Declaration { id: Span, export_prefix: Option<Span> },
+    /// `const f = <init>` where `init` is an arrow or function expression.
+    ConstInit { init: Span },
+}
+
+/// A module-level function binding that might be compiled natively.
 pub struct Candidate<'a> {
     pub name: String,
-    pub func: &'a Function<'a>,
+    pub node: FnNode<'a>,
     pub symbol: SymbolId,
-    /// Span of the `export ` prefix of `export function f`, if any.
-    pub export_prefix: Option<Span>,
+    pub site: Site,
+    /// Whether other native functions may call this one directly. False for
+    /// `const` bindings that may still be in their TDZ when native code runs.
+    direct_callable: bool,
     params: Vec<(SymbolId, Ty)>,
     ret: Option<Ty>,
 }
@@ -63,7 +90,7 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
         // Direct eval can read and rebind module-level bindings, so nothing
         // about this module can be assumed statically.
         for c in candidates.drain(..) {
-            let span = c.func.span;
+            let span = c.node.span();
             rejected.push((c.name, span, Reject { span, msg: "module uses `eval`".into() }));
         }
     }
@@ -97,7 +124,7 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
         let mut keep = Vec::new();
         for (i, c) in candidates.into_iter().enumerate() {
             match reasons.remove(&i) {
-                Some(r) => rejected.push((c.name, c.func.span, r)),
+                Some(r) => rejected.push((c.name, c.node.span(), r)),
                 None => keep.push(c),
             }
         }
@@ -112,10 +139,22 @@ fn collect_toplevel<'a>(
     rejected: &mut Vec<(String, Span, Reject)>,
     consts: &mut HashMap<SymbolId, ConstVal>,
 ) {
-    // Module-level consts can be folded only while no code has run yet:
-    // before the first statement that is not a pure declaration, nothing can
-    // observe them in their TDZ.
+    // Module-level consts can be folded, and const-bound functions called
+    // directly from native code, only while no code has run yet: before the
+    // first statement that is not a pure declaration, nothing can observe
+    // them in their TDZ.
     let mut pure_prefix = true;
+    let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
+        if scoping.get_resolved_references(symbol).any(|r| r.is_write()) {
+            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned") };
+            rejected.push((name, node.span(), r));
+            return;
+        }
+        match header(node) {
+            Ok((params, ret)) => out.push(Candidate { name, node, symbol, site, direct_callable, params, ret }),
+            Err(r) => rejected.push((name, node.span(), r)),
+        }
+    };
     for stmt in &program.body {
         let (decl, export_prefix) = match stmt {
             Statement::ExportDeclaration(e) => {
@@ -134,32 +173,34 @@ fn collect_toplevel<'a>(
         match decl {
             Declaration::FunctionDeclaration(f) if f.body.is_some() => {
                 let Some(id) = &f.id else { continue };
-                let name = id.name.to_string();
                 let symbol = id.symbol_id.get().expect("semantic analysis ran");
-                if scoping.get_resolved_references(symbol).any(|r| r.is_write()) {
-                    let r = Reject { span: id.span, msg: format!("`{name}` is reassigned") };
-                    rejected.push((name, f.span, r));
-                    continue;
-                }
-                match header(f) {
-                    Ok((params, ret)) => out.push(Candidate { name, func: f, symbol, export_prefix, params, ret }),
-                    Err(r) => rejected.push((name, f.span, r)),
-                }
+                let site = Site::Declaration { id: id.span, export_prefix };
+                // Function declarations are hoisted: always initialized.
+                add(id.name.to_string(), FnNode::Function(f), symbol, site, true);
             }
             Declaration::FunctionDeclaration(_) => {} // overload signature or `declare`
-            Declaration::VariableDeclaration(v)
-                if pure_prefix && v.kind == VariableDeclarationKind::Const && !v.declare =>
-            {
+            Declaration::VariableDeclaration(v) if v.kind == VariableDeclarationKind::Const && !v.declare => {
                 for d in &v.declarations {
                     let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init) else {
                         pure_prefix = false;
                         continue;
                     };
-                    match literal(init) {
-                        Some(val) => {
-                            consts.insert(id.symbol_id.get().unwrap(), val);
+                    let symbol = id.symbol_id.get().unwrap();
+                    let site = Site::ConstInit { init: init.span() };
+                    // Creating a function runs no code, so it keeps the prefix pure.
+                    match init.without_parentheses() {
+                        Expression::ArrowFunctionExpression(a) => {
+                            add(id.name.to_string(), FnNode::Arrow(a), symbol, site, pure_prefix);
                         }
-                        None => pure_prefix = false,
+                        Expression::FunctionExpression(f) => {
+                            add(id.name.to_string(), FnNode::Function(f), symbol, site, pure_prefix);
+                        }
+                        _ => match literal(init) {
+                            Some(val) if pure_prefix => {
+                                consts.insert(symbol, val);
+                            }
+                            _ => pure_prefix = false,
+                        },
                     }
                 }
             }
@@ -197,24 +238,37 @@ fn ts_type(t: &TSType) -> Option<Ty> {
 /// Parameter symbols with their types, and the annotated return type if any.
 type Header = (Vec<(SymbolId, Ty)>, Option<Ty>);
 
-fn header(f: &Function) -> R<Header> {
-    if f.r#async {
-        return reject(f.span, "async functions are not supported");
+fn header(node: FnNode) -> R<Header> {
+    let (span, is_async, generator, generic, this_param, params, return_type) = match node {
+        FnNode::Function(f) => (
+            f.span,
+            f.r#async,
+            f.generator,
+            f.type_parameters.is_some(),
+            f.this_param.is_some(),
+            &f.params,
+            &f.return_type,
+        ),
+        FnNode::Arrow(a) => (a.span, a.r#async, false, a.type_parameters.is_some(), false, &a.params, &a.return_type),
+    };
+    if is_async {
+        return reject(span, "async functions are not supported yet");
     }
-    if f.generator {
-        return reject(f.span, "generators are not supported");
+    if generator {
+        return reject(span, "generators are not supported yet");
     }
-    if f.type_parameters.is_some() {
-        return reject(f.span, "generic functions are not supported");
+    if generic {
+        return reject(span, "generic functions are not supported yet");
     }
-    if f.this_param.is_some() {
-        return reject(f.span, "`this` parameters are not supported");
+    if this_param {
+        return reject(span, "`this` parameters are not supported");
     }
-    if let Some(rest) = &f.params.rest {
-        return reject(rest.span, "rest parameters are not supported");
+    if let Some(rest) = &params.rest {
+        return reject(rest.span, "rest parameters are not supported yet");
     }
+    let formal = params;
     let mut params = Vec::new();
-    for p in &f.params.items {
+    for p in &formal.items {
         let BindingPattern::BindingIdentifier(id) = &p.pattern else {
             return reject(p.span, "destructuring parameters are not supported");
         };
@@ -227,7 +281,7 @@ fn header(f: &Function) -> R<Header> {
             _ => return reject(p.span, format!("parameter `{}` must be annotated `number` or `boolean`", id.name)),
         }
     }
-    let ret = match &f.return_type {
+    let ret = match return_type {
         None => None,
         Some(a) => match ts_type(&a.type_annotation) {
             Some(t) => Some(t),
@@ -279,6 +333,15 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
 
     /// Signature of candidate `i` as seen by a caller.
     fn signature(&mut self, i: usize, call_span: Span) -> R<(Vec<Ty>, Ty)> {
+        if !self.cands[i].direct_callable {
+            return reject(
+                call_span,
+                format!(
+                    "calls `{}`, which may be uninitialized when this runs (its `const` is declared after top-level code)",
+                    self.cands[i].name
+                ),
+            );
+        }
         let params = self.cands[i].params.iter().map(|p| p.1).collect();
         if let Some(ret) = self.cands[i].ret {
             // Annotated: callers may proceed optimistically, even while the
@@ -326,11 +389,28 @@ impl FnCx<'_, '_, '_> {
             self.declare(sym, ty, true);
             params.push(ty);
         }
-        let body = c.func.body.as_ref().unwrap();
-        if let Some(d) = body.directives.first() {
-            return reject(d.span, "directives are not supported");
-        }
-        let stmts = self.stmts(&body.statements)?;
+        // Directives ("use strict", "use aot") have no effect in module code.
+        let stmts = match c.node {
+            FnNode::Function(f) => self.stmts(&f.body.as_ref().unwrap().statements)?,
+            FnNode::Arrow(a) => match &a.body {
+                ArrowFunctionBody::FunctionBody(b) => self.stmts(&b.statements)?,
+                body => {
+                    // Concise body: `(x) => expr` returns `expr`.
+                    let e = body.as_expression().expect("concise arrow body is an expression");
+                    let x = self.expr(e)?;
+                    self.returns.push((x.ty, e.span()));
+                    if let Some(expected) = self.ret
+                        && expected != x.ty
+                    {
+                        return reject(
+                            e.span(),
+                            format!("returns `{}` from a function declared to return `{expected}`", x.ty),
+                        );
+                    }
+                    vec![Stmt::Return(Some(x))]
+                }
+            },
+        };
         let completes = completes_list(&stmts);
         let ret = match self.ret {
             Some(t) => t,
@@ -349,7 +429,7 @@ impl FnCx<'_, '_, '_> {
             }
         };
         if ret != Ty::Void && completes {
-            return reject(c.func.span, "not all code paths return a value (would return `undefined`)");
+            return reject(c.node.span(), "not all code paths return a value (would return `undefined`)");
         }
         Ok(ir::Func { name: c.name.clone(), params, ret, locals: std::mem::take(&mut self.locals), body: stmts })
     }

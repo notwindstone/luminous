@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-oxc = { version = "0.153.0", features = ["transformer", "codegen", "semantic"] }
+oxc = { version = "0.153.0", features = ["transformer", "codegen", "semantic", "ast_visit"] }

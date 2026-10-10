@@ -23,6 +23,9 @@ double tsaot_round(double a);
 int32_t tsaot_toint32_slow(double d);
 void tsaot_stack_overflow(void);
 
+/* Called once while the context is created. */
+int tsaot_lock_builtins(JSContext *ctx);
+
 /* Entry-stub helpers. */
 static inline bool tsaot_arg_f64(JSValueConst v, double *out)
 {

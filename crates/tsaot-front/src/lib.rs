@@ -1,25 +1,38 @@
 //! Front end: parse TypeScript with oxc, select natively compilable functions,
 //! lower them to typed IR, and produce the type-erased JS for the rest.
 
+pub mod builtins;
 pub mod check;
 pub mod erase;
 pub mod ir;
+pub mod marker;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use oxc::allocator::Allocator;
+use oxc::ast::ast::{ArrowFunctionBody, ArrowFunctionExpression, Function, FunctionBody};
+use oxc::ast_visit::{Visit, walk};
+use oxc::diagnostics::{LabeledSpan, OxcDiagnostic};
 use oxc::parser::Parser;
 use oxc::semantic::SemanticBuilder;
-use oxc::span::SourceType;
+use oxc::span::{SourceType, Span};
+use oxc::syntax::scope::ScopeFlags;
 
-/// A natively compiled function's declaration, for source rewriting.
+/// How a native function's binding is rewritten in the interpreted module.
+#[derive(Debug, Clone)]
+pub enum NativeSite {
+    /// `function f` (byte span of the name, and of an `export ` prefix).
+    Declaration { id_span: (u32, u32), export_prefix: Option<(u32, u32)> },
+    /// `const f = <init>` (byte span of the initializer).
+    ConstInit { init_span: (u32, u32) },
+}
+
+/// A natively compiled function, for source rewriting and reporting.
 #[derive(Debug, Clone)]
 pub struct NativeDecl {
     pub name: String,
-    /// Byte span of the function's name in the declaration.
-    pub id_span: (u32, u32),
-    /// Byte span of the `export ` keyword prefix, if exported.
-    pub export_prefix: Option<(u32, u32)>,
+    pub site: NativeSite,
     pub line: u32,
 }
 
@@ -34,42 +47,88 @@ pub struct Rejected {
 
 #[derive(Debug)]
 pub struct Analysis {
+    /// The source with `aot` markers blanked out; same byte offsets as the
+    /// original.
+    pub source: String,
     pub module: ir::Module,
     /// Parallel to `module.funcs`.
     pub natives: Vec<NativeDecl>,
     pub rejected: Vec<Rejected>,
 }
 
-pub fn analyze(source: &str, path: &Path) -> Result<Analysis, String> {
+fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
+    erase::render(diags, source, path)
+}
+
+pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
+    let stripped = marker::strip(original);
+    let source = stripped.source;
+
     let allocator = Allocator::default();
     let source_type = SourceType::ts().with_module(true);
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let parsed = Parser::new(&allocator, &source, source_type).parse();
     if !parsed.diagnostics.is_empty() {
-        return Err(erase::render(parsed.diagnostics, source));
+        let misplaced = marker::misplaced(original).into_iter().map(|at| {
+            OxcDiagnostic::error("`aot` can only mark a function or an arrow function")
+                .with_label(Span::sized(at, marker::KEYWORD.len() as u32))
+        });
+        return Err(parse_error(misplaced.chain(parsed.diagnostics), original, path));
     }
     let program = allocator.alloc(parsed.program);
     let sem = SemanticBuilder::new().build(program);
     if !sem.diagnostics.is_empty() {
-        return Err(erase::render(sem.diagnostics, source));
+        return Err(parse_error(sem.diagnostics, original, path));
     }
     let scoping = sem.semantic.into_scoping();
-    let _ = path;
 
+    let mut errors = builtins::check(program, &scoping);
     let out = check::check(program, &scoping);
+
     let line = |pos: u32| source[..pos as usize].matches('\n').count() as u32 + 1;
-    let natives = out
+    let natives: Vec<NativeDecl> = out
         .native
         .iter()
-        .map(|c| {
-            let id = c.func.id.as_ref().unwrap();
-            NativeDecl {
-                name: c.name.clone(),
-                id_span: (id.span.start, id.span.end),
-                export_prefix: c.export_prefix.map(|s| (s.start, s.end)),
-                line: line(c.func.span.start),
-            }
+        .map(|c| NativeDecl {
+            name: c.name.clone(),
+            site: match c.site {
+                check::Site::Declaration { id, export_prefix } => NativeSite::Declaration {
+                    id_span: (id.start, id.end),
+                    export_prefix: export_prefix.map(|s| (s.start, s.end)),
+                },
+                check::Site::ConstInit { init } => NativeSite::ConstInit { init_span: (init.start, init.end) },
+            },
+            line: line(c.node.span().start),
         })
         .collect();
+
+    // Functions marked `aot` must have been compiled natively.
+    let mut marks = MarkedFunctions { marked: &stripped.marked, found: Vec::new() };
+    marks.visit_program(program);
+    for m in marks.found {
+        if out.native.iter().any(|c| c.node.span() == m.span) {
+            continue;
+        }
+        errors.push(match out.rejected.iter().find(|r| r.1 == m.span) {
+            Some((name, _, reason)) => {
+                let mut d = OxcDiagnostic::error(format!("`aot` function `{name}` cannot be compiled natively"))
+                    .with_labels([LabeledSpan::new_primary_with_span(Some(reason.msg.clone()), reason.span)]);
+                if let Some(help) = callee_chain(&reason.msg, &out.rejected) {
+                    d = d.with_help(help);
+                }
+                d
+            }
+            None => {
+                OxcDiagnostic::error(format!("`aot` cannot be applied to {}", m.what)).with_label(m.span).with_help(
+                    "`aot` is supported on top-level function declarations and on top-level \
+                     `const` bindings of arrow functions and function expressions",
+                )
+            }
+        });
+    }
+    if !errors.is_empty() {
+        return Err(erase::render(errors, original, path));
+    }
+
     let mut rejected: Vec<Rejected> = out
         .rejected
         .into_iter()
@@ -81,11 +140,74 @@ pub fn analyze(source: &str, path: &Path) -> Result<Analysis, String> {
         })
         .collect();
     rejected.sort_by_key(|r| r.line);
-    Ok(Analysis { module: out.module, natives, rejected })
+    Ok(Analysis { source: source.clone(), module: out.module, natives, rejected })
+}
+
+/// For "calls `g`, which is not compiled natively", explain why `g` is not.
+fn callee_chain(msg: &str, rejected: &[(String, Span, check::Reject)]) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut msg = msg.to_string();
+    let mut seen = HashSet::new();
+    while let Some(callee) = msg.strip_prefix("calls `").and_then(|m| m.split('`').next()).map(str::to_string) {
+        if !seen.insert(callee.clone()) {
+            break;
+        }
+        let Some((_, _, r)) = rejected.iter().find(|r| r.0 == callee) else { break };
+        lines.push(format!("`{callee}` is interpreted: {}", r.msg));
+        msg = r.msg.clone();
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+struct Mark {
+    span: Span,
+    what: &'static str,
+}
+
+/// Collects functions marked by the `aot` keyword or a `"use aot"` directive.
+struct MarkedFunctions<'m> {
+    marked: &'m HashSet<u32>,
+    found: Vec<Mark>,
+}
+
+fn has_use_aot(body: Option<&FunctionBody>) -> bool {
+    body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use aot"))
+}
+
+impl<'a> Visit<'a> for MarkedFunctions<'_> {
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        if self.marked.contains(&it.span.start) || has_use_aot(it.body.as_deref()) {
+            let what = if it.r#async {
+                "async functions (not supported yet)"
+            } else if it.generator {
+                "generators (not supported yet)"
+            } else {
+                "this function (nested functions, methods and callbacks are not supported yet)"
+            };
+            self.found.push(Mark { span: it.span, what });
+        }
+        walk::walk_function(self, it, flags);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        let body = match &it.body {
+            ArrowFunctionBody::FunctionBody(b) => Some(&**b),
+            _ => None,
+        };
+        if self.marked.contains(&it.span.start) || has_use_aot(body) {
+            let what = if it.r#async {
+                "async functions (not supported yet)"
+            } else {
+                "this arrow function (only top-level `const` arrow functions are supported yet)"
+            };
+            self.found.push(Mark { span: it.span, what });
+        }
+        walk::walk_arrow_function_expression(self, it);
+    }
 }
 
 /// Full front-end pipeline for the interpreted half: rewrite + type erasure.
-pub fn erased_js(source: &str, path: &Path, analysis: &Analysis) -> Result<String, String> {
-    let rewritten = erase::rewrite(source, &analysis.natives);
+pub fn erased_js(path: &Path, analysis: &Analysis) -> Result<String, String> {
+    let rewritten = erase::rewrite(&analysis.source, &analysis.natives);
     erase::strip_types(&rewritten, path)
 }

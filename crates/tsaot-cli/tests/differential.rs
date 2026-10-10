@@ -112,3 +112,32 @@ fn differential() {
     }
     assert!(failures.is_empty(), "failed cases: {failures:?}");
 }
+
+/// Every program in `tests/errors` must fail to compile, with diagnostics
+/// containing each `// @error <text>` line.
+#[test]
+fn compile_errors() {
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(repo().join("tests/errors"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+        .collect();
+    cases.sort();
+    let mut failures = Vec::new();
+    for case in &cases {
+        let name = case.file_name().unwrap().to_string_lossy().into_owned();
+        let src = std::fs::read_to_string(case).unwrap();
+        let expected = src.lines().filter_map(|l| l.strip_prefix("// @error ")).collect::<Vec<_>>();
+        assert!(!expected.is_empty(), "{name}: no `// @error` lines");
+        let out = tsaot().arg("report").arg(case).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let missing: Vec<_> = expected.iter().filter(|e| !stderr.contains(*e)).collect();
+        if out.status.success() || !missing.is_empty() {
+            eprintln!("FAIL {name}: success={} missing={missing:?}\n{stderr}", out.status.success());
+            failures.push(name);
+        } else {
+            eprintln!("ok   {name}");
+        }
+    }
+    assert!(failures.is_empty(), "failed cases: {failures:?}");
+}
