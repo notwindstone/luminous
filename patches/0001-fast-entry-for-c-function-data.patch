@@ -1,0 +1,152 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -467,6 +467,12 @@
+ typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+ typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+ typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
++/* Optional fast entry of a C function data object, tried before its regular
++   JSCFunctionData. It sees no `this` and no data values, and the interpreter
++   calls it directly from its call opcodes, without pushing a stack frame.
++   Return the result, JS_EXCEPTION after throwing, or JS_UNINITIALIZED to
++   decline: the regular function is then called with the same arguments. */
++typedef JSValue JSCFunctionFast(JSContext *ctx, int argc, JSValueConst *argv);
+ typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
+ 
+ typedef struct JSMallocFunctions {
+@@ -1342,6 +1348,10 @@
+ JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
+                                       int length, int magic, int data_len,
+                                       JSValueConst *data);
++JS_EXTERN JSValue JS_NewCFunctionDataFast(JSContext *ctx, JSCFunctionFast *fast,
++                                          JSCFunctionData *func, const char *name,
++                                          int length, int magic, int data_len,
++                                          JSValueConst *data);
+ JS_EXTERN JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
+                                        const char *name,
+                                        int length, int magic, int data_len,
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6560,6 +6560,7 @@
+ 
+ typedef struct JSCFunctionDataRecord {
+     JSCFunctionData *func;
++    JSCFunctionFast *fast; /* optional, see JSCFunctionFast */
+     uint8_t length;
+     uint8_t data_len;
+     uint16_t magic;
+@@ -6608,6 +6609,11 @@
+     s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
+     if (!s)
+         return JS_EXCEPTION; // can't really happen
++    if (s->fast && !(flags & JS_CALL_FLAG_CONSTRUCTOR)) {
++        ret = s->fast(ctx, argc, argv);
++        if (!JS_IsUninitialized(ret))
++            return ret;
++    }
+     arg_buf = argv;
+     arg_count = s->length;
+     if (unlikely(argc < arg_count)) {
+@@ -6653,6 +6659,7 @@
+         return JS_EXCEPTION;
+     }
+     s->func = func;
++    s->fast = NULL;
+     s->length = length;
+     s->data_len = data_len;
+     s->magic = magic;
+@@ -6672,6 +6679,18 @@
+     return func_obj;
+ }
+ 
++JSValue JS_NewCFunctionDataFast(JSContext *ctx, JSCFunctionFast *fast,
++                                JSCFunctionData *func, const char *name,
++                                int length, int magic, int data_len,
++                                JSValueConst *data)
++{
++    JSValue func_obj = JS_NewCFunctionData2(ctx, func, name, length, magic,
++                                            data_len, data);
++    if (!JS_IsException(func_obj))
++        JS_VALUE_GET_OBJ(func_obj)->u.c_function_data_record->fast = fast;
++    return func_obj;
++}
++
+ JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
+                             int length, int magic, int data_len,
+                             JSValueConst *data)
+@@ -18047,6 +18066,28 @@
+     return can_store_error_stack(exc) || can_add_backtrace(exc);
+ }
+ 
++static inline bool js_is_c_function_data(JSValueConst v)
++{
++    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++           JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_C_FUNCTION_DATA;
++}
++
++/* Calls the JSCFunctionFast entry of C function data `func_obj`. Returns
++   JS_UNINITIALIZED if there is none or it declined, in which case the caller
++   takes the regular call path. Lets the interpreter's call opcodes enter
++   native code without a JS_CallInternal frame. The result is returned by
++   value, in registers: taking the address of the interpreter's ret_val
++   would force every call result through memory. */
++static no_inline JSValue js_call_fast(JSContext *ctx, JSValueConst func_obj,
++                                     int argc, JSValueConst *argv)
++{
++    JSCFunctionDataRecord *s = JS_VALUE_GET_OBJ(func_obj)->u.c_function_data_record;
++
++    if (!s->fast)
++        return JS_UNINITIALIZED;
++    return s->fast(ctx, argc, argv);
++}
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -18548,9 +18589,12 @@
+             has_call_argc:
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (unlikely(js_is_c_function_data(call_argv[-1])))
++                    goto call_c_function_data;
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
++            call_returned:
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+                 if (opcode == OP_tail_call)
+@@ -18585,9 +18629,12 @@
+                 pc += 2;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (unlikely(js_is_c_function_data(call_argv[-1])))
++                    goto call_method_c_function_data;
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
++            call_method_returned:
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+                 if (opcode == OP_tail_call_method)
+@@ -18598,6 +18645,21 @@
+                 *sp++ = ret_val;
+             }
+             BREAK;
++        call_c_function_data:
++            /* Calls to C function data objects (which may have a JSCFunctionFast
++               entry), out of line: the regular call path above keeps the code
++               the compiler generates for it without this hook. */
++            ret_val = js_call_fast(ctx, call_argv[-1], call_argc, vc(call_argv));
++            if (JS_IsUninitialized(ret_val))
++                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED, JS_UNDEFINED,
++                                          call_argc, vc(call_argv), 0);
++            goto call_returned;
++        call_method_c_function_data:
++            ret_val = js_call_fast(ctx, call_argv[-1], call_argc, vc(call_argv));
++            if (JS_IsUninitialized(ret_val))
++                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
++                                          call_argc, vc(call_argv), 0);
++            goto call_method_returned;
+         CASE(OP_array_from):
+             {
+                 call_argc = get_u16(pc);

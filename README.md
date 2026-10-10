@@ -26,7 +26,7 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
              │                                                                  ├─ cc ─> foo
              └─ rewrite + type erasure ── foo.js ── qjsc ── bytecode + main.c ──┤
                                                                                 │
-                     generated C glue (entry stubs) + runtime ──────────────────┘
+                     generated C glue + runtime ────────────────────────────────┘
 ```
 
 1. **Selection.** Every top-level `function` declaration, and every top-level
@@ -40,19 +40,61 @@ elapsed: 905 ms         # 4.5x faster than the same program interpreted
    are direct machine calls.
 3. **Interpreted code.** The whole module is type-erased (oxc transformer) and
    compiled by `qjsc` to bytecode. Each native declaration `f` is renamed to a
-   fallback `__tsaot_fb_f` and its binding is re-pointed at its entry stub;
+   fallback `__tsaot_fb_f` and its binding is re-pointed at a function object
+   whose entry is native code;
    native `const` initializers are wrapped in place:
    ```js
    import { __tsaot_bind } from "tsaot:native";
    const f = __tsaot_bind(0, __tsaot_fb_f);    // first statement of the module
    const g = __tsaot_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
    ```
-4. **Entry stubs (the "deopt" point).** TypeScript types are unsound at
+4. **JS entries (the "deopt" point).** TypeScript types are unsound at
    runtime: interpreted code can pass a string where `number` is declared. Each
-   stub checks the argument tags. On a match it unboxes and calls native code;
-   on a mismatch it calls the interpreted fallback, which has exactly the
+   native function has a Cranelift-generated entry that checks the argument
+   tags. On a match it unboxes and runs native code; on a mismatch it declines,
+   and the engine calls the interpreted fallback, which has exactly the
    original JS semantics. Native code therefore never sees a value outside its
    declared type.
+
+### Crossing from interpreted to native code
+
+Calls from the interpreter into native code are close to free. The whole
+boundary is machine code, with nothing in C:
+
+- **An engine hook.** `patches/0001-fast-entry-for-c-function-data.patch` adds
+  `JSCFunctionFast` to QuickJS-NG: an optional fast entry on C function
+  objects. The interpreter's `OP_call`/`OP_call_method` call it directly on
+  their stack slots, without recursing into `JS_CallInternal` and without
+  pushing a stack frame. Other callers (`f.call`, `Array.prototype.map`, …)
+  reach it from the generic C-function path.
+- **Inline guard and unboxing.** `tsaot_fast_<i>` reads the argument tags and
+  payloads straight from the interpreter's `JSValue` slots. The layout is
+  `_Static_assert`ed in the generated glue.
+- **Inlined body.** Unless a function is large, its body is compiled straight
+  into its JS entry, so there is no second call, prologue or stack check.
+- **Boxing without float round-trips.** Results are normalized to int32 the
+  way the interpreter's `js_number()` does, using integer ops on the bit
+  pattern instead of a chain of dependent float conversions.
+- **Result in registers.** The `JSValue` comes back in `rax:rdx` (`x0:x1` on
+  AArch64). A result written to memory as two 8-byte halves and reloaded by
+  the interpreter as one 16-byte value defeats store forwarding, and that
+  stall alone used to be the single largest cost of a call.
+
+`bench/micro/crossing.ts` measures the cost of one call from an interpreted
+loop:
+
+| callee | interpreted callee | native callee |
+|---|---:|---:|
+| `id(x)` (pure crossing) | 61 ns | **17 ns** |
+| `lerp(a, b, t)` (cost beyond doing the same math inline) | 65 ns | **2 ns** |
+
+The hook is the only engine change. QuickJS-NG's interpreter loop is very
+sensitive to code layout: in A/B runs, even a never-taken branch in `OP_call`
+moved unrelated benchmarks by −23% to +9%. The hook is therefore an
+out-of-line `unlikely` jump that leaves the regular call path's generated code
+alone. With it, purely interpreted code measured between −12% (`fib`) and
++8% (`boundary`'s interpreted baseline) against the unpatched engine, inside
+that same layout-noise band.
 
 ## The native subset (phase 1)
 
@@ -151,7 +193,7 @@ Requires Nix with flakes (or rustc ≥ 1.88, clang, cmake and ninja on `PATH`).
 git clone --recursive https://github.com/notwindstone/typescript-aot
 cd typescript-aot
 nix develop
-scripts/build-quickjs.sh          # builds vendor/quickjs into build/quickjs
+scripts/build-quickjs.sh          # patches/ applied to vendor/quickjs, built into build/quickjs
 cargo build --release
 
 ./target/release/tsaot run bench/fib.ts
@@ -170,17 +212,17 @@ The compiled executable targets the host CPU (like `-march=native`).
 Mean wall time for the whole program, measured with hyperfine. "Interpreted" is
 the same program built with `--no-native`, i.e. plain QuickJS-NG bytecode.
 
-| benchmark    | what it stresses                         | interpreted | native  | speedup |
-|--------------|------------------------------------------|------------:|--------:|--------:|
-| mandelbrot   | float loops                              |      884 ms |   35 ms |   25.5× |
-| fib          | recursive calls                          |      427 ms |   32 ms |   13.3× |
-| integrate    | libm calls (`sin`, `exp`, `sqrt`)        |     3.90 s  |  584 ms |    6.7× |
-| primes       | `%`, loops                               |     4.09 s  |  0.91 s |    4.5× |
-| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)     |     3.59 s  |  1.12 s |    3.2× |
-| boundary     | 5M tiny native calls *from interpreted code* | 524 ms  |  420 ms |    1.25× |
+| benchmark    | what it stresses                             | interpreted | native  | speedup |
+|--------------|----------------------------------------------|------------:|--------:|--------:|
+| mandelbrot   | float loops                                  |      878 ms |   35 ms |   25.3× |
+| fib          | recursive calls                              |      466 ms |   33 ms |   14.1× |
+| integrate    | libm calls (`sin`, `exp`, `sqrt`)            |     4.25 s  |  475 ms |    8.9× |
+| primes       | `%`, loops                                   |     4.05 s  |  0.91 s |    4.5× |
+| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)         |     3.63 s  |  1.12 s |    3.2× |
+| boundary     | 5M tiny native calls *from interpreted code* |      605 ms |  367 ms |    1.65× |
 
-`boundary` is the worst case: the cost is dominated by QuickJS's
-C-function call path, not by native code.
+In `boundary` the interpreted loop around the calls dominates; the calls
+themselves cost about 2 ns each (see the crossing section above).
 
 ## Roadmap
 
@@ -205,8 +247,9 @@ crates/tsaot-front    oxc front end, strict-subset checker, typed IR, type erasu
 crates/tsaot-codegen  Cranelift backend (IR -> object file)
 crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + cc driver; differential tests
 runtime/              C runtime linked into every program (pow, round, ToInt32, stack guard)
-vendor/quickjs        QuickJS-NG (git submodule)
+vendor/quickjs        QuickJS-NG (git submodule, kept pristine)
+patches/              engine patches applied by scripts/build-quickjs.sh
 tests/cases           differential test programs
 tests/errors          programs that must fail to compile, with expected diagnostics
-bench/                benchmarks + bench/run.sh
+bench/                benchmarks + bench/run.sh; bench/micro/ for microbenchmarks
 ```

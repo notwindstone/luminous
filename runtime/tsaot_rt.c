@@ -1,5 +1,5 @@
 #include <math.h>
-#include <string.h>
+
 #include "tsaot_rt.h"
 
 uintptr_t tsaot_stack_limit;
@@ -64,6 +64,12 @@ int32_t tsaot_toint32_slow(double d)
 void tsaot_stack_overflow(void)
 {
     tsaot_unwinding = 1;
+}
+
+/* Same error as the interpreter's own stack overflow. */
+void tsaot_throw_stack_overflow(JSContext *ctx)
+{
+    JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
 }
 
 /* Make the builtins that native code relies on immutable, before any user

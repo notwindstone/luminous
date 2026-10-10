@@ -35,7 +35,7 @@
 
           shellHook = ''
             export TSAOT_ROOT="$PWD"
-            export TSAOT_QUICKJS_DIR="$PWD/vendor/quickjs"
+            export TSAOT_QUICKJS_DIR="$PWD/build/quickjs-src"
             export TSAOT_QUICKJS_BUILD="$PWD/build/quickjs"
           '';
         };

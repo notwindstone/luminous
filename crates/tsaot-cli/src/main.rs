@@ -163,11 +163,14 @@ fn quickjs(opts: &BuildOpts) -> Result<QuickJs> {
         arg.clone().or_else(|| std::env::var_os(var).map(PathBuf::from)).unwrap_or(default)
     };
     let q = QuickJs {
-        src: pick(&opts.quickjs_dir, "TSAOT_QUICKJS_DIR", repo.join("vendor/quickjs")),
+        src: pick(&opts.quickjs_dir, "TSAOT_QUICKJS_DIR", repo.join("build/quickjs-src")),
         build: pick(&opts.quickjs_build, "TSAOT_QUICKJS_BUILD", repo.join("build/quickjs")),
     };
     if !q.src.join("quickjs.h").exists() {
-        bail!("QuickJS-NG sources not found at {} (set TSAOT_QUICKJS_DIR)", q.src.display());
+        bail!(
+            "QuickJS-NG sources not found at {} (run scripts/build-quickjs.sh, or set TSAOT_QUICKJS_DIR)",
+            q.src.display()
+        );
     }
     for f in ["qjsc", "libqjs.a", "libqjs-libc.a"] {
         if !q.build.join(f).exists() {

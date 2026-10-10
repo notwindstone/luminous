@@ -1,16 +1,20 @@
 //! Lowers typed IR to native code with Cranelift and emits a relocatable
 //! object file.
 //!
-//! Native ABI: every IR function `i` becomes the symbol `tsaot_fn_<i>` taking
-//! and returning plain scalars (`double` for `number`, zero-extended `uint8_t`
-//! for `boolean`). JS-facing entry stubs live in the generated C glue.
+//! Every IR function `i` produces two symbols:
+//! - `tsaot_fn_<i>`: the function itself, taking and returning plain scalars
+//!   (`double` for `number`, zero-extended `uint8_t` for `boolean`). Native
+//!   callers call this directly.
+//! - `tsaot_fast_<i>`: its entry from JS, a QuickJS-NG `JSCFunctionFast` that
+//!   the interpreter's call opcodes invoke directly on their stack slots. The
+//!   type guard, unboxing and boxing are all inline machine code here.
 //!
 //! Stack overflow: each function compares the stack pointer against the
 //! runtime's `tsaot_stack_limit` on entry. On overflow it calls
 //! `tsaot_stack_overflow()` (which sets `tsaot_unwinding`) and returns. After
 //! every native call the caller checks `tsaot_unwinding` and returns
-//! immediately, so the whole native stack unwinds back to the entry stub,
-//! which turns it into a JS `RangeError`.
+//! immediately, so the whole native stack unwinds back to the JS entry,
+//! which throws the interpreter's `RangeError`.
 
 use std::collections::HashMap;
 
@@ -28,6 +32,28 @@ use tsaot_front::ir::{self, BinOp, CmpOp, Expr, ExprKind, LogicalOp, MathFn, Stm
 
 pub fn symbol_name(id: ir::FuncId) -> String {
     format!("tsaot_fn_{id}")
+}
+
+pub fn fast_symbol_name(id: ir::FuncId) -> String {
+    format!("tsaot_fast_{id}")
+}
+
+/// Native stack available to one entry from JS. QuickJS keeps its own usage
+/// under `JS_DEFAULT_STACK_SIZE` (1 MiB), so both fit a default 8 MiB stack.
+pub const NATIVE_STACK_BUDGET: u64 = 2 * 1024 * 1024;
+
+/// QuickJS-NG `JSValue` layout on 64-bit targets without NaN boxing: a
+/// 16-byte struct with the payload union at offset 0 and an `int64_t` tag at
+/// offset 8. The generated C glue `_Static_assert`s all of these.
+pub mod jsvalue {
+    pub const SIZE: usize = 16;
+    pub const TAG_OFFSET: i32 = 8;
+    pub const TAG_INT: i64 = 0;
+    pub const TAG_BOOL: i64 = 1;
+    pub const TAG_UNDEFINED: i64 = 3;
+    pub const TAG_UNINITIALIZED: i64 = 4;
+    pub const TAG_EXCEPTION: i64 = 6;
+    pub const TAG_FLOAT64: i64 = 8;
 }
 
 pub struct Options {
@@ -55,6 +81,7 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Vec<u8>> {
     let mut cg = Codegen::new(&mut module, m)?;
     for (i, f) in m.funcs.iter().enumerate() {
         cg.define(i, f).with_context(|| format!("compiling `{}`", f.name))?;
+        cg.define_fast(i, f).with_context(|| format!("compiling the entry of `{}`", f.name))?;
     }
     Ok(module.finish().emit()?)
 }
@@ -77,6 +104,7 @@ fn abi(t: Ty) -> AbiParam {
 struct Codegen<'m> {
     module: &'m mut ObjectModule,
     funcs: Vec<FuncId>,
+    fast_funcs: Vec<FuncId>,
     imports: HashMap<&'static str, FuncId>,
     stack_limit: DataId,
     unwinding: DataId,
@@ -94,11 +122,17 @@ impl<'m> Codegen<'m> {
             }
             funcs.push(module.declare_function(&symbol_name(i), Linkage::Export, &sig)?);
         }
+        let fast_sig = fast_signature(module);
+        let mut fast_funcs = Vec::new();
+        for i in 0..m.funcs.len() {
+            fast_funcs.push(module.declare_function(&fast_symbol_name(i), Linkage::Export, &fast_sig)?);
+        }
         let stack_limit = module.declare_data("tsaot_stack_limit", Linkage::Import, true, false)?;
         let unwinding = module.declare_data("tsaot_unwinding", Linkage::Import, true, false)?;
         Ok(Codegen {
             module,
             funcs,
+            fast_funcs,
             imports: HashMap::new(),
             stack_limit,
             unwinding,
@@ -118,8 +152,8 @@ impl<'m> Codegen<'m> {
         Ok(id)
     }
 
-    fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        // Declare every helper up front so lowering does not need `&mut module`.
+    /// Imports every external function `f`'s body may call.
+    fn helpers(&mut self, f: &ir::Func) -> Result<HashMap<&'static str, FuncId>> {
         let mut helpers = HashMap::new();
         helpers.insert("fmod", self.import("fmod", &[F64, F64], Some(F64))?);
         helpers.insert("tsaot_pow", self.import("tsaot_pow", &[F64, F64], Some(F64))?);
@@ -131,73 +165,161 @@ impl<'m> Codegen<'m> {
                 helpers.insert(sym, self.import(sym, &params, Some(F64))?);
             }
         }
+        Ok(helpers)
+    }
 
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = self.signature(f);
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut self.fctx);
-
-        let helper_refs: HashMap<&str, FuncRef> =
-            helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, b.func))).collect();
-        let func_refs: Vec<FuncRef> =
-            self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, b.func)).collect();
+    /// Sets up lowering of `f`'s body into `b`'s current block, with the
+    /// parameters bound to `params`.
+    fn lowerer<'b>(
+        &mut self,
+        mut b: FunctionBuilder<'b>,
+        f: &ir::Func,
+        helpers: &HashMap<&'static str, FuncId>,
+        params: &[Value],
+        exits: Exits,
+    ) -> Lower<'b> {
+        let helpers = helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, b.func))).collect();
+        let func_refs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, b.func)).collect();
         let stack_limit = self.module.declare_data_in_func(self.stack_limit, b.func);
         let unwinding = self.module.declare_data_in_func(self.unwinding, b.func);
-        let ptr = self.module.target_config().pointer_type();
-
-        let entry = b.create_block();
-        b.append_block_params_for_function_params(entry);
-        b.switch_to_block(entry);
         let vars: Vec<Variable> = f.locals.iter().map(|&t| b.declare_var(clif_ty(t))).collect();
-        let params: Vec<Value> = b.block_params(entry).to_vec();
         for (i, &t) in f.locals.iter().enumerate() {
             let v = if i < params.len() { params[i] } else { zero(&mut b, t) };
             b.def_var(vars[i], v);
         }
-
-        let mut l = Lower {
+        Lower {
             b,
             ret: f.ret,
             vars,
             func_refs,
-            helpers: helper_refs,
+            helpers,
+            stack_limit,
             unwinding,
-            ptr,
+            ptr: self.module.target_config().pointer_type(),
             loops: HashMap::new(),
             unwind_block: None,
-        };
-
-        // Stack check.
-        let limit_addr = l.b.ins().symbol_value(ptr, stack_limit);
-        let limit = l.b.ins().load(ptr, MemFlagsData::trusted(), limit_addr, 0);
-        let sp = l.b.ins().get_stack_pointer(ptr);
-        let overflow = l.b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
-        let overflow_block = l.b.create_block();
-        let body_block = l.b.create_block();
-        l.b.ins().brif(overflow, overflow_block, &[], body_block, &[]);
-        l.b.switch_to_block(overflow_block);
-        l.b.set_cold_block(overflow_block);
-        let so = l.helpers["tsaot_stack_overflow"];
-        l.b.ins().call(so, &[]);
-        let ub = l.unwind_block();
-        l.b.ins().jump(ub, &[]);
-        l.b.switch_to_block(body_block);
-
-        l.stmts(&f.body);
-        if !l.is_filled() {
-            // Only reachable for `void` functions; the checker rejects
-            // non-void functions that can fall off the end.
-            l.ret_default();
+            exits,
         }
-        if let Some(ub) = l.unwind_block {
-            l.b.switch_to_block(ub);
-            l.ret_default();
-        }
+    }
+
+    /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
+    fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        let helpers = self.helpers(f)?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = self.signature(f);
+        let mut fctx = std::mem::take(&mut self.fctx);
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let params = b.block_params(entry).to_vec();
+        let mut l = self.lowerer(b, f, &helpers, &params, Exits { ret: Exit::Return, unwind: Exit::Return });
+        l.stack_check();
+        l.body(&f.body);
         l.b.seal_all_blocks();
-        let config = self.module.target_config();
-        l.b.finalize(config);
-
+        l.b.finalize(self.module.target_config());
         self.module.define_function(self.funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
         self.module.clear_context(&mut ctx);
+        self.fctx = fctx;
+        Ok(())
+    }
+
+    /// Defines `tsaot_fast_<index>`, the JS-facing entry of native function
+    /// `index`, with the engine's `JSCFunctionFast` signature:
+    ///
+    /// ```c
+    /// JSValue tsaot_fast_i(JSContext *ctx, int argc, JSValueConst *argv);
+    /// ```
+    ///
+    /// The whole boundary is inline machine code: argument tags are checked
+    /// and payloads unboxed straight from the interpreter's stack slots, the
+    /// body runs (inlined, unless it is large), and the boxed result is
+    /// returned in registers. Ill-typed arguments return `JS_UNINITIALIZED`,
+    /// which makes the engine call the interpreted fallback instead; a stack
+    /// overflow throws a `RangeError` and returns `JS_EXCEPTION`.
+    fn define_fast(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        let ptr = self.module.target_config().pointer_type();
+        let throw_so = self.import("tsaot_throw_stack_overflow", &[ptr], None)?;
+        let helpers = self.helpers(f)?;
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = fast_signature(self.module);
+        let mut fctx = std::mem::take(&mut self.fctx);
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let throw_so = self.module.declare_func_in_func(throw_so, b.func);
+        let stack_limit = self.module.declare_data_in_func(self.stack_limit, b.func);
+        let unwinding = self.module.declare_data_in_func(self.unwinding, b.func);
+        let mem = MemFlagsData::trusted();
+
+        let entry = b.create_block();
+        let decline = b.create_block();
+        let overflow = b.create_block();
+        let boxing = b.create_block();
+        b.set_cold_block(decline);
+        b.set_cold_block(overflow);
+        let result = (f.ret != Ty::Void).then(|| b.append_block_param(boxing, clif_ty(f.ret)));
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let [js_ctx, argc, argv] = b.block_params(entry).try_into().unwrap();
+
+        let enough = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, argc, f.params.len() as i64);
+        let unbox = b.create_block();
+        b.ins().brif(enough, unbox, &[], decline, &[]);
+        b.switch_to_block(unbox);
+        let args = unbox_args(&mut b, &f.params, argv, decline);
+
+        // This entry starts a fresh native stack budget.
+        let sp = b.ins().get_stack_pointer(ptr);
+        let limit = b.ins().iadd_imm_s(sp, -(NATIVE_STACK_BUDGET as i64));
+        let limit_addr = b.ins().symbol_value(ptr, stack_limit);
+        b.ins().store(mem, limit, limit_addr, 0);
+
+        let mut b = if ir_size(f) <= INLINE_LIMIT {
+            // The body itself, with `return` jumping to the boxing code. It
+            // needs no stack check: the budget was just reset.
+            let exits = Exits { ret: Exit::Jump(boxing), unwind: Exit::Jump(overflow) };
+            let mut l = self.lowerer(b, f, &helpers, &args, exits);
+            l.body(&f.body);
+            l.b
+        } else {
+            let callee = self.module.declare_func_in_func(self.funcs[index], b.func);
+            let call = b.ins().call(callee, &args);
+            let r: Vec<BlockArg> = b.inst_results(call).iter().map(|&v| BlockArg::Value(v)).collect();
+            let flag_addr = b.ins().symbol_value(ptr, unwinding);
+            let flag = b.ins().load(I8, mem, flag_addr, 0);
+            b.ins().brif(flag, overflow, &[], boxing, &r);
+            b
+        };
+
+        b.switch_to_block(boxing);
+        let (payload, tag) = match (f.ret, result) {
+            (Ty::Void, _) => (b.ins().iconst(I64, 0), b.ins().iconst(I64, jsvalue::TAG_UNDEFINED)),
+            (Ty::Bool, Some(r)) => (b.ins().uextend(I64, r), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
+            (Ty::F64, Some(d)) => box_number(&mut b, d),
+            _ => unreachable!("non-void function returns a value"),
+        };
+        // Returned in registers: the result never touches memory on its way
+        // back into the interpreter.
+        b.ins().return_(&[payload, tag]);
+
+        b.switch_to_block(overflow);
+        let flag_addr = b.ins().symbol_value(ptr, unwinding);
+        let zero8 = b.ins().iconst(I8, 0);
+        b.ins().store(mem, zero8, flag_addr, 0);
+        b.ins().call(throw_so, &[js_ctx]);
+        let payload = b.ins().iconst(I64, 0);
+        let tag = b.ins().iconst(I64, jsvalue::TAG_EXCEPTION);
+        b.ins().return_(&[payload, tag]);
+
+        b.switch_to_block(decline);
+        let payload = b.ins().iconst(I64, 0);
+        let tag = b.ins().iconst(I64, jsvalue::TAG_UNINITIALIZED);
+        b.ins().return_(&[payload, tag]);
+
+        b.seal_all_blocks();
+        b.finalize(self.module.target_config());
+        self.module.define_function(self.fast_funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
+        self.module.clear_context(&mut ctx);
+        self.fctx = fctx;
         Ok(())
     }
 
@@ -269,11 +391,136 @@ struct Lower<'a> {
     vars: Vec<Variable>,
     func_refs: Vec<FuncRef>,
     helpers: HashMap<&'static str, FuncRef>,
+    stack_limit: GlobalValue,
     unwinding: GlobalValue,
     ptr: Type,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Block, Block)>,
     unwind_block: Option<Block>,
+    exits: Exits,
+}
+
+/// Where lowered code goes when it leaves the body.
+#[derive(Clone, Copy)]
+enum Exit {
+    /// Return from the Cranelift function.
+    Return,
+    /// Jump to a block: for `ret`, with the return value as its parameter
+    /// (if not `void`); for `unwind`, without parameters.
+    Jump(Block),
+}
+
+#[derive(Clone, Copy)]
+struct Exits {
+    /// `return` statements.
+    ret: Exit,
+    /// Stack-overflow unwinding.
+    unwind: Exit,
+}
+
+/// Bodies up to this many IR nodes are inlined into their JS entry.
+const INLINE_LIMIT: usize = 256;
+
+fn ir_size(f: &ir::Func) -> usize {
+    fn e(x: &Expr) -> usize {
+        1 + match &x.kind {
+            ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Update { .. } => 0,
+            ExprKind::SetLocal(_, a) | ExprKind::Unary(_, a) | ExprKind::Truthy(a) => e(a),
+            ExprKind::Binary(_, a, b) | ExprKind::Compare(_, a, b) | ExprKind::Logical(_, a, b) => e(a) + e(b),
+            ExprKind::Cond(a, b, c) => e(a) + e(b) + e(c),
+            ExprKind::Call(_, xs) | ExprKind::Math(_, xs) | ExprKind::Seq(xs) => xs.iter().map(e).sum(),
+        }
+    }
+    fn s(x: &Stmt) -> usize {
+        1 + match x {
+            Stmt::Expr(x) => e(x),
+            Stmt::If(c, a, b) => e(c) + a.iter().chain(b).map(s).sum::<usize>(),
+            Stmt::Loop { test, body, update, .. } => {
+                test.iter().chain(update).map(e).sum::<usize>() + body.iter().map(s).sum::<usize>()
+            }
+            Stmt::Return(x) => x.iter().map(e).sum(),
+            Stmt::Block(b) => b.iter().map(s).sum(),
+            Stmt::Break(_) | Stmt::Continue(_) => 0,
+        }
+    }
+    f.body.iter().map(s).sum()
+}
+
+/// Reads the arguments of a JS call straight from the interpreter's
+/// `JSValue` slots, branching to `decline` on any type mismatch.
+fn unbox_args(b: &mut FunctionBuilder, params: &[Ty], argv: Value, decline: Block) -> Vec<Value> {
+    let mem = MemFlagsData::trusted();
+    let mut args = Vec::with_capacity(params.len());
+    for (k, &t) in params.iter().enumerate() {
+        let at = (k * jsvalue::SIZE) as i32;
+        let tag = b.ins().load(I64, mem, argv, at + jsvalue::TAG_OFFSET);
+        match t {
+            Ty::F64 => {
+                let is_int = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_INT);
+                let int_blk = b.create_block();
+                let not_int = b.create_block();
+                let float_blk = b.create_block();
+                let join = b.create_block();
+                let v = b.append_block_param(join, F64);
+                b.ins().brif(is_int, int_blk, &[], not_int, &[]);
+                b.switch_to_block(int_blk);
+                let i = b.ins().load(I32, mem, argv, at);
+                let d = b.ins().fcvt_from_sint(F64, i);
+                b.ins().jump(join, &[BlockArg::Value(d)]);
+                b.switch_to_block(not_int);
+                let is_float = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_FLOAT64);
+                b.ins().brif(is_float, float_blk, &[], decline, &[]);
+                b.switch_to_block(float_blk);
+                let d = b.ins().load(F64, mem, argv, at);
+                b.ins().jump(join, &[BlockArg::Value(d)]);
+                b.switch_to_block(join);
+                args.push(v);
+            }
+            Ty::Bool => {
+                let is_bool = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_BOOL);
+                let ok = b.create_block();
+                b.ins().brif(is_bool, ok, &[], decline, &[]);
+                b.switch_to_block(ok);
+                let i = b.ins().load(I32, mem, argv, at);
+                args.push(b.ins().icmp_imm_s(IntCC::NotEqual, i, 0));
+            }
+            Ty::Void => unreachable!(),
+        }
+    }
+    args
+}
+
+/// Boxes a number like the interpreter's `js_number()`: int32-valued doubles
+/// (except -0) become `JS_TAG_INT`, everything else `JS_TAG_FLOAT64`.
+///
+/// The int32 test is QuickJS's `double_is_int32`, done on the bit pattern
+/// with integer ops only. The obvious test (convert to int and back, then
+/// compare) is a ~20-cycle chain of dependent float conversions that sits
+/// right on the latency path back into the interpreter; here the conversion
+/// that produces the int payload runs in parallel with the test instead.
+/// Returns `(payload, tag)`.
+fn box_number(b: &mut FunctionBuilder, d: Value) -> (Value, Value) {
+    let u = b.ins().bitcast(I64, MemFlagsData::new(), d);
+    // Unbiased exponent; negative exponents wrap to huge unsigned values.
+    let e = b.ins().ushr_imm_u(u, 52);
+    let e = b.ins().band_imm_u(e, 0x7ff);
+    let e = b.ins().iadd_imm_s(e, -1023);
+    // |d| in [1, 2^31): integral iff no mantissa bits below the binary point.
+    let small = b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, e, 30);
+    let frac = b.ins().ishl_imm_u(u, 12);
+    let frac = b.ins().ishl(frac, e);
+    let small_int = b.ins().icmp_imm_s(IntCC::Equal, frac, 0);
+    // Otherwise only +0 and INT32_MIN are int32 (this rejects -0).
+    let is_zero = b.ins().icmp_imm_s(IntCC::Equal, u, 0);
+    let is_min = b.ins().icmp_imm_s(IntCC::Equal, u, 0xc1e0_0000_0000_0000_u64 as i64);
+    let big_int = b.ins().bor(is_zero, is_min);
+    let is_int = b.ins().select(small, small_int, big_int);
+    let i = b.ins().fcvt_to_sint_sat(I32, d);
+    let int_payload = b.ins().uextend(I64, i);
+    let payload = b.ins().select(is_int, int_payload, u);
+    let int_tag = b.ins().iconst(I64, jsvalue::TAG_INT);
+    let float_tag = b.ins().iconst(I64, jsvalue::TAG_FLOAT64);
+    (payload, b.ins().select(is_int, int_tag, float_tag))
 }
 
 impl Lower<'_> {
@@ -296,12 +543,64 @@ impl Lower<'_> {
         })
     }
 
-    fn ret_default(&mut self) {
-        if self.ret == Ty::Void {
-            self.b.ins().return_(&[]);
-        } else {
-            let z = zero(&mut self.b, self.ret);
-            self.b.ins().return_(&[z]);
+    /// Leave the body with `value` (`None` for `void`).
+    fn exit_with(&mut self, value: Option<Value>) {
+        let args: Vec<Value> = value.into_iter().collect();
+        match self.exits.ret {
+            Exit::Return => self.b.ins().return_(&args),
+            Exit::Jump(blk) => {
+                let args: Vec<BlockArg> = args.into_iter().map(BlockArg::Value).collect();
+                self.b.ins().jump(blk, &args)
+            }
+        };
+    }
+
+    /// Leave the body with a placeholder value; used where the checker
+    /// guarantees the code is unreachable or the result is ignored.
+    fn exit_default(&mut self) {
+        let v = (self.ret != Ty::Void).then(|| zero(&mut self.b, self.ret));
+        self.exit_with(v);
+    }
+
+    /// Entry check of a function called from native code.
+    fn stack_check(&mut self) {
+        let limit_addr = self.b.ins().symbol_value(self.ptr, self.stack_limit);
+        let limit = self.b.ins().load(self.ptr, MemFlagsData::trusted(), limit_addr, 0);
+        let sp = self.b.ins().get_stack_pointer(self.ptr);
+        let overflow = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
+        let overflow_block = self.b.create_block();
+        let body_block = self.b.create_block();
+        self.b.ins().brif(overflow, overflow_block, &[], body_block, &[]);
+        self.b.switch_to_block(overflow_block);
+        self.b.set_cold_block(overflow_block);
+        let so = self.helpers["tsaot_stack_overflow"];
+        self.b.ins().call(so, &[]);
+        let ub = self.unwind_block();
+        self.b.ins().jump(ub, &[]);
+        self.b.switch_to_block(body_block);
+    }
+
+    /// Lower a whole function body, including its exits.
+    fn body(&mut self, body: &[Stmt]) {
+        self.stmts(body);
+        if !self.is_filled() {
+            // Only reachable for `void` functions (or dead code): the checker
+            // rejects non-void functions that can fall off the end.
+            self.exit_default();
+        }
+        if let Some(ub) = self.unwind_block {
+            self.b.switch_to_block(ub);
+            match self.exits.unwind {
+                // The caller sees `tsaot_unwinding` and ignores the value.
+                Exit::Return => {
+                    let v: Vec<Value> =
+                        (self.ret != Ty::Void).then(|| zero(&mut self.b, self.ret)).into_iter().collect();
+                    self.b.ins().return_(&v);
+                }
+                Exit::Jump(blk) => {
+                    self.b.ins().jump(blk, &[]);
+                }
+            }
         }
     }
 
@@ -390,10 +689,10 @@ impl Lower<'_> {
             Stmt::Return(e) => {
                 let v = e.as_ref().and_then(|e| self.expr(e));
                 match (self.ret, v) {
-                    (Ty::Void, _) => self.b.ins().return_(&[]),
-                    (_, Some(v)) => self.b.ins().return_(&[v]),
+                    (Ty::Void, _) => self.exit_with(None),
+                    (_, Some(v)) => self.exit_with(Some(v)),
                     (_, None) => unreachable!("checker guarantees a value"),
-                };
+                }
                 self.after_terminator();
             }
         }
@@ -704,4 +1003,14 @@ impl Lower<'_> {
         let eq = self.b.ins().fcmp(FloatCC::Equal, t, x);
         self.b.ins().band(fin, eq)
     }
+}
+
+fn fast_signature(module: &ObjectModule) -> Signature {
+    let ptr = module.target_config().pointer_type();
+    let mut sig = module.make_signature();
+    sig.params.extend([AbiParam::new(ptr), AbiParam::new(I32), AbiParam::new(ptr)]);
+    // A 16-byte JSValue struct is returned in two integer registers (rax:rdx on
+    // x86-64 SysV, x0:x1 on AArch64), which is what two I64 returns lower to.
+    sig.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+    sig
 }
