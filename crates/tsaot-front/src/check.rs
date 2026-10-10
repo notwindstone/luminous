@@ -1,31 +1,36 @@
-//! Strict-subset checker: decides which module-level functions can be compiled
-//! natively and lowers them to the typed IR.
+//! Checker: decides which module-level functions can be compiled natively and
+//! lowers them to the typed IR.
 //!
-//! The checker is deliberately conservative. A function is native only if
-//! every construct in its body is understood here, with exact JS semantics;
-//! it does not trust TypeScript's (unsound) type system beyond annotations on
-//! parameters, which are re-checked at runtime by the entry stubs. Anything
-//! else keeps running in the QuickJS interpreter.
+//! TypeScript types are unsound at runtime, so they are only trusted where
+//! they are re-checked: `number` / `boolean` parameters become unboxed
+//! values, guarded by the function's JS entry (which falls back to the
+//! interpreter on a mismatch). Everything else is an `Any` value with exact JS
+//! semantics. A function stays interpreted only if it uses a construct this
+//! checker does not lower yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use oxc::ast::ast::*;
 use oxc::semantic::{Scoping, SymbolId};
 use oxc::span::{GetSpan, Span};
 
-use crate::ir::{self, BinOp, CmpOp, Expr, ExprKind, LogicalOp, MathFn, Stmt, Ty, UnOp};
+use crate::ir::{
+    self, AnyBinOp, AnyCmpOp, AnyUnOp, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MathFn, Stmt, Ty, UnOp,
+};
 
-/// Source location of a rejection.
+/// Why a function stays interpreted.
 #[derive(Debug, Clone)]
 pub struct Reject {
     pub span: Span,
     pub msg: String,
+    /// Internal: a local was widened to `Any`; check the function again.
+    retry: bool,
 }
 
 type R<T> = Result<T, Reject>;
 
 fn reject<T>(span: Span, msg: impl Into<String>) -> R<T> {
-    Err(Reject { span, msg: msg.into() })
+    Err(Reject { span, msg: msg.into(), retry: false })
 }
 
 /// The syntax of a candidate function.
@@ -53,6 +58,14 @@ pub enum Site {
     ConstInit { init: Span },
 }
 
+struct Param<'a> {
+    symbol: SymbolId,
+    /// ABI type: unboxed (and guarded by the JS entry) only for `number` and
+    /// `boolean` annotations.
+    ty: Ty,
+    default: Option<&'a Expression<'a>>,
+}
+
 /// A module-level function binding that might be compiled natively.
 pub struct Candidate<'a> {
     pub name: String,
@@ -62,7 +75,8 @@ pub struct Candidate<'a> {
     /// Whether other native functions may call this one directly. False for
     /// `const` bindings that may still be in their TDZ when native code runs.
     direct_callable: bool,
-    params: Vec<(SymbolId, Ty)>,
+    params: Vec<Param<'a>>,
+    /// Annotated return type, if any (only a hint for callers).
     ret: Option<Ty>,
 }
 
@@ -72,10 +86,59 @@ enum ConstVal {
     Bool(bool),
 }
 
+/// How a module-level binding is declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingKind {
+    Function,
+    Const,
+    Let,
+    Var,
+    Class,
+    Import,
+}
+
+/// A module-level binding that native code may access through a cell.
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub kind: BindingKind,
+    pub name: String,
+    /// Assigned anywhere after its declaration.
+    pub written: bool,
+    pub exported: bool,
+    /// Span of the initializer of a single-identifier declarator.
+    pub init: Option<Span>,
+    /// End of the declaring statement.
+    pub stmt_end: u32,
+}
+
+/// When a cell gets its value, for source rewriting.
+#[derive(Clone, Copy, Debug)]
+pub enum CellInit {
+    /// In the module header (hoisted functions, imports, native functions).
+    Header,
+    /// By wrapping the declarator's initializer: `x = __tsaot_init(k, init)`.
+    Wrap(Span),
+    /// After the declaring statement.
+    After(u32),
+}
+
+#[derive(Clone, Debug)]
+pub struct CellInfo {
+    pub symbol: SymbolId,
+    pub name: String,
+    /// Written after initialization: interpreted code must access the cell
+    /// itself instead of its own binding.
+    pub mutable: bool,
+    pub init: CellInit,
+    /// `var`: `undefined` from the module header until its declaration runs.
+    pub hoisted_undefined: bool,
+}
+
 pub struct Outcome<'a> {
     /// Native functions, in source order; index == `ir::FuncId`.
     pub native: Vec<Candidate<'a>>,
     pub module: ir::Module,
+    pub cells: Vec<CellInfo>,
     /// Rejected candidates with the reason they stay interpreted.
     pub rejected: Vec<(String, Span, Reject)>,
 }
@@ -84,36 +147,62 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
     let mut consts = HashMap::new();
-    collect_toplevel(program, scoping, &mut candidates, &mut rejected, &mut consts);
+    let mut bindings = HashMap::new();
+    collect_toplevel(program, scoping, &mut candidates, &mut rejected, &mut consts, &mut bindings);
 
     if scoping.root_unresolved_references().contains_key("eval") {
         // Direct eval can read and rebind module-level bindings, so nothing
         // about this module can be assumed statically.
         for c in candidates.drain(..) {
             let span = c.node.span();
-            rejected.push((c.name, span, Reject { span, msg: "module uses `eval`".into() }));
+            rejected.push((c.name, span, Reject { span, msg: "module uses `eval`".into(), retry: false }));
         }
     }
 
-    // Fixpoint: a function is native only if all its native callees are. A
-    // pass that rejects nothing is self-consistent.
+    let mut widened: HashMap<SymbolId, HashSet<SymbolId>> = HashMap::new();
+    let mut ret_override: HashMap<SymbolId, Ty> = HashMap::new();
+    // Fixpoint: a function is native only if all its native callees are, and
+    // callers must agree with the callees' actual return types.
     loop {
-        let mut cx =
-            ModuleCx { scoping, consts: &consts, cands: &candidates, state: vec![State::Todo; candidates.len()] };
+        let mut cx = ModuleCx {
+            scoping,
+            consts: &consts,
+            bindings: &bindings,
+            cands: &candidates,
+            state: vec![State::Todo; candidates.len()],
+            widened: &mut widened,
+            ret_override: &mut ret_override,
+            ret_changed: false,
+            strings: Vec::new(),
+            string_ids: HashMap::new(),
+            atoms: Vec::new(),
+            atom_ids: HashMap::new(),
+            cells: Vec::new(),
+            cell_ids: HashMap::new(),
+        };
         for i in 0..candidates.len() {
             cx.ensure(i);
         }
+        if cx.ret_changed {
+            continue;
+        }
         let failed: Vec<usize> = (0..candidates.len()).filter(|&i| matches!(cx.state[i], State::Failed(_))).collect();
         if failed.is_empty() {
-            let funcs = cx
-                .state
+            let funcs = std::mem::take(&mut cx.state)
                 .into_iter()
                 .map(|s| match s {
                     State::Done(f) => f,
                     _ => unreachable!(),
                 })
                 .collect();
-            return Outcome { native: candidates, module: ir::Module { funcs }, rejected };
+            let cells = cx.cell_infos();
+            let module = ir::Module {
+                funcs,
+                strings: cx.strings,
+                atoms: cx.atoms,
+                cells: cells.iter().map(|c| c.name.clone()).collect(),
+            };
+            return Outcome { native: candidates, module, cells, rejected };
         }
         let mut reasons: HashMap<usize, Reject> = HashMap::new();
         for &i in &failed {
@@ -138,15 +227,45 @@ fn collect_toplevel<'a>(
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
     consts: &mut HashMap<SymbolId, ConstVal>,
+    bindings: &mut HashMap<SymbolId, Binding>,
 ) {
+    let written = |sym: SymbolId| scoping.get_resolved_references(sym).any(|r| r.is_write());
+    // Names exported through `export { a, b as c }`.
+    let mut export_names = HashSet::new();
+    for stmt in &program.body {
+        if let Statement::ExportNamedDeclaration(e) = stmt {
+            for s in &e.specifiers {
+                export_names.insert(s.local.name().to_string());
+            }
+        }
+    }
+    let mut bind = |id: &BindingIdentifier, kind: BindingKind, init: Option<Span>, stmt_end: u32, exported: bool| {
+        let sym = id.symbol_id.get().unwrap();
+        let name = id.name.to_string();
+        let exported = exported || export_names.contains(&name);
+        bindings.insert(sym, Binding { kind, name, written: written(sym), exported, init, stmt_end });
+    };
+
     // Module-level consts can be folded, and const-bound functions called
     // directly from native code, only while no code has run yet: before the
     // first statement that is not a pure declaration, nothing can observe
     // them in their TDZ.
     let mut pure_prefix = true;
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
-        if scoping.get_resolved_references(symbol).any(|r| r.is_write()) {
-            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned") };
+        if written(symbol) {
+            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false };
+            rejected.push((name, node.span(), r));
+            return;
+        }
+        let body = match node {
+            FnNode::Function(f) => f.body.as_deref(),
+            FnNode::Arrow(a) => match &a.body {
+                ArrowFunctionBody::FunctionBody(b) => Some(&**b),
+                _ => None,
+            },
+        };
+        if body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use no aot")) {
+            let r = Reject { span: node.span(), msg: "marked \"use no aot\"".into(), retry: false };
             rejected.push((name, node.span(), r));
             return;
         }
@@ -156,6 +275,13 @@ fn collect_toplevel<'a>(
         }
     };
     for stmt in &program.body {
+        let end = stmt.span().end;
+        if let Statement::ImportDeclaration(i) = stmt {
+            for s in i.specifiers.iter().flatten() {
+                bind(s.local(), BindingKind::Import, None, end, false);
+            }
+            continue;
+        }
         let (decl, export_prefix) = match stmt {
             Statement::ExportDeclaration(e) => {
                 (&e.declaration, Some(Span::new(e.span.start, e.declaration.span().start)))
@@ -163,29 +289,52 @@ fn collect_toplevel<'a>(
             _ => match stmt.as_declaration() {
                 Some(d) => (d, None),
                 None => {
-                    if !matches!(stmt, Statement::ImportDeclaration(_) | Statement::EmptyStatement(_)) {
+                    if !matches!(stmt, Statement::EmptyStatement(_) | Statement::ExportNamedDeclaration(_)) {
                         pure_prefix = false;
                     }
                     continue;
                 }
             },
         };
+        let exported = export_prefix.is_some();
         match decl {
             Declaration::FunctionDeclaration(f) if f.body.is_some() => {
                 let Some(id) = &f.id else { continue };
+                bind(id, BindingKind::Function, None, end, exported);
                 let symbol = id.symbol_id.get().expect("semantic analysis ran");
                 let site = Site::Declaration { id: id.span, export_prefix };
                 // Function declarations are hoisted: always initialized.
                 add(id.name.to_string(), FnNode::Function(f), symbol, site, true);
             }
             Declaration::FunctionDeclaration(_) => {} // overload signature or `declare`
-            Declaration::VariableDeclaration(v) if v.kind == VariableDeclarationKind::Const && !v.declare => {
+            Declaration::VariableDeclaration(v) if !v.declare => {
+                let kind = match v.kind {
+                    VariableDeclarationKind::Const => BindingKind::Const,
+                    VariableDeclarationKind::Let => BindingKind::Let,
+                    VariableDeclarationKind::Var => BindingKind::Var,
+                    _ => {
+                        pure_prefix = false;
+                        continue;
+                    }
+                };
                 for d in &v.declarations {
-                    let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init) else {
+                    let BindingPattern::BindingIdentifier(id) = &d.id else {
+                        // Destructuring: bind every name; initialized after the statement.
+                        for id in d.id.get_binding_identifiers() {
+                            bind(id, kind, None, end, exported);
+                        }
                         pure_prefix = false;
                         continue;
                     };
+                    bind(id, kind, d.init.as_ref().map(|i| i.span()), end, exported);
                     let symbol = id.symbol_id.get().unwrap();
+                    let Some(init) = &d.init else {
+                        continue;
+                    };
+                    if kind != BindingKind::Const {
+                        pure_prefix = false;
+                        continue;
+                    }
                     let site = Site::ConstInit { init: init.span() };
                     // Creating a function runs no code, so it keeps the prefix pure.
                     match init.without_parentheses() {
@@ -204,8 +353,13 @@ fn collect_toplevel<'a>(
                     }
                 }
             }
-            Declaration::VariableDeclaration(v) if v.declare => {}
-            Declaration::VariableDeclaration(_) | Declaration::ClassDeclaration(_) => pure_prefix = false,
+            Declaration::VariableDeclaration(_) => {}
+            Declaration::ClassDeclaration(c) => {
+                if let Some(id) = &c.id {
+                    bind(id, BindingKind::Class, None, end, exported);
+                }
+                pure_prefix = false;
+            }
             // Pure type-level declarations; enums and namespaces emit code but
             // nothing that can call into this module.
             _ => {}
@@ -225,6 +379,7 @@ fn literal(e: &Expression) -> Option<ConstVal> {
     }
 }
 
+/// The unboxed type a TS annotation allows, if any.
 fn ts_type(t: &TSType) -> Option<Ty> {
     match t {
         TSType::TSNumberKeyword(_) => Some(Ty::F64),
@@ -235,21 +390,13 @@ fn ts_type(t: &TSType) -> Option<Ty> {
     }
 }
 
-/// Parameter symbols with their types, and the annotated return type if any.
-type Header = (Vec<(SymbolId, Ty)>, Option<Ty>);
+/// Parameters, and the annotated return type if any.
+type Header<'a> = (Vec<Param<'a>>, Option<Ty>);
 
-fn header(node: FnNode) -> R<Header> {
-    let (span, is_async, generator, generic, this_param, params, return_type) = match node {
-        FnNode::Function(f) => (
-            f.span,
-            f.r#async,
-            f.generator,
-            f.type_parameters.is_some(),
-            f.this_param.is_some(),
-            &f.params,
-            &f.return_type,
-        ),
-        FnNode::Arrow(a) => (a.span, a.r#async, false, a.type_parameters.is_some(), false, &a.params, &a.return_type),
+fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
+    let (span, is_async, generator, this_param, params, return_type) = match node {
+        FnNode::Function(f) => (f.span, f.r#async, f.generator, f.this_param.is_some(), &f.params, &f.return_type),
+        FnNode::Arrow(a) => (a.span, a.r#async, false, false, &a.params, &a.return_type),
     };
     if is_async {
         return reject(span, "async functions are not supported yet");
@@ -257,38 +404,26 @@ fn header(node: FnNode) -> R<Header> {
     if generator {
         return reject(span, "generators are not supported yet");
     }
-    if generic {
-        return reject(span, "generic functions are not supported yet");
-    }
     if this_param {
         return reject(span, "`this` parameters are not supported");
     }
     if let Some(rest) = &params.rest {
         return reject(rest.span, "rest parameters are not supported yet");
     }
-    let formal = params;
-    let mut params = Vec::new();
-    for p in &formal.items {
+    let mut out = Vec::new();
+    for p in &params.items {
         let BindingPattern::BindingIdentifier(id) = &p.pattern else {
-            return reject(p.span, "destructuring parameters are not supported");
+            return reject(p.span, "destructuring parameters are not supported yet");
         };
-        if p.initializer.is_some() || p.optional {
-            return reject(p.span, "optional parameters are not supported");
-        }
-        let ty = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
-        match ty {
-            Some(ty @ (Ty::F64 | Ty::Bool)) => params.push((id.symbol_id.get().unwrap(), ty)),
-            _ => return reject(p.span, format!("parameter `{}` must be annotated `number` or `boolean`", id.name)),
-        }
+        let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
+        let ty = match annotated {
+            Some(t @ (Ty::F64 | Ty::Bool)) if p.initializer.is_none() && !p.optional => t,
+            _ => Ty::Any,
+        };
+        out.push(Param { symbol: id.symbol_id.get().unwrap(), ty, default: p.initializer.as_deref() });
     }
-    let ret = match return_type {
-        None => None,
-        Some(a) => match ts_type(&a.type_annotation) {
-            Some(t) => Some(t),
-            None => return reject(a.span, "return type must be `number`, `boolean` or `void`"),
-        },
-    };
-    Ok((params, ret))
+    let ret = return_type.as_ref().map(|a| ts_type(&a.type_annotation).unwrap_or(Ty::Any));
+    Ok((out, ret))
 }
 
 #[derive(Clone)]
@@ -302,8 +437,20 @@ enum State {
 struct ModuleCx<'m, 'a> {
     scoping: &'a Scoping,
     consts: &'m HashMap<SymbolId, ConstVal>,
+    bindings: &'m HashMap<SymbolId, Binding>,
     cands: &'m [Candidate<'a>],
     state: Vec<State>,
+    /// Per function: locals that must be `Any`.
+    widened: &'m mut HashMap<SymbolId, HashSet<SymbolId>>,
+    /// Actual return types that differ from the annotation.
+    ret_override: &'m mut HashMap<SymbolId, Ty>,
+    ret_changed: bool,
+    strings: Vec<String>,
+    string_ids: HashMap<String, ir::StrId>,
+    atoms: Vec<String>,
+    atom_ids: HashMap<String, ir::AtomId>,
+    cells: Vec<SymbolId>,
+    cell_ids: HashMap<SymbolId, ir::CellId>,
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
@@ -312,43 +459,58 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             return;
         }
         self.state[i] = State::InProgress;
-        let c = &self.cands[i];
-        let mut fx = FnCx {
-            m: self,
-            locals: Vec::new(),
-            mutable: Vec::new(),
-            sym_local: HashMap::new(),
-            loops: Vec::new(),
-            next_loop: 0,
-            label: None,
-            ret: c.ret,
-            returns: Vec::new(),
+        let sym = self.cands[i].symbol;
+        let result = loop {
+            let widened = self.widened.get(&sym).cloned().unwrap_or_default();
+            let mut fx = FnCx {
+                m: self,
+                locals: Vec::new(),
+                mutable: Vec::new(),
+                sym_local: HashMap::new(),
+                widened,
+                widen_request: None,
+                jumps: Vec::new(),
+                next_loop: 0,
+                label: None,
+                returns: Vec::new(),
+                in_finally: 0,
+            };
+            let r = fx.function(i);
+            match (r, fx.widen_request) {
+                (Err(e), Some(s)) if e.retry => {
+                    self.widened.entry(sym).or_default().insert(s);
+                }
+                (r, _) => break r,
+            }
         };
-        let result = fx.function(c);
         self.state[i] = match result {
-            Ok(f) => State::Done(f),
+            Ok(f) => {
+                // Callers assumed the annotated (or previously overridden)
+                // return type; check that it held.
+                let c = &self.cands[i];
+                let assumed = self.ret_override.get(&c.symbol).copied().or(c.ret);
+                if let Some(assumed) = assumed
+                    && assumed != f.ret
+                {
+                    self.ret_override.insert(c.symbol, f.ret);
+                    self.ret_changed = true;
+                }
+                State::Done(f)
+            }
             Err(r) => State::Failed(r),
         };
     }
 
-    /// Signature of candidate `i` as seen by a caller.
+    /// Signature of candidate `i` as seen by a direct caller.
     fn signature(&mut self, i: usize, call_span: Span) -> R<(Vec<Ty>, Ty)> {
-        if !self.cands[i].direct_callable {
-            return reject(
-                call_span,
-                format!(
-                    "calls `{}`, which may be uninitialized when this runs (its `const` is declared after top-level code)",
-                    self.cands[i].name
-                ),
-            );
-        }
-        let params = self.cands[i].params.iter().map(|p| p.1).collect();
-        if let Some(ret) = self.cands[i].ret {
-            // Annotated: callers may proceed optimistically, even while the
-            // callee is still being checked (recursion). The fixpoint undoes
-            // this if the callee turns out not to be native.
+        let params = self.cands[i].params.iter().map(|p| p.ty).collect();
+        let c = &self.cands[i];
+        if let Some(ret) = self.ret_override.get(&c.symbol).copied().or(c.ret) {
+            // Callers may proceed optimistically, even while the callee is
+            // still being checked (recursion). The fixpoint undoes this if
+            // the callee turns out not to be native or to return otherwise.
             if let State::Failed(_) = self.state[i] {
-                return reject(call_span, format!("calls `{}`, which is not compiled natively", self.cands[i].name));
+                return reject(call_span, format!("calls `{}`, which is not compiled natively", c.name));
             }
             return Ok((params, ret));
         }
@@ -365,6 +527,74 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             State::Todo => unreachable!(),
         }
     }
+
+    fn string(&mut self, s: &str) -> ir::StrId {
+        if let Some(&id) = self.string_ids.get(s) {
+            return id;
+        }
+        self.strings.push(s.to_string());
+        self.string_ids.insert(s.to_string(), self.strings.len() - 1);
+        self.strings.len() - 1
+    }
+
+    fn atom(&mut self, s: &str) -> ir::AtomId {
+        if let Some(&id) = self.atom_ids.get(s) {
+            return id;
+        }
+        self.atoms.push(s.to_string());
+        self.atom_ids.insert(s.to_string(), self.atoms.len() - 1);
+        self.atoms.len() - 1
+    }
+
+    /// The cell giving native code access to module binding `sym`.
+    fn cell(&mut self, sym: SymbolId, span: Span) -> R<ir::CellId> {
+        if let Some(&id) = self.cell_ids.get(&sym) {
+            return Ok(id);
+        }
+        let Some(b) = self.bindings.get(&sym) else {
+            return reject(span, "unsupported reference to a module binding");
+        };
+        if b.written && b.exported {
+            return reject(span, format!("`{}` is an exported binding that is reassigned", b.name));
+        }
+        self.cells.push(sym);
+        self.cell_ids.insert(sym, self.cells.len() - 1);
+        Ok(self.cells.len() - 1)
+    }
+
+    fn cell_infos(&self) -> Vec<CellInfo> {
+        self.cells
+            .iter()
+            .map(|&sym| {
+                let b = &self.bindings[&sym];
+                let native = self.cands.iter().find(|c| c.symbol == sym);
+                let init = match (b.kind, native) {
+                    (BindingKind::Function | BindingKind::Import, _) => CellInit::Header,
+                    (_, Some(c)) => match c.site {
+                        Site::ConstInit { init } => CellInit::Wrap(init),
+                        Site::Declaration { .. } => CellInit::Header,
+                    },
+                    (_, None) => match b.init {
+                        Some(span) => CellInit::Wrap(span),
+                        None => CellInit::After(b.stmt_end),
+                    },
+                };
+                CellInfo {
+                    symbol: sym,
+                    name: b.name.clone(),
+                    mutable: b.written,
+                    init,
+                    hoisted_undefined: b.kind == BindingKind::Var,
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum JumpKind {
+    Loop,
+    Switch,
 }
 
 struct FnCx<'x, 'm, 'a> {
@@ -374,72 +604,181 @@ struct FnCx<'x, 'm, 'a> {
     /// Locals that have been declared so far in program order. A reference to
     /// a local symbol not in here would hit its TDZ.
     sym_local: HashMap<SymbolId, ir::LocalId>,
-    loops: Vec<(Option<String>, ir::LoopId)>,
+    /// Locals known to need type `Any` (from previous attempts).
+    widened: HashSet<SymbolId>,
+    widen_request: Option<SymbolId>,
+    /// Enclosing `break` / `continue` targets.
+    jumps: Vec<(Option<String>, ir::LoopId, JumpKind)>,
     next_loop: ir::LoopId,
     /// Label attached to the loop statement about to be checked.
     label: Option<String>,
-    ret: Option<Ty>,
-    returns: Vec<(Ty, Span)>,
+    returns: Vec<Ty>,
+    /// Depth of `finally` blocks being checked (no jumps out of them).
+    in_finally: usize,
+}
+
+/// `e` as a JS value.
+fn any(e: Expr) -> Expr {
+    match e.ty {
+        Ty::Any => e,
+        Ty::F64 | Ty::Bool => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
+        Ty::Void => Expr::new(Ty::Any, ExprKind::Void(Box::new(e))),
+    }
+}
+
+fn undefined() -> Expr {
+    Expr::new(Ty::Any, ExprKind::Undefined)
+}
+
+fn join(a: Ty, b: Ty) -> Ty {
+    if a == b { a } else { Ty::Any }
+}
+
+fn coerce(e: Expr, ty: Ty) -> Expr {
+    if e.ty == ty {
+        e
+    } else {
+        debug_assert_eq!(ty, Ty::Any);
+        any(e)
+    }
+}
+
+fn seq(mut xs: Vec<Expr>) -> Expr {
+    if xs.len() == 1 {
+        return xs.pop().unwrap();
+    }
+    let ty = xs.last().unwrap().ty;
+    Expr::new(ty, ExprKind::Seq(xs))
+}
+
+/// What an assignment writes to.
+enum Place {
+    Local(ir::LocalId),
+    Cell(ir::CellId),
+    Global(ir::AtomId),
+    /// Object and key, already stored in `Any` temporaries.
+    Prop(ir::LocalId, ir::AtomId),
+    Elem(ir::LocalId, ir::LocalId),
 }
 
 impl FnCx<'_, '_, '_> {
-    fn function(&mut self, c: &Candidate) -> R<ir::Func> {
-        let mut params = Vec::new();
-        for &(sym, ty) in &c.params {
-            self.declare(sym, ty, true);
-            params.push(ty);
+    fn function(&mut self, i: usize) -> R<ir::Func> {
+        let c = &self.m.cands[i];
+        let (node, name) = (c.node, c.name.clone());
+        let params: Vec<(SymbolId, Ty, Option<&Expression>)> =
+            c.params.iter().map(|p| (p.symbol, p.ty, p.default)).collect();
+        let mut abi = Vec::new();
+        for &(sym, ty, _) in &params {
+            let local_ty = if self.widened.contains(&sym) { Ty::Any } else { ty };
+            self.declare(sym, local_ty, true);
+            abi.push(ty);
         }
-        // Directives ("use strict", "use aot") have no effect in module code.
-        let stmts = match c.node {
-            FnNode::Function(f) => self.stmts(&f.body.as_ref().unwrap().statements)?,
+        // Default parameter values, in order (each may see the previous ones).
+        let mut prologue = Vec::new();
+        for (k, &(_, _, default)) in params.iter().enumerate() {
+            if let Some(d) = default {
+                let v = any(self.expr(d)?);
+                let missing = Expr::new(
+                    Ty::Bool,
+                    ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(k)), Box::new(undefined())),
+                );
+                let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(k, Box::new(v))));
+                prologue.push(Stmt::If(missing, vec![set], vec![]));
+            }
+        }
+        let body = match node {
+            FnNode::Function(f) => {
+                let body = f.body.as_ref().unwrap();
+                self.hoist_vars(&body.statements)?;
+                self.stmts(&body.statements)?
+            }
             FnNode::Arrow(a) => match &a.body {
-                ArrowFunctionBody::FunctionBody(b) => self.stmts(&b.statements)?,
+                ArrowFunctionBody::FunctionBody(b) => {
+                    self.hoist_vars(&b.statements)?;
+                    self.stmts(&b.statements)?
+                }
                 body => {
                     // Concise body: `(x) => expr` returns `expr`.
                     let e = body.as_expression().expect("concise arrow body is an expression");
                     let x = self.expr(e)?;
-                    self.returns.push((x.ty, e.span()));
-                    if let Some(expected) = self.ret
-                        && expected != x.ty
-                    {
-                        return reject(
-                            e.span(),
-                            format!("returns `{}` from a function declared to return `{expected}`", x.ty),
-                        );
-                    }
+                    self.returns.push(x.ty);
                     vec![Stmt::Return(Some(x))]
                 }
             },
         };
-        let completes = completes_list(&stmts);
-        let ret = match self.ret {
-            Some(t) => t,
-            None => {
-                let mut ret = None;
-                for &(t, span) in &self.returns {
-                    match ret {
-                        None => ret = Some(t),
-                        Some(r) if r != t => {
-                            return reject(span, format!("returns both `{r}` and `{t}`"));
-                        }
-                        _ => {}
-                    }
-                }
-                ret.unwrap_or(Ty::Void)
-            }
-        };
-        if ret != Ty::Void && completes {
-            return reject(c.node.span(), "not all code paths return a value (would return `undefined`)");
+        let mut ret = None;
+        for &t in &self.returns {
+            ret = Some(ret.map_or(t, |r| join(r, t)));
         }
-        Ok(ir::Func { name: c.name.clone(), params, ret, locals: std::mem::take(&mut self.locals), body: stmts })
+        if completes_list(&body) {
+            ret = Some(ret.map_or(Ty::Void, |r| join(r, Ty::Void)));
+        }
+        let ret = ret.unwrap_or(Ty::Void);
+        // Values returned from a function of type `Any` must be boxed.
+        let body = if ret == Ty::Any { box_returns(body) } else { body };
+        prologue.extend(body);
+        Ok(ir::Func { name, params: abi, ret, locals: std::mem::take(&mut self.locals), body: prologue })
     }
 
     fn declare(&mut self, sym: SymbolId, ty: Ty, mutable: bool) -> ir::LocalId {
-        let id = self.locals.len();
-        self.locals.push(ty);
-        self.mutable.push(mutable);
+        let id = self.temp(ty);
+        self.mutable[id] = mutable;
         self.sym_local.insert(sym, id);
         id
+    }
+
+    /// A hidden local.
+    fn temp(&mut self, ty: Ty) -> ir::LocalId {
+        self.locals.push(ty);
+        self.mutable.push(true);
+        self.locals.len() - 1
+    }
+
+    fn local(&self, l: ir::LocalId) -> Expr {
+        Expr::new(self.locals[l], ExprKind::Local(l))
+    }
+
+    fn set_local(&mut self, sym: Option<SymbolId>, l: ir::LocalId, v: Expr, span: Span) -> R<Expr> {
+        let ty = self.locals[l];
+        if v.ty != ty && ty != Ty::Any {
+            // A local of an unboxed type gets another type: make it `Any`
+            // and check the function again.
+            let Some(sym) = sym else { unreachable!("hidden locals are `Any`") };
+            self.widen_request = Some(sym);
+            return Err(Reject { span, msg: "retry".into(), retry: true });
+        }
+        Ok(Expr::new(ty, ExprKind::SetLocal(l, Box::new(coerce(v, ty)))))
+    }
+
+    /// `var` declarations are function-scoped: declare them up front, as
+    /// `Any` locals holding `undefined`.
+    fn hoist_vars(&mut self, stmts: &[Statement]) -> R<()> {
+        struct Vars(Vec<SymbolId>);
+        impl<'a> oxc::ast_visit::Visit<'a> for Vars {
+            fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+                if it.kind == VariableDeclarationKind::Var {
+                    for d in &it.declarations {
+                        for id in d.id.get_binding_identifiers() {
+                            self.0.push(id.symbol_id.get().unwrap());
+                        }
+                    }
+                }
+                oxc::ast_visit::walk::walk_variable_declaration(self, it);
+            }
+            // Nested functions have their own `var` scope.
+            fn visit_function(&mut self, _: &Function<'a>, _: oxc::syntax::scope::ScopeFlags) {}
+            fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+        }
+        let mut v = Vars(Vec::new());
+        for s in stmts {
+            oxc::ast_visit::Visit::visit_statement(&mut v, s);
+        }
+        for sym in v.0 {
+            if !self.sym_local.contains_key(&sym) {
+                self.declare(sym, Ty::Any, true);
+            }
+        }
+        Ok(())
     }
 
     // ---- statements ----
@@ -485,11 +824,11 @@ impl FnCx<'_, '_, '_> {
             }
             Statement::WhileStatement(w) => {
                 let test = self.cond(&w.test)?;
-                self.lp(label, |cx, id| {
+                self.lp(label, JumpKind::Loop, |cx, id| {
                     Ok(Stmt::Loop { id, test: Some(test), post_test: false, body: cx.body(&w.body)?, update: None })
                 })?
             }
-            Statement::DoWhileStatement(w) => self.lp(label, |cx, id| {
+            Statement::DoWhileStatement(w) => self.lp(label, JumpKind::Loop, |cx, id| {
                 let body = cx.body(&w.body)?;
                 let test = cx.cond(&w.test)?;
                 Ok(Stmt::Loop { id, test: Some(test), post_test: true, body, update: None })
@@ -501,7 +840,7 @@ impl FnCx<'_, '_, '_> {
                     Some(init) => vec![Stmt::Expr(self.expr(init.to_expression())?)],
                 };
                 let test = f.test.as_ref().map(|t| self.cond(t)).transpose()?;
-                let lp = self.lp(label, |cx, id| {
+                let lp = self.lp(label, JumpKind::Loop, |cx, id| {
                     let body = cx.body(&f.body)?;
                     let update = f.update.as_ref().map(|u| cx.expr(u)).transpose()?;
                     Ok(Stmt::Loop { id, test, post_test: false, body, update })
@@ -514,74 +853,128 @@ impl FnCx<'_, '_, '_> {
                 self.label = Some(l.label.name.to_string());
                 return self.stmt(&l.body);
             }
-            Statement::BreakStatement(b) => Stmt::Break(self.jump_target(b.label.as_ref(), b.span)?),
-            Statement::ContinueStatement(c) => Stmt::Continue(self.jump_target(c.label.as_ref(), c.span)?),
-            Statement::ReturnStatement(r) => self.ret_stmt(r)?,
+            Statement::BreakStatement(b) => Stmt::Break(self.jump_target(b.label.as_ref(), b.span, false)?),
+            Statement::ContinueStatement(c) => Stmt::Continue(self.jump_target(c.label.as_ref(), c.span, true)?),
+            Statement::ReturnStatement(r) => {
+                if self.in_finally > 0 {
+                    return reject(r.span, "`return` inside `finally` is not supported");
+                }
+                let arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
+                self.returns.push(arg.as_ref().map_or(Ty::Void, |a| a.ty));
+                Stmt::Return(arg)
+            }
+            Statement::ThrowStatement(t) => Stmt::Throw(any(self.expr(&t.argument)?)),
+            Statement::TryStatement(t) => self.try_stmt(t)?,
+            Statement::SwitchStatement(sw) => self.switch(sw)?,
             other => return reject(other.span(), format!("unsupported statement: {}", describe_stmt(other))),
         }))
     }
 
-    fn lp(&mut self, label: Option<String>, f: impl FnOnce(&mut Self, ir::LoopId) -> R<Stmt>) -> R<Stmt> {
+    fn lp(
+        &mut self,
+        label: Option<String>,
+        kind: JumpKind,
+        f: impl FnOnce(&mut Self, ir::LoopId) -> R<Stmt>,
+    ) -> R<Stmt> {
         let id = self.next_loop;
         self.next_loop += 1;
-        self.loops.push((label, id));
+        self.jumps.push((label, id, kind));
         let r = f(self, id);
-        self.loops.pop();
+        self.jumps.pop();
         r
     }
 
-    fn jump_target(&self, label: Option<&LabelIdentifier>, span: Span) -> R<ir::LoopId> {
-        let found = match label {
-            None => self.loops.last(),
-            Some(l) => self.loops.iter().rev().find(|(n, _)| n.as_deref() == Some(l.name.as_str())),
-        };
+    fn jump_target(&self, label: Option<&LabelIdentifier>, span: Span, is_continue: bool) -> R<ir::LoopId> {
+        if self.in_finally > 0 {
+            return reject(span, "jumps inside `finally` are not supported");
+        }
+        let found = self.jumps.iter().rev().find(|(name, _, kind)| match label {
+            Some(l) => name.as_deref() == Some(l.name.as_str()),
+            // Unlabeled `continue` skips switches; unlabeled `break` does not.
+            None => !is_continue || *kind == JumpKind::Loop,
+        });
         match found {
-            Some(&(_, id)) => Ok(id),
-            None => reject(span, "jump target not found"),
+            Some(&(_, id, kind)) if !(is_continue && kind != JumpKind::Loop) => Ok(id),
+            _ => reject(span, "jump target not found"),
         }
     }
 
-    fn ret_stmt(&mut self, r: &ReturnStatement) -> R<Stmt> {
-        let arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
-        let ty = arg.as_ref().map_or(Ty::Void, |a| a.ty);
-        match self.ret {
-            Some(Ty::Void) if ty == Ty::Void => {}
-            Some(expected) if expected != ty => {
-                return reject(r.span, format!("returns `{ty}` from a function declared to return `{expected}`"));
+    fn switch(&mut self, sw: &SwitchStatement) -> R<Stmt> {
+        let d = any(self.expr(&sw.discriminant)?);
+        let disc = self.temp(Ty::Any);
+        let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(disc, Box::new(d))));
+        let label = self.label.take();
+        let sw_stmt = self.lp(label, JumpKind::Switch, |cx, id| {
+            let mut cases = Vec::new();
+            for c in &sw.cases {
+                let test = c.test.as_ref().map(|t| cx.expr(t).map(any)).transpose()?;
+                cases.push((test, cx.stmts(&c.consequent)?));
             }
-            _ => {}
-        }
-        self.returns.push((ty, r.span));
-        Ok(Stmt::Return(arg))
+            Ok(Stmt::Switch { id, disc, cases })
+        })?;
+        Ok(Stmt::Block(vec![set, sw_stmt]))
+    }
+
+    fn try_stmt(&mut self, t: &TryStatement) -> R<Stmt> {
+        let body = self.stmts(&t.block.body)?;
+        let catch = match &t.handler {
+            None => None,
+            Some(h) => {
+                let param = match &h.param {
+                    None => None,
+                    Some(p) => {
+                        let BindingPattern::BindingIdentifier(id) = &p.pattern else {
+                            return reject(p.span, "destructuring `catch` parameters are not supported yet");
+                        };
+                        Some(self.declare(id.symbol_id.get().unwrap(), Ty::Any, true))
+                    }
+                };
+                Some((param, self.stmts(&h.body.body)?))
+            }
+        };
+        let finally = match &t.finalizer {
+            None => None,
+            Some(f) => {
+                self.in_finally += 1;
+                let r = self.stmts(&f.body);
+                self.in_finally -= 1;
+                Some(r?)
+            }
+        };
+        Ok(Stmt::Try { body, catch, finally })
     }
 
     fn var_decl(&mut self, v: &VariableDeclaration) -> R<Vec<Stmt>> {
-        let mutable = match v.kind {
-            VariableDeclarationKind::Let => true,
-            VariableDeclarationKind::Const => false,
-            _ => return reject(v.span, "only `let` and `const` declarations are supported"),
+        let (mutable, is_var) = match v.kind {
+            VariableDeclarationKind::Let => (true, false),
+            VariableDeclarationKind::Const => (false, false),
+            VariableDeclarationKind::Var => (true, true),
+            _ => return reject(v.span, "`using` declarations are not supported"),
         };
         let mut out = Vec::new();
         for d in &v.declarations {
             let BindingPattern::BindingIdentifier(id) = &d.id else {
-                return reject(d.span, "destructuring is not supported");
+                return reject(d.span, "destructuring is not supported yet");
             };
-            let Some(init) = &d.init else {
-                return reject(d.span, format!("`{}` must be initialized", id.name));
-            };
+            let sym = id.symbol_id.get().unwrap();
+            if is_var {
+                // Hoisted: just an assignment, if there is an initializer.
+                let l = self.sym_local[&sym];
+                if let Some(init) = &d.init {
+                    let v = self.expr(init)?;
+                    out.push(Stmt::Expr(self.set_local(Some(sym), l, v, d.span)?));
+                }
+                continue;
+            }
             // The initializer is checked before the binding exists, so a
             // self-reference is rejected exactly like the TDZ would throw.
-            let init = self.expr(init)?;
-            if let Some(a) = &d.type_annotation
-                && ts_type(&a.type_annotation) != Some(init.ty)
-            {
-                return reject(a.span, format!("annotation does not match initializer type `{}`", init.ty));
-            }
-            if init.ty == Ty::Void {
-                return reject(d.span, "cannot store the result of a `void` function");
-            }
-            let local = self.declare(id.symbol_id.get().unwrap(), init.ty, mutable);
-            out.push(Stmt::Expr(Expr::new(init.ty, ExprKind::SetLocal(local, Box::new(init)))));
+            let init = match &d.init {
+                Some(init) => self.expr(init)?,
+                None => undefined(),
+            };
+            let ty = if init.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { init.ty };
+            let local = self.declare(sym, ty, mutable);
+            out.push(Stmt::Expr(Expr::new(ty, ExprKind::SetLocal(local, Box::new(coerce(init, ty))))));
         }
         Ok(out)
     }
@@ -591,7 +984,7 @@ impl FnCx<'_, '_, '_> {
     /// An expression used as a condition: converted with JS truthiness.
     fn cond(&mut self, e: &Expression) -> R<Expr> {
         let x = self.expr(e)?;
-        truthy(x, e.span())
+        Ok(truthy(x))
     }
 
     fn expr(&mut self, e: &Expression) -> R<Expr> {
@@ -599,167 +992,444 @@ impl FnCx<'_, '_, '_> {
         Ok(match e {
             Expression::NumericLiteral(n) => Expr::num(n.value),
             Expression::BooleanLiteral(b) => Expr::new(Ty::Bool, ExprKind::Bool(b.value)),
+            Expression::StringLiteral(s) => {
+                let id = self.m.string(s.value.as_str());
+                Expr::new(Ty::Any, ExprKind::Str(id))
+            }
+            Expression::NullLiteral(_) => Expr::new(Ty::Any, ExprKind::Null),
+            Expression::TemplateLiteral(t) => self.template(t)?,
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             Expression::Identifier(id) => self.ident(id)?,
             Expression::StaticMemberExpression(m) => match builtin_const(m, self.m.scoping) {
                 Some(v) => Expr::num(v),
-                None => return reject(span, "property access is not supported"),
+                None => {
+                    if m.optional {
+                        return reject(span, "optional chaining is not supported yet");
+                    }
+                    let obj = any(self.expr(&m.object)?);
+                    let atom = self.m.atom(m.property.name.as_str());
+                    Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), atom))
+                }
             },
+            Expression::ComputedMemberExpression(m) => {
+                if m.optional {
+                    return reject(span, "optional chaining is not supported yet");
+                }
+                let obj = any(self.expr(&m.object)?);
+                match self.key(&m.expression)? {
+                    Key::Atom(a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), a)),
+                    Key::Value(k) => Expr::new(Ty::Any, ExprKind::GetElem(Box::new(obj), k)),
+                }
+            }
             Expression::UnaryExpression(u) => self.unary(u)?,
             Expression::BinaryExpression(b) => self.binary(b)?,
             Expression::LogicalExpression(l) => {
+                let a = self.expr(&l.left)?;
+                let b = self.expr(&l.right)?;
                 let op = match l.operator {
                     LogicalOperator::And => LogicalOp::And,
                     LogicalOperator::Or => LogicalOp::Or,
-                    LogicalOperator::Coalesce => return reject(span, "`??` is not supported on non-nullable values"),
+                    // A number or boolean is never nullish.
+                    LogicalOperator::Coalesce if a.ty != Ty::Any => return Ok(a),
+                    LogicalOperator::Coalesce => LogicalOp::Nullish,
                 };
-                let a = self.expr(&l.left)?;
-                let b = self.expr(&l.right)?;
-                if a.ty != b.ty || a.ty == Ty::Void {
-                    return reject(
-                        span,
-                        format!("operands of `{}` have types `{}` and `{}`", l.operator.as_str(), a.ty, b.ty),
-                    );
-                }
-                Expr::new(a.ty, ExprKind::Logical(op, Box::new(a), Box::new(b)))
+                let ty = join(a.ty, b.ty);
+                let ty = if ty == Ty::Void { Ty::Any } else { ty };
+                Expr::new(ty, ExprKind::Logical(op, Box::new(coerce(a, ty)), Box::new(coerce(b, ty))))
             }
             Expression::ConditionalExpression(c) => {
                 let test = self.cond(&c.test)?;
                 let a = self.expr(&c.consequent)?;
                 let b = self.expr(&c.alternate)?;
-                if a.ty != b.ty {
-                    return reject(span, format!("conditional branches have types `{}` and `{}`", a.ty, b.ty));
-                }
-                Expr::new(a.ty, ExprKind::Cond(Box::new(test), Box::new(a), Box::new(b)))
+                let ty = join(a.ty, b.ty);
+                Expr::new(ty, ExprKind::Cond(Box::new(test), Box::new(coerce(a, ty)), Box::new(coerce(b, ty))))
             }
             Expression::AssignmentExpression(a) => self.assign(a)?,
-            Expression::UpdateExpression(u) => {
-                let (local, ty) = self.target_local(&u.argument)?;
-                if ty != Ty::F64 {
-                    return reject(span, "`++`/`--` require a `number`");
-                }
-                let delta = if u.operator == UpdateOperator::Increment { 1.0 } else { -1.0 };
-                Expr::new(Ty::F64, ExprKind::Update { local, delta, prefix: u.prefix })
-            }
+            Expression::UpdateExpression(u) => self.update(u)?,
             Expression::SequenceExpression(s) => {
                 let xs = s.expressions.iter().map(|x| self.expr(x)).collect::<R<Vec<_>>>()?;
-                Expr::new(xs.last().unwrap().ty, ExprKind::Seq(xs))
+                seq(xs)
             }
             Expression::CallExpression(c) => self.call(c)?,
-            // Type-level wrappers are no-ops when they do not change the type.
+            Expression::NewExpression(n) => {
+                if n.type_arguments.is_some() {
+                    // Type arguments are erased.
+                }
+                let callee = any(self.expr(&n.callee)?);
+                let args = self.args(&n.arguments)?;
+                Expr::new(Ty::Any, ExprKind::New(Box::new(callee), args))
+            }
+            Expression::ObjectExpression(o) => self.object(o)?,
+            Expression::ArrayExpression(a) => {
+                let mut elems = Vec::new();
+                for el in &a.elements {
+                    match el.as_expression() {
+                        Some(x) => elems.push(any(self.expr(x)?)),
+                        None => return reject(el.span(), "array holes and spreads are not supported yet"),
+                    }
+                }
+                Expr::new(Ty::Any, ExprKind::Array(elems))
+            }
+            // Type-level wrappers have no runtime effect; their types are
+            // not trusted.
             Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
-            Expression::TSAsExpression(a) => self.same_type(&a.expression, &a.type_annotation, span)?,
-            Expression::TSSatisfiesExpression(a) => self.same_type(&a.expression, &a.type_annotation, span)?,
+            Expression::TSAsExpression(a) => self.expr(&a.expression)?,
+            Expression::TSSatisfiesExpression(a) => self.expr(&a.expression)?,
+            Expression::TSTypeAssertion(a) => self.expr(&a.expression)?,
+            Expression::TSInstantiationExpression(a) => self.expr(&a.expression)?,
             other => return reject(span, format!("unsupported expression: {}", describe_expr(other))),
         })
     }
 
-    fn same_type(&mut self, e: &Expression, t: &TSType, span: Span) -> R<Expr> {
-        let x = self.expr(e)?;
-        if ts_type(t) != Some(x.ty) {
-            return reject(span, "type assertions that change the type are not supported");
+    fn template(&mut self, t: &TemplateLiteral) -> R<Expr> {
+        // `a${x}b` is "a" + ToString(x) + "b": strings concatenate exactly.
+        let mut acc: Option<Expr> = None;
+        let mut push = |cx: &mut Self, part: Expr| {
+            acc = Some(match acc.take() {
+                None => part,
+                Some(a) => Expr::new(Ty::Any, ExprKind::AnyBinary(AnyBinOp::Add, Box::new(a), Box::new(part))),
+            });
+            let _ = cx;
+        };
+        for (i, q) in t.quasis.iter().enumerate() {
+            let Some(cooked) = &q.value.cooked else {
+                return reject(q.span, "invalid escape in template literal");
+            };
+            if i == 0 || !cooked.is_empty() {
+                let id = self.m.string(cooked.as_str());
+                push(self, Expr::new(Ty::Any, ExprKind::Str(id)));
+            }
+            if let Some(e) = t.expressions.get(i) {
+                let x = any(self.expr(e)?);
+                push(self, Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::ToStr, Box::new(x))));
+            }
         }
-        Ok(x)
+        Ok(acc.unwrap())
+    }
+
+    fn object(&mut self, o: &ObjectExpression) -> R<Expr> {
+        let mut props = Vec::new();
+        for p in &o.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = p else {
+                return reject(p.span(), "object spread is not supported yet");
+            };
+            if p.kind != PropertyKind::Init || p.method || p.computed {
+                return reject(p.span, "methods, accessors and computed keys in object literals are not supported yet");
+            }
+            let name = match &p.key {
+                PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                PropertyKey::StringLiteral(s) => s.value.to_string(),
+                PropertyKey::NumericLiteral(n) if n.value.fract() == 0.0 && n.value >= 0.0 => {
+                    format!("{}", n.value as u64)
+                }
+                _ => return reject(p.span, "unsupported object literal key"),
+            };
+            if name == "__proto__" {
+                return reject(p.span, "`__proto__` in object literals is not supported");
+            }
+            let v = any(self.expr(&p.value)?);
+            let atom = self.m.atom(&name);
+            props.push((atom, v));
+        }
+        Ok(Expr::new(Ty::Any, ExprKind::Object(props)))
+    }
+
+    /// A property key: an atom for constant names.
+    fn key(&mut self, e: &Expression) -> R<Key> {
+        Ok(match e.without_parentheses() {
+            Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
+            other => Key::Value(Box::new(any(self.expr(other)?))),
+        })
+    }
+
+    fn args(&mut self, args: &[Argument]) -> R<Vec<Expr>> {
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            match a.as_expression() {
+                Some(e) => out.push(any(self.expr(e)?)),
+                None => return reject(a.span(), "spread arguments are not supported yet"),
+            }
+        }
+        Ok(out)
+    }
+
+    fn resolve(&self, id: &IdentifierReference) -> Option<SymbolId> {
+        let scoping = self.m.scoping;
+        id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id())
+    }
+
+    fn is_module_symbol(&self, sym: SymbolId) -> bool {
+        let scoping = self.m.scoping;
+        scoping.symbol_scope_id(sym) == scoping.root_scope_id()
     }
 
     fn ident(&mut self, id: &IdentifierReference) -> R<Expr> {
-        let scoping = self.m.scoping;
-        let sym = id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id());
-        match sym {
+        match self.resolve(id) {
             Some(sym) => {
                 if let Some(&l) = self.sym_local.get(&sym) {
-                    return Ok(Expr::new(self.locals[l], ExprKind::Local(l)));
+                    return Ok(self.local(l));
                 }
-                match self.m.consts.get(&sym) {
-                    Some(ConstVal::Num(v)) => Ok(Expr::num(*v)),
-                    Some(ConstVal::Bool(b)) => Ok(Expr::new(Ty::Bool, ExprKind::Bool(*b))),
-                    None => reject(id.span, format!("`{}` is not a local variable or compile-time constant", id.name)),
+                if let Some(c) = self.m.consts.get(&sym) {
+                    return Ok(match *c {
+                        ConstVal::Num(v) => Expr::num(v),
+                        ConstVal::Bool(b) => Expr::new(Ty::Bool, ExprKind::Bool(b)),
+                    });
                 }
+                if self.is_module_symbol(sym) {
+                    let cell = self.m.cell(sym, id.span)?;
+                    return Ok(Expr::new(Ty::Any, ExprKind::Cell(cell)));
+                }
+                reject(id.span, format!("`{}` is not a local variable, module binding or global", id.name))
             }
-            None => match id.name.as_str() {
-                "NaN" => Ok(Expr::num(f64::NAN)),
-                "Infinity" => Ok(Expr::num(f64::INFINITY)),
-                name => reject(id.span, format!("global `{name}` is not supported")),
-            },
+            None => Ok(match id.name.as_str() {
+                "NaN" => Expr::num(f64::NAN),
+                "Infinity" => Expr::num(f64::INFINITY),
+                "undefined" => undefined(),
+                "arguments" => return reject(id.span, "`arguments` is not supported"),
+                name => {
+                    let atom = self.m.atom(name);
+                    Expr::new(Ty::Any, ExprKind::Global(atom))
+                }
+            }),
         }
     }
 
-    fn target_local(&self, t: &SimpleAssignmentTarget) -> R<(ir::LocalId, Ty)> {
-        let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = t else {
-            return reject(t.span(), "only local variables can be assigned");
-        };
-        let scoping = self.m.scoping;
-        let sym = id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id());
-        match sym.and_then(|s| self.sym_local.get(&s)) {
-            Some(&l) if self.mutable[l] => Ok((l, self.locals[l])),
-            Some(_) => reject(id.span, format!("assignment to constant `{}`", id.name)),
-            None => reject(id.span, format!("`{}` is not a local variable", id.name)),
+    // ---- assignment ----
+
+    /// Resolve an assignment target, evaluating its object and key (in
+    /// order) into temporaries. Returns the setup expressions and the place.
+    fn place(&mut self, t: &SimpleAssignmentTarget) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+        Ok(match t {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => match self.resolve(id) {
+                Some(sym) => {
+                    if let Some(&l) = self.sym_local.get(&sym) {
+                        if !self.mutable[l] {
+                            return reject(id.span, format!("assignment to constant `{}`", id.name));
+                        }
+                        (vec![], Place::Local(l), Some(sym))
+                    } else if self.is_module_symbol(sym) {
+                        let b = self.m.bindings.get(&sym);
+                        if b.is_none_or(|b| b.kind == BindingKind::Const || b.kind == BindingKind::Import) {
+                            return reject(id.span, format!("assignment to constant `{}`", id.name));
+                        }
+                        (vec![], Place::Cell(self.m.cell(sym, id.span)?), None)
+                    } else {
+                        return reject(id.span, format!("`{}` is not a local variable or module binding", id.name));
+                    }
+                }
+                None => match id.name.as_str() {
+                    "undefined" | "NaN" | "Infinity" | "arguments" => {
+                        return reject(id.span, format!("assignment to `{}`", id.name));
+                    }
+                    name => (vec![], Place::Global(self.m.atom(name)), None),
+                },
+            },
+            SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                let obj = any(self.expr(&m.object)?);
+                let t = self.temp(Ty::Any);
+                let atom = self.m.atom(m.property.name.as_str());
+                (vec![set(t, obj)], Place::Prop(t, atom), None)
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                let obj = any(self.expr(&m.object)?);
+                let t = self.temp(Ty::Any);
+                match self.key(&m.expression)? {
+                    Key::Atom(a) => (vec![set(t, obj)], Place::Prop(t, a), None),
+                    Key::Value(k) => {
+                        let tk = self.temp(Ty::Any);
+                        (vec![set(t, obj), set(tk, *k)], Place::Elem(t, tk), None)
+                    }
+                }
+            }
+            SimpleAssignmentTarget::TSAsExpression(a) => return self.place_expr(&a.expression),
+            SimpleAssignmentTarget::TSNonNullExpression(a) => return self.place_expr(&a.expression),
+            SimpleAssignmentTarget::TSSatisfiesExpression(a) => return self.place_expr(&a.expression),
+            SimpleAssignmentTarget::TSTypeAssertion(a) => return self.place_expr(&a.expression),
+            other => return reject(other.span(), "unsupported assignment target"),
+        })
+    }
+
+    fn place_expr(&mut self, e: &Expression) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+        match e.without_parentheses() {
+            Expression::Identifier(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_) => {
+                // Re-dispatch through the simple target form.
+                let t = match e.without_parentheses() {
+                    Expression::Identifier(id) => {
+                        return self.place_ident(id);
+                    }
+                    Expression::StaticMemberExpression(m) => {
+                        let obj = any(self.expr(&m.object)?);
+                        let t = self.temp(Ty::Any);
+                        let atom = self.m.atom(m.property.name.as_str());
+                        (vec![set(t, obj)], Place::Prop(t, atom), None)
+                    }
+                    Expression::ComputedMemberExpression(m) => {
+                        let obj = any(self.expr(&m.object)?);
+                        let t = self.temp(Ty::Any);
+                        let tk = self.temp(Ty::Any);
+                        let k = any(self.expr(&m.expression)?);
+                        (vec![set(t, obj), set(tk, k)], Place::Elem(t, tk), None)
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(t)
+            }
+            other => reject(other.span(), "unsupported assignment target"),
         }
+    }
+
+    fn place_ident(&mut self, id: &IdentifierReference) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+        match self.resolve(id) {
+            Some(sym) if self.sym_local.contains_key(&sym) => {
+                let l = self.sym_local[&sym];
+                if !self.mutable[l] {
+                    return reject(id.span, format!("assignment to constant `{}`", id.name));
+                }
+                Ok((vec![], Place::Local(l), Some(sym)))
+            }
+            _ => reject(id.span, "unsupported assignment target"),
+        }
+    }
+
+    /// The current value at `place`.
+    fn read(&self, p: &Place) -> Expr {
+        match *p {
+            Place::Local(l) => self.local(l),
+            Place::Cell(c) => Expr::new(Ty::Any, ExprKind::Cell(c)),
+            Place::Global(a) => Expr::new(Ty::Any, ExprKind::Global(a)),
+            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(o)), a)),
+            Place::Elem(o, k) => {
+                Expr::new(Ty::Any, ExprKind::GetElem(Box::new(self.local(o)), Box::new(self.local(k))))
+            }
+        }
+    }
+
+    /// Store `v` at `place`; evaluates to the stored value.
+    fn write(&mut self, p: &Place, sym: Option<SymbolId>, v: Expr, span: Span) -> R<Expr> {
+        Ok(match *p {
+            Place::Local(l) => return self.set_local(sym, l, v, span),
+            Place::Cell(c) => Expr::new(Ty::Any, ExprKind::SetCell(c, Box::new(any(v)))),
+            Place::Global(a) => Expr::new(Ty::Any, ExprKind::SetGlobal(a, Box::new(any(v)))),
+            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::SetProp(Box::new(self.local(o)), a, Box::new(any(v)))),
+            Place::Elem(o, k) => Expr::new(
+                Ty::Any,
+                ExprKind::SetElem(Box::new(self.local(o)), Box::new(self.local(k)), Box::new(any(v))),
+            ),
+        })
     }
 
     fn assign(&mut self, a: &AssignmentExpression) -> R<Expr> {
         let Some(target) = a.left.as_simple_assignment_target() else {
-            return reject(a.span, "destructuring assignment is not supported");
+            return reject(a.span, "destructuring assignment is not supported yet");
         };
-        let (local, ty) = self.target_local(target)?;
-        let rhs = self.expr(&a.right)?;
+        let (mut setup, place, sym) = self.place(target)?;
         let value = if a.operator == AssignmentOperator::Assign {
-            if rhs.ty != ty {
-                return reject(a.span, format!("cannot assign `{}` to a `{ty}` variable", rhs.ty));
-            }
-            rhs
+            self.expr(&a.right)?
         } else {
             let op = match a.operator {
-                AssignmentOperator::Addition => BinOp::Add,
-                AssignmentOperator::Subtraction => BinOp::Sub,
-                AssignmentOperator::Multiplication => BinOp::Mul,
-                AssignmentOperator::Division => BinOp::Div,
-                AssignmentOperator::Remainder => BinOp::Rem,
-                AssignmentOperator::Exponential => BinOp::Pow,
-                AssignmentOperator::ShiftLeft => BinOp::Shl,
-                AssignmentOperator::ShiftRight => BinOp::Sar,
-                AssignmentOperator::ShiftRightZeroFill => BinOp::Shr,
-                AssignmentOperator::BitwiseOR => BinOp::BitOr,
-                AssignmentOperator::BitwiseXOR => BinOp::BitXor,
-                AssignmentOperator::BitwiseAnd => BinOp::BitAnd,
-                _ => return reject(a.span, format!("`{}` is not supported", a.operator.as_str())),
+                AssignmentOperator::Addition => AnyBinOp::Add,
+                AssignmentOperator::Subtraction => AnyBinOp::Sub,
+                AssignmentOperator::Multiplication => AnyBinOp::Mul,
+                AssignmentOperator::Division => AnyBinOp::Div,
+                AssignmentOperator::Remainder => AnyBinOp::Rem,
+                AssignmentOperator::Exponential => AnyBinOp::Pow,
+                AssignmentOperator::ShiftLeft => AnyBinOp::Shl,
+                AssignmentOperator::ShiftRight => AnyBinOp::Sar,
+                AssignmentOperator::ShiftRightZeroFill => AnyBinOp::Shr,
+                AssignmentOperator::BitwiseOR => AnyBinOp::BitOr,
+                AssignmentOperator::BitwiseXOR => AnyBinOp::BitXor,
+                AssignmentOperator::BitwiseAnd => AnyBinOp::BitAnd,
+                _ => return reject(a.span, format!("`{}` is not supported yet", a.operator.as_str())),
             };
-            if ty != Ty::F64 || rhs.ty != Ty::F64 {
-                return reject(a.span, format!("`{}` requires `number` operands", a.operator.as_str()));
-            }
-            let cur = Expr::new(ty, ExprKind::Local(local));
-            Expr::new(Ty::F64, ExprKind::Binary(op, Box::new(cur), Box::new(rhs)))
+            let cur = self.read(&place);
+            let rhs = self.expr(&a.right)?;
+            arith(op, cur, rhs)
         };
-        Ok(Expr::new(ty, ExprKind::SetLocal(local, Box::new(value))))
+        setup.push(self.write(&place, sym, value, a.span)?);
+        Ok(seq(setup))
+    }
+
+    fn update(&mut self, u: &UpdateExpression) -> R<Expr> {
+        let (mut setup, place, sym) = self.place(&u.argument)?;
+        let inc = u.operator == UpdateOperator::Increment;
+        if let Place::Local(l) = place
+            && self.locals[l] == Ty::F64
+        {
+            let delta = if inc { 1.0 } else { -1.0 };
+            return Ok(Expr::new(Ty::F64, ExprKind::Update { local: l, delta, prefix: u.prefix }));
+        }
+        if let Place::Local(l) = place
+            && self.locals[l] != Ty::Any
+        {
+            // `++` on a boolean local makes it a number.
+            self.widen_request = sym;
+            return Err(Reject { span: u.span, msg: "retry".into(), retry: true });
+        }
+        // old = ToNumeric(current); place = old ± 1; value: old or new.
+        let old = self.temp(Ty::Any);
+        let cur = self.read(&place);
+        setup.push(set(old, Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::ToNumeric, Box::new(cur)))));
+        let op = if inc { AnyUnOp::Inc } else { AnyUnOp::Dec };
+        let new = Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(self.local(old))));
+        let stored = self.write(&place, sym, new, u.span)?;
+        if u.prefix {
+            setup.push(stored);
+        } else {
+            setup.push(stored);
+            setup.push(self.local(old));
+        }
+        Ok(seq(setup))
     }
 
     fn unary(&mut self, u: &UnaryExpression) -> R<Expr> {
+        if u.operator == UnaryOperator::Typeof
+            && let Expression::Identifier(id) = u.argument.without_parentheses()
+            && self.resolve(id).is_none()
+            && !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity")
+        {
+            // `typeof undeclared` is "undefined", not a ReferenceError.
+            let atom = self.m.atom(id.name.as_str());
+            let g = Expr::new(Ty::Any, ExprKind::GlobalOrUndefined(atom));
+            return Ok(Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::Typeof, Box::new(g))));
+        }
+        if u.operator == UnaryOperator::Delete {
+            return Ok(match u.argument.without_parentheses() {
+                Expression::StaticMemberExpression(m) => {
+                    let obj = any(self.expr(&m.object)?);
+                    let atom = self.m.atom(m.property.name.as_str());
+                    Expr::new(Ty::Bool, ExprKind::DeleteProp(Box::new(obj), atom))
+                }
+                Expression::ComputedMemberExpression(m) => {
+                    let obj = any(self.expr(&m.object)?);
+                    match self.key(&m.expression)? {
+                        Key::Atom(a) => Expr::new(Ty::Bool, ExprKind::DeleteProp(Box::new(obj), a)),
+                        Key::Value(k) => Expr::new(Ty::Bool, ExprKind::DeleteElem(Box::new(obj), k)),
+                    }
+                }
+                _ => return reject(u.span, "`delete` of a non-property is not supported"),
+            });
+        }
         let x = self.expr(&u.argument)?;
-        let num = |x: &Expr| -> R<()> {
-            if x.ty == Ty::F64 {
-                Ok(())
-            } else {
-                reject(u.span, format!("`{}` requires a `number`", u.operator.as_str()))
+        let dynamic = |op: AnyUnOp, x: Expr| Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(any(x))));
+        Ok(match (u.operator, x.ty) {
+            (UnaryOperator::UnaryNegation, Ty::F64) => Expr::new(Ty::F64, ExprKind::Unary(UnOp::Neg, Box::new(x))),
+            (UnaryOperator::UnaryNegation, _) => dynamic(AnyUnOp::Neg, x),
+            (UnaryOperator::UnaryPlus, Ty::F64) => x,
+            (UnaryOperator::UnaryPlus, _) => dynamic(AnyUnOp::Plus, x),
+            (UnaryOperator::BitwiseNot, Ty::F64) => Expr::new(Ty::F64, ExprKind::Unary(UnOp::BitNot, Box::new(x))),
+            (UnaryOperator::BitwiseNot, _) => dynamic(AnyUnOp::BitNot, x),
+            (UnaryOperator::LogicalNot, _) => Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(truthy(x)))),
+            (UnaryOperator::Typeof, Ty::F64 | Ty::Bool) => {
+                // Statically known; still evaluate the operand.
+                let name = if x.ty == Ty::F64 { "number" } else { "boolean" };
+                let id = self.m.string(name);
+                seq(vec![x, Expr::new(Ty::Any, ExprKind::Str(id))])
             }
-        };
-        Ok(match u.operator {
-            UnaryOperator::UnaryNegation => {
-                num(&x)?;
-                Expr::new(Ty::F64, ExprKind::Unary(UnOp::Neg, Box::new(x)))
-            }
-            UnaryOperator::UnaryPlus => {
-                num(&x)?;
-                x
-            }
-            UnaryOperator::BitwiseNot => {
-                num(&x)?;
-                Expr::new(Ty::F64, ExprKind::Unary(UnOp::BitNot, Box::new(x)))
-            }
-            UnaryOperator::LogicalNot => {
-                let b = truthy(x, u.span)?;
-                Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(b)))
-            }
-            op => return reject(u.span, format!("`{}` is not supported", op.as_str())),
+            (UnaryOperator::Typeof, _) => dynamic(AnyUnOp::Typeof, x),
+            (UnaryOperator::Void, _) => Expr::new(Ty::Any, ExprKind::Void(Box::new(x))),
+            (op, _) => return reject(u.span, format!("`{}` is not supported", op.as_str())),
         })
     }
 
@@ -768,104 +1438,203 @@ impl FnCx<'_, '_, '_> {
         let x = self.expr(&b.left)?;
         let y = self.expr(&b.right)?;
         let cmp = match b.operator {
-            B::LessThan => Some(CmpOp::Lt),
-            B::LessEqualThan => Some(CmpOp::Le),
-            B::GreaterThan => Some(CmpOp::Gt),
-            B::GreaterEqualThan => Some(CmpOp::Ge),
-            B::Equality | B::StrictEquality => Some(CmpOp::Eq),
-            B::Inequality | B::StrictInequality => Some(CmpOp::Ne),
+            B::LessThan => Some((CmpOp::Lt, AnyCmpOp::Lt)),
+            B::LessEqualThan => Some((CmpOp::Le, AnyCmpOp::Le)),
+            B::GreaterThan => Some((CmpOp::Gt, AnyCmpOp::Gt)),
+            B::GreaterEqualThan => Some((CmpOp::Ge, AnyCmpOp::Ge)),
+            B::Equality => Some((CmpOp::Eq, AnyCmpOp::Eq)),
+            B::StrictEquality => Some((CmpOp::Eq, AnyCmpOp::StrictEq)),
+            B::Inequality => Some((CmpOp::Ne, AnyCmpOp::Ne)),
+            B::StrictInequality => Some((CmpOp::Ne, AnyCmpOp::StrictNe)),
+            B::In => Some((CmpOp::Eq, AnyCmpOp::In)),
+            B::Instanceof => Some((CmpOp::Eq, AnyCmpOp::InstanceOf)),
             _ => None,
         };
-        if let Some(op) = cmp {
-            let ok = x.ty == y.ty
+        if let Some((op, any_op)) = cmp {
+            let unboxed = !matches!(any_op, AnyCmpOp::In | AnyCmpOp::InstanceOf)
+                && x.ty == y.ty
                 && match x.ty {
                     Ty::F64 => true,
                     Ty::Bool => matches!(op, CmpOp::Eq | CmpOp::Ne),
-                    Ty::Void => false,
+                    _ => false,
                 };
-            if !ok {
-                return reject(
-                    b.span,
-                    format!("cannot compare `{}` with `{}` using `{}`", x.ty, y.ty, b.operator.as_str()),
-                );
+            if unboxed {
+                return Ok(Expr::new(Ty::Bool, ExprKind::Compare(op, Box::new(x), Box::new(y))));
             }
-            return Ok(Expr::new(Ty::Bool, ExprKind::Compare(op, Box::new(x), Box::new(y))));
+            return Ok(Expr::new(Ty::Bool, ExprKind::AnyCompare(any_op, Box::new(any(x)), Box::new(any(y)))));
         }
         let op = match b.operator {
-            B::Addition => BinOp::Add,
-            B::Subtraction => BinOp::Sub,
-            B::Multiplication => BinOp::Mul,
-            B::Division => BinOp::Div,
-            B::Remainder => BinOp::Rem,
-            B::Exponential => BinOp::Pow,
-            B::ShiftLeft => BinOp::Shl,
-            B::ShiftRight => BinOp::Sar,
-            B::ShiftRightZeroFill => BinOp::Shr,
-            B::BitwiseOR => BinOp::BitOr,
-            B::BitwiseXOR => BinOp::BitXor,
-            B::BitwiseAnd => BinOp::BitAnd,
+            B::Addition => AnyBinOp::Add,
+            B::Subtraction => AnyBinOp::Sub,
+            B::Multiplication => AnyBinOp::Mul,
+            B::Division => AnyBinOp::Div,
+            B::Remainder => AnyBinOp::Rem,
+            B::Exponential => AnyBinOp::Pow,
+            B::ShiftLeft => AnyBinOp::Shl,
+            B::ShiftRight => AnyBinOp::Sar,
+            B::ShiftRightZeroFill => AnyBinOp::Shr,
+            B::BitwiseOR => AnyBinOp::BitOr,
+            B::BitwiseXOR => AnyBinOp::BitXor,
+            B::BitwiseAnd => AnyBinOp::BitAnd,
             op => return reject(b.span, format!("`{}` is not supported", op.as_str())),
         };
-        if x.ty != Ty::F64 || y.ty != Ty::F64 {
-            return reject(
-                b.span,
-                format!("`{}` requires `number` operands, got `{}` and `{}`", b.operator.as_str(), x.ty, y.ty),
-            );
-        }
-        Ok(Expr::new(Ty::F64, ExprKind::Binary(op, Box::new(x), Box::new(y))))
+        Ok(arith(op, x, y))
     }
 
     fn call(&mut self, c: &CallExpression) -> R<Expr> {
         if c.optional {
-            return reject(c.span, "optional calls are not supported");
+            return reject(c.span, "optional calls are not supported yet");
         }
-        if c.type_arguments.is_some() {
-            return reject(c.span, "explicit type arguments are not supported");
-        }
-        let mut args = Vec::with_capacity(c.arguments.len());
-        for a in &c.arguments {
-            match a.as_expression() {
-                Some(e) => args.push(self.expr(e)?),
-                None => return reject(a.span(), "spread arguments are not supported"),
-            }
-        }
-        match &c.callee {
+        match c.callee.without_parentheses() {
             Expression::Identifier(id) => {
-                let scoping = self.m.scoping;
-                let sym = id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id());
-                let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == s)) else {
-                    return reject(c.span, format!("call to `{}`, which is not a natively compiled function", id.name));
-                };
-                let (params, ret) = self.m.signature(i, c.span)?;
-                let tys: Vec<Ty> = args.iter().map(|a| a.ty).collect();
-                if tys != params {
-                    return reject(
-                        c.span,
-                        format!("call to `{}` with argument types {tys:?}, expected {params:?}", id.name),
-                    );
+                let sym = self.resolve(id);
+                if let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == s))
+                    && !self.sym_local.contains_key(&sym.unwrap())
+                    && let Some(e) = self.direct_call(i, &c.arguments, c.span)?
+                {
+                    return Ok(e);
                 }
-                Ok(Expr::new(ret, ExprKind::Call(i, args)))
+                let callee = any(self.ident(id)?);
+                let args = self.args(&c.arguments)?;
+                Ok(Expr::new(Ty::Any, ExprKind::CallValue(Box::new(callee), args)))
             }
             Expression::StaticMemberExpression(m) => {
-                let Some(f) = builtin_fn(m, self.m.scoping) else {
-                    return reject(c.span, "method calls are not supported");
-                };
-                if args.iter().any(|a| a.ty != Ty::F64) {
-                    return reject(c.span, "math functions require `number` arguments");
+                if let Some(f) = builtin_fn(m, self.m.scoping) {
+                    let args = c.arguments.iter().map(|a| a.as_expression()).collect::<Option<Vec<_>>>();
+                    if let Some(args) = args {
+                        let args = args.into_iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+                        if args.iter().all(|a| a.ty == Ty::F64) {
+                            return math_call(f, args, c.span);
+                        }
+                        // Generic call with the already-checked arguments.
+                        let obj = Expr::new(
+                            Ty::Any,
+                            ExprKind::Global(self.m.atom(global_member(m, self.m.scoping).unwrap().0)),
+                        );
+                        let atom = self.m.atom(m.property.name.as_str());
+                        return Ok(Expr::new(
+                            Ty::Any,
+                            ExprKind::CallMethod(Box::new(obj), Key::Atom(atom), args.into_iter().map(any).collect()),
+                        ));
+                    }
                 }
-                math_call(f, args, c.span)
+                if m.optional {
+                    return reject(c.span, "optional chaining is not supported yet");
+                }
+                let obj = any(self.expr(&m.object)?);
+                let atom = self.m.atom(m.property.name.as_str());
+                let args = self.args(&c.arguments)?;
+                Ok(Expr::new(Ty::Any, ExprKind::CallMethod(Box::new(obj), Key::Atom(atom), args)))
             }
-            _ => reject(c.span, "unsupported callee"),
+            Expression::ComputedMemberExpression(m) => {
+                if m.optional {
+                    return reject(c.span, "optional chaining is not supported yet");
+                }
+                let obj = any(self.expr(&m.object)?);
+                let key = self.key(&m.expression)?;
+                let args = self.args(&c.arguments)?;
+                Ok(Expr::new(Ty::Any, ExprKind::CallMethod(Box::new(obj), key, args)))
+            }
+            Expression::PrivateFieldExpression(_) => reject(c.span, "private fields are not supported yet"),
+            Expression::Super(_) => reject(c.span, "`super` is not supported yet"),
+            other => {
+                let callee = any(self.expr(other)?);
+                let args = self.args(&c.arguments)?;
+                Ok(Expr::new(Ty::Any, ExprKind::CallValue(Box::new(callee), args)))
+            }
         }
+    }
+
+    /// A direct machine call to native function `i`, if the arguments fit
+    /// its parameters exactly (otherwise the call goes through its JS entry,
+    /// which guards the types and may fall back to the interpreter).
+    fn direct_call(&mut self, i: usize, args: &[Argument], span: Span) -> R<Option<Expr>> {
+        if !self.m.cands[i].direct_callable {
+            return Ok(None);
+        }
+        let (params, ret) = self.m.signature(i, span)?;
+        if args.len() > params.len() || args.iter().any(|a| a.as_expression().is_none()) {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(params.len());
+        for (k, &p) in params.iter().enumerate() {
+            let x = match args.get(k) {
+                Some(a) => self.expr(a.as_expression().unwrap())?,
+                None if p == Ty::Any => undefined(),
+                None => return Ok(None),
+            };
+            out.push(match (p, x.ty) {
+                (Ty::Any, _) => any(x),
+                (p, t) if p == t => x,
+                // An unproven argument for an unboxed parameter.
+                _ => return Ok(None),
+            });
+        }
+        Ok(Some(Expr::new(ret, ExprKind::Call(i, out))))
     }
 }
 
-fn truthy(x: Expr, span: Span) -> R<Expr> {
-    match x.ty {
-        Ty::Bool => Ok(x),
-        Ty::F64 => Ok(Expr::new(Ty::Bool, ExprKind::Truthy(Box::new(x)))),
-        Ty::Void => reject(span, "`void` value used as a condition"),
+fn set(l: ir::LocalId, v: Expr) -> Expr {
+    Expr::new(Ty::Any, ExprKind::SetLocal(l, Box::new(v)))
+}
+
+/// Arithmetic: unboxed when both operands are numbers, generic otherwise.
+fn arith(op: AnyBinOp, x: Expr, y: Expr) -> Expr {
+    if x.ty == Ty::F64 && y.ty == Ty::F64 {
+        let op = match op {
+            AnyBinOp::Add => BinOp::Add,
+            AnyBinOp::Sub => BinOp::Sub,
+            AnyBinOp::Mul => BinOp::Mul,
+            AnyBinOp::Div => BinOp::Div,
+            AnyBinOp::Rem => BinOp::Rem,
+            AnyBinOp::Pow => BinOp::Pow,
+            AnyBinOp::Shl => BinOp::Shl,
+            AnyBinOp::Sar => BinOp::Sar,
+            AnyBinOp::Shr => BinOp::Shr,
+            AnyBinOp::BitAnd => BinOp::BitAnd,
+            AnyBinOp::BitOr => BinOp::BitOr,
+            AnyBinOp::BitXor => BinOp::BitXor,
+        };
+        return Expr::new(Ty::F64, ExprKind::Binary(op, Box::new(x), Box::new(y)));
     }
+    Expr::new(Ty::Any, ExprKind::AnyBinary(op, Box::new(any(x)), Box::new(any(y))))
+}
+
+/// JS truthiness as a `Bool`.
+fn truthy(x: Expr) -> Expr {
+    match x.ty {
+        Ty::Bool => x,
+        _ => Expr::new(Ty::Bool, ExprKind::Truthy(Box::new(any_or_num(x)))),
+    }
+}
+
+fn any_or_num(x: Expr) -> Expr {
+    if x.ty == Ty::F64 { x } else { any(x) }
+}
+
+/// In a function returning `Any`, box every returned value.
+fn box_returns(body: Vec<Stmt>) -> Vec<Stmt> {
+    fn s(st: Stmt) -> Stmt {
+        match st {
+            Stmt::Return(e) => Stmt::Return(Some(e.map_or_else(undefined, any))),
+            Stmt::If(c, a, b) => Stmt::If(c, l(a), l(b)),
+            Stmt::Loop { id, test, post_test, body, update } => {
+                Stmt::Loop { id, test, post_test, body: l(body), update }
+            }
+            Stmt::Switch { id, disc, cases } => {
+                Stmt::Switch { id, disc, cases: cases.into_iter().map(|(t, b)| (t, l(b))).collect() }
+            }
+            Stmt::Block(b) => Stmt::Block(l(b)),
+            Stmt::Try { body, catch, finally } => {
+                Stmt::Try { body: l(body), catch: catch.map(|(p, b)| (p, l(b))), finally: finally.map(l) }
+            }
+            other => other,
+        }
+    }
+    fn l(v: Vec<Stmt>) -> Vec<Stmt> {
+        v.into_iter().map(s).collect()
+    }
+    l(body)
 }
 
 fn math_call(f: MathFn, mut args: Vec<Expr>, span: Span) -> R<Expr> {
@@ -981,12 +1750,18 @@ fn completes_list(list: &[Stmt]) -> bool {
 fn completes(s: &Stmt) -> bool {
     match s {
         Stmt::Expr(_) => true,
-        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => false,
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Throw(_) => false,
         Stmt::Block(b) => completes_list(b),
         Stmt::If(_, a, b) => completes_list(a) || completes_list(b),
         Stmt::Loop { id, test, body, .. } => {
             let infinite = matches!(test, None | Some(Expr { kind: ExprKind::Bool(true), .. }));
             !infinite || breaks_to(body, *id)
+        }
+        // Conservative: a switch may complete.
+        Stmt::Switch { .. } => true,
+        Stmt::Try { body, catch, finally } => {
+            (completes_list(body) || catch.as_ref().is_some_and(|(_, c)| completes_list(c)))
+                && finally.as_ref().is_none_or(|f| completes_list(f))
         }
     }
 }
@@ -997,15 +1772,18 @@ fn breaks_to(list: &[Stmt], id: ir::LoopId) -> bool {
         Stmt::Block(b) => breaks_to(b, id),
         Stmt::If(_, a, b) => breaks_to(a, id) || breaks_to(b, id),
         Stmt::Loop { body, .. } => breaks_to(body, id),
+        Stmt::Switch { cases, .. } => cases.iter().any(|(_, b)| breaks_to(b, id)),
+        Stmt::Try { body, catch, finally } => {
+            breaks_to(body, id)
+                || catch.as_ref().is_some_and(|(_, c)| breaks_to(c, id))
+                || finally.as_ref().is_some_and(|f| breaks_to(f, id))
+        }
         _ => false,
     })
 }
 
 fn describe_stmt(s: &Statement) -> &'static str {
     match s {
-        Statement::ThrowStatement(_) => "throw",
-        Statement::TryStatement(_) => "try",
-        Statement::SwitchStatement(_) => "switch",
         Statement::ForInStatement(_) => "for-in",
         Statement::ForOfStatement(_) => "for-of",
         Statement::FunctionDeclaration(_) => "nested function",
@@ -1016,17 +1794,15 @@ fn describe_stmt(s: &Statement) -> &'static str {
 
 fn describe_expr(e: &Expression) -> &'static str {
     match e {
-        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => "string",
-        Expression::NullLiteral(_) => "null",
         Expression::BigIntLiteral(_) => "bigint",
-        Expression::ArrayExpression(_) => "array literal",
-        Expression::ObjectExpression(_) => "object literal",
+        Expression::RegExpLiteral(_) => "regular expression",
         Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => "closure",
+        Expression::ClassExpression(_) => "class expression",
         Expression::ThisExpression(_) => "this",
-        Expression::NewExpression(_) => "new",
         Expression::AwaitExpression(_) => "await",
-        Expression::ComputedMemberExpression(_) => "indexing",
+        Expression::ChainExpression(_) => "optional chaining",
         Expression::ImportExpression(_) => "dynamic import",
+        Expression::TaggedTemplateExpression(_) => "tagged template",
         _ => "this expression kind",
     }
 }

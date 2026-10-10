@@ -1,5 +1,5 @@
-// @native fib sq cube twice clamp exported viaConst later
-// @interpreted aot usesLater
+// @native fib sq cube twice clamp exported viaConst later aot usesLater
+
 // The `aot` keyword and the "use aot" directive force native compilation.
 aot function fib(n: number): number {
   return n < 2 ? n : fib(n - 1) + fib(n - 2);
@@ -30,9 +30,9 @@ console.log(sq.name, sq.length, cube.name, typeof cube);
 // Fallbacks keep working for marked functions.
 console.log((sq as unknown as (x: unknown) => unknown)("ab"), (clamp as unknown as () => unknown)());
 
-// A const function declared after top-level code has run is still native,
-// but native callers cannot call it directly (it may be in its TDZ), so
-// `usesLater` stays interpreted.
+// A const function declared after top-level code has run is native, and
+// native callers reach it through its TDZ-checked binding instead of a
+// direct call.
 function usesLater(x: number): number { return later(x) * 10; }
 console.log("tdz boundary");
 const later = (x: number): number => x + 1;

@@ -1,19 +1,25 @@
 //! Typed intermediate representation for natively compiled functions.
 //!
-//! The IR is fully owned (no AST lifetimes) and fully typed: every expression
-//! carries its machine-level type, every local has a fixed type, and the only
-//! callees are other native functions or known pure math intrinsics. Code that
-//! lowers this IR may rely on these invariants without re-checking anything.
+//! Every expression carries its machine-level type. `F64` and `Bool` are
+//! unboxed values whose type is *proven* (by the checker, or by the type
+//! guards of a function's JS entry). `Any` is a boxed QuickJS `JSValue` whose
+//! type is unknown; operations on it have exact JS semantics (fast paths for
+//! common cases, generic engine helpers otherwise).
+//!
+//! Lowering may rely on these invariants without re-checking anything: the
+//! operand types of every node are the ones its documentation states.
 
 use std::fmt;
 
-/// Machine-level value types. `F64` is the JS `number`.
+/// Machine-level value types. `F64` is a JS `number` known to be one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     F64,
     Bool,
-    /// Only valid as a function return type.
+    /// Only valid as a function return type (the function returns `undefined`).
     Void,
+    /// Any JS value (a reference-counted `JSValue`).
+    Any,
 }
 
 impl fmt::Display for Ty {
@@ -22,27 +28,44 @@ impl fmt::Display for Ty {
             Ty::F64 => "number",
             Ty::Bool => "boolean",
             Ty::Void => "void",
+            Ty::Any => "any",
         })
     }
 }
 
 pub type FuncId = usize;
 pub type LocalId = usize;
+/// Target of `break` / `continue`: a loop, a `switch`, or a labeled block.
 pub type LoopId = usize;
+/// Index into `Module::strings`.
+pub type StrId = usize;
+/// Index into `Module::atoms` (property names and global variable names).
+pub type AtomId = usize;
+/// Index into `Module::cells` (module-level bindings used by native code).
+pub type CellId = usize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Module {
     pub funcs: Vec<Func>,
+    /// String constants.
+    pub strings: Vec<String>,
+    /// Property and global variable names, interned as engine atoms.
+    pub atoms: Vec<String>,
+    /// Names of the module-level bindings native code reads or writes. Each
+    /// cell holds the binding's current value, or is uninitialized (TDZ).
+    pub cells: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Func {
     /// JS name of the function (the module-level binding).
     pub name: String,
-    /// Locals `0..params.len()` are the parameters, in order.
+    /// ABI types of the parameters. Locals `0..params.len()` are the
+    /// parameters; a local may be `Any` where its parameter is not, in
+    /// which case the incoming value is boxed on entry.
     pub params: Vec<Ty>,
     pub ret: Ty,
-    /// Types of all locals, including parameters.
+    /// Types of all locals, including parameters and hidden temporaries.
     pub locals: Vec<Ty>,
     pub body: Vec<Stmt>,
 }
@@ -61,10 +84,26 @@ pub enum Stmt {
         body: Vec<Stmt>,
         update: Option<Expr>,
     },
+    /// `switch (local) { case ...: }`: cases are compared with `===` in
+    /// order; `None` is `default`. Bodies fall through. `break` targets `id`.
+    Switch {
+        id: LoopId,
+        disc: LocalId,
+        cases: Vec<(Option<Expr>, Vec<Stmt>)>,
+    },
     Break(LoopId),
     Continue(LoopId),
     Return(Option<Expr>),
     Block(Vec<Stmt>),
+    /// `throw e` (`Any`).
+    Throw(Expr),
+    /// `try { body } catch (param) { handler } finally { finalizer }`. The
+    /// finalizer contains no `return`, `break` or `continue`.
+    Try {
+        body: Vec<Stmt>,
+        catch: Option<(Option<LocalId>, Vec<Stmt>)>,
+        finally: Option<Vec<Stmt>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +117,10 @@ pub enum ExprKind {
     Num(f64),
     Bool(bool),
     Local(LocalId),
-    /// Assignment; evaluates to the assigned value.
+    /// Assignment; evaluates to the assigned value. The value has the
+    /// local's type.
     SetLocal(LocalId, Box<Expr>),
-    /// `++x`, `x--`, ... on a number local.
+    /// `++x`, `x--`, ... on a `F64` local.
     Update {
         local: LocalId,
         delta: f64,
@@ -88,18 +128,106 @@ pub enum ExprKind {
     },
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    /// Comparison of two operands of the same type; result is `Bool`.
+    /// Comparison of two `F64` or two `Bool` operands; result is `Bool`.
     Compare(CmpOp, Box<Expr>, Box<Expr>),
-    /// `&&` / `||` with JS short-circuit semantics. Both operands and the
-    /// result have the same type; truthiness of the left operand decides.
+    /// `&&` / `||` / `??` with JS short-circuit semantics. Both operands and
+    /// the result have the same type; `??` is only used on `Any`.
     Logical(LogicalOp, Box<Expr>, Box<Expr>),
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
-    /// JS truthiness of a number or boolean, as a `Bool`.
+    /// JS truthiness of any value, as a `Bool`.
     Truthy(Box<Expr>),
+    /// Direct call of a native function; argument types match its params.
     Call(FuncId, Vec<Expr>),
     Math(MathFn, Vec<Expr>),
     /// Comma operator: all evaluated, value of the last.
     Seq(Vec<Expr>),
+
+    // ---- dynamic values (all `Any` unless noted) ----
+    Undefined,
+    Null,
+    Str(StrId),
+    /// `F64` or `Bool` as a JS value.
+    Box(Box<Expr>),
+    AnyUnary(AnyUnOp, Box<Expr>),
+    AnyBinary(AnyBinOp, Box<Expr>, Box<Expr>),
+    /// Comparison of two `Any` operands; result is `Bool`.
+    AnyCompare(AnyCmpOp, Box<Expr>, Box<Expr>),
+    /// Read of a module-level binding (ReferenceError while uninitialized).
+    Cell(CellId),
+    SetCell(CellId, Box<Expr>),
+    /// Global variable (ReferenceError if it does not exist).
+    Global(AtomId),
+    /// `typeof` operand: a global variable that may not exist (undefined).
+    GlobalOrUndefined(AtomId),
+    SetGlobal(AtomId, Box<Expr>),
+    GetProp(Box<Expr>, AtomId),
+    /// Evaluates to the assigned value.
+    SetProp(Box<Expr>, AtomId, Box<Expr>),
+    GetElem(Box<Expr>, Box<Expr>),
+    SetElem(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `delete obj.prop` / `delete obj[key]` (`Bool`; TypeError if it fails).
+    DeleteProp(Box<Expr>, AtomId),
+    DeleteElem(Box<Expr>, Box<Expr>),
+    /// `callee(args)` with `this` undefined.
+    CallValue(Box<Expr>, Vec<Expr>),
+    /// `obj.name(args)` / `obj[key](args)`, with `this` = obj.
+    CallMethod(Box<Expr>, Key, Vec<Expr>),
+    New(Box<Expr>, Vec<Expr>),
+    /// Object literal with plain data properties, defined in order.
+    Object(Vec<(AtomId, Expr)>),
+    /// Array literal without holes or spreads.
+    Array(Vec<Expr>),
+    /// Discard the value (`void e`, statement-level use of a void call).
+    Void(Box<Expr>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Key {
+    Atom(AtomId),
+    Value(Box<Expr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnyUnOp {
+    Neg,
+    Plus,
+    BitNot,
+    Inc,
+    Dec,
+    ToNumeric,
+    Typeof,
+    /// ToString, as in template literals.
+    ToStr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnyBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Pow,
+    Shl,
+    Sar,
+    Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnyCmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    StrictEq,
+    StrictNe,
+    In,
+    InstanceOf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +270,8 @@ pub enum CmpOp {
 pub enum LogicalOp {
     And,
     Or,
+    /// `??` (only on `Any`).
+    Nullish,
 }
 
 /// Pure numeric intrinsics. Builtins are assumed unmodified at runtime.

@@ -1,6 +1,6 @@
-// @error `aot` function `greet` cannot be compiled natively
-// @error parameter `name` must be annotated `number` or `boolean`
-function greet(name: string): string {
+// @error `aot` function `gen` cannot be compiled natively
+// @error generators are not supported yet
+function* gen(n: number) {
   "use aot";
-  return "hi " + name;
+  yield n;
 }

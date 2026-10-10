@@ -1,0 +1,301 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -467,6 +467,13 @@
+ typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+ typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+ typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
++/* Optional fast entry of a C function data object, tried before its regular
++   JSCFunctionData. The interpreter calls it directly from its call opcodes,
++   without pushing a stack frame. Return the result, JS_EXCEPTION after
++   throwing, or JS_UNINITIALIZED to decline: the regular function is then
++   called with the same arguments. */
++typedef JSValue JSCFunctionFast(JSContext *ctx, JSValueConst this_val, int argc,
++                                JSValueConst *argv, JSValueConst *func_data);
+ typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
+ 
+ typedef struct JSMallocFunctions {
+@@ -1052,6 +1059,26 @@
+                               const char *input, size_t input_len,
+                               JSEvalOptions *options);
+ JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
++
++/* Generic operators with exactly the interpreter's semantics (operands are
++   borrowed), and strict mode global variable access. */
++typedef enum JSBinaryOperatorEnum {
++    JS_BINOP_ADD, JS_BINOP_SUB, JS_BINOP_MUL, JS_BINOP_DIV, JS_BINOP_MOD,
++    JS_BINOP_POW, JS_BINOP_SHL, JS_BINOP_SAR, JS_BINOP_SHR, JS_BINOP_AND,
++    JS_BINOP_OR, JS_BINOP_XOR, JS_BINOP_LT, JS_BINOP_LTE, JS_BINOP_GT,
++    JS_BINOP_GTE, JS_BINOP_EQ, JS_BINOP_NEQ, JS_BINOP_STRICT_EQ,
++    JS_BINOP_STRICT_NEQ, JS_BINOP_IN, JS_BINOP_INSTANCEOF,
++} JSBinaryOperatorEnum;
++typedef enum JSUnaryOperatorEnum {
++    JS_UNOP_NEG, JS_UNOP_PLUS, JS_UNOP_BITNOT, JS_UNOP_INC, JS_UNOP_DEC,
++    JS_UNOP_TONUMERIC, JS_UNOP_TYPEOF,
++} JSUnaryOperatorEnum;
++JS_EXTERN JSValue JS_BinaryOperator(JSContext *ctx, JSBinaryOperatorEnum op,
++                                    JSValueConst op1, JSValueConst op2);
++JS_EXTERN JSValue JS_UnaryOperator(JSContext *ctx, JSUnaryOperatorEnum op,
++                                   JSValueConst op1);
++JS_EXTERN JSValue JS_GetGlobalVariable(JSContext *ctx, JSAtom prop);
++JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, JSAtom prop, JSValue val);
+ JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
+ JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
+                                 JSAtom prop, JSValueConst val,
+@@ -1342,6 +1369,10 @@
+ JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
+                                       int length, int magic, int data_len,
+                                       JSValueConst *data);
++JS_EXTERN JSValue JS_NewCFunctionDataFast(JSContext *ctx, JSCFunctionFast *fast,
++                                          JSCFunctionData *func, const char *name,
++                                          int length, int magic, int data_len,
++                                          JSValueConst *data);
+ JS_EXTERN JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
+                                        const char *name,
+                                        int length, int magic, int data_len,
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6560,6 +6560,7 @@
+ 
+ typedef struct JSCFunctionDataRecord {
+     JSCFunctionData *func;
++    JSCFunctionFast *fast; /* optional, see JSCFunctionFast */
+     uint8_t length;
+     uint8_t data_len;
+     uint16_t magic;
+@@ -6608,6 +6609,11 @@
+     s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
+     if (!s)
+         return JS_EXCEPTION; // can't really happen
++    if (s->fast && !(flags & JS_CALL_FLAG_CONSTRUCTOR)) {
++        ret = s->fast(ctx, this_val, argc, argv, vc(s->data));
++        if (!JS_IsUninitialized(ret))
++            return ret;
++    }
+     arg_buf = argv;
+     arg_count = s->length;
+     if (unlikely(argc < arg_count)) {
+@@ -6653,6 +6659,7 @@
+         return JS_EXCEPTION;
+     }
+     s->func = func;
++    s->fast = NULL;
+     s->length = length;
+     s->data_len = data_len;
+     s->magic = magic;
+@@ -6672,6 +6679,18 @@
+     return func_obj;
+ }
+ 
++JSValue JS_NewCFunctionDataFast(JSContext *ctx, JSCFunctionFast *fast,
++                                JSCFunctionData *func, const char *name,
++                                int length, int magic, int data_len,
++                                JSValueConst *data)
++{
++    JSValue func_obj = JS_NewCFunctionData2(ctx, func, name, length, magic,
++                                            data_len, data);
++    if (!JS_IsException(func_obj))
++        JS_VALUE_GET_OBJ(func_obj)->u.c_function_data_record->fast = fast;
++    return func_obj;
++}
++
+ JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
+                             int length, int magic, int data_len,
+                             JSValueConst *data)
+@@ -16550,6 +16569,119 @@
+     return atom;
+ }
+ 
++/* Generic operators with exactly the interpreter's semantics, for code
++   generated outside of the bytecode interpreter. Operands are borrowed; the
++   result is returned, or JS_EXCEPTION. */
++JSValue JS_BinaryOperator(JSContext *ctx, JSBinaryOperatorEnum op,
++                          JSValueConst op1, JSValueConst op2)
++{
++    JSValue buf[2], *sp = buf + 2;
++    int ret;
++
++    buf[0] = js_dup(op1);
++    buf[1] = js_dup(op2);
++    switch (op) {
++    case JS_BINOP_ADD: ret = js_add_slow(ctx, sp); break;
++    case JS_BINOP_SUB: ret = js_binary_arith_slow(ctx, sp, OP_sub); break;
++    case JS_BINOP_MUL: ret = js_binary_arith_slow(ctx, sp, OP_mul); break;
++    case JS_BINOP_DIV: ret = js_binary_arith_slow(ctx, sp, OP_div); break;
++    case JS_BINOP_MOD: ret = js_binary_arith_slow(ctx, sp, OP_mod); break;
++    case JS_BINOP_POW: ret = js_binary_arith_slow(ctx, sp, OP_pow); break;
++    case JS_BINOP_SHL: ret = js_binary_logic_slow(ctx, sp, OP_shl); break;
++    case JS_BINOP_SAR: ret = js_binary_logic_slow(ctx, sp, OP_sar); break;
++    case JS_BINOP_SHR: ret = js_shr_slow(ctx, sp); break;
++    case JS_BINOP_AND: ret = js_binary_logic_slow(ctx, sp, OP_and); break;
++    case JS_BINOP_OR:  ret = js_binary_logic_slow(ctx, sp, OP_or); break;
++    case JS_BINOP_XOR: ret = js_binary_logic_slow(ctx, sp, OP_xor); break;
++    case JS_BINOP_LT:  ret = js_relational_slow(ctx, sp, OP_lt); break;
++    case JS_BINOP_LTE: ret = js_relational_slow(ctx, sp, OP_lte); break;
++    case JS_BINOP_GT:  ret = js_relational_slow(ctx, sp, OP_gt); break;
++    case JS_BINOP_GTE: ret = js_relational_slow(ctx, sp, OP_gte); break;
++    case JS_BINOP_EQ:  ret = js_eq_slow(ctx, sp, false); break;
++    case JS_BINOP_NEQ: ret = js_eq_slow(ctx, sp, true); break;
++    case JS_BINOP_STRICT_EQ:  ret = js_strict_eq_slow(ctx, sp, false); break;
++    case JS_BINOP_STRICT_NEQ: ret = js_strict_eq_slow(ctx, sp, true); break;
++    case JS_BINOP_IN:
++    case JS_BINOP_INSTANCEOF:
++        /* these leave their operands in place on failure */
++        ret = op == JS_BINOP_IN ? js_operator_in(ctx, sp)
++                                : js_operator_instanceof(ctx, sp);
++        if (ret < 0) {
++            JS_FreeValue(ctx, buf[0]);
++            JS_FreeValue(ctx, buf[1]);
++        }
++        break;
++    default:
++        JS_FreeValue(ctx, buf[0]);
++        JS_FreeValue(ctx, buf[1]);
++        return JS_ThrowInternalError(ctx, "invalid binary operator");
++    }
++    if (ret < 0)
++        return JS_EXCEPTION;
++    return buf[0];
++}
++
++JSValue JS_UnaryOperator(JSContext *ctx, JSUnaryOperatorEnum op,
++                         JSValueConst op1)
++{
++    JSValue buf[1], *sp = buf + 1;
++    int ret;
++
++    switch (op) {
++    case JS_UNOP_TYPEOF:
++        return JS_AtomToString(ctx, js_operator_typeof(ctx, op1));
++    case JS_UNOP_TONUMERIC:
++        return JS_ToNumericFree(ctx, js_dup(op1));
++    default:
++        break;
++    }
++    buf[0] = js_dup(op1);
++    switch (op) {
++    case JS_UNOP_NEG:    ret = js_unary_arith_slow(ctx, sp, OP_neg); break;
++    case JS_UNOP_PLUS:   ret = js_unary_arith_slow(ctx, sp, OP_plus); break;
++    case JS_UNOP_INC:    ret = js_unary_arith_slow(ctx, sp, OP_inc); break;
++    case JS_UNOP_DEC:    ret = js_unary_arith_slow(ctx, sp, OP_dec); break;
++    case JS_UNOP_BITNOT: ret = js_not_slow(ctx, sp); break;
++    default:
++        JS_FreeValue(ctx, buf[0]);
++        return JS_ThrowInternalError(ctx, "invalid unary operator");
++    }
++    if (ret < 0)
++        return JS_EXCEPTION;
++    return buf[0];
++}
++
++/* A global variable reference, as in strict mode code: ReferenceError if it
++   does not exist. */
++JSValue JS_GetGlobalVariable(JSContext *ctx, JSAtom prop)
++{
++    return JS_GetGlobalVar(ctx, prop, true);
++}
++
++/* Assignment to a global variable with strict mode semantics, whatever the
++   current stack frame: ReferenceError if it does not exist, TypeError if it
++   is read-only. Frees `val`. */
++int JS_SetGlobalVariable(JSContext *ctx, JSAtom prop, JSValue val)
++{
++    JSObject *p;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    int ret;
++
++    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
++    prs = find_own_property(&pr, p, prop);
++    if (prs)
++        return JS_SetGlobalVar(ctx, prop, val, 0);
++    ret = JS_HasProperty(ctx, ctx->global_obj, prop);
++    if (ret <= 0) {
++        JS_FreeValue(ctx, val);
++        if (ret == 0)
++            JS_ThrowReferenceErrorNotDefined(ctx, prop);
++        return -1;
++    }
++    return JS_SetPropertyInternal(ctx, ctx->global_obj, prop, val, JS_PROP_THROW);
++}
++
+ static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
+ {
+     JSValue op1, op2;
+@@ -18047,6 +18179,29 @@
+     return can_store_error_stack(exc) || can_add_backtrace(exc);
+ }
+ 
++static inline bool js_is_c_function_data(JSValueConst v)
++{
++    return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++           JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_C_FUNCTION_DATA;
++}
++
++/* Calls the JSCFunctionFast entry of C function data `func_obj`. Returns
++   JS_UNINITIALIZED if there is none or it declined, in which case the caller
++   takes the regular call path. Lets the interpreter's call opcodes enter
++   native code without a JS_CallInternal frame. The result is returned by
++   value, in registers: taking the address of the interpreter's ret_val
++   would force every call result through memory. */
++static no_inline JSValue js_call_fast(JSContext *ctx, JSValueConst func_obj,
++                                     JSValueConst this_val,
++                                     int argc, JSValueConst *argv)
++{
++    JSCFunctionDataRecord *s = JS_VALUE_GET_OBJ(func_obj)->u.c_function_data_record;
++
++    if (!s->fast)
++        return JS_UNINITIALIZED;
++    return s->fast(ctx, this_val, argc, argv, vc(s->data));
++}
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -18548,9 +18703,12 @@
+             has_call_argc:
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (unlikely(js_is_c_function_data(call_argv[-1])))
++                    goto call_c_function_data;
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
++            call_returned:
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+                 if (opcode == OP_tail_call)
+@@ -18585,9 +18743,12 @@
+                 pc += 2;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++                if (unlikely(js_is_c_function_data(call_argv[-1])))
++                    goto call_method_c_function_data;
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
+                                           vc(call_argv), 0);
++            call_method_returned:
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+                 if (opcode == OP_tail_call_method)
+@@ -18598,6 +18759,21 @@
+                 *sp++ = ret_val;
+             }
+             BREAK;
++        call_c_function_data:
++            /* Calls to C function data objects (which may have a JSCFunctionFast
++               entry), out of line: the regular call path above keeps the code
++               the compiler generates for it without this hook. */
++            ret_val = js_call_fast(ctx, call_argv[-1], JS_UNDEFINED, call_argc, vc(call_argv));
++            if (JS_IsUninitialized(ret_val))
++                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED, JS_UNDEFINED,
++                                          call_argc, vc(call_argv), 0);
++            goto call_returned;
++        call_method_c_function_data:
++            ret_val = js_call_fast(ctx, call_argv[-1], call_argv[-2], call_argc, vc(call_argv));
++            if (JS_IsUninitialized(ret_val))
++                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2], JS_UNDEFINED,
++                                          call_argc, vc(call_argv), 0);
++            goto call_method_returned;
+         CASE(OP_array_from):
+             {
+                 call_argc = get_u16(pc);

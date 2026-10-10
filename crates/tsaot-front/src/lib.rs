@@ -36,6 +36,34 @@ pub struct NativeDecl {
     pub line: u32,
 }
 
+/// A module-level binding that native code accesses through a cell.
+#[derive(Debug, Clone)]
+pub struct CellDecl {
+    pub name: String,
+    /// Interpreted code accesses the cell instead of its own binding.
+    pub mutable: bool,
+    pub init: CellInitSite,
+    /// `var`: initialized to `undefined` in the module header.
+    pub hoisted_undefined: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CellInitSite {
+    Header,
+    /// Byte span of the initializer to wrap.
+    Wrap(u32, u32),
+    /// Byte offset after the declaring statement.
+    After(u32),
+}
+
+/// An interpreted reference to a mutable cell's binding.
+#[derive(Debug, Clone, Copy)]
+pub struct CellRef {
+    pub span: (u32, u32),
+    pub cell: ir::CellId,
+    /// `{ x }` shorthand: must become `{ x: <cell> }`.
+    pub shorthand: bool,
+}
 #[derive(Debug, Clone)]
 pub struct Rejected {
     pub name: String,
@@ -53,6 +81,8 @@ pub struct Analysis {
     pub module: ir::Module,
     /// Parallel to `module.funcs`.
     pub natives: Vec<NativeDecl>,
+    pub cells: Vec<CellDecl>,
+    pub cell_refs: Vec<CellRef>,
     pub rejected: Vec<Rejected>,
 }
 
@@ -140,7 +170,78 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
         })
         .collect();
     rejected.sort_by_key(|r| r.line);
-    Ok(Analysis { source: source.clone(), module: out.module, natives, rejected })
+
+    let cells: Vec<CellDecl> = out
+        .cells
+        .iter()
+        .map(|c| CellDecl {
+            name: c.name.clone(),
+            mutable: c.mutable,
+            init: match c.init {
+                check::CellInit::Header => CellInitSite::Header,
+                check::CellInit::Wrap(s) => CellInitSite::Wrap(s.start, s.end),
+                check::CellInit::After(p) => CellInitSite::After(p),
+            },
+            hoisted_undefined: c.hoisted_undefined,
+        })
+        .collect();
+    let mutable: std::collections::HashMap<oxc::semantic::SymbolId, ir::CellId> =
+        out.cells.iter().enumerate().filter(|(_, c)| c.mutable).map(|(i, c)| (c.symbol, i)).collect();
+    let mut refs = CellRefs { scoping: &scoping, mutable: &mutable, out: Vec::new() };
+    if !mutable.is_empty() {
+        refs.visit_program(program);
+    }
+    let cell_refs = refs.out;
+    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected })
+}
+
+/// Collects interpreted references to bindings that live in mutable cells.
+struct CellRefs<'s> {
+    scoping: &'s oxc::semantic::Scoping,
+    mutable: &'s std::collections::HashMap<oxc::semantic::SymbolId, ir::CellId>,
+    out: Vec<CellRef>,
+}
+
+impl CellRefs<'_> {
+    fn cell_of(&self, id: &oxc::ast::ast::IdentifierReference) -> Option<ir::CellId> {
+        let r = id.reference_id.get()?;
+        let sym = self.scoping.get_reference(r).symbol_id()?;
+        self.mutable.get(&sym).copied()
+    }
+}
+
+impl<'a> Visit<'a> for CellRefs<'_> {
+    fn visit_identifier_reference(&mut self, it: &oxc::ast::ast::IdentifierReference<'a>) {
+        if let Some(cell) = self.cell_of(it) {
+            self.out.push(CellRef { span: (it.span.start, it.span.end), cell, shorthand: false });
+        }
+    }
+
+    fn visit_object_property(&mut self, it: &oxc::ast::ast::ObjectProperty<'a>) {
+        if it.shorthand
+            && let oxc::ast::ast::Expression::Identifier(id) = &it.value
+            && let Some(cell) = self.cell_of(id)
+        {
+            self.out.push(CellRef { span: (id.span.start, id.span.end), cell, shorthand: true });
+            return;
+        }
+        walk::walk_object_property(self, it);
+    }
+
+    fn visit_assignment_target_property_identifier(
+        &mut self,
+        it: &oxc::ast::ast::AssignmentTargetPropertyIdentifier<'a>,
+    ) {
+        if let Some(cell) = self.cell_of(&it.binding) {
+            let s = it.binding.span;
+            self.out.push(CellRef { span: (s.start, s.end), cell, shorthand: true });
+            if let Some(init) = &it.init {
+                self.visit_expression(init);
+            }
+            return;
+        }
+        walk::walk_assignment_target_property_identifier(self, it);
+    }
 }
 
 /// For "calls `g`, which is not compiled natively", explain why `g` is not.
@@ -208,6 +309,6 @@ impl<'a> Visit<'a> for MarkedFunctions<'_> {
 
 /// Full front-end pipeline for the interpreted half: rewrite + type erasure.
 pub fn erased_js(path: &Path, analysis: &Analysis) -> Result<String, String> {
-    let rewritten = erase::rewrite(&analysis.source, &analysis.natives);
+    let rewritten = erase::rewrite(&analysis.source, analysis);
     erase::strip_types(&rewritten, path)
 }

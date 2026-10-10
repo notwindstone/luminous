@@ -10,7 +10,7 @@
 use std::fmt::Write;
 
 use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue};
-use tsaot_front::erase::{BIND_FN, NATIVE_MODULE};
+use tsaot_front::erase::{BIND_FN, CELLS_OBJ, INIT_FN, NATIVE_MODULE};
 use tsaot_front::ir;
 
 /// C init function name passed to `qjsc -M tsaot:native,<CNAME>`.
@@ -30,7 +30,7 @@ fn c_str(s: &str) -> String {
     out
 }
 
-pub fn generate(m: &ir::Module) -> String {
+pub fn generate(m: &ir::Module, mutable: &[usize]) -> String {
     let mut c = String::new();
     write!(
         c,
@@ -43,7 +43,10 @@ _Static_assert(sizeof(JSValue) == {size}, "tsaot needs the 64-bit struct JSValue
 _Static_assert(offsetof(JSValue, tag) == {tag_off}, "unexpected JSValue layout");
 _Static_assert(JS_TAG_INT == {int} && JS_TAG_BOOL == {bool} && JS_TAG_UNDEFINED == {undef} &&
                JS_TAG_UNINITIALIZED == {uninit} && JS_TAG_EXCEPTION == {exc} &&
-               JS_TAG_FLOAT64 == {f64}, "unexpected JSValue tags");
+               JS_TAG_FLOAT64 == {f64} && JS_TAG_STRING == {string} && JS_TAG_NULL == {null},
+               "unexpected JSValue tags");
+_Static_assert(JS_BINOP_ADD == 0 && JS_BINOP_XOR == 11 && JS_BINOP_LT == 12 && JS_BINOP_INSTANCEOF == 21 &&
+               JS_UNOP_NEG == 0 && JS_UNOP_TYPEOF == 6, "unexpected operator numbering");
 _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
 
 "#,
@@ -55,6 +58,8 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
         uninit = jsvalue::TAG_UNINITIALIZED,
         exc = jsvalue::TAG_EXCEPTION,
         f64 = jsvalue::TAG_FLOAT64,
+        string = jsvalue::TAG_STRING,
+        null = jsvalue::TAG_NULL,
         budget = NATIVE_STACK_BUDGET,
     )
     .unwrap();
@@ -64,12 +69,47 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     }
 
     let n = m.funcs.len();
-    // A trailing sentinel keeps the array non-empty when nothing is native.
+    // Trailing sentinels keep arrays non-empty.
     c.push_str("\nstatic const struct { JSCFunctionFast *fast; const char *name; int length; } tsaot_table[] = {\n");
     for (i, f) in m.funcs.iter().enumerate() {
         writeln!(c, "    {{ tsaot_fast_{i}, {}, {} }},", c_str(&f.name), f.params.len()).unwrap();
     }
     c.push_str("    { NULL, NULL, 0 },\n};\n\n");
+
+    // Module state tables.
+    let list = |items: Vec<String>| -> String {
+        let mut s: String = items.into_iter().map(|i| format!("    {i},\n")).collect();
+        s.push_str("    0\n");
+        s
+    };
+    let (ncells, nstrings, natoms) = (m.cells.len(), m.strings.len(), m.atoms.len());
+    writeln!(c, "JSValue tsaot_cells[{}];", ncells + 1).unwrap();
+    writeln!(c, "JSValue tsaot_strings[{}];", nstrings + 1).unwrap();
+    writeln!(c, "JSAtom tsaot_atoms[{}];", natoms + 1).unwrap();
+    writeln!(
+        c,
+        "const int tsaot_ncells = {ncells}, tsaot_nstrings = {nstrings}, tsaot_natoms = {natoms}, tsaot_nmutable = {};",
+        mutable.len()
+    )
+    .unwrap();
+    write!(c, "const char *const tsaot_cell_names[] = {{\n{}}};\n", list(m.cells.iter().map(|s| c_str(s)).collect()))
+        .unwrap();
+    write!(c, "const char *const tsaot_atom_names[] = {{\n{}}};\n", list(m.atoms.iter().map(|s| c_str(s)).collect()))
+        .unwrap();
+    write!(
+        c,
+        "const char *const tsaot_string_data[] = {{\n{}}};\n",
+        list(m.strings.iter().map(|s| c_str(s)).collect())
+    )
+    .unwrap();
+    write!(
+        c,
+        "const size_t tsaot_string_lens[] = {{\n{}}};\n",
+        list(m.strings.iter().map(|s| s.len().to_string()).collect())
+    )
+    .unwrap();
+    write!(c, "const int tsaot_mutable_cells[] = {{\n{}}};\n\n", list(mutable.iter().map(|k| k.to_string()).collect()))
+        .unwrap();
 
     write!(
         c,
@@ -93,10 +133,19 @@ static JSValue tsaot_bind(JSContext *ctx, JSValueConst this_val, int argc, JSVal
                                    tsaot_table[i].length, 0, 1, &argv[1]);
 }}
 
+static JSValue tsaot_exports[3];
+
 static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 {{
-    return JS_SetModuleExport(ctx, m, "{BIND_FN}",
-                              JS_NewCFunction(ctx, tsaot_bind, "{BIND_FN}", 2));
+    if (JS_SetModuleExport(ctx, m, "{BIND_FN}",
+                           JS_NewCFunction(ctx, tsaot_bind, "{BIND_FN}", 2)) < 0)
+        return -1;
+    /* The module owns the state object: its finalizer releases the cells. */
+    if (JS_SetModuleExport(ctx, m, "__tsaot_state", tsaot_exports[0]) < 0 ||
+        JS_SetModuleExport(ctx, m, "{INIT_FN}", tsaot_exports[1]) < 0 ||
+        JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0)
+        return -1;
+    return 0;
 }}
 
 /* Registered as "{NATIVE_MODULE}"; called while the context is created,
@@ -104,12 +153,15 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
 {{
     JSModuleDef *m;
-    if (tsaot_lock_builtins(ctx) < 0)
+    if (tsaot_runtime_init(ctx, &tsaot_exports[0], &tsaot_exports[1], &tsaot_exports[2]) < 0)
         return NULL;
     m = JS_NewCModule(ctx, name, tsaot_module_init);
     if (!m)
         return NULL;
     JS_AddModuleExport(ctx, m, "{BIND_FN}");
+    JS_AddModuleExport(ctx, m, "__tsaot_state");
+    JS_AddModuleExport(ctx, m, "{INIT_FN}");
+    JS_AddModuleExport(ctx, m, "{CELLS_OBJ}");
     return m;
 }}
 "#

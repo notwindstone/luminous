@@ -29,7 +29,9 @@ use oxc::semantic::SemanticBuilder;
 use oxc::span::SourceType;
 use oxc::transformer::{TransformOptions, Transformer};
 
-use crate::{NativeDecl, NativeSite};
+use std::collections::HashMap;
+
+use crate::{Analysis, CellInitSite, NativeSite};
 
 pub const NATIVE_MODULE: &str = "tsaot:native";
 pub const BIND_FN: &str = "__tsaot_bind";
@@ -38,13 +40,22 @@ pub fn fallback_name(name: &str) -> String {
     format!("__tsaot_fb_{name}")
 }
 
-/// Rewrite `source` so native functions are routed through their entry stubs.
-pub fn rewrite(source: &str, natives: &[NativeDecl]) -> String {
-    // (start, end, replacement), applied back to front.
+pub const INIT_FN: &str = "__tsaot_init";
+pub const CELLS_OBJ: &str = "__tsaot_m";
+
+/// Rewrite `source` so native functions are routed through their JS entries
+/// and module bindings shared with native code live in cells.
+pub fn rewrite(source: &str, a: &Analysis) -> String {
+    // Replacements (start < end) and insertions (start == end). At equal
+    // positions, replacements are applied first and insertions accumulate in
+    // order, outermost last.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut prefixes: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut suffixes: HashMap<usize, Vec<String>> = HashMap::new();
     let mut exports = Vec::new();
-    let mut bindings = Vec::new();
-    for (i, n) in natives.iter().enumerate() {
+    let mut header = Vec::new();
+
+    for (i, n) in a.natives.iter().enumerate() {
         match n.site {
             NativeSite::Declaration { id_span, export_prefix } => {
                 edits.push((id_span.0 as usize, id_span.1 as usize, fallback_name(&n.name)));
@@ -52,33 +63,60 @@ pub fn rewrite(source: &str, natives: &[NativeDecl]) -> String {
                     edits.push((s as usize, e as usize, String::new()));
                     exports.push(n.name.clone());
                 }
-                bindings.push(format!("{} = {BIND_FN}({i}, {})", n.name, fallback_name(&n.name)));
+                header.push(format!("const {} = {BIND_FN}({i}, {});", n.name, fallback_name(&n.name)));
             }
             NativeSite::ConstInit { init_span: (s, e) } => {
-                edits.push((s as usize, s as usize, format!("{BIND_FN}({i}, ")));
-                edits.push((e as usize, e as usize, ")".into()));
+                prefixes.entry(s as usize).or_default().push(format!("{BIND_FN}({i}, "));
+                suffixes.entry(e as usize).or_default().push(")".into());
             }
         }
     }
+    for (k, c) in a.cells.iter().enumerate() {
+        if c.hoisted_undefined {
+            header.push(format!("{INIT_FN}({k}, undefined);"));
+        }
+        match c.init {
+            CellInitSite::Header => header.push(format!("{INIT_FN}({k}, {});", c.name)),
+            CellInitSite::Wrap(s, e) => {
+                prefixes.entry(s as usize).or_default().push(format!("{INIT_FN}({k}, "));
+                suffixes.entry(e as usize).or_default().push(")".into());
+            }
+            CellInitSite::After(p) => {
+                suffixes.entry(p as usize).or_default().push(format!(";{INIT_FN}({k}, {});", c.name));
+            }
+        }
+    }
+    for r in &a.cell_refs {
+        let name = &a.cells[r.cell].name;
+        let text = if r.shorthand { format!("{name}: {CELLS_OBJ}.{name}") } else { format!("{CELLS_OBJ}.{name}") };
+        edits.push((r.span.0 as usize, r.span.1 as usize, text));
+    }
+    for (pos, v) in prefixes {
+        // Innermost wrapper was pushed first; the outermost goes first in text.
+        edits.push((pos, pos, v.into_iter().rev().collect()));
+    }
+    for (pos, v) in suffixes {
+        edits.push((pos, pos, v.concat()));
+    }
+    // Back to front; at equal starts, the replacement before the insertion.
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     let mut out = source.to_string();
     for (s, e, r) in edits {
         out.replace_range(s..e, &r);
     }
 
-    // A named import that ends up unused would be elided by type stripping
-    // (as tsc does), so without native functions use a side-effect import.
-    let mut header = if natives.is_empty() {
-        format!("import \"{NATIVE_MODULE}\";")
-    } else {
-        format!("import {{ {BIND_FN} }} from \"{NATIVE_MODULE}\";")
-    };
-    if !bindings.is_empty() {
-        header.push_str(&format!(" const {};", bindings.join(", ")));
+    // The bare import is what initializes the native module (and so locks
+    // the builtins) even when nothing else is needed: named imports that end
+    // up unused are elided by type stripping.
+    let mut head =
+        format!("import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ} }} from \"{NATIVE_MODULE}\";");
+    for h in header {
+        head.push(' ');
+        head.push_str(&h);
     }
     // Keep a hashbang line first.
     let at = if out.starts_with("#!") { out.find('\n').map_or(out.len(), |i| i + 1) } else { 0 };
-    out.insert_str(at, &format!("{header}\n"));
+    out.insert_str(at, &format!("{head}\n"));
     if !exports.is_empty() {
         out.push_str(&format!("\nexport {{ {} }};\n", exports.join(", ")));
     }

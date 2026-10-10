@@ -15,3 +15,9 @@ for p in patches/*.patch; do
 done
 cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build/quickjs qjsc qjs qjs_exe
+
+# Variant with assertions enabled (no NDEBUG), used by the test suite: the
+# engine then aborts at exit if any object leaked, which catches reference
+# counting bugs in generated code.
+cmake -S build/quickjs-src -B build/quickjs-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-O1
+ninja -C build/quickjs-check qjsc qjs qjs-libc

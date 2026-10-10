@@ -7,7 +7,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tsaot() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tsaot"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tsaot"));
+    // Link against the engine built with assertions, so that leaked objects
+    // abort the program at exit (see scripts/build-quickjs.sh).
+    let check = repo().join("build/quickjs-check");
+    if check.join("libqjs.a").exists() {
+        cmd.env("TSAOT_QUICKJS_BUILD", check);
+    }
+    cmd
 }
 
 fn repo() -> PathBuf {

@@ -128,7 +128,13 @@ fn analyze(input: &Path) -> Result<(String, Analysis)> {
 
 fn disable_native(a: &mut Analysis) {
     a.natives.clear();
-    a.module.funcs.clear();
+    a.module = Default::default();
+    a.cells.clear();
+    a.cell_refs.clear();
+}
+
+fn mutable_cells(a: &Analysis) -> Vec<usize> {
+    a.cells.iter().enumerate().filter(|(_, c)| c.mutable).map(|(i, _)| i).collect()
 }
 
 fn print_report(input: &Path, a: &Analysis) {
@@ -224,7 +230,7 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts) -> Result<()> {
         qjsc.arg("-M").arg(format!("{NATIVE_MODULE},{}", glue::MODULE_CNAME));
         run(qjsc.arg(&js_path))?;
 
-        std::fs::write(tmp.join("glue.c"), glue::generate(&analysis.module))?;
+        std::fs::write(tmp.join("glue.c"), glue::generate(&analysis.module, &mutable_cells(&analysis)))?;
         std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
         std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());

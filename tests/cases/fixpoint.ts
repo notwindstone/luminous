@@ -3,7 +3,7 @@
 function isEven(n: number): boolean { return n === 0 ? true : isOdd(n - 1); }
 function isOdd(n: number): boolean { return n === 0 ? false : isEven(n - 1); }
 
-function bad(n: number): number { return String(n).length; }
+function bad(n: number): number { debugger; return String(n).length; }
 function usesBad(n: number): number { return bad(n) + 1; }
 function usesUsesBad(n: number): number { return usesBad(n) * 2; }
 

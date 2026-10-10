@@ -1,3 +1,3 @@
-// @error `aot` function `half` cannot be compiled natively
-// @error parameter `x` must be annotated
-const half = aot x => x;
+// @error `aot` function `count` cannot be compiled natively
+// @error rest parameters are not supported yet
+const count = aot (...xs: number[]): number => xs.length;

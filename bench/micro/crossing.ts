@@ -2,7 +2,7 @@
 // Build twice and compare:
 //   tsaot run bench/micro/crossing.ts               (id/lerp native)
 //   tsaot run --no-native bench/micro/crossing.ts   (everything interpreted)
-// The loops themselves stay interpreted (untyped parameter), so "call - base"
+// The loops themselves stay interpreted ("use no aot"), so "call - base"
 // is what one call costs, including the native work.
 function id(x: number): number {
   return x;
@@ -12,27 +12,32 @@ function lerp(a: number, b: number, t: number): number {
 }
 
 function idCall(n) {
+  "use no aot";
   let acc = 0;
   for (let i = 0; i < n; i++) acc += id(i);
   return acc;
 }
 function idBase(n) {
+  "use no aot";
   let acc = 0;
   for (let i = 0; i < n; i++) acc += i;
   return acc;
 }
 function lerpCall(n) {
+  "use no aot";
   let acc = 0;
   for (let i = 0; i < n; i++) acc += lerp(i, i + 1, 0.25);
   return acc;
 }
 function lerpBase(n) {
+  "use no aot";
   let acc = 0;
   for (let i = 0; i < n; i++) acc += i + (i + 1 - i) * 0.25;
   return acc;
 }
 
 function nsPerIter(f, n) {
+  "use no aot";
   f(1000);
   let best = Infinity;
   for (let round = 0; round < 3; round++) {

@@ -61,15 +61,175 @@ int32_t tsaot_toint32_slow(double d)
     return (int32_t)(uint32_t)m;
 }
 
-void tsaot_stack_overflow(void)
-{
-    tsaot_unwinding = 1;
-}
-
-/* Same error as the interpreter's own stack overflow. */
-void tsaot_throw_stack_overflow(JSContext *ctx)
+/* Stack overflow detected by native code (same error as the interpreter's). */
+void tsaot_stack_overflow(JSContext *ctx)
 {
     JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
+}
+
+void tsaot_throw_uninitialized(JSContext *ctx, int cell)
+{
+    JS_ThrowReferenceError(ctx, "%s is not initialized", tsaot_cell_names[cell]);
+}
+
+/* ---- operations with more JSValue arguments than fit in registers ---- */
+
+/* obj[key] = val. Takes ownership of key and val. */
+int tsaot_set_elem(JSContext *ctx, JSValue *v)
+{
+    return JS_SetPropertyValue(ctx, v[0], v[1], v[2], JS_PROP_THROW);
+}
+
+/* delete obj[key]. Borrows both. */
+int tsaot_delete_elem(JSContext *ctx, JSValue *v)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, v[1]);
+    int ret;
+    if (atom == JS_ATOM_NULL)
+        return -1;
+    ret = JS_DeleteProperty(ctx, v[0], atom, JS_PROP_THROW);
+    JS_FreeAtom(ctx, atom);
+    return ret;
+}
+
+/* f.call(this, ...argv) with fthis = { f, this }. Borrows everything. */
+JSValue tsaot_call(JSContext *ctx, JSValue *fthis, int argc, JSValue *argv)
+{
+    return JS_Call(ctx, fthis[0], fthis[1], argc, (JSValueConst *)argv);
+}
+
+/* The global `name`, or undefined (as in `typeof name`). */
+JSValue tsaot_global_or_undefined(JSContext *ctx, JSAtom name)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue ret = JS_GetProperty(ctx, global, name);
+    JS_FreeValue(ctx, global);
+    return ret;
+}
+
+/* Object literal field. Takes ownership of val. */
+int tsaot_define_field(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue val)
+{
+    return JS_DefinePropertyValue(ctx, *obj, prop, val, JS_PROP_C_W_E | JS_PROP_THROW);
+}
+
+/* Array literal. Takes ownership of the elements. */
+JSValue tsaot_new_array(JSContext *ctx, int count, JSValue *values)
+{
+    return JS_NewArrayFrom(ctx, count, values);
+}
+
+/* ---- module state: cells, string constants, atoms ---- */
+
+static JSClassID tsaot_state_class;
+
+static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    int i;
+    for (i = 0; i < tsaot_ncells; i++) {
+        JS_FreeValueRT(rt, tsaot_cells[i]);
+        tsaot_cells[i] = JS_UNINITIALIZED;
+    }
+    for (i = 0; i < tsaot_nstrings; i++) {
+        JS_FreeValueRT(rt, tsaot_strings[i]);
+        tsaot_strings[i] = JS_UNDEFINED;
+    }
+    for (i = 0; i < tsaot_natoms; i++)
+        JS_FreeAtomRT(rt, tsaot_atoms[i]);
+}
+
+/* The cells are reachable from native code at any time, so they are roots
+   for the cycle collector: marking them through this object (which the
+   module keeps alive) lets cycles that go through cells be collected once
+   the module itself goes away. */
+static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    int i;
+    for (i = 0; i < tsaot_ncells; i++)
+        JS_MarkValue(rt, tsaot_cells[i], mark_func);
+}
+
+static JSValue tsaot_cell_get(JSContext *ctx, JSValueConst this_val, int argc,
+                              JSValueConst *argv, int cell)
+{
+    if (JS_IsUninitialized(tsaot_cells[cell]))
+        return tsaot_throw_uninitialized(ctx, cell), JS_EXCEPTION;
+    return JS_DupValue(ctx, tsaot_cells[cell]);
+}
+
+static JSValue tsaot_cell_set(JSContext *ctx, JSValueConst this_val, int argc,
+                              JSValueConst *argv, int cell)
+{
+    JSValue old = tsaot_cells[cell];
+    if (JS_IsUninitialized(old))
+        return tsaot_throw_uninitialized(ctx, cell), JS_EXCEPTION;
+    tsaot_cells[cell] = JS_DupValue(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
+    JS_FreeValue(ctx, old);
+    return JS_UNDEFINED;
+}
+
+/* __tsaot_init(cell, value): the binding's declaration ran; returns value. */
+static JSValue tsaot_cell_init(JSContext *ctx, JSValueConst this_val, int argc,
+                               JSValueConst *argv)
+{
+    int32_t cell;
+    JSValue old;
+    if (argc < 2 || JS_ToInt32(ctx, &cell, argv[0]) || cell < 0 || cell >= tsaot_ncells)
+        return JS_ThrowRangeError(ctx, "__tsaot_init: bad cell");
+    old = tsaot_cells[cell];
+    tsaot_cells[cell] = JS_DupValue(ctx, argv[1]);
+    JS_FreeValue(ctx, old);
+    return JS_DupValue(ctx, argv[1]);
+}
+
+/* Set up the module state; returns the objects the module exports, or -1. */
+int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *cells_obj)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSClassDef def = { "TsaotState", .finalizer = tsaot_state_finalizer, .gc_mark = tsaot_state_mark };
+    int i;
+
+    if (tsaot_lock_builtins(ctx) < 0)
+        return -1;
+    /* Absolute limit for native frames, below the stack in use now. */
+    tsaot_stack_limit = (uintptr_t)__builtin_frame_address(0) - TSAOT_NATIVE_STACK;
+
+    for (i = 0; i < tsaot_natoms; i++) {
+        tsaot_atoms[i] = JS_NewAtom(ctx, tsaot_atom_names[i]);
+        if (tsaot_atoms[i] == JS_ATOM_NULL)
+            return -1;
+    }
+    for (i = 0; i < tsaot_nstrings; i++) {
+        tsaot_strings[i] = JS_NewStringLen(ctx, tsaot_string_data[i], tsaot_string_lens[i]);
+        if (JS_IsException(tsaot_strings[i]))
+            return -1;
+    }
+    for (i = 0; i < tsaot_ncells; i++)
+        tsaot_cells[i] = JS_UNINITIALIZED;
+
+    JS_NewClassID(rt, &tsaot_state_class);
+    if (JS_NewClass(rt, tsaot_state_class, &def) < 0)
+        return -1;
+    *state = JS_NewObjectClass(ctx, tsaot_state_class);
+    if (JS_IsException(*state))
+        return -1;
+    *init_fn = JS_NewCFunction(ctx, tsaot_cell_init, "__tsaot_init", 2);
+
+    /* Accessors through which interpreted code uses mutable cells. */
+    *cells_obj = JS_NewObjectProto(ctx, JS_NULL);
+    for (i = 0; i < tsaot_nmutable; i++) {
+        int cell = tsaot_mutable_cells[i];
+        JSAtom name = JS_NewAtom(ctx, tsaot_cell_names[cell]);
+        JSValue get = JS_NewCFunctionMagic(ctx, tsaot_cell_get, tsaot_cell_names[cell], 0,
+                                           JS_CFUNC_generic_magic, cell);
+        JSValue set = JS_NewCFunctionMagic(ctx, tsaot_cell_set, tsaot_cell_names[cell], 1,
+                                           JS_CFUNC_generic_magic, cell);
+        int r = JS_DefinePropertyGetSet(ctx, *cells_obj, name, get, set, 0);
+        JS_FreeAtom(ctx, name);
+        if (r < 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* Make the builtins that native code relies on immutable, before any user
