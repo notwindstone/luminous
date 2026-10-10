@@ -85,6 +85,8 @@ pub struct Func {
     pub is_closure: bool,
     /// Methods: `this` is passed in (borrowed).
     pub has_this: bool,
+    /// `async`: compiled as a resumable step function over a heap frame.
+    pub is_async: bool,
     pub body: Vec<Stmt>,
 }
 
@@ -114,6 +116,11 @@ pub enum Stmt {
     },
     /// Fresh, uninitialized boxes for these boxed locals (entering their scope).
     NewBoxes(Vec<LocalId>),
+    /// `await value` (`Any`) at statement level, then deliver the result.
+    Await {
+        value: Expr,
+        target: AwaitTarget,
+    },
     Break(LoopId),
     Continue(LoopId),
     Return(Option<Expr>),
@@ -193,6 +200,8 @@ pub enum ExprKind {
     DeleteElem(Box<Expr>, Box<Expr>),
     /// `callee(args)` with `this` undefined.
     CallValue(Box<Expr>, Vec<Expr>),
+    /// `f(args)` with an explicit `this`.
+    CallThis(Box<Expr>, Box<Expr>, Vec<Expr>),
     /// `obj.name(args)` / `obj[key](args)`, with `this` = obj.
     CallMethod(Box<Expr>, Key, Vec<Expr>),
     New(Box<Expr>, Vec<Expr>),
@@ -208,6 +217,19 @@ pub enum ExprKind {
     Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).
     Void(Box<Expr>),
+}
+
+/// Where an awaited value goes.
+#[derive(Debug, Clone, Copy)]
+pub enum AwaitTarget {
+    /// `await e;`
+    Discard,
+    /// `x = await e;` (an `Any` local)
+    Set(LocalId),
+    /// `const x = await e;` (an `Any` local)
+    Init(LocalId),
+    /// `return await e;`
+    Return,
 }
 
 #[derive(Debug, Clone)]

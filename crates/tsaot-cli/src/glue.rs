@@ -77,6 +77,22 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     }
     c.push_str("    { NULL, NULL, 0 },\n};\n\n");
 
+    // Step functions of async functions.
+    for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
+        if f.is_async {
+            writeln!(c, "extern TsaotStep tsaot_fn_{i};").unwrap();
+        }
+    }
+    c.push_str("TsaotStep *const tsaot_steps[] = {\n");
+    for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
+        if f.is_async {
+            writeln!(c, "    tsaot_fn_{i},").unwrap();
+        } else {
+            c.push_str("    NULL,\n");
+        }
+    }
+    c.push_str("    NULL,\n};\n\n");
+
     // Module state tables.
     let list = |items: Vec<String>| -> String {
         let mut s: String = items.into_iter().map(|i| format!("    {i},\n")).collect();

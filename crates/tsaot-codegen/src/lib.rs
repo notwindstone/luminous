@@ -132,6 +132,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_throw_uninitialized_atom", &[P, Int], &[]),
         ("tsaot_box_new", &[P, P], &[W, W]),
         ("tsaot_make_closure", &[P, Int, Int, P], &[W, W]),
+        ("tsaot_async_start", &[P, Int, Int, P, P], &[W, W]),
+        ("tsaot_async_step", &[P, P, Int, P, Int], &[]),
+        ("tsaot_await", &[P, P, W, W, Int], &[Int]),
         ("tsaot_pow", &[D, D], &[D]),
         ("tsaot_toint32_slow", &[D], &[Int]),
         ("fmod", &[D, D], &[D]),
@@ -222,6 +225,9 @@ impl<'m> Codegen<'m> {
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
     fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        if f.is_async {
+            return self.define_step(index, f);
+        }
         let ptr = self.module.target_config().pointer_type();
         let mut ctx = self.module.make_context();
         ctx.func.signature = native_signature(self.module, f);
@@ -258,6 +264,175 @@ impl<'m> Codegen<'m> {
         Ok(())
     }
 
+    /// Defines the step function of async function `index` (as
+    /// `tsaot_fn_<index>`): runs the body from the start (state 0) or from
+    /// the await it suspended at, until it completes or suspends again.
+    fn define_step(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        let ptr = self.module.target_config().pointer_type();
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = native_signature(self.module, f);
+        let env = self.env(&mut ctx.func);
+        let mut fctx = std::mem::take(&mut self.fctx);
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let raw = b.block_params(entry).to_vec();
+        let (js_ctx, slots, state, value, is_throw) = (raw[0], raw[1], raw[2], raw[3], raw[4]);
+        let exits = Exits { ret: Exit::Return, unwind: Exit::Return };
+        let mut l = Lower::new(b, env, js_ctx, ptr, f, &[], None, exits);
+        l.stack_check();
+        l.enter_async(slots, state, value, is_throw, f);
+        let mut b = l.body(&f.body);
+        b.seal_all_blocks();
+        b.finalize(self.module.target_config());
+        self.module.define_function(self.funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
+        self.module.clear_context(&mut ctx);
+        self.fctx = fctx;
+        Ok(())
+    }
+
+    /// The JS entry of async function `index`: type guards as for other
+    /// functions, then a new frame holding the arguments (and captured boxes,
+    /// and `this`), the first step, and the promise as the result.
+    fn define_async_entry(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        let ptr = self.module.target_config().pointer_type();
+        let mut ctx = self.module.make_context();
+        ctx.func.signature = fast_signature(self.module);
+        let env = self.env(&mut ctx.func);
+        let mut fctx = std::mem::take(&mut self.fctx);
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let mem = MemFlagsData::trusted();
+        let entry = b.create_block();
+        let decline = b.create_block();
+        b.set_cold_block(decline);
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let raw = b.block_params(entry).to_vec();
+        let (js_ctx, this_val, argc, argv, data) = (raw[0], (raw[1], raw[2]), raw[3], raw[4], raw[5]);
+
+        let required = f.params.iter().rposition(|&t| t != Ty::Any).map_or(0, |i| i + 1);
+        if required > 0 {
+            let enough = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, argc, required as i64);
+            let ok = b.create_block();
+            b.ins().brif(enough, ok, &[], decline, &[]);
+            b.switch_to_block(ok);
+        }
+        let mut params = vec![V::Void; f.params.len()];
+        for (k, &t) in f.params.iter().enumerate() {
+            if t != Ty::Any {
+                params[k] = unbox_arg(&mut b, t, argv, k, decline);
+            }
+        }
+
+        // The frame and the promise.
+        let (layout, this_slot, nslots) = lower::frame_layout(f);
+        let out = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            32,
+            4,
+        ));
+        let promise_addr = b.ins().stack_addr(ptr, out, 0);
+        let slots_addr = b.ins().stack_addr(ptr, out, 16);
+        let fi = b.ins().iconst(I32, index as i64);
+        let ns = b.ins().iconst(I32, nslots as i64);
+        let start = b.ins().call(env.helpers["tsaot_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr]);
+        let frame = b.inst_results(start).to_vec();
+        let failed = b.ins().icmp_imm_s(IntCC::Equal, frame[1], jsvalue::TAG_EXCEPTION);
+        let exception = b.create_block();
+        let ok = b.create_block();
+        b.set_cold_block(exception);
+        b.ins().brif(failed, exception, &[], ok, &[]);
+        b.switch_to_block(ok);
+        let slots = b.ins().load(ptr, mem, slots_addr, 0);
+        let dup = env.helpers["JS_DupValue"];
+        let store = |b: &mut FunctionBuilder, s: usize, p: Value, t: Value| {
+            let at = (s * jsvalue::SIZE) as i32;
+            b.ins().store(mem, p, slots, at);
+            b.ins().store(mem, t, slots, at + jsvalue::TAG_OFFSET);
+        };
+        let dup_value = |b: &mut FunctionBuilder, p: Value, t: Value| {
+            let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0);
+            let yes = b.create_block();
+            let join = b.create_block();
+            b.ins().brif(rc, yes, &[], join, &[]);
+            b.switch_to_block(yes);
+            b.ins().call(dup, &[js_ctx, p, t]);
+            b.ins().jump(join, &[]);
+            b.switch_to_block(join);
+        };
+        for (k, &t) in f.params.iter().enumerate() {
+            let s = layout[k];
+            let local_ty = f.locals[k];
+            let (p, tag) = match (t, params[k]) {
+                (Ty::Any, _) => {
+                    let (p, tag) = load_arg(&mut b, argc, argv, k);
+                    dup_value(&mut b, p, tag);
+                    (p, tag)
+                }
+                (_, V::Num(d)) if local_ty == Ty::Any => box_number(&mut b, d),
+                (_, V::Num(d)) => {
+                    (b.ins().bitcast(I64, MemFlagsData::new(), d), b.ins().iconst(I64, jsvalue::TAG_FLOAT64))
+                }
+                (_, V::Bool(x)) => (b.ins().uextend(I64, x), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
+                _ => unreachable!(),
+            };
+            store(&mut b, s, p, tag);
+        }
+        if f.is_closure {
+            // Captured boxes: new references for the frame.
+            for (c, &l) in f.captures.iter().enumerate() {
+                let at = (2 * c * jsvalue::SIZE) as i32;
+                let p = b.ins().load(I64, mem, data, at);
+                let t = b.ins().load(I64, mem, data, at + jsvalue::TAG_OFFSET);
+                let sp = b.ins().load(I64, mem, data, at + jsvalue::SIZE as i32);
+                dup_value(&mut b, p, t);
+                store(&mut b, layout[l], p, t);
+                let ft = b.ins().iconst(I64, jsvalue::TAG_FLOAT64);
+                store(&mut b, layout[l] + 1, sp, ft);
+            }
+        }
+        if let Some(s) = this_slot {
+            dup_value(&mut b, this_val.0, this_val.1);
+            store(&mut b, s, this_val.0, this_val.1);
+        }
+        // First step, then drop this entry's reference to the frame.
+        let undef_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            16,
+            4,
+        ));
+        let zero = b.ins().iconst(I64, 0);
+        let undef = b.ins().iconst(I64, jsvalue::TAG_UNDEFINED);
+        b.ins().stack_store(ptr, zero, undef_slot, 0);
+        b.ins().stack_store(ptr, undef, undef_slot, jsvalue::TAG_OFFSET);
+        let vaddr = b.ins().stack_addr(ptr, undef_slot, 0);
+        let st0 = b.ins().iconst(I32, 0);
+        let no = b.ins().iconst(I32, 0);
+        b.ins().call(env.helpers["tsaot_async_step"], &[js_ctx, slots, st0, vaddr, no]);
+        b.ins().call(env.helpers["JS_FreeValue"], &[js_ctx, frame[0], frame[1]]);
+        let pp = b.ins().load(I64, mem, promise_addr, 0);
+        let pt = b.ins().load(I64, mem, promise_addr, jsvalue::TAG_OFFSET);
+        b.ins().return_(&[pp, pt]);
+
+        b.switch_to_block(exception);
+        let z = b.ins().iconst(I64, 0);
+        let t = b.ins().iconst(I64, jsvalue::TAG_EXCEPTION);
+        b.ins().return_(&[z, t]);
+
+        b.switch_to_block(decline);
+        let z = b.ins().iconst(I64, 0);
+        let t = b.ins().iconst(I64, jsvalue::TAG_UNINITIALIZED);
+        b.ins().return_(&[z, t]);
+
+        b.seal_all_blocks();
+        b.finalize(self.module.target_config());
+        self.module.define_function(self.fast_funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
+        self.module.clear_context(&mut ctx);
+        self.fctx = fctx;
+        Ok(())
+    }
+
     /// Defines `tsaot_fast_<index>`, the JS-facing entry of native function
     /// `index`, with the engine's `JSCFunctionFast` signature:
     ///
@@ -273,6 +448,9 @@ impl<'m> Codegen<'m> {
     /// `JS_UNINITIALIZED`, which makes the engine call the interpreted
     /// fallback instead; an exception returns `JS_EXCEPTION`.
     fn define_fast(&mut self, index: usize, f: &ir::Func) -> Result<()> {
+        if f.is_async {
+            return self.define_async_entry(index, f);
+        }
         let ptr = self.module.target_config().pointer_type();
         let mut ctx = self.module.make_context();
         ctx.func.signature = fast_signature(self.module);
@@ -392,6 +570,20 @@ impl<'m> Codegen<'m> {
 fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
     let ptr = module.target_config().pointer_type();
     let mut sig = module.make_signature();
+    if f.is_async {
+        // The step function: (ctx, frame slots, state, value delivered on
+        // resumption, whether to throw it) -> completion value, or
+        // JS_UNINITIALIZED (suspended), or JS_EXCEPTION.
+        sig.params.extend([
+            AbiParam::new(ptr),
+            AbiParam::new(ptr),
+            AbiParam::new(I32),
+            AbiParam::new(ptr),
+            AbiParam::new(I32),
+        ]);
+        sig.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+        return sig;
+    }
     sig.params.push(AbiParam::new(ptr));
     if f.is_closure {
         // The closure's data slots.
@@ -582,6 +774,11 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
                 e(a, f);
                 xs.iter().for_each(|x| e(x, f));
             }
+            CallThis(a, b, xs) => {
+                e(a, f);
+                e(b, f);
+                xs.iter().for_each(|x| e(x, f));
+            }
             CallMethod(a, k, xs) => {
                 e(a, f);
                 if let ir::Key::Value(k) = k {
@@ -594,7 +791,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
     }
     for st in body {
         match st {
-            Stmt::Expr(x) | Stmt::Throw(x) => e(x, f),
+            Stmt::Expr(x) | Stmt::Throw(x) | Stmt::Await { value: x, .. } => e(x, f),
             Stmt::Return(x) => x.iter().for_each(|x| e(x, f)),
             Stmt::If(c, a, b) => {
                 e(c, f);

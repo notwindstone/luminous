@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,26 @@
+@@ -1052,6 +1059,28 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -38,10 +38,12 @@
 +                                   JSValueConst op1);
 +JS_EXTERN JSValue JS_GetGlobalVariable(JSContext *ctx, JSAtom prop);
 +JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, JSAtom prop, JSValue val);
++JS_EXTERN int JS_AwaitValue(JSContext *ctx, JSValueConst value,
++                            JSValueConst on_fulfilled, JSValueConst on_rejected);
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1369,10 @@
+@@ -1342,6 +1371,10 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -299,3 +301,30 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
+@@ -56106,6 +56282,26 @@
+     return result_promise;
+ }
+ 
++/* `await value` for code generated outside of the interpreter: as the
++   interpreter's await, PromiseResolve(%Promise%, value) then
++   PerformPromiseThen(promise, on_fulfilled, on_rejected) with no result
++   capability (no observable `then` lookups). Returns -1 on exception. */
++int JS_AwaitValue(JSContext *ctx, JSValueConst value, JSValueConst on_fulfilled,
++                  JSValueConst on_rejected)
++{
++    JSValueConst funcs[2] = { on_fulfilled, on_rejected };
++    JSValueConst none[2] = { JS_UNDEFINED, JS_UNDEFINED };
++    JSValue promise;
++    int res;
++
++    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, 0);
++    if (JS_IsException(promise))
++        return -1;
++    res = perform_promise_then(ctx, promise, funcs, none);
++    JS_FreeValue(ctx, promise);
++    return res;
++}
++
+ static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+ {

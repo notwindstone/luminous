@@ -169,6 +169,132 @@ void tsaot_throw_uninitialized_atom(JSContext *ctx, JSAtom name)
     JS_FreeCString(ctx, s);
 }
 
+/* ---- async functions ---- */
+
+/* The heap frame of a running async function: its locals while it is
+   suspended, and its promise's resolving functions. */
+typedef struct TsaotFrame {
+    void *self;               /* the frame object (not a counted reference) */
+    JSValue resolve, reject;
+    int fn, nslots;
+    JSValue slots[];
+} TsaotFrame;
+
+static JSClassID tsaot_frame_class;
+
+static TsaotFrame *tsaot_frame_of(JSValue *slots)
+{
+    return (TsaotFrame *)((char *)slots - offsetof(TsaotFrame, slots));
+}
+
+static void tsaot_frame_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    TsaotFrame *f = JS_GetOpaque(val, tsaot_frame_class);
+    int i;
+    if (!f)
+        return;
+    JS_FreeValueRT(rt, f->resolve);
+    JS_FreeValueRT(rt, f->reject);
+    for (i = 0; i < f->nslots; i++)
+        JS_FreeValueRT(rt, f->slots[i]);
+    js_free_rt(rt, f);
+}
+
+/* While the step function runs, it has moved the locals out of the slots
+   (they hold `undefined`), so this only sees values the frame owns. */
+static void tsaot_frame_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    TsaotFrame *f = JS_GetOpaque(val, tsaot_frame_class);
+    int i;
+    if (!f)
+        return;
+    JS_MarkValue(rt, f->resolve, mark_func);
+    JS_MarkValue(rt, f->reject, mark_func);
+    for (i = 0; i < f->nslots; i++)
+        JS_MarkValue(rt, f->slots[i], mark_func);
+}
+
+/* A new frame for async function `fn` (returned), its promise and slots. */
+JSValue tsaot_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots)
+{
+    TsaotFrame *f = js_mallocz(ctx, sizeof(*f) + nslots * sizeof(JSValue));
+    JSValue funcs[2], obj;
+    int i;
+    if (!f)
+        return JS_EXCEPTION;
+    f->fn = fn;
+    f->nslots = nslots;
+    f->resolve = f->reject = JS_UNDEFINED;
+    for (i = 0; i < nslots; i++)
+        f->slots[i] = JS_UNDEFINED;
+    obj = JS_NewObjectClass(ctx, tsaot_frame_class);
+    if (JS_IsException(obj)) {
+        js_free(ctx, f);
+        return obj;
+    }
+    JS_SetOpaque(obj, f);
+    f->self = JS_VALUE_GET_PTR(obj);
+    *promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(*promise)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    f->resolve = funcs[0];
+    f->reject = funcs[1];
+    *slots = f->slots;
+    return obj;
+}
+
+/* Run the async function from `state` (0: start) with `value` delivered at
+   its await (thrown there if `is_throw`); settle its promise on completion. */
+void tsaot_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw)
+{
+    TsaotFrame *f = tsaot_frame_of(slots);
+    JSValue r = tsaot_steps[f->fn](ctx, slots, state, value, is_throw);
+    JSValue settle, arg, ret;
+    if (JS_IsUninitialized(r))
+        return; /* suspended at an await */
+    if (JS_IsException(r)) {
+        settle = f->reject;
+        arg = JS_GetException(ctx);
+    } else {
+        settle = f->resolve;
+        arg = r;
+    }
+    ret = JS_Call(ctx, settle, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    JS_FreeValue(ctx, arg);
+    JS_FreeValue(ctx, ret);
+}
+
+static JSValue tsaot_async_resume(JSContext *ctx, JSValueConst this_val, int argc,
+                                  JSValueConst *argv, int is_throw, JSValueConst *data)
+{
+    TsaotFrame *f = JS_GetOpaque(data[0], tsaot_frame_class);
+    JSValue value = argc > 0 ? argv[0] : JS_UNDEFINED;
+    tsaot_async_step(ctx, f->slots, JS_VALUE_GET_INT(data[1]), &value, is_throw);
+    return JS_UNDEFINED;
+}
+
+/* `await value` at resume point `state`: continue the frame when the value
+   settles. Takes ownership of `value`. Returns -1 on exception. */
+int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
+{
+    TsaotFrame *f = tsaot_frame_of(slots);
+    JSValue data[2], on_fulfilled, on_rejected;
+    int ret = -1;
+    data[0] = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, f->self));
+    data[1] = JS_NewInt32(ctx, state);
+    on_fulfilled = JS_NewCFunctionData(ctx, tsaot_async_resume, 1, 0, 2, data);
+    on_rejected = JS_NewCFunctionData(ctx, tsaot_async_resume, 1, 1, 2, data);
+    if (!JS_IsException(on_fulfilled) && !JS_IsException(on_rejected))
+        ret = JS_AwaitValue(ctx, value, on_fulfilled, on_rejected);
+    JS_FreeValue(ctx, on_fulfilled);
+    JS_FreeValue(ctx, on_rejected);
+    JS_FreeValue(ctx, data[0]);
+    JS_FreeValue(ctx, value);
+    return ret;
+}
+
 /* ---- module state: cells, string constants, atoms ---- */
 
 static JSClassID tsaot_state_class;
@@ -261,6 +387,12 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
         JSClassDef box_def = { "TsaotBox", .finalizer = tsaot_box_finalizer, .gc_mark = tsaot_box_mark };
         JS_NewClassID(rt, &tsaot_box_class);
         if (JS_NewClass(rt, tsaot_box_class, &box_def) < 0)
+            return -1;
+    }
+    {
+        JSClassDef frame_def = { "TsaotFrame", .finalizer = tsaot_frame_finalizer, .gc_mark = tsaot_frame_mark };
+        JS_NewClassID(rt, &tsaot_frame_class);
+        if (JS_NewClass(rt, tsaot_frame_class, &frame_def) < 0)
             return -1;
     }
     JS_NewClassID(rt, &tsaot_state_class);

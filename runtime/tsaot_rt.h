@@ -44,6 +44,12 @@ JSValue tsaot_box_new(JSContext *ctx, JSValue **slot);
 void tsaot_throw_uninitialized_atom(JSContext *ctx, JSAtom name);
 /* Defined by the generated glue. */
 JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data);
+/* Step functions of async functions (NULL for others), by function index. */
+typedef JSValue TsaotStep(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
+extern TsaotStep *const tsaot_steps[];
+JSValue tsaot_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots);
+void tsaot_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
+int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);

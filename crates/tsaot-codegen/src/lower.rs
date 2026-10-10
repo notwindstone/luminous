@@ -200,6 +200,7 @@ pub(crate) struct Lower<'a> {
     exits: Exits,
     /// Methods: the receiver (borrowed).
     pub(crate) this: Option<(Value, Value)>,
+    async_cx: Option<AsyncCx>,
 }
 
 impl<'a> Lower<'a> {
@@ -225,7 +226,9 @@ impl<'a> Lower<'a> {
                 _ if f.boxed[i] => LVar::Boxed {
                     obj: (b.declare_var(I64), b.declare_var(I64)),
                     slot: b.declare_var(I64),
-                    owned: !f.captures.contains(&i),
+                    // Async functions own every box (captures are dup'ed
+                    // into their frame).
+                    owned: f.is_async || !f.captures.contains(&i),
                 },
                 Ty::Any => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
@@ -255,6 +258,7 @@ impl<'a> Lower<'a> {
             ret_block,
             exits,
             this: None,
+            async_cx: None,
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -563,18 +567,31 @@ impl<'a> Lower<'a> {
             self.b.ins().jump(rb, &args);
         }
 
+        let is_async = self.async_cx.is_some();
+
         // Normal exit: free the locals, then leave with the return value.
         let rb = self.ret_block;
         self.b.switch_to_block(rb);
         let rv: Vec<Value> = self.b.block_params(rb).to_vec();
         self.free_all_locals();
-        match self.exits.ret {
-            Exit::Return => {
-                self.b.ins().return_(&rv);
-            }
-            Exit::Jump(blk) => {
-                let args: Vec<BlockArg> = rv.into_iter().map(BlockArg::Value).collect();
-                self.b.ins().jump(blk, &args);
+        if is_async {
+            // The value the promise resolves to.
+            let (p, t) = match from_values(self.ret, &rv) {
+                V::Num(d) => self.box_number(d),
+                V::Bool(x) => (self.b.ins().uextend(I64, x), self.b.ins().iconst(I64, TAG_BOOL)),
+                V::Any(p, t) => (p, t),
+                V::Void => (self.b.ins().iconst(I64, 0), self.b.ins().iconst(I64, TAG_UNDEFINED)),
+            };
+            self.b.ins().return_(&[p, t]);
+        } else {
+            match self.exits.ret {
+                Exit::Return => {
+                    self.b.ins().return_(&rv);
+                }
+                Exit::Jump(blk) => {
+                    let args: Vec<BlockArg> = rv.into_iter().map(BlockArg::Value).collect();
+                    self.b.ins().jump(blk, &args);
+                }
             }
         }
 
@@ -582,19 +599,27 @@ impl<'a> Lower<'a> {
         let ee = self.exc_exit;
         self.b.switch_to_block(ee);
         self.free_all_locals();
-        match self.exits.unwind {
-            Exit::Return => {
-                let addr = self.b.ins().symbol_value(self.ptr, self.env.unwinding);
-                let one = self.b.ins().iconst(I8, 1);
-                self.b.ins().store(Self::mem(), one, addr, 0);
-                let z = self.zero(self.ret);
-                let vals = z.values();
-                self.b.ins().return_(&vals);
-            }
-            Exit::Jump(blk) => {
-                self.b.ins().jump(blk, &[]);
+        if is_async {
+            // The exception is pending; the runtime rejects the promise.
+            let z = self.b.ins().iconst(I64, 0);
+            let t = self.b.ins().iconst(I64, TAG_EXCEPTION);
+            self.b.ins().return_(&[z, t]);
+        } else {
+            match self.exits.unwind {
+                Exit::Return => {
+                    let addr = self.b.ins().symbol_value(self.ptr, self.env.unwinding);
+                    let one = self.b.ins().iconst(I8, 1);
+                    self.b.ins().store(Self::mem(), one, addr, 0);
+                    let z = self.zero(self.ret);
+                    let vals = z.values();
+                    self.b.ins().return_(&vals);
+                }
+                Exit::Jump(blk) => {
+                    self.b.ins().jump(blk, &[]);
+                }
             }
         }
+        self.emit_dispatch();
 
         // Exception edges: free their live temporaries, then go to the handler.
         let pending = std::mem::take(&mut self.pending);
@@ -620,6 +645,7 @@ impl<'a> Lower<'a> {
         match s {
             Stmt::Expr(e) => self.effect(e),
             Stmt::NewBoxes(ls) => self.new_boxes(ls, false),
+            Stmt::Await { value, target } => self.await_stmt(value, *target),
             Stmt::Block(b) => self.stmts(b),
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
@@ -1293,6 +1319,16 @@ impl<'a> Lower<'a> {
                 let undef = self.konst(0, TAG_UNDEFINED);
                 self.call_values(fv, undef, args)
             }
+            ExprKind::CallThis(f, this, args) => {
+                let fv = self.expr(f);
+                self.hold(fv);
+                let tv = self.expr(this);
+                self.hold(tv);
+                let r = self.call_values(fv, tv, args);
+                self.release(tv);
+                self.free_v(tv);
+                r
+            }
             ExprKind::CallMethod(o, key, args) => {
                 // The method is read before the arguments are evaluated.
                 let obj = self.expr(o);
@@ -1947,5 +1983,197 @@ impl V {
             (V::Num(v), Ty::Bool) => V::Bool(v),
             (v, _) => v,
         }
+    }
+}
+
+/// Frame layout of an async function: per local, its first slot (boxed
+/// locals use two: the box object and the address of its value), then the
+/// slot of `this` (methods), and the total number of slots.
+pub(crate) fn frame_layout(f: &ir::Func) -> (Vec<usize>, Option<usize>, usize) {
+    let mut at = Vec::with_capacity(f.locals.len());
+    let mut n = 0;
+    for i in 0..f.locals.len() {
+        at.push(n);
+        n += if f.boxed[i] { 2 } else { 1 };
+    }
+    let this = f.has_this.then(|| {
+        n += 1;
+        n - 1
+    });
+    (at, this, n)
+}
+
+/// State of an async step function being lowered.
+pub(crate) struct AsyncCx {
+    /// The frame's slots (`JSValue *`).
+    pub slots: Value,
+    pub state: Value,
+    /// The value delivered on resumption (`JSValue *`, borrowed).
+    pub value: Value,
+    pub is_throw: Value,
+    pub layout: Vec<usize>,
+    /// Resume points, by state - 1.
+    resumes: Vec<Block>,
+    dispatch: Block,
+}
+
+impl Lower<'_> {
+    /// Start lowering an async step function: move the locals out of the
+    /// frame, then dispatch on the state (0: start of the body).
+    pub(crate) fn enter_async(&mut self, slots: Value, state: Value, value: Value, is_throw: Value, f: &ir::Func) {
+        let (layout, this_slot, _) = frame_layout(f);
+        for (l, &s) in layout.iter().enumerate() {
+            let at = (s * SIZE) as i32;
+            let p = self.b.ins().load(I64, Self::mem(), slots, at);
+            let t = self.b.ins().load(I64, Self::mem(), slots, at + TAG_OFFSET);
+            match self.vars[l] {
+                LVar::Boxed { obj: (op, ot), slot, .. } => {
+                    let sp = self.b.ins().load(I64, Self::mem(), slots, at + SIZE as i32);
+                    self.b.def_var(op, p);
+                    self.b.def_var(ot, t);
+                    self.b.def_var(slot, sp);
+                }
+                LVar::Two(vp, vt) => {
+                    self.b.def_var(vp, p);
+                    self.b.def_var(vt, t);
+                }
+                LVar::One(v) => {
+                    let x = match self.locals[l] {
+                        Ty::F64 => self.b.ins().bitcast(F64, MemFlagsData::new(), p),
+                        _ => self.b.ins().ireduce(I8, p),
+                    };
+                    self.b.def_var(v, x);
+                }
+            }
+            // The frame no longer owns these values while the step runs.
+            let zero = self.b.ins().iconst(I64, 0);
+            let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
+            self.b.ins().store(Self::mem(), zero, slots, at);
+            self.b.ins().store(Self::mem(), undef, slots, at + TAG_OFFSET);
+        }
+        if let Some(s) = this_slot {
+            // `this` stays owned by the frame; borrowed here.
+            let at = (s * SIZE) as i32;
+            let p = self.b.ins().load(I64, Self::mem(), slots, at);
+            let t = self.b.ins().load(I64, Self::mem(), slots, at + TAG_OFFSET);
+            self.this = Some((p, t));
+        }
+        let dispatch = self.b.create_block();
+        self.b.ins().jump(dispatch, &[]);
+        let start = self.b.create_block();
+        self.b.switch_to_block(start);
+        self.async_cx = Some(AsyncCx { slots, state, value, is_throw, layout, resumes: vec![start], dispatch });
+    }
+
+    /// Move every local into the frame (suspending).
+    fn spill_locals(&mut self) {
+        let cx = self.async_cx.as_ref().unwrap();
+        let (slots, layout) = (cx.slots, cx.layout.clone());
+        for (l, &s) in layout.iter().enumerate() {
+            let at = (s * SIZE) as i32;
+            let (p, t) = match self.vars[l] {
+                LVar::Boxed { obj: (op, ot), slot, .. } => {
+                    let sp = self.b.use_var(slot);
+                    let ft = self.b.ins().iconst(I64, TAG_FLOAT64);
+                    self.b.ins().store(Self::mem(), sp, slots, at + SIZE as i32);
+                    self.b.ins().store(Self::mem(), ft, slots, at + SIZE as i32 + TAG_OFFSET);
+                    (self.b.use_var(op), self.b.use_var(ot))
+                }
+                LVar::Two(vp, vt) => (self.b.use_var(vp), self.b.use_var(vt)),
+                LVar::One(v) => {
+                    let x = self.b.use_var(v);
+                    match self.locals[l] {
+                        Ty::F64 => {
+                            let p = self.b.ins().bitcast(I64, MemFlagsData::new(), x);
+                            (p, self.b.ins().iconst(I64, TAG_FLOAT64))
+                        }
+                        _ => {
+                            let p = self.b.ins().uextend(I64, x);
+                            (p, self.b.ins().iconst(I64, TAG_BOOL))
+                        }
+                    }
+                }
+            };
+            self.b.ins().store(Self::mem(), p, slots, at);
+            self.b.ins().store(Self::mem(), t, slots, at + TAG_OFFSET);
+        }
+    }
+
+    /// `await value`: register the continuation, spill, return "suspended";
+    /// lowering continues at the resume point.
+    fn await_stmt(&mut self, value: &Expr, target: ir::AwaitTarget) {
+        let resume = self.b.create_block();
+        let state = {
+            let cx = self.async_cx.as_mut().expect("await in an async function");
+            cx.resumes.push(resume);
+            cx.resumes.len() - 1
+        };
+        let (p, t) = self.expr(value).any();
+        let slots = self.async_cx.as_ref().unwrap().slots;
+        let st = self.b.ins().iconst(I32, state as i64);
+        let ctx = self.ctx;
+        // Takes ownership of the value.
+        let r = self.helper("tsaot_await", &[ctx, slots, p, t, st]);
+        self.check_int(r[0]);
+        self.spill_locals();
+        let z = self.b.ins().iconst(I64, 0);
+        let suspended = self.b.ins().iconst(I64, TAG_UNINITIALIZED);
+        self.b.ins().return_(&[z, suspended]);
+
+        // Resumed: the locals come back from the frame (see enter_async).
+        self.b.switch_to_block(resume);
+        let (vptr, is_throw) = {
+            let cx = self.async_cx.as_ref().unwrap();
+            (cx.value, cx.is_throw)
+        };
+        let vp = self.b.ins().load(I64, Self::mem(), vptr, 0);
+        let vt = self.b.ins().load(I64, Self::mem(), vptr, TAG_OFFSET);
+        self.dup((vp, vt));
+        let throw = self.b.create_block();
+        let ok = self.b.create_block();
+        self.b.set_cold_block(throw);
+        self.b.ins().brif(is_throw, throw, &[], ok, &[]);
+        self.b.switch_to_block(throw);
+        // A rejection is thrown at the await.
+        self.helper("JS_Throw", &[ctx, vp, vt]);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(ok);
+        let v = V::Any(vp, vt);
+        match target {
+            ir::AwaitTarget::Discard => self.free((vp, vt)),
+            ir::AwaitTarget::Set(l) => self.set_local(l, v),
+            ir::AwaitTarget::Init(l) => self.init_local(l, v),
+            ir::AwaitTarget::Return => {
+                let v = if self.ret == Ty::Void {
+                    self.free((vp, vt));
+                    V::Void
+                } else {
+                    v
+                };
+                if self.scopes.iter().any(|s| matches!(s, Scope::Finally { .. })) {
+                    self.hold(v);
+                    self.run_finally_until(0);
+                    self.release(v);
+                }
+                let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
+                let rb = self.ret_block;
+                self.b.ins().jump(rb, &args);
+                self.after_terminator();
+            }
+        }
+    }
+
+    /// The dispatch on the resume state.
+    fn emit_dispatch(&mut self) {
+        let Some(cx) = self.async_cx.take() else { return };
+        self.b.switch_to_block(cx.dispatch);
+        for (k, &blk) in cx.resumes.iter().enumerate().skip(1) {
+            let is_k = self.b.ins().icmp_imm_s(IntCC::Equal, cx.state, k as i64);
+            let next = self.b.create_block();
+            self.b.ins().brif(is_k, blk, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(cx.resumes[0], &[]);
     }
 }
