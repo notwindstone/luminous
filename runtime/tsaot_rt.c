@@ -299,6 +299,8 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 
 static JSClassID tsaot_state_class;
 
+static int tsaot_ic_count(void);
+
 static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
@@ -316,6 +318,11 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, tsaot_ta_pins[i]);
         tsaot_ta_pins[i] = JS_UNDEFINED;
     }
+    for (i = 0; i < tsaot_ic_count(); i++) {
+        if (tsaot_ics[i].shape)
+            JS_FreeCachedShape(rt, tsaot_ics[i].shape);
+        tsaot_ics[i].shape = NULL;
+    }
 }
 
 /* The cells are reachable from native code at any time, so they are roots
@@ -329,6 +336,9 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
         JS_MarkValue(rt, tsaot_cells[i], mark_func);
     for (i = 0; i < TSAOT_TYPED_ARRAYS; i++)
         JS_MarkValue(rt, tsaot_ta_pins[i], mark_func);
+    for (i = 0; i < tsaot_ic_count(); i++)
+        if (tsaot_ics[i].shape)
+            JS_MarkCachedShape(rt, tsaot_ics[i].shape, mark_func);
 }
 
 static JSValue tsaot_cell_get(JSContext *ctx, JSValueConst this_val, int argc,
@@ -476,4 +486,47 @@ int tsaot_lock_builtins(JSContext *ctx)
     }
     JS_FreeValue(ctx, r);
     return 0;
+}
+
+/* ---- inline caches ---- */
+
+static int tsaot_ic_count(void)
+{
+    return &tsaot_nics ? tsaot_nics : 0;
+}
+
+static void tsaot_ic_fill(JSContext *ctx, JSValue obj, JSAtom prop, bool for_write, TsaotIC *ic)
+{
+    void *shape;
+    int slot = JS_CacheOwnProperty(ctx, obj, prop, for_write, &shape);
+    if (slot < 0)
+        return;
+    if (ic->shape)
+        JS_FreeCachedShape(JS_GetRuntime(ctx), ic->shape);
+    ic->shape = shape;
+    ic->slot = slot;
+}
+
+/* A cache miss reading obj.prop (obj borrowed). */
+JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
+{
+    JSValue v = JS_GetProperty(ctx, obj, prop);
+    if (!JS_IsException(v))
+        tsaot_ic_fill(ctx, obj, prop, false, ic);
+    return v;
+}
+
+/* A cache miss writing obj.prop = val (obj borrowed, val consumed). Only
+ * writes that find the property are cached: a site that adds it sees the
+ * object's shape from before. */
+int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic)
+{
+    void *before = NULL;
+    int r;
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+        before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    r = JS_SetProperty(ctx, obj, prop, val);
+    if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
+        tsaot_ic_fill(ctx, obj, prop, true, ic);
+    return r;
 }

@@ -56,6 +56,18 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 extern JSValue tsaot_ta_pins[];
 extern void *tsaot_ta_shapes[];
 
+/* Inline caches of own data properties, one per property access site in
+ * native code (defined by it; absent without native code). */
+typedef struct TsaotIC {
+    void *shape; /* a referenced shape, or NULL */
+    uint32_t slot;
+    uint32_t unused;
+} TsaotIC;
+extern TsaotIC tsaot_ics[] __attribute__((weak));
+extern const int32_t tsaot_nics __attribute__((weak));
+JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
+int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
+
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);
 int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *cells_obj);

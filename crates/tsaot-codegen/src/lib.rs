@@ -124,6 +124,7 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Vec<u8>> {
         cg.define(i, f).with_context(|| format!("compiling `{}`", f.name))?;
         cg.define_fast(i, f).with_context(|| format!("compiling the entry of `{}`", f.name))?;
     }
+    cg.define_ics()?;
     Ok(module.finish().emit()?)
 }
 
@@ -157,6 +158,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_GetException", &[P], &[W, W]),
         ("JS_Throw", &[P, W, W], &[W, W]),
         ("tsaot_set_elem", &[P, P], &[Int]),
+        ("tsaot_ic_get", &[P, W, W, Int, P], &[W, W]),
+        ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
@@ -193,7 +196,9 @@ struct Codegen<'m> {
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 6],
+    data: [DataId; 7],
+    /// Inline caches allocated so far (`tsaot_ics` entries).
+    ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
     fctx: FunctionBuilderContext,
 }
@@ -241,12 +246,15 @@ impl<'m> Codegen<'m> {
         {
             data.push(module.declare_data(name, Linkage::Import, true, false)?);
         }
+        // Defined here, once all sites are known (`define_ics`).
+        data.push(module.declare_data("tsaot_ics", Linkage::Export, true, false)?);
         Ok(Codegen {
             module,
             funcs,
             fast_funcs,
             helpers,
             data: data.try_into().unwrap(),
+            ics: Default::default(),
             closure_base: m.funcs.len(),
             fctx: FunctionBuilderContext::new(),
         })
@@ -255,7 +263,7 @@ impl<'m> Codegen<'m> {
     fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
         let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
-        let [stack_limit, unwinding, cells, strings, atoms, ta_shapes] =
+        let [stack_limit, unwinding, cells, strings, atoms, ta_shapes, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
         Env {
             helpers,
@@ -266,8 +274,25 @@ impl<'m> Codegen<'m> {
             strings,
             atoms,
             ta_shapes,
+            ics,
+            next_ic: self.ics.clone(),
             closure_base: self.closure_base,
         }
+    }
+
+    /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, 16 bytes per
+    /// entry, zeroed) and its length `tsaot_nics`.
+    fn define_ics(&mut self) -> Result<()> {
+        let n = self.ics.get();
+        let mut table = cranelift_module::DataDescription::new();
+        table.define_zeroinit(n.max(1) * 16);
+        table.set_align(8);
+        self.module.define_data(self.data[6], &table)?;
+        let count = self.module.declare_data("tsaot_nics", Linkage::Export, false, false)?;
+        let mut desc = cranelift_module::DataDescription::new();
+        desc.define((n as i32).to_le_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(count, &desc)?;
+        Ok(())
     }
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
@@ -788,80 +813,7 @@ fn all_math(m: &ir::Module) -> Vec<MathFn> {
     out
 }
 
-/// Visit `x` and every expression in it.
-pub(crate) fn walk_expr(x: &Expr, f: &mut impl FnMut(&Expr)) {
-    f(x);
-    use ExprKind::*;
-    match &x.kind {
-        Num(_)
-        | Bool(_)
-        | Local(_)
-        | Update { .. }
-        | Undefined
-        | Null
-        | Str(_)
-        | Cell(_)
-        | Global(_)
-        | GlobalOrUndefined(_)
-        | This
-        | Closure(..) => {}
-        SetLocal(_, a)
-        | InitLocal(_, a)
-        | Unary(_, a)
-        | Truthy(a)
-        | Box(a)
-        | AnyUnary(_, a)
-        | SetCell(_, a)
-        | SetGlobal(_, a)
-        | GetProp(a, _)
-        | Length(a, _)
-        | DeleteProp(a, _)
-        | Void(a) => walk_expr(a, f),
-        TypedGet(_, a, b) => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-        }
-        TypedSet(_, a, b, c) => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-            walk_expr(c, f);
-        }
-        Binary(_, a, b)
-        | Compare(_, a, b)
-        | Logical(_, a, b)
-        | AnyBinary(_, a, b)
-        | AnyCompare(_, a, b)
-        | SetProp(a, _, b)
-        | GetElem(a, b)
-        | DeleteElem(a, b) => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-        }
-        Cond(a, b, c) | SetElem(a, b, c) => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-            walk_expr(c, f);
-        }
-        Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => xs.iter().for_each(|x| walk_expr(x, f)),
-        CallValue(a, xs) | New(a, xs) => {
-            walk_expr(a, f);
-            xs.iter().for_each(|x| walk_expr(x, f));
-        }
-        CallThis(a, b, xs) => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-            xs.iter().for_each(|x| walk_expr(x, f));
-        }
-        CallMethod(a, k, xs) => {
-            walk_expr(a, f);
-            if let ir::Key::Value(k) = k {
-                walk_expr(k, f);
-            }
-            xs.iter().for_each(|x| walk_expr(x, f));
-        }
-        Object(props) => props.iter().for_each(|(_, x)| walk_expr(x, f)),
-    }
-}
+pub(crate) use tsaot_front::ir::visit as walk_expr;
 
 /// Visit every expression in `body`.
 fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {

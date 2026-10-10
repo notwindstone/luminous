@@ -120,6 +120,10 @@ regular call path's generated code alone.
   the interpreter's semantics, for the slow paths of native code;
 - `JS_GetGlobalVariable` / `JS_SetGlobalVariable`: strict-mode global access;
 - `JS_AwaitValue`: resume a native async function when a value settles;
+- `JS_CacheOwnProperty` and friends: inline caches. A cache holds a reference
+  to a shape, which makes the engine clone that shape instead of modifying
+  it in place, so every object with the shape has the property in the same
+  slot;
 - `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
   counts, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
@@ -133,7 +137,9 @@ regular call path's generated code alone.
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
 - **JS values**: `let` / `const` / `var` holding anything, plus:
   - string, template, object and array literals;
-  - property and element access, assignment and `delete`;
+  - property and element access, assignment and `delete`. Own data
+    properties are read and written through per-site inline caches: a shape
+    check, then a load or store;
   - `typeof`, `in`, `instanceof`, `new`;
   - calls to any function: native functions directly, interpreted ones
     through the engine;

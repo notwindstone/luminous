@@ -830,7 +830,8 @@ enum Place {
     Local(ir::LocalId),
     Cell(ir::CellId),
     Global(ir::AtomId),
-    /// Object and key, already stored in `Any` temporaries.
+    /// Object and key in locals: temporaries, or (the object) a plain local
+    /// used in place, which `assign` copies when the value may reassign it.
     Prop(ir::LocalId, ir::AtomId),
     Elem(ir::LocalId, ir::LocalId),
 }
@@ -1283,6 +1284,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     fn expr_stmt(&mut self, e: &'a Expression<'a>) -> R<Stmt> {
         match e.without_parentheses() {
+            Expression::UpdateExpression(u) => Ok(Stmt::Expr(self.update(u, false)?)),
             Expression::AwaitExpression(aw) => {
                 self.await_allowed(aw.span)?;
                 let value = any(self.expr(&aw.argument)?);
@@ -1647,7 +1649,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Expr::new(ty, ExprKind::Cond(Box::new(test), Box::new(coerce(a, ty)), Box::new(coerce(b, ty))))
             }
             Expression::AssignmentExpression(a) => self.assign(a)?,
-            Expression::UpdateExpression(u) => self.update(u)?,
+            Expression::UpdateExpression(u) => self.update(u, true)?,
             Expression::SequenceExpression(s) => {
                 let mut xs: Vec<Expr> = Vec::new();
                 for x in &s.expressions {
@@ -1908,20 +1910,33 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 },
             },
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                let atom = self.m.atom(m.property.name.as_str());
+                if let Some(l) = self.plain_local(&m.object) {
+                    // Used in place; `assign` copies it if the value may
+                    // reassign it.
+                    return Ok((vec![], Place::Prop(l, atom), None));
+                }
                 let obj = any(self.expr(&m.object)?);
                 let t = self.temp(Ty::Any);
-                let atom = self.m.atom(m.property.name.as_str());
                 (vec![set(t, obj)], Place::Prop(t, atom), None)
             }
             SimpleAssignmentTarget::ComputedMemberExpression(m) => {
                 // Typed arrays keep their type.
+                let direct = self.plain_local(&m.object);
                 let obj = self.expr(&m.object)?;
                 let obj = if matches!(obj.ty, Ty::Arr(_)) { obj } else { any(obj) };
-                let t = self.temp(obj.ty);
-                let mut setup = vec![set(t, obj)];
                 let mark = self.pre.len();
                 let key = self.elem_key(&m.expression)?;
-                self.flush_setup(&mut setup, mark);
+                let mut setup = Vec::new();
+                let t = match direct {
+                    Some(l) if self.pre.len() == mark && !matches!(&key, Key::Value(k) if ir::assigns_local(k, l)) => l,
+                    _ => {
+                        let t = self.temp(obj.ty);
+                        setup.push(set(t, obj));
+                        self.flush_setup(&mut setup, mark);
+                        t
+                    }
+                };
                 match key {
                     Key::Atom(a) => (setup, Place::Prop(t, a), None),
                     Key::Value(k) => {
@@ -1937,6 +1952,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             SimpleAssignmentTarget::TSTypeAssertion(a) => return self.place_expr(&a.expression),
             other => return reject(other.span(), "unsupported assignment target"),
         })
+    }
+
+    /// A local that `e` names and that only this function's own code can
+    /// assign (not captured), holding a JS value.
+    fn plain_local(&self, e: &'a Expression<'a>) -> Option<ir::LocalId> {
+        let Expression::Identifier(id) = e.without_parentheses() else { return None };
+        let &l = self.sym_local.get(&self.resolve(id)?)?;
+        (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_))).then_some(l)
     }
 
     fn place_expr(&mut self, e: &'a Expression<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
@@ -2047,11 +2070,29 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let [cur] = cur;
             arith(op, cur, rhs)
         };
+        // An object held in a named local is used in place, unless the value
+        // may reassign the local (or awaits run in between): then the object
+        // is copied first, as JS evaluates it before the value.
+        let mut place = place;
+        if let Place::Prop(o, _) | Place::Elem(o, _) = place
+            && self.local_names[o].is_some()
+            && (ir::assigns_local(&value, o) || self.pre.len() > mark)
+        {
+            let t = self.temp(self.locals[o]);
+            setup.insert(0, set(t, self.local(o)));
+            self.flush_setup(&mut setup, mark);
+            place = match place {
+                Place::Prop(_, a) => Place::Prop(t, a),
+                Place::Elem(_, k) => Place::Elem(t, k),
+                other => other,
+            };
+        }
         setup.push(self.write(&place, sym, value, a.span)?);
         Ok(seq(setup))
     }
 
-    fn update(&mut self, u: &'a UpdateExpression<'a>) -> R<Expr> {
+    /// `x++` and friends; `used`: whether the value of the expression is.
+    fn update(&mut self, u: &'a UpdateExpression<'a>, used: bool) -> R<Expr> {
         let (mut setup, place, sym) = self.place(&u.argument)?;
         let inc = u.operator == UpdateOperator::Increment;
         if let Place::Local(l) = place
@@ -2080,18 +2121,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             return Ok(seq(setup));
         }
-        // old = ToNumeric(current); place = old ± 1; value: old or new.
+        let op = if inc { AnyUnOp::Inc } else { AnyUnOp::Dec };
+        if u.prefix || !used {
+            // The value is the new one (ToNumeric is part of the increment).
+            let new = Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(any(cur))));
+            setup.push(self.write(&place, sym, new, u.span)?);
+            return Ok(seq(setup));
+        }
+        // old = ToNumeric(current); place = old ± 1; value: old.
         let old = self.temp(Ty::Any);
         setup.push(set(old, Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::ToNumeric, Box::new(cur)))));
-        let op = if inc { AnyUnOp::Inc } else { AnyUnOp::Dec };
         let new = Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(self.local(old))));
-        let stored = self.write(&place, sym, new, u.span)?;
-        if u.prefix {
-            setup.push(stored);
-        } else {
-            setup.push(stored);
-            setup.push(self.local(old));
-        }
+        setup.push(self.write(&place, sym, new, u.span)?);
+        setup.push(self.local(old));
         Ok(seq(setup))
     }
 

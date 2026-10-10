@@ -500,3 +500,92 @@ impl Expr {
         Expr::new(Ty::F64, ExprKind::Num(v))
     }
 }
+
+/// Visit `x` and every expression in it.
+pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(x);
+    use ExprKind::*;
+    match &x.kind {
+        Num(_)
+        | Bool(_)
+        | Local(_)
+        | Update { .. }
+        | Undefined
+        | Null
+        | Str(_)
+        | Cell(_)
+        | Global(_)
+        | GlobalOrUndefined(_)
+        | This
+        | Closure(..) => {}
+        SetLocal(_, a)
+        | InitLocal(_, a)
+        | Unary(_, a)
+        | Truthy(a)
+        | Box(a)
+        | AnyUnary(_, a)
+        | SetCell(_, a)
+        | SetGlobal(_, a)
+        | GetProp(a, _)
+        | Length(a, _)
+        | DeleteProp(a, _)
+        | Void(a) => visit(a, f),
+        TypedGet(_, a, b) => {
+            visit(a, f);
+            visit(b, f);
+        }
+        TypedSet(_, a, b, c) => {
+            visit(a, f);
+            visit(b, f);
+            visit(c, f);
+        }
+        Binary(_, a, b)
+        | Compare(_, a, b)
+        | Logical(_, a, b)
+        | AnyBinary(_, a, b)
+        | AnyCompare(_, a, b)
+        | SetProp(a, _, b)
+        | GetElem(a, b)
+        | DeleteElem(a, b) => {
+            visit(a, f);
+            visit(b, f);
+        }
+        Cond(a, b, c) | SetElem(a, b, c) => {
+            visit(a, f);
+            visit(b, f);
+            visit(c, f);
+        }
+        Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => xs.iter().for_each(|x| visit(x, f)),
+        CallValue(a, xs) | New(a, xs) => {
+            visit(a, f);
+            xs.iter().for_each(|x| visit(x, f));
+        }
+        CallThis(a, b, xs) => {
+            visit(a, f);
+            visit(b, f);
+            xs.iter().for_each(|x| visit(x, f));
+        }
+        CallMethod(a, k, xs) => {
+            visit(a, f);
+            if let Key::Value(k) = k {
+                visit(k, f);
+            }
+            xs.iter().for_each(|x| visit(x, f));
+        }
+        Object(props) => props.iter().for_each(|(_, x)| visit(x, f)),
+    }
+}
+
+/// Whether evaluating `x` may assign local `l` (only the function's own code
+/// assigns a local that is not captured).
+pub fn assigns_local(x: &Expr, l: LocalId) -> bool {
+    let mut found = false;
+    visit(x, &mut |e| {
+        if let ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } = e.kind
+            && m == l
+        {
+            found = true;
+        }
+    });
+    found
+}

@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,45 @@
+@@ -1052,6 +1059,54 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -40,6 +40,15 @@
 +JS_EXTERN int JS_SetGlobalVariable(JSContext *ctx, JSAtom prop, JSValue val);
 +JS_EXTERN int JS_AwaitValue(JSContext *ctx, JSValueConst value,
 +                            JSValueConst on_fulfilled, JSValueConst on_rejected);
++/* Inline caches of own data properties. If `obj` has a shared shape and an
++   own data property `prop` (writable, for a write), returns the property's
++   index in the object's property array and a new reference to the shape in
++   `*pshape`, else -1. While referenced, a shape is never modified in place:
++   every object with this shape has the same property at the same index. */
++JS_EXTERN int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
++                                  bool for_write, void **pshape);
++JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
++JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
 +
 +/* Memory layout that natively compiled code reads directly, as byte offsets
 +   on 64-bit targets (checked by static assertions in quickjs.c). Offsets are
@@ -60,7 +69,7 @@
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1388,10 @@
+@@ -1342,6 +1397,10 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -344,7 +353,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -56106,6 +56301,26 @@
+@@ -56106,6 +56301,64 @@
      return result_promise;
  }
  
@@ -366,6 +375,44 @@
 +    res = perform_promise_then(ctx, promise, funcs, none);
 +    JS_FreeValue(ctx, promise);
 +    return res;
++}
++
++int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
++                        bool for_write, void **pshape)
++{
++    JSObject *p;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    int flags;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    /* Only shared shapes: an unhashed shape belongs to one object, which
++       may modify it in place. A hashed one, once referenced here, is cloned
++       by any modification (js_shape_prepare_update, add_property). */
++    if (!p->shape->is_hashed)
++        return -1;
++    prs = find_own_property(&pr, p, prop);
++    if (!prs)
++        return -1;
++    flags = prs->flags;
++    if ((flags & JS_PROP_TMASK) != JS_PROP_NORMAL || (flags & JS_PROP_LENGTH))
++        return -1;
++    if (for_write && !(flags & JS_PROP_WRITABLE))
++        return -1;
++    *pshape = js_dup_shape(p->shape);
++    return pr - p->prop;
++}
++
++void JS_FreeCachedShape(JSRuntime *rt, void *shape)
++{
++    js_free_shape(rt, shape);
++}
++
++void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func)
++{
++    mark_func(rt, &((JSShape *)shape)->header);
 +}
 +
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,

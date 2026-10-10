@@ -171,6 +171,9 @@ pub(crate) struct Env {
     pub atoms: GlobalValue,
     /// `tsaot_ta_shapes`: the shape of a pristine typed array, by kind.
     pub ta_shapes: GlobalValue,
+    /// `tsaot_ics`: inline caches, and the next free one.
+    pub ics: GlobalValue,
+    pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
 }
@@ -1252,30 +1255,58 @@ impl<'a> Lower<'a> {
             }
             ExprKind::GetProp(o, a) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let atom = self.atom(*a);
                 let (p, t) = obj.any();
+                let ic = self.new_ic();
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                // An own data property of a cached shape.
+                let at = self.ic_hit(p, t, ic, slow);
+                let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+                let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.dup((vp, vt));
+                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                self.b.switch_to_block(slow);
+                let atom = self.atom(*a);
                 let ctx = self.ctx;
-                let r = self.helper("JS_GetProperty", &[ctx, p, t, atom]);
+                let r = self.helper("tsaot_ic_get", &[ctx, p, t, atom, ic]);
                 self.check_value(r[1]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
-                V::Any(r[0], r[1])
+                V::Any(rp, rt)
             }
             ExprKind::SetProp(o, a, x) => {
-                let obj = self.expr(o);
-                self.hold(obj);
+                let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
                 let (vp, vt) = v.any();
                 // One reference for the property, one for the expression.
                 self.dup((vp, vt));
+                let (p, t) = obj.any();
+                let ic = self.new_ic();
+                let join = self.b.create_block();
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                // An own writable data property of a cached shape.
+                let at = self.ic_hit(p, t, ic, slow);
+                let old_p = self.b.ins().load(I64, Self::mem(), at, 0);
+                let old_t = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.b.ins().store(Self::mem(), vp, at, 0);
+                self.b.ins().store(Self::mem(), vt, at, TAG_OFFSET);
+                self.free((old_p, old_t));
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(slow);
                 let atom = self.atom(*a);
-                let (op_, ot) = obj.any();
                 let ctx = self.ctx;
-                let r = self.helper("JS_SetProperty", &[ctx, op_, ot, atom, vp, vt]);
+                let r = self.helper("tsaot_ic_set", &[ctx, p, t, atom, vp, vt, ic]);
                 self.check_int(r[0]);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
                 self.release(v);
-                self.release(obj);
-                self.free_v(obj);
+                self.drop_operand(obj, owned);
                 v
             }
             ExprKind::GetElem(o, k) => {
@@ -1776,6 +1807,44 @@ impl<'a> Lower<'a> {
         res
     }
 
+    /// If all of `vals` are int32s, try `f` on them: it gives a result and an
+    /// overflow flag. Without overflow the result, an int32, goes to `join`.
+    /// Otherwise code continues in the (new) current block.
+    fn int_fast_path(
+        &mut self,
+        vals: &[(Value, Value)],
+        join: Block,
+        f: impl FnOnce(&mut FunctionBuilder, &[Value]) -> Option<(Value, Value)>,
+    ) {
+        let mut all = None;
+        for &(_, t) in vals {
+            let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
+            all = Some(match all {
+                None => is_int,
+                Some(a) => self.b.ins().band(a, is_int),
+            });
+        }
+        let int_blk = self.b.create_block();
+        let rest = self.b.create_block();
+        self.b.ins().brif(all.expect("operands"), int_blk, &[], rest, &[]);
+        self.b.switch_to_block(int_blk);
+        let xs: Vec<Value> = vals.iter().map(|&(p, _)| self.b.ins().ireduce(I32, p)).collect();
+        match f(&mut self.b, &xs) {
+            Some((r, overflow)) => {
+                let ok = self.b.create_block();
+                self.b.ins().brif(overflow, rest, &[], ok, &[]);
+                self.b.switch_to_block(ok);
+                let p = self.b.ins().uextend(I64, r);
+                let t = self.b.ins().iconst(I64, TAG_INT);
+                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+            }
+            None => {
+                self.b.ins().jump(rest, &[]);
+            }
+        }
+        self.b.switch_to_block(rest);
+    }
+
     /// `op a b` on owned values (consumed). Fast path for two numbers.
     fn binary_any(&mut self, op: AnyBinOp, a: (Value, Value), c: (Value, Value)) -> (Value, Value) {
         let na = self.is_number(a.1);
@@ -1786,6 +1855,33 @@ impl<'a> Lower<'a> {
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
+        // Two int32s: integer ops, unless the result overflows.
+        let int_op = |b: &mut FunctionBuilder, x: Value, y: Value| -> Option<(Value, Value)> {
+            let no = b.ins().iconst(I8, 0);
+            Some(match op {
+                AnyBinOp::Add => b.ins().sadd_overflow(x, y),
+                AnyBinOp::Sub => b.ins().ssub_overflow(x, y),
+                AnyBinOp::BitAnd => (b.ins().band(x, y), no),
+                AnyBinOp::BitOr => (b.ins().bor(x, y), no),
+                AnyBinOp::BitXor => (b.ins().bxor(x, y), no),
+                // The shift count is taken modulo 32, as in JS.
+                AnyBinOp::Shl => (b.ins().ishl(x, y), no),
+                AnyBinOp::Sar => (b.ins().sshr(x, y), no),
+                _ => return None,
+            })
+        };
+        if matches!(
+            op,
+            AnyBinOp::Add
+                | AnyBinOp::Sub
+                | AnyBinOp::BitAnd
+                | AnyBinOp::BitOr
+                | AnyBinOp::BitXor
+                | AnyBinOp::Shl
+                | AnyBinOp::Sar
+        ) {
+            self.int_fast_path(&[a, c], join, |b, xs| int_op(b, xs[0], xs[1]));
+        }
         self.b.ins().brif(both, fast, &[], slow, &[]);
 
         self.b.switch_to_block(fast);
@@ -1836,7 +1932,6 @@ impl<'a> Lower<'a> {
         (rp, rt)
     }
 
-    /// Comparison of borrowed values. Fast path for two numbers.
     /// A number from a number, or from a JS value known to be one.
     fn num_value(&mut self, v: V) -> Value {
         match v {
@@ -1853,6 +1948,7 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Comparison of borrowed values. Fast path for two numbers.
     fn compare_any(&mut self, op: AnyCmpOp, a: (Value, Value), c: (Value, Value)) -> Value {
         self.compare_mixed(op, V::Any(a.0, a.1), V::Any(c.0, c.1))
     }
@@ -1949,6 +2045,14 @@ impl<'a> Lower<'a> {
                 self.b.ins().jump(slow, &[]);
             }
             _ => {
+                if matches!(op, AnyUnOp::Inc | AnyUnOp::Dec) {
+                    // An int32 that does not overflow stays one.
+                    let delta = if op == AnyUnOp::Inc { 1 } else { -1 };
+                    self.int_fast_path(&[v], join, |b, xs| {
+                        let one = b.ins().iconst(I32, delta);
+                        Some(b.ins().sadd_overflow(xs[0], one))
+                    });
+                }
                 let num = self.is_number(v.1);
                 let fast = self.b.create_block();
                 self.b.ins().brif(num, fast, &[], slow, &[]);
@@ -1999,16 +2103,6 @@ impl<'a> Lower<'a> {
         (rp, rt)
     }
 
-    /// Boxes a number like the interpreter's `js_number()`: int32-valued
-    /// doubles (except -0) become `JS_TAG_INT`, everything else
-    /// `JS_TAG_FLOAT64`.
-    ///
-    /// The int32 test is QuickJS's `double_is_int32`, done on the bit pattern
-    /// with integer ops only. The obvious test (convert to int and back, then
-    /// compare) is a ~20-cycle chain of dependent float conversions that
-    /// sits right on the latency path back into the interpreter; here the
-    /// conversion that produces the int payload runs in parallel instead.
-    /// Returns `(payload, tag)`.
     /// Box a `MaybeF64`: its reserved NaN is `undefined`.
     fn box_maybe(&mut self, d: Value) -> (Value, Value) {
         let (p, t) = self.box_number(d);
@@ -2021,6 +2115,16 @@ impl<'a> Lower<'a> {
         (p, t)
     }
 
+    /// Boxes a number like the interpreter's `js_number()`: int32-valued
+    /// doubles (except -0) become `JS_TAG_INT`, everything else
+    /// `JS_TAG_FLOAT64`.
+    ///
+    /// The int32 test is QuickJS's `double_is_int32`, done on the bit pattern
+    /// with integer ops only. The obvious test (convert to int and back, then
+    /// compare) is a ~20-cycle chain of dependent float conversions that
+    /// sits right on the latency path back into the interpreter; here the
+    /// conversion that produces the int payload runs in parallel instead.
+    /// Returns `(payload, tag)`.
     pub(crate) fn box_number(&mut self, d: Value) -> (Value, Value) {
         let b = &mut self.b;
         let u = b.ins().bitcast(I64, MemFlagsData::new(), d);
@@ -2126,9 +2230,13 @@ impl<'a> Lower<'a> {
     /// them assigns it (nothing else can: it is not captured). Returns the
     /// value and whether it is owned (then also held).
     fn operand(&mut self, e: &Expr, later: &[&Expr]) -> (V, bool) {
+        if let ExprKind::This = e.kind {
+            let (p, t) = self.this.expect("`this` in a method");
+            return (V::Any(p, t), false);
+        }
         if let ExprKind::Local(l) = e.kind
             && let LVar::Two(..) = self.vars[l]
-            && !later.iter().any(|x| assigns(x, l))
+            && !later.iter().any(|x| ir::assigns_local(x, l))
         {
             return (self.use_local(l), false);
         }
@@ -2143,6 +2251,35 @@ impl<'a> Lower<'a> {
             self.release(v);
             self.free_v(v);
         }
+    }
+
+    // ---- inline caches ----
+
+    /// The address of a new inline cache (a `TsaotIC`).
+    fn new_ic(&mut self) -> Value {
+        let i = self.env.next_ic.get();
+        self.env.next_ic.set(i + 1);
+        let base = self.b.ins().symbol_value(self.ptr, self.env.ics);
+        self.b.ins().iadd_imm_s(base, (i * 16) as i64)
+    }
+
+    /// Continue if `(p, t)` is an object with the shape cached in `ic`, else
+    /// go to `slow`. Returns the address of the cached property's value.
+    fn ic_hit(&mut self, p: Value, t: Value, ic: Value, slow: Block) -> Value {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let shape = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_SHAPE);
+        let cached = self.b.ins().load(I64, Self::mem(), ic, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+        let hit = self.b.create_block();
+        self.b.ins().brif(same, hit, &[], slow, &[]);
+        self.b.switch_to_block(hit);
+        let slot = self.b.ins().uload32(Self::mem(), ic, 8);
+        let props = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_PROP);
+        let off = self.b.ins().imul_imm_s(slot, SIZE as i64);
+        self.b.ins().iadd(props, off)
     }
 
     // ---- arrays ----
@@ -2591,17 +2728,4 @@ impl Lower<'_> {
         }
         self.b.ins().jump(cx.resumes[0], &[]);
     }
-}
-
-/// Whether evaluating `x` may assign local `l`.
-fn assigns(x: &Expr, l: ir::LocalId) -> bool {
-    let mut found = false;
-    crate::walk_expr(x, &mut |e| {
-        if let ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } = e.kind
-            && m == l
-        {
-            found = true;
-        }
-    });
-    found
 }
