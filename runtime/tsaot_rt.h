@@ -51,10 +51,19 @@ JSValue tsaot_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, 
 void tsaot_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
 int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 
-/* Pristine typed arrays, by JSTypedArrayEnum, and their shapes. */
+/* Pristine objects and their shapes: typed arrays by JSTypedArrayEnum,
+ * then an array; then the original array iteration objects. */
 #define TSAOT_TYPED_ARRAYS 12
-extern JSValue tsaot_ta_pins[];
-extern void *tsaot_ta_shapes[];
+#define TSAOT_SHAPE_ARRAY 12
+#define TSAOT_PIN_ARRAY_PROTO 13
+#define TSAOT_PIN_ARRAY_VALUES 14
+#define TSAOT_PIN_ARRAY_ITERATOR_PROTO 15
+#define TSAOT_PIN_ARRAY_ITERATOR_NEXT 16
+#define TSAOT_PIN_SYMBOL_ITERATOR 17
+#define TSAOT_PINS 18
+int tsaot_array_iter_ok(JSContext *ctx);
+extern JSValue tsaot_pins[];
+extern void *tsaot_shapes[];
 
 /* Inline caches of own data properties, one per property access site in
  * native code (defined by it; absent without native code). */
@@ -67,6 +76,18 @@ extern TsaotIC tsaot_ics[] __attribute__((weak));
 extern const int32_t tsaot_nics __attribute__((weak));
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
+
+/* Spread, rest and iteration. */
+int tsaot_array_push(JSContext *ctx, JSValue arr, JSValue v);
+int tsaot_array_hole(JSContext *ctx, JSValue arr);
+int tsaot_array_spread(JSContext *ctx, JSValue arr, JSValue iterable);
+JSValue tsaot_apply(JSContext *ctx, JSValue *v);
+JSValue tsaot_construct(JSContext *ctx, JSValue f, JSValue args);
+JSValue tsaot_rest(JSContext *ctx, int argc, JSValue *argv, int start);
+JSValue tsaot_object_rest(JSContext *ctx, JSValue *v, int nkeys);
+int tsaot_define_computed(JSContext *ctx, JSValue *v, JSValue val);
+int tsaot_object_spread(JSContext *ctx, JSValue obj, JSValue source);
+int tsaot_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_throw);
 
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);

@@ -314,9 +314,9 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     }
     for (i = 0; i < tsaot_natoms; i++)
         JS_FreeAtomRT(rt, tsaot_atoms[i]);
-    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++) {
-        JS_FreeValueRT(rt, tsaot_ta_pins[i]);
-        tsaot_ta_pins[i] = JS_UNDEFINED;
+    for (i = 0; i < TSAOT_PINS; i++) {
+        JS_FreeValueRT(rt, tsaot_pins[i]);
+        tsaot_pins[i] = JS_UNDEFINED;
     }
     for (i = 0; i < tsaot_ic_count(); i++) {
         if (tsaot_ics[i].shape)
@@ -334,8 +334,8 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     int i;
     for (i = 0; i < tsaot_ncells; i++)
         JS_MarkValue(rt, tsaot_cells[i], mark_func);
-    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++)
-        JS_MarkValue(rt, tsaot_ta_pins[i], mark_func);
+    for (i = 0; i < TSAOT_PINS; i++)
+        JS_MarkValue(rt, tsaot_pins[i], mark_func);
     for (i = 0; i < tsaot_ic_count(); i++)
         if (tsaot_ics[i].shape)
             JS_MarkCachedShape(rt, tsaot_ics[i].shape, mark_func);
@@ -445,9 +445,10 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
  * Each typed array prototype also gets the inherited `length` getter as a
  * locked own property. Then the `length` of a typed array whose shape is
  * that of a fresh instance (no own properties, original prototype) is
- * always its element count, which native code reads inline. */
-JSValue tsaot_ta_pins[TSAOT_TYPED_ARRAYS];
-void *tsaot_ta_shapes[TSAOT_TYPED_ARRAYS];
+ * always its element count, which native code reads inline.
+ */
+JSValue tsaot_pins[TSAOT_PINS];
+void *tsaot_shapes[TSAOT_PINS];
 
 int tsaot_lock_builtins(JSContext *ctx)
 {
@@ -472,17 +473,21 @@ int tsaot_lock_builtins(JSContext *ctx)
         "    lock(g, [names[i]]);\n"
         "    fresh.push(new C(0));\n"
         "  }\n"
+        "  var arrayIteratorProto = Object.getPrototypeOf([][Symbol.iterator]());\n"
+        "  fresh.push([], g.Array.prototype, g.Array.prototype[Symbol.iterator],\n"
+        "             arrayIteratorProto, arrayIteratorProto.next, Symbol.iterator);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
     int i;
     if (JS_IsException(r))
         return -1;
-    for (i = 0; i < TSAOT_TYPED_ARRAYS; i++) {
-        tsaot_ta_pins[i] = JS_GetPropertyUint32(ctx, r, i);
-        if (JS_IsException(tsaot_ta_pins[i]))
+    for (i = 0; i < TSAOT_PINS; i++) {
+        tsaot_pins[i] = JS_GetPropertyUint32(ctx, r, i);
+        if (JS_IsException(tsaot_pins[i]))
             return JS_FreeValue(ctx, r), -1;
-        tsaot_ta_shapes[i] = *(void **)((char *)JS_VALUE_GET_PTR(tsaot_ta_pins[i]) + JS_LAYOUT_OBJ_SHAPE);
+        if (i <= TSAOT_SHAPE_ARRAY)
+            tsaot_shapes[i] = *(void **)((char *)JS_VALUE_GET_PTR(tsaot_pins[i]) + JS_LAYOUT_OBJ_SHAPE);
     }
     JS_FreeValue(ctx, r);
     return 0;
@@ -529,4 +534,230 @@ int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC 
     if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
         tsaot_ic_fill(ctx, obj, prop, true, ic);
     return r;
+}
+
+/* ---- spread, rest and iteration ---- */
+
+/* arr[arr.length] = v (array literal element). Takes ownership of v. */
+int tsaot_array_push(JSContext *ctx, JSValue arr, JSValue v)
+{
+    int64_t len;
+    if (JS_GetLength(ctx, arr, &len) < 0) {
+        JS_FreeValue(ctx, v);
+        return -1;
+    }
+    return JS_DefinePropertyValueUint32(ctx, arr, (uint32_t)len, v, JS_PROP_C_W_E | JS_PROP_THROW);
+}
+
+/* An array literal hole: only the length grows. */
+int tsaot_array_hole(JSContext *ctx, JSValue arr)
+{
+    int64_t len;
+    if (JS_GetLength(ctx, arr, &len) < 0)
+        return -1;
+    return JS_SetPropertyStr(ctx, arr, "length", JS_NewInt64(ctx, len + 1));
+}
+
+/* ...iterable in an array literal (or argument list). Borrows both. */
+int tsaot_array_spread(JSContext *ctx, JSValue arr, JSValue iterable)
+{
+    JSValue iter, next, v;
+    int64_t len;
+    int done;
+    if (JS_GetLength(ctx, arr, &len) < 0)
+        return -1;
+    iter = JS_GetIteratorObject(ctx, iterable, false);
+    if (JS_IsException(iter))
+        return -1;
+    next = JS_GetPropertyStr(ctx, iter, "next");
+    if (JS_IsException(next)) {
+        JS_FreeValue(ctx, iter);
+        return -1;
+    }
+    for (;;) {
+        v = JS_IteratorStep(ctx, iter, next, 0, NULL, &done);
+        if (JS_IsException(v))
+            break;
+        if (done) {
+            JS_FreeValue(ctx, iter);
+            JS_FreeValue(ctx, next);
+            return 0;
+        }
+        if (JS_DefinePropertyValueUint32(ctx, arr, (uint32_t)len++, v, JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            JS_IteratorCloseCompletion(ctx, iter, true);
+            break;
+        }
+    }
+    JS_FreeValue(ctx, iter);
+    JS_FreeValue(ctx, next);
+    return -1;
+}
+
+/* The elements of an array built for a call. */
+static JSValue *tsaot_array_values(JSContext *ctx, JSValue arr, int *pcount)
+{
+    int64_t len, i;
+    JSValue *tab;
+    if (JS_GetLength(ctx, arr, &len) < 0)
+        return NULL;
+    if (len > 65535) {
+        JS_ThrowRangeError(ctx, "too many arguments in function call (only 65535 allowed)");
+        return NULL;
+    }
+    tab = js_malloc(ctx, sizeof(JSValue) * (len > 0 ? len : 1));
+    if (!tab)
+        return NULL;
+    for (i = 0; i < len; i++) {
+        tab[i] = JS_GetPropertyInt64(ctx, arr, i);
+        if (JS_IsException(tab[i])) {
+            while (i-- > 0)
+                JS_FreeValue(ctx, tab[i]);
+            js_free(ctx, tab);
+            return NULL;
+        }
+    }
+    *pcount = (int)len;
+    return tab;
+}
+
+/* f.apply(this, args) with v = { f, this, args }. Borrows everything. */
+JSValue tsaot_apply(JSContext *ctx, JSValue *v)
+{
+    int argc, i;
+    JSValue *argv = tsaot_array_values(ctx, v[2], &argc), ret;
+    if (!argv)
+        return JS_EXCEPTION;
+    ret = JS_Call(ctx, v[0], v[1], argc, (JSValueConst *)argv);
+    for (i = 0; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    js_free(ctx, argv);
+    return ret;
+}
+
+/* new f(...args). Borrows both. */
+JSValue tsaot_construct(JSContext *ctx, JSValue f, JSValue args)
+{
+    int argc, i;
+    JSValue *argv = tsaot_array_values(ctx, args, &argc), ret;
+    if (!argv)
+        return JS_EXCEPTION;
+    ret = JS_CallConstructor(ctx, f, argc, (JSValueConst *)argv);
+    for (i = 0; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    js_free(ctx, argv);
+    return ret;
+}
+
+/* Rest parameter: the arguments from `start` on, in a new array. */
+JSValue tsaot_rest(JSContext *ctx, int argc, JSValue *argv, int start)
+{
+    int i, n = argc > start ? argc - start : 0;
+    JSValue *tab = js_malloc(ctx, sizeof(JSValue) * (n > 0 ? n : 1)), arr;
+    if (!tab)
+        return JS_EXCEPTION;
+    for (i = 0; i < n; i++)
+        tab[i] = JS_DupValue(ctx, argv[start + i]);
+    arr = JS_NewArrayFrom(ctx, n, tab);
+    js_free(ctx, tab);
+    return arr;
+}
+
+/* Object rest: v = { source, keys... }, nkeys keys (borrowed). */
+JSValue tsaot_object_rest(JSContext *ctx, JSValue *v, int nkeys)
+{
+    JSValue excluded = JS_NewObject(ctx), target;
+    int i;
+    if (JS_IsException(excluded))
+        return excluded;
+    for (i = 0; i < nkeys; i++) {
+        JSAtom atom = JS_ValueToAtom(ctx, v[1 + i]);
+        int r = atom == JS_ATOM_NULL ? -1
+                : JS_DefinePropertyValue(ctx, excluded, atom, JS_NULL, JS_PROP_C_W_E | JS_PROP_THROW);
+        JS_FreeAtom(ctx, atom);
+        if (r < 0) {
+            JS_FreeValue(ctx, excluded);
+            return JS_EXCEPTION;
+        }
+    }
+    target = JS_NewObject(ctx);
+    if (!JS_IsException(target) && JS_CopyDataPropertiesExcluding(ctx, target, v[0], excluded) < 0) {
+        JS_FreeValue(ctx, target);
+        target = JS_EXCEPTION;
+    }
+    JS_FreeValue(ctx, excluded);
+    return target;
+}
+
+/* obj[key] = val in an object literal: v = { obj, key } (borrowed), val
+ * taken. The key is already a property key. */
+int tsaot_define_computed(JSContext *ctx, JSValue *v, JSValue val)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, v[1]);
+    int ret;
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    ret = JS_DefinePropertyValue(ctx, v[0], atom, val, JS_PROP_C_W_E | JS_PROP_THROW);
+    JS_FreeAtom(ctx, atom);
+    return ret;
+}
+
+/* `...source` in an object literal. Borrows both. */
+int tsaot_object_spread(JSContext *ctx, JSValue obj, JSValue source)
+{
+    return JS_CopyDataPropertiesExcluding(ctx, obj, source, JS_UNDEFINED);
+}
+
+/* Close the iteration of `arr` that native code did directly, at `idx`:
+ * as closing an array iterator at that position, which runs a `return`
+ * method only if one was added to the iterator's prototype chain. */
+int tsaot_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_throw)
+{
+    JSValue it = JS_NewArrayIteratorAt(ctx, arr, (uint32_t)idx);
+    int r;
+    if (JS_IsException(it))
+        return -1;
+    r = JS_IteratorCloseCompletion(ctx, it, is_throw);
+    JS_FreeValue(ctx, it);
+    return r;
+}
+
+/* Whether own property `prop` of `obj` is still the data property `value`
+ * (checked without calling any getter). */
+static bool tsaot_own_data_is(JSContext *ctx, JSValue obj, JSAtom prop, JSValue value)
+{
+    JSPropertyDescriptor desc;
+    bool same;
+    int r = JS_GetOwnProperty(ctx, &desc, obj, prop);
+    if (r < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return false;
+    }
+    if (r == 0)
+        return false;
+    same = !(desc.flags & JS_PROP_GETSET) && JS_VALUE_GET_TAG(desc.value) == JS_VALUE_GET_TAG(value) &&
+           JS_VALUE_GET_PTR(desc.value) == JS_VALUE_GET_PTR(value);
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+    return same;
+}
+
+/* Whether iterating an array with the shape of a fresh one is still the
+ * original array iteration: Array.prototype[Symbol.iterator] and the
+ * array iterator's `next` are unchanged (both are read once, when an
+ * iteration starts). */
+int tsaot_array_iter_ok(JSContext *ctx)
+{
+    JSAtom it = JS_ValueToAtom(ctx, tsaot_pins[TSAOT_PIN_SYMBOL_ITERATOR]), next;
+    bool ok = tsaot_own_data_is(ctx, tsaot_pins[TSAOT_PIN_ARRAY_PROTO], it, tsaot_pins[TSAOT_PIN_ARRAY_VALUES]);
+    JS_FreeAtom(ctx, it);
+    if (!ok)
+        return 0;
+    next = JS_NewAtom(ctx, "next");
+    ok = tsaot_own_data_is(ctx, tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_PROTO], next,
+                           tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_NEXT]);
+    JS_FreeAtom(ctx, next);
+    return ok;
 }

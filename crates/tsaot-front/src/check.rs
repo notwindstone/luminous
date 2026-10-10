@@ -26,12 +26,20 @@ pub struct Reject {
     pub msg: String,
     /// Internal: a local was widened to `Any`; check the function again.
     retry: bool,
+    /// It calls a function that turned out not to be native (once that one
+    /// is interpreted, the call goes through its binding instead).
+    callee: bool,
 }
 
 type R<T> = Result<T, Reject>;
 
 fn reject<T>(span: Span, msg: impl Into<String>) -> R<T> {
-    Err(Reject { span, msg: msg.into(), retry: false })
+    Err(Reject { span, msg: msg.into(), retry: false, callee: false })
+}
+
+fn callee_failed<T>(span: Span, name: &str) -> R<T> {
+    let msg = format!("calls `{name}`, which is not compiled natively");
+    Err(Reject { span, msg, retry: false, callee: true })
 }
 
 /// The syntax of a candidate function.
@@ -70,7 +78,8 @@ pub enum Site {
 }
 
 struct Param<'a> {
-    symbol: SymbolId,
+    /// The binding (an identifier, or a pattern destructuring the argument).
+    pattern: &'a BindingPattern<'a>,
     /// ABI type: unboxed (and guarded by the JS entry) only for `number` and
     /// `boolean` annotations.
     ty: Ty,
@@ -90,6 +99,8 @@ pub struct Candidate<'a> {
     /// `const` bindings that may still be in their TDZ when native code runs.
     direct_callable: bool,
     params: Vec<Param<'a>>,
+    /// The last parameter is a rest parameter.
+    rest: bool,
     /// Annotated return type, if any (only a hint for callers).
     ret: Option<Ty>,
 }
@@ -171,7 +182,11 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
         // about this module can be assumed statically.
         for c in candidates.drain(..) {
             let span = c.node.span();
-            rejected.push((c.name, span, Reject { span, msg: "module uses `eval`".into(), retry: false }));
+            rejected.push((
+                c.name,
+                span,
+                Reject { span, msg: "module uses `eval`".into(), retry: false, callee: false },
+            ));
         }
     }
 
@@ -231,6 +246,12 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
                 reasons.insert(i, r.clone());
             }
         }
+        // Functions that failed only because a callee did are checked again
+        // once their failing callees are interpreted (and called through
+        // their bindings).
+        if reasons.values().any(|r| !r.callee) {
+            reasons.retain(|_, r| !r.callee);
+        }
         let mut keep = Vec::new();
         for (i, c) in candidates.into_iter().enumerate() {
             match reasons.remove(&i) {
@@ -276,7 +297,7 @@ fn collect_toplevel<'a>(
     let mut method_rejects = Vec::new();
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
         if written(symbol) {
-            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false };
+            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false, callee: false };
             rejected.push((name, node.span(), r));
             return;
         }
@@ -288,12 +309,12 @@ fn collect_toplevel<'a>(
             },
         };
         if body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use no aot")) {
-            let r = Reject { span: node.span(), msg: "marked \"use no aot\"".into(), retry: false };
+            let r = Reject { span: node.span(), msg: "marked \"use no aot\"".into(), retry: false, callee: false };
             rejected.push((name, node.span(), r));
             return;
         }
         match header(node) {
-            Ok((params, ret)) => out.push(Candidate {
+            Ok((params, rest, ret)) => out.push(Candidate {
                 name,
                 node,
                 symbol: Some(symbol),
@@ -301,6 +322,7 @@ fn collect_toplevel<'a>(
                 site,
                 direct_callable,
                 params,
+                rest,
                 ret,
             }),
             Err(r) => rejected.push((name, node.span(), r)),
@@ -430,7 +452,7 @@ fn class_methods<'a>(
         let node = FnNode::Function(&m.value);
         let site = Site::Method { class: class.to_string(), is_static: m.r#static, key: key.clone(), stmt_end };
         match header(node) {
-            Ok((params, ret)) => out.push(Candidate {
+            Ok((params, rest, ret)) => out.push(Candidate {
                 name: key,
                 node,
                 symbol: None,
@@ -438,6 +460,7 @@ fn class_methods<'a>(
                 site,
                 direct_callable: false,
                 params,
+                rest,
                 ret,
             }),
             Err(r) => rejected.push((format!("{class}.{key}"), node.span(), r)),
@@ -474,8 +497,13 @@ fn ts_type(t: &TSType) -> Option<Ty> {
     }
 }
 
-/// Parameters, and the annotated return type if any.
-type Header<'a> = (Vec<Param<'a>>, Option<Ty>);
+/// A parameter as `FnCx::function` takes it: its binding, ABI type and
+/// default value.
+type ParamSpec<'a> = (&'a BindingPattern<'a>, Ty, Option<&'a Expression<'a>>);
+
+/// Parameters, whether the last one is a rest parameter, and the annotated
+/// return type if any.
+type Header<'a> = (Vec<Param<'a>>, bool, Option<Ty>);
 
 fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     let (span, is_async, generator, this_param, params, return_type) = match node {
@@ -489,23 +517,26 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     if this_param {
         return reject(span, "`this` parameters are not supported");
     }
-    if let Some(rest) = &params.rest {
-        return reject(rest.span, "rest parameters are not supported yet");
-    }
     let mut out = Vec::new();
     for p in &params.items {
-        let BindingPattern::BindingIdentifier(id) = &p.pattern else {
-            return reject(p.span, "destructuring parameters are not supported yet");
-        };
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::Bool | Ty::Arr(_))) if p.initializer.is_none() && !p.optional => t,
+            Some(t @ (Ty::F64 | Ty::Bool | Ty::Arr(_)))
+                if p.initializer.is_none()
+                    && !p.optional
+                    && matches!(p.pattern, BindingPattern::BindingIdentifier(_)) =>
+            {
+                t
+            }
             _ => Ty::Any,
         };
-        out.push(Param { symbol: id.symbol_id.get().unwrap(), ty, default: p.initializer.as_deref() });
+        out.push(Param { pattern: &p.pattern, ty, default: p.initializer.as_deref() });
+    }
+    if let Some(rest) = &params.rest {
+        out.push(Param { pattern: &rest.rest.argument, ty: Ty::Any, default: None });
     }
     let ret = return_type.as_ref().map(|a| ts_type(&a.type_annotation).unwrap_or(Ty::Any));
-    Ok((out, ret))
+    Ok((out, params.rest.is_some(), ret))
 }
 
 #[derive(Clone)]
@@ -545,12 +576,13 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         self.state[i] = State::InProgress;
         let c = &self.cands[i];
         let (sym, node, name, has_this) = (c.node.span().start, c.node, c.name.clone(), c.has_this);
-        let params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)> =
-            c.params.iter().map(|p| (p.symbol, p.ty, p.default)).collect();
+        let params: Vec<ParamSpec<'a>> = c.params.iter().map(|p| (p.pattern, p.ty, p.default)).collect();
+        let rest = c.rest;
         let caps = Rc::new(capture_info(node, self.scoping));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
             let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
+            fx.rest = rest;
             fx.has_this = has_this;
             let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
@@ -587,7 +619,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             // still being checked (recursion). The fixpoint undoes this if
             // the callee turns out not to be native or to return otherwise.
             if let State::Failed(_) = self.state[i] {
-                return reject(call_span, format!("calls `{}`, which is not compiled natively", c.name));
+                return callee_failed(call_span, &c.name);
             }
             return Ok((params, ret));
         }
@@ -598,9 +630,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                 call_span,
                 format!("recursive call to `{}`, which has no return type annotation", self.cands[i].name),
             ),
-            State::Failed(_) => {
-                reject(call_span, format!("calls `{}`, which is not compiled natively", self.cands[i].name))
-            }
+            State::Failed(_) => callee_failed(call_span, &self.cands[i].name),
             State::Todo => unreachable!(),
         }
     }
@@ -685,6 +715,8 @@ struct FnCx<'x, 'm, 'a> {
     has_this: bool,
     is_async: bool,
     is_generator: bool,
+    /// The last parameter is a rest parameter.
+    rest: bool,
     /// Functions that suspend: where a return value waits for `finally`s.
     ret_slot: Option<ir::LocalId>,
     locals: Vec<Ty>,
@@ -828,6 +860,15 @@ fn seq(mut xs: Vec<Expr>) -> Expr {
     Expr::new(ty, ExprKind::Seq(xs))
 }
 
+/// How a binding pattern declares its names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    Let,
+    Const,
+    /// Hoisted: the names exist already.
+    Var,
+}
+
 /// What an assignment writes to.
 enum Place {
     Local(ir::LocalId),
@@ -856,6 +897,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_async: false,
             is_generator: false,
             ret_slot: None,
+            rest: false,
             locals: Vec::new(),
             mutable: Vec::new(),
             boxed: Vec::new(),
@@ -874,12 +916,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         }
     }
 
-    fn function(
-        &mut self,
-        node: FnNode<'a>,
-        name: String,
-        params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)>,
-    ) -> R<ir::Func> {
+    fn function(&mut self, node: FnNode<'a>, name: String, params: Vec<ParamSpec<'a>>) -> R<ir::Func> {
         self.is_async = match node {
             FnNode::Function(f) => f.r#async,
             FnNode::Arrow(a) => a.r#async,
@@ -887,13 +924,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mut abi = Vec::new();
         let mut prologue = Vec::new();
         let mut boxed_params = Vec::new();
-        for &(sym, ty, _) in &params {
-            let local_ty = if self.widened.contains(&sym) { Ty::Any } else { ty };
+        for &(pat, ty, _) in &params {
+            // A destructured parameter is a hidden local, bound below.
+            let sym = match pat {
+                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+                _ => None,
+            };
+            let local_ty = if sym.is_none_or(|s| self.widened.contains(&s)) { Ty::Any } else { ty };
             let l = self.temp(local_ty);
-            self.sym_local.insert(sym, l);
             abi.push(ty);
-            if self.caps.captured.contains(&sym) {
-                boxed_params.push((sym, l));
+            if let Some(sym) = sym {
+                self.sym_local.insert(sym, l);
+                if self.caps.captured.contains(&sym) {
+                    boxed_params.push((sym, l));
+                }
             }
         }
         if self.suspends() {
@@ -919,17 +963,29 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             prologue.push(Stmt::NewBoxes(new_boxes));
             prologue.extend(inits);
         }
-        // Default parameter values, in order (each may see the previous ones).
-        for &(sym, _, default) in &params {
+        // Default values and destructuring, in order (each parameter may see
+        // the previous ones).
+        for (i, &(pat, _, default)) in params.iter().enumerate() {
+            let l = match pat {
+                BindingPattern::BindingIdentifier(id) => self.sym_local[&id.symbol_id.get().unwrap()],
+                _ => i,
+            };
             if let Some(d) = default {
-                let l = self.sym_local[&sym];
+                if let BindingPattern::BindingIdentifier(id) = pat {
+                    self.name_hint = Some(id.name.to_string());
+                }
                 let v = any(self.expr(d)?);
+                self.name_hint = None;
                 let missing = Expr::new(
                     Ty::Bool,
                     ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(l)), Box::new(undefined())),
                 );
                 let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(l, Box::new(v))));
                 prologue.push(Stmt::If(missing, vec![set], vec![]));
+            }
+            if !matches!(pat, BindingPattern::BindingIdentifier(_)) {
+                let v = self.local(i);
+                self.bind_pattern(pat, v, BindKind::Let, &mut prologue)?;
             }
         }
         let body = match node {
@@ -969,7 +1025,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // Values returned from a function of type `Any` must be boxed.
         let body = if ret == Ty::Any { box_returns(body) } else { body };
         prologue.extend(body);
-        let js_length = params.iter().take_while(|p| p.2.is_none()).count();
+        // Parameters before the first default, not counting a rest one.
+        let fixed = params.len() - self.rest as usize;
+        let js_length = params[..fixed].iter().take_while(|p| p.2.is_none()).count();
         Ok(ir::Func {
             name,
             js_length,
@@ -982,6 +1040,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_closure: self.is_closure,
             has_this: self.has_this,
             is_async: self.is_async,
+            rest: self.rest,
             ret_slot: self.ret_slot,
             body: prologue,
         })
@@ -1036,7 +1095,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             // and check the function again.
             let Some(sym) = sym else { unreachable!("hidden locals are `Any`") };
             self.widen_request = Some(sym);
-            return Err(Reject { span, msg: "retry".into(), retry: true });
+            return Err(Reject { span, msg: "retry".into(), retry: true, callee: false });
         }
         Ok(Expr::new(ty, ExprKind::SetLocal(l, Box::new(coerce(v, ty)))))
     }
@@ -1175,7 +1234,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn stmt_inner(&mut self, s: &'a Statement<'a>) -> R<Option<Stmt>> {
         let label = self.label.take();
         if label.is_some()
-            && !matches!(s, Statement::WhileStatement(_) | Statement::DoWhileStatement(_) | Statement::ForStatement(_))
+            && !matches!(
+                s,
+                Statement::WhileStatement(_)
+                    | Statement::DoWhileStatement(_)
+                    | Statement::ForStatement(_)
+                    | Statement::ForOfStatement(_)
+                    | Statement::ForInStatement(_)
+            )
         {
             return reject(s.span(), "labels are only supported on loops");
         }
@@ -1269,6 +1335,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 block.push(lp);
                 Stmt::Block(block)
             }
+            Statement::ForOfStatement(_) | Statement::ForInStatement(_) => self.for_in_of(s, label)?,
             Statement::LabeledStatement(l) => {
                 self.label = Some(l.label.name.to_string());
                 return self.stmt(&l.body);
@@ -1323,7 +1390,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 if self.locals[l] != Ty::Any {
                     self.widen_request = Some(sym);
-                    return Err(Reject { span: a.span, msg: "retry".into(), retry: true });
+                    return Err(Reject { span: a.span, msg: "retry".into(), retry: true, callee: false });
                 }
                 let value = any(self.expr(&aw.argument)?);
                 Ok(Stmt::Await { value, target: ir::AwaitTarget::Set(l) })
@@ -1469,22 +1536,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let param = match &h.param {
                     None => None,
                     Some(p) => {
-                        let BindingPattern::BindingIdentifier(id) = &p.pattern else {
-                            return reject(p.span, "destructuring `catch` parameters are not supported yet");
+                        let sym = match &p.pattern {
+                            BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+                            _ => None,
                         };
-                        let sym = id.symbol_id.get().unwrap();
-                        if self.caps.captured.contains(&sym) {
-                            // The exception goes to a plain local, then to a box.
-                            let raw = self.temp(Ty::Any);
-                            let b = self.declare_boxed(sym);
-                            handler.push(Stmt::NewBoxes(vec![b]));
-                            handler.push(Stmt::Expr(Expr::new(
-                                Ty::Any,
-                                ExprKind::InitLocal(b, Box::new(self.local(raw))),
-                            )));
-                            Some(raw)
-                        } else {
+                        if let Some(sym) = sym
+                            && !self.caps.captured.contains(&sym)
+                        {
                             Some(self.declare(sym, Ty::Any, true))
+                        } else {
+                            // The exception goes to a hidden local, then to
+                            // the pattern (or the box of a captured name).
+                            let raw = self.temp(Ty::Any);
+                            let v = self.local(raw);
+                            self.bind_pattern(&p.pattern, v, BindKind::Let, &mut handler)?;
+                            Some(raw)
                         }
                     }
                 };
@@ -1517,7 +1583,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let base = self.pre.len();
         for d in &v.declarations {
             let BindingPattern::BindingIdentifier(id) = &d.id else {
-                return reject(d.span, "destructuring is not supported yet");
+                // Destructuring.
+                let Some(init) = &d.init else {
+                    return reject(d.span, "a destructuring declaration needs an initializer");
+                };
+                let v = self.expr(init)?;
+                out.extend(self.pre.drain(base..));
+                let kind = if is_var {
+                    BindKind::Var
+                } else if mutable {
+                    BindKind::Let
+                } else {
+                    BindKind::Const
+                };
+                self.bind_pattern(&d.id, v, kind, &mut out)?;
+                continue;
             };
             let sym = id.symbol_id.get().unwrap();
             if let Some(Expression::AwaitExpression(aw)) = d.init.as_ref().map(|i| i.without_parentheses()) {
@@ -1572,14 +1652,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// the variables it captures.
     fn closure(&mut self, node: FnNode<'a>, name: String) -> R<Expr> {
         let key = node.span().start;
-        let (params, _) = header(node)?;
+        let (params, rest, _) = header(node)?;
         // There is no interpreted fallback to decline to: every parameter is
         // a JS value.
-        let params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)> =
-            params.into_iter().map(|p| (p.symbol, Ty::Any, p.default)).collect();
+        let params: Vec<ParamSpec<'a>> = params.into_iter().map(|p| (p.pattern, Ty::Any, p.default)).collect();
         let caps = self.caps.clone();
         let widened = self.widened.clone();
         let mut inner = FnCx::new(&mut *self.m, caps, key, true, widened);
+        inner.rest = rest;
         let r = inner.function(node, name, params);
         let request = inner.widen_request;
         let f = match r {
@@ -1602,6 +1682,356 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.m.closure_spans.push(node.span());
         Ok(Expr::new(Ty::Any, ExprKind::Closure(self.m.closures.len() - 1, boxes)))
     }
+    // ---- destructuring ----
+
+    /// Evaluate `e` for a statement appended to `out`: the statements
+    /// hoisted out of it (`await`s) go to `out` first.
+    fn eval_into(&mut self, e: &'a Expression<'a>, out: &mut Vec<Stmt>) -> R<Expr> {
+        let mark = self.pre.len();
+        let x = self.expr(e)?;
+        out.extend(self.pre.split_off(mark));
+        Ok(x)
+    }
+
+    /// `local === undefined`.
+    fn is_undefined(&self, l: ir::LocalId) -> Expr {
+        Expr::new(Ty::Bool, ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(l)), Box::new(undefined())))
+    }
+
+    /// Initialize the names in pattern `pat` from `v`, appending the
+    /// statements to `out`.
+    fn bind_pattern(&mut self, pat: &'a BindingPattern<'a>, v: Expr, kind: BindKind, out: &mut Vec<Stmt>) -> R<()> {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => self.bind_ident(id, v, kind, out),
+            BindingPattern::AssignmentPattern(p) => {
+                let t = self.temp(Ty::Any);
+                out.push(Stmt::Expr(set(t, any(v))));
+                if let BindingPattern::BindingIdentifier(id) = &p.left {
+                    self.name_hint = Some(id.name.to_string());
+                }
+                let mut arm = Vec::new();
+                let d = self.eval_into(&p.right, &mut arm)?;
+                self.name_hint = None;
+                arm.push(Stmt::Expr(set(t, any(d))));
+                out.push(Stmt::If(self.is_undefined(t), arm, vec![]));
+                let v = self.local(t);
+                self.bind_pattern(&p.left, v, kind, out)
+            }
+            BindingPattern::ObjectPattern(o) => {
+                let src = self.temp(Ty::Any);
+                out.push(Stmt::Expr(set(src, Expr::new(Ty::Any, ExprKind::ToObject(Box::new(any(v)))))));
+                let mut excluded = Vec::new();
+                for p in &o.properties {
+                    let key = self.pattern_key(&p.key, p.computed, out)?;
+                    let value = get_elem(self.local(src), key.0.clone());
+                    excluded.push(key.1);
+                    self.bind_pattern(&p.value, value, kind, out)?;
+                }
+                if let Some(r) = &o.rest {
+                    let rest = Expr::new(Ty::Any, ExprKind::ObjectRest(Box::new(self.local(src)), excluded));
+                    self.bind_pattern(&r.argument, rest, kind, out)?;
+                }
+                Ok(())
+            }
+            BindingPattern::ArrayPattern(a) => {
+                let (iter, next) = self.open_iterator(v, out);
+                let mut body = Vec::new();
+                for el in &a.elements {
+                    let value = Expr::new(Ty::Any, ExprKind::IterStep(iter, Some(next)));
+                    match el {
+                        None => body.push(Stmt::Expr(value)),
+                        Some(p) => {
+                            let t = self.temp(Ty::Any);
+                            body.push(Stmt::Expr(set(t, value)));
+                            let v = self.local(t);
+                            self.bind_pattern(p, v, kind, &mut body)?;
+                        }
+                    }
+                }
+                if let Some(r) = &a.rest {
+                    let rest = self.rest_of_iterator(iter, next, &mut body);
+                    let v = self.local(rest);
+                    self.bind_pattern(&r.argument, v, kind, &mut body)?;
+                }
+                body.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::IterClose(iter, next))));
+                out.push(Stmt::IterGuard { iter, next, loop_id: None, body });
+                Ok(())
+            }
+        }
+    }
+
+    /// Initialize one name.
+    fn bind_ident(&mut self, id: &'a BindingIdentifier<'a>, v: Expr, kind: BindKind, out: &mut Vec<Stmt>) -> R<()> {
+        let sym = id.symbol_id.get().unwrap();
+        if kind == BindKind::Var {
+            let l = self.sym_local[&sym];
+            out.push(Stmt::Expr(self.set_local(Some(sym), l, v, id.span)?));
+            return Ok(());
+        }
+        let local = match self.sym_local.get(&sym) {
+            Some(&l) if self.boxed[l] => l,
+            _ if self.caps.captured.contains(&sym) => {
+                // Not declared by a block (a parameter, `catch` or loop
+                // binding): a fresh box.
+                let l = self.declare_boxed(sym);
+                self.mutable[l] = kind != BindKind::Const;
+                out.push(Stmt::NewBoxes(vec![l]));
+                l
+            }
+            _ => {
+                let ty = if v.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { v.ty };
+                self.declare(sym, ty, kind != BindKind::Const)
+            }
+        };
+        let ty = self.locals[local];
+        out.push(Stmt::Expr(Expr::new(ty, ExprKind::InitLocal(local, Box::new(coerce(v, ty))))));
+        Ok(())
+    }
+
+    /// A pattern's property key: for the property read, and as a value for
+    /// the rest's excluded keys. Computed keys are converted once.
+    fn pattern_key(&mut self, key: &'a PropertyKey<'a>, computed: bool, out: &mut Vec<Stmt>) -> R<(Key, Expr)> {
+        let name = match key {
+            PropertyKey::StaticIdentifier(id) if !computed => id.name.to_string(),
+            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            PropertyKey::NumericLiteral(n) if n.value.fract() == 0.0 && n.value >= 0.0 && n.value < 4294967295.0 => {
+                format!("{}", n.value as u64)
+            }
+            PropertyKey::PrivateIdentifier(p) => return reject(p.span, "private names in patterns are not supported"),
+            k => {
+                let Some(e) = k.as_expression() else {
+                    return reject(k.span(), "unsupported property key");
+                };
+                let x = self.eval_into(e, out)?;
+                let t = self.temp(Ty::Any);
+                out.push(Stmt::Expr(set(t, Expr::new(Ty::Any, ExprKind::ToPropKey(Box::new(any(x)))))));
+                return Ok((Key::Value(Box::new(self.local(t))), self.local(t)));
+            }
+        };
+        let id = self.m.string(&name);
+        Ok((Key::Atom(self.m.atom(&name)), Expr::new(Ty::Any, ExprKind::Str(id))))
+    }
+
+    /// `GetIterator(v)` and its `next` method, in new locals.
+    fn open_iterator(&mut self, v: Expr, out: &mut Vec<Stmt>) -> (ir::LocalId, ir::LocalId) {
+        let iter = self.temp(Ty::Any);
+        let next = self.temp(Ty::Any);
+        let atom = self.m.atom("next");
+        out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::IterOpen(Box::new(any(v)), iter, next, atom))));
+        (iter, next)
+    }
+
+    /// The rest of an iterator's values, in a new array (in a new local).
+    fn rest_of_iterator(&mut self, iter: ir::LocalId, next: ir::LocalId, out: &mut Vec<Stmt>) -> ir::LocalId {
+        let arr = self.temp(Ty::Any);
+        out.push(Stmt::Expr(set(arr, Expr::new(Ty::Any, ExprKind::ArrayParts(vec![])))));
+        let id = self.next_loop;
+        self.next_loop += 1;
+        let t = self.temp(Ty::Any);
+        let body = vec![
+            Stmt::Expr(set(t, Expr::new(Ty::Any, ExprKind::IterStep(iter, Some(next))))),
+            Stmt::If(self.is_undefined(iter), vec![Stmt::Break(id)], vec![]),
+            Stmt::Expr(Expr::new(Ty::Any, ExprKind::ArrayPush(arr, Box::new(self.local(t))))),
+        ];
+        out.push(Stmt::Loop { id, test: None, post_test: false, body, update: None, per_iteration: vec![] });
+        arr
+    }
+
+    /// Assign `v` to an assignment target (a reference or a pattern).
+    fn assign_target(&mut self, t: &'a AssignmentTarget<'a>, v: Expr, out: &mut Vec<Stmt>) -> R<()> {
+        match t.as_simple_assignment_target() {
+            Some(simple) => {
+                let mark = self.pre.len();
+                let (setup, place, sym) = self.place(simple)?;
+                out.extend(self.pre.split_off(mark));
+                out.extend(setup.into_iter().map(Stmt::Expr));
+                out.push(Stmt::Expr(self.write(&place, sym, v, t.span())?));
+                Ok(())
+            }
+            None => self.assign_pattern(t.as_assignment_target_pattern().unwrap(), v, out),
+        }
+    }
+
+    fn assign_pattern(&mut self, p: &'a AssignmentTargetPattern<'a>, v: Expr, out: &mut Vec<Stmt>) -> R<()> {
+        match p {
+            AssignmentTargetPattern::ObjectAssignmentTarget(o) => {
+                let src = self.temp(Ty::Any);
+                out.push(Stmt::Expr(set(src, Expr::new(Ty::Any, ExprKind::ToObject(Box::new(any(v)))))));
+                let mut excluded = Vec::new();
+                for prop in &o.properties {
+                    match prop {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                            let name = p.binding.name.as_str();
+                            let atom = self.m.atom(name);
+                            let sid = self.m.string(name);
+                            excluded.push(Expr::new(Ty::Any, ExprKind::Str(sid)));
+                            let value = Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(src)), atom));
+                            let (setup, place, sym) = self.ident_place(&p.binding)?;
+                            out.extend(setup.into_iter().map(Stmt::Expr));
+                            let value = self.with_default(value, p.init.as_ref(), Some(name), out)?;
+                            out.push(Stmt::Expr(self.write(&place, sym, value, p.span)?));
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            let (key, kv) = self.pattern_key(&p.name, p.computed, out)?;
+                            excluded.push(kv);
+                            self.assign_element(&p.binding, |cx| get_elem(cx.local(src), key.clone()), out)?;
+                        }
+                    }
+                }
+                if let Some(r) = &o.rest {
+                    let rest = Expr::new(Ty::Any, ExprKind::ObjectRest(Box::new(self.local(src)), excluded));
+                    self.assign_target(&r.target, rest, out)?;
+                }
+                Ok(())
+            }
+            AssignmentTargetPattern::ArrayAssignmentTarget(a) => {
+                let (iter, next) = self.open_iterator(v, out);
+                let mut body = Vec::new();
+                for el in &a.elements {
+                    let step = |_: &mut Self| Expr::new(Ty::Any, ExprKind::IterStep(iter, Some(next)));
+                    match el {
+                        None => body.push(Stmt::Expr(step(self))),
+                        Some(t) => self.assign_element(t, step, &mut body)?,
+                    }
+                }
+                if let Some(r) = &a.rest {
+                    // The target reference is evaluated first.
+                    match r.target.as_simple_assignment_target() {
+                        Some(simple) => {
+                            let mark = self.pre.len();
+                            let (setup, place, sym) = self.place(simple)?;
+                            body.extend(self.pre.split_off(mark));
+                            body.extend(setup.into_iter().map(Stmt::Expr));
+                            let rest = self.rest_of_iterator(iter, next, &mut body);
+                            let v = self.local(rest);
+                            body.push(Stmt::Expr(self.write(&place, sym, v, r.span)?));
+                        }
+                        None => {
+                            let rest = self.rest_of_iterator(iter, next, &mut body);
+                            let v = self.local(rest);
+                            self.assign_target(&r.target, v, &mut body)?;
+                        }
+                    }
+                }
+                body.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::IterClose(iter, next))));
+                out.push(Stmt::IterGuard { iter, next, loop_id: None, body });
+                Ok(())
+            }
+        }
+    }
+
+    /// An element of an assignment pattern: a simple target's reference is
+    /// evaluated before its value is read (by `read`), then the default.
+    fn assign_element(
+        &mut self,
+        t: &'a AssignmentTargetMaybeDefault<'a>,
+        read: impl FnOnce(&mut Self) -> Expr,
+        out: &mut Vec<Stmt>,
+    ) -> R<()> {
+        let (target, init) = match t {
+            AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => (&d.binding, Some(&d.init)),
+            other => (other.as_assignment_target().unwrap(), None),
+        };
+        let hint = match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+            _ => None,
+        };
+        match target.as_simple_assignment_target() {
+            Some(simple) => {
+                let mark = self.pre.len();
+                let (setup, place, sym) = self.place(simple)?;
+                out.extend(self.pre.split_off(mark));
+                out.extend(setup.into_iter().map(Stmt::Expr));
+                let value = read(self);
+                let value = self.with_default(value, init, hint, out)?;
+                out.push(Stmt::Expr(self.write(&place, sym, value, target.span())?));
+            }
+            None => {
+                let value = read(self);
+                let value = self.with_default(value, init, hint, out)?;
+                self.assign_pattern(target.as_assignment_target_pattern().unwrap(), value, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `v`, or `init` if it is `undefined`.
+    fn with_default(
+        &mut self,
+        v: Expr,
+        init: Option<&'a Expression<'a>>,
+        name: Option<&str>,
+        out: &mut Vec<Stmt>,
+    ) -> R<Expr> {
+        let Some(init) = init else { return Ok(v) };
+        let t = self.temp(Ty::Any);
+        out.push(Stmt::Expr(set(t, any(v))));
+        self.name_hint = name.map(str::to_string);
+        let mut arm = Vec::new();
+        let d = self.eval_into(init, &mut arm)?;
+        self.name_hint = None;
+        arm.push(Stmt::Expr(set(t, any(d))));
+        out.push(Stmt::If(self.is_undefined(t), arm, vec![]));
+        Ok(self.local(t))
+    }
+
+    // ---- for-of / for-in ----
+
+    fn for_in_of(&mut self, s: &'a Statement<'a>, label: Option<String>) -> R<Stmt> {
+        let (left, right, stmt_body, is_of) = match s {
+            Statement::ForOfStatement(f) => {
+                if f.r#await {
+                    return reject(f.span, "`for await` is not supported yet");
+                }
+                (&f.left, &f.right, &f.body, true)
+            }
+            Statement::ForInStatement(f) => (&f.left, &f.right, &f.body, false),
+            _ => unreachable!(),
+        };
+        let mut out = Vec::new();
+        // The iterated value (with `let` / `const` bindings in their TDZ).
+        let v = self.eval_into(right, &mut out)?;
+        let (iter, next) = if is_of {
+            let (i, n) = self.open_iterator(v, &mut out);
+            (i, Some(n))
+        } else {
+            let i = self.temp(Ty::Any);
+            out.push(Stmt::Expr(set(i, Expr::new(Ty::Any, ExprKind::ForInIterator(Box::new(any(v)))))));
+            (i, None)
+        };
+        let lp = self.lp(label, JumpKind::Loop, |cx, id| {
+            let value = cx.temp(Ty::Any);
+            let mut body = vec![
+                Stmt::Expr(set(value, Expr::new(Ty::Any, ExprKind::IterStep(iter, next)))),
+                Stmt::If(cx.is_undefined(iter), vec![Stmt::Break(id)], vec![]),
+            ];
+            // Each iteration binds the loop variable anew.
+            let mut inner = Vec::new();
+            let v = cx.local(value);
+            match left {
+                ForStatementLeft::VariableDeclaration(d) => {
+                    let kind = match d.kind {
+                        VariableDeclarationKind::Let => BindKind::Let,
+                        VariableDeclarationKind::Const => BindKind::Const,
+                        VariableDeclarationKind::Var => BindKind::Var,
+                        _ => return reject(d.span, "`using` declarations are not supported"),
+                    };
+                    cx.bind_pattern(&d.declarations[0].id, v, kind, &mut inner)?;
+                }
+                target => cx.assign_target(target.to_assignment_target(), v, &mut inner)?,
+            }
+            inner.extend(cx.body(stmt_body)?);
+            if is_of {
+                body.push(Stmt::IterGuard { iter, next: next.unwrap(), loop_id: Some(id), body: inner });
+            } else {
+                body.extend(inner);
+            }
+            Ok(Stmt::Loop { id, test: None, post_test: false, body, update: None, per_iteration: vec![] })
+        })?;
+        out.push(lp);
+        Ok(Stmt::Block(out))
+    }
+
     // ---- expressions ----
 
     /// An expression used as a condition: converted with JS truthiness.
@@ -1737,6 +2167,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             Expression::CallExpression(c) => self.call(c)?,
             Expression::ChainExpression(c) => self.chain(c)?,
+            Expression::NewExpression(n) if has_spread(&n.arguments) => {
+                let mut earlier = [any(self.expr(&n.callee)?)];
+                let arr = self.arg_array(&n.arguments, &mut earlier)?;
+                let [callee] = earlier;
+                Expr::new(Ty::Any, ExprKind::NewSpread(Box::new(callee), Box::new(arr)))
+            }
             Expression::NewExpression(n) => {
                 let mut v = vec![any(self.expr(&n.callee)?)];
                 self.push_args(&mut v, &n.arguments)?;
@@ -1752,6 +2188,30 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Expr::new(ty, ExprKind::New(Box::new(callee), v))
             }
             Expression::ObjectExpression(o) => self.object(o)?,
+            Expression::ArrayExpression(a) if a.elements.iter().any(|e| e.as_expression().is_none()) => {
+                let mut parts = Vec::new();
+                let mut values = Vec::new();
+                for el in &a.elements {
+                    match el {
+                        ArrayExpressionElement::Elision(_) => parts.push(None),
+                        ArrayExpressionElement::SpreadElement(s) => {
+                            let mark = self.pre.len();
+                            let v = any(self.expr(&s.argument)?);
+                            self.order(&mut values, mark);
+                            values.push(v);
+                            parts.push(Some(true));
+                        }
+                        other => {
+                            let mark = self.pre.len();
+                            let v = any(self.expr(other.to_expression())?);
+                            self.order(&mut values, mark);
+                            values.push(v);
+                            parts.push(Some(false));
+                        }
+                    }
+                }
+                array_parts(parts, values)
+            }
             Expression::ArrayExpression(a) => {
                 let mut elems = Vec::new();
                 for el in &a.elements {
@@ -1927,14 +2387,45 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     fn object(&mut self, o: &'a ObjectExpression<'a>) -> R<Expr> {
-        let mut atoms = Vec::new();
+        // Parts: a field (its atom), a computed key, a spread; `values` are
+        // all the operands, in evaluation order.
+        enum Part {
+            Field(ir::AtomId),
+            Computed,
+            Spread,
+        }
+        let mut parts = Vec::new();
         let mut values = Vec::new();
+        let push = |cx: &mut Self, e: Expr, values: &mut Vec<Expr>, mark: usize| {
+            cx.order(values, mark);
+            values.push(e);
+        };
         for p in &o.properties {
-            let ObjectPropertyKind::ObjectProperty(p) = p else {
-                return reject(p.span(), "object spread is not supported yet");
+            let p = match p {
+                ObjectPropertyKind::SpreadProperty(s) => {
+                    let mark = self.pre.len();
+                    let v = any(self.expr(&s.argument)?);
+                    push(self, v, &mut values, mark);
+                    parts.push(Part::Spread);
+                    continue;
+                }
+                ObjectPropertyKind::ObjectProperty(p) => p,
             };
-            if p.kind != PropertyKind::Init || p.method || p.computed {
-                return reject(p.span, "methods, accessors and computed keys in object literals are not supported yet");
+            if p.kind != PropertyKind::Init || p.method {
+                return reject(p.span, "methods and accessors in object literals are not supported yet");
+            }
+            if p.computed {
+                let Some(k) = p.key.as_expression() else {
+                    return reject(p.span, "unsupported object literal key");
+                };
+                let mark = self.pre.len();
+                let k = any(self.expr(k)?);
+                push(self, Expr::new(Ty::Any, ExprKind::ToPropKey(Box::new(k))), &mut values, mark);
+                let mark = self.pre.len();
+                let v = any(self.expr(&p.value)?);
+                push(self, v, &mut values, mark);
+                parts.push(Part::Computed);
+                continue;
             }
             let name = match &p.key {
                 PropertyKey::StaticIdentifier(id) => id.name.to_string(),
@@ -1949,11 +2440,32 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             let mark = self.pre.len();
             let v = any(self.expr(&p.value)?);
-            self.order(&mut values, mark);
-            values.push(v);
-            atoms.push(self.m.atom(&name));
+            push(self, v, &mut values, mark);
+            parts.push(Part::Field(self.m.atom(&name)));
         }
-        Ok(Expr::new(Ty::Any, ExprKind::Object(atoms.into_iter().zip(values).collect())))
+        let mut values = values.into_iter();
+        if parts.iter().all(|p| matches!(p, Part::Field(_))) {
+            let props = parts
+                .into_iter()
+                .map(|p| match p {
+                    Part::Field(a) => (a, values.next().unwrap()),
+                    _ => unreachable!(),
+                })
+                .collect();
+            return Ok(Expr::new(Ty::Any, ExprKind::Object(props)));
+        }
+        let parts = parts
+            .into_iter()
+            .map(|p| match p {
+                Part::Field(a) => ir::ObjPart::Field(a, values.next().unwrap()),
+                Part::Computed => {
+                    let k = values.next().unwrap();
+                    ir::ObjPart::Computed(k, values.next().unwrap())
+                }
+                Part::Spread => ir::ObjPart::Spread(values.next().unwrap()),
+            })
+            .collect();
+        Ok(Expr::new(Ty::Any, ExprKind::ObjectParts(parts)))
     }
 
     /// A property key: an atom for constant names.
@@ -1973,6 +2485,26 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Key::Value(Box::new(if k.ty == Ty::F64 { k } else { any(k) }))
             }
         })
+    }
+
+    /// Arguments with spreads, as an array; operands in `earlier` (checked
+    /// before) are evaluated before any `await` hoisted out of them.
+    fn arg_array(&mut self, args: &'a [Argument<'a>], earlier: &mut [Expr]) -> R<Expr> {
+        let mut parts = Vec::new();
+        let mut values = Vec::new();
+        for a in args {
+            let (e, spread) = match a {
+                Argument::SpreadElement(s) => (&s.argument, true),
+                other => (other.to_expression(), false),
+            };
+            let mark = self.pre.len();
+            let v = any(self.expr(e)?);
+            self.order(&mut values, mark);
+            self.order(earlier, mark);
+            values.push(v);
+            parts.push(Some(spread));
+        }
+        Ok(array_parts(parts, values))
     }
 
     fn args(&mut self, args: &'a [Argument<'a>]) -> R<Vec<Expr>> {
@@ -2085,30 +2617,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// order) into temporaries. Returns the setup expressions and the place.
     fn place(&mut self, t: &'a SimpleAssignmentTarget<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         Ok(match t {
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => match self.resolve(id) {
-                Some(sym) => {
-                    if let Some(&l) = self.sym_local.get(&sym) {
-                        if !self.mutable[l] {
-                            return reject(id.span, format!("assignment to constant `{}`", id.name));
-                        }
-                        (vec![], Place::Local(l), Some(sym))
-                    } else if self.is_module_symbol(sym) {
-                        let b = self.m.bindings.get(&sym);
-                        if b.is_none_or(|b| b.kind == BindingKind::Const || b.kind == BindingKind::Import) {
-                            return reject(id.span, format!("assignment to constant `{}`", id.name));
-                        }
-                        (vec![], Place::Cell(self.m.cell(sym, id.span)?), None)
-                    } else {
-                        return reject(id.span, format!("`{}` is not a local variable or module binding", id.name));
-                    }
-                }
-                None => match id.name.as_str() {
-                    "undefined" | "NaN" | "Infinity" | "arguments" => {
-                        return reject(id.span, format!("assignment to `{}`", id.name));
-                    }
-                    name => (vec![], Place::Global(self.m.atom(name)), None),
-                },
-            },
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => return self.ident_place(id),
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 let atom = self.m.atom(m.property.name.as_str());
                 if let Some(l) = self.plain_local(&m.object) {
@@ -2160,6 +2669,34 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let Expression::Identifier(id) = e.without_parentheses() else { return None };
         let &l = self.sym_local.get(&self.resolve(id)?)?;
         (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_))).then_some(l)
+    }
+
+    /// An identifier as an assignment target.
+    fn ident_place(&mut self, id: &'a IdentifierReference<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+        Ok(match self.resolve(id) {
+            Some(sym) => {
+                if let Some(&l) = self.sym_local.get(&sym) {
+                    if !self.mutable[l] {
+                        return reject(id.span, format!("assignment to constant `{}`", id.name));
+                    }
+                    (vec![], Place::Local(l), Some(sym))
+                } else if self.is_module_symbol(sym) {
+                    let b = self.m.bindings.get(&sym);
+                    if b.is_none_or(|b| b.kind == BindingKind::Const || b.kind == BindingKind::Import) {
+                        return reject(id.span, format!("assignment to constant `{}`", id.name));
+                    }
+                    (vec![], Place::Cell(self.m.cell(sym, id.span)?), None)
+                } else {
+                    return reject(id.span, format!("`{}` is not a local variable or module binding", id.name));
+                }
+            }
+            None => match id.name.as_str() {
+                "undefined" | "NaN" | "Infinity" | "arguments" => {
+                    return reject(id.span, format!("assignment to `{}`", id.name));
+                }
+                name => (vec![], Place::Global(self.m.atom(name)), None),
+            },
+        })
     }
 
     fn place_expr(&mut self, e: &'a Expression<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
@@ -2236,7 +2773,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     fn assign(&mut self, a: &'a AssignmentExpression<'a>) -> R<Expr> {
         let Some(target) = a.left.as_simple_assignment_target() else {
-            return reject(a.span, "destructuring assignment is not supported yet");
+            // Destructuring: statements that run before the current one (as
+            // for `await`); the expression's value is the right-hand side.
+            let pattern = a.left.as_assignment_target_pattern().unwrap();
+            let v = self.expr(&a.right)?;
+            let t = self.temp(Ty::Any);
+            let mut stmts = vec![Stmt::Expr(set(t, any(v)))];
+            self.assign_pattern(pattern, self.local(t), &mut stmts)?;
+            self.pre.extend(stmts);
+            return Ok(self.local(t));
         };
         let (mut setup, place, sym) = self.place(target)?;
         let mark = self.pre.len();
@@ -2306,7 +2851,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         {
             // `++` on a boolean local makes it a number.
             self.widen_request = sym;
-            return Err(Reject { span: u.span, msg: "retry".into(), retry: true });
+            return Err(Reject { span: u.span, msg: "retry".into(), retry: true, callee: false });
         }
         let cur = self.read(&place);
         if num(cur.ty) {
@@ -2519,6 +3064,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     fn call_value(&mut self, callee: Expr, args: &'a [Argument<'a>]) -> R<Expr> {
+        if has_spread(args) {
+            let mut earlier = [callee];
+            let arr = self.arg_array(args, &mut earlier)?;
+            let [callee] = earlier;
+            let this = undefined();
+            return Ok(Expr::new(Ty::Any, ExprKind::CallSpread(Box::new(callee), Box::new(this), Box::new(arr))));
+        }
         let mut v = vec![callee];
         self.push_args(&mut v, args)?;
         let callee = v.remove(0);
@@ -2529,6 +3081,25 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// evaluated: when they await, into a temporary before the awaits.
     fn call_method(&mut self, obj: Expr, key: Key, args: &'a [Argument<'a>]) -> R<Expr> {
         let mark = self.pre.len();
+        if has_spread(args) {
+            // The method is read into a temporary, then the arguments.
+            let arr = self.arg_array(args, &mut [])?;
+            let o = self.temp(Ty::Any);
+            let f = self.temp(Ty::Any);
+            let method = get_elem(self.local(o), key);
+            let setup = vec![set(o, obj), set(f, any(method))];
+            let call = Expr::new(
+                Ty::Any,
+                ExprKind::CallSpread(Box::new(self.local(f)), Box::new(self.local(o)), Box::new(arr)),
+            );
+            if self.pre.len() == mark {
+                let mut xs = setup;
+                xs.push(call);
+                return Ok(seq(xs));
+            }
+            self.pre.splice(mark..mark, setup.into_iter().map(Stmt::Expr));
+            return Ok(call);
+        }
         let args = self.args(args)?;
         if self.pre.len() == mark {
             return Ok(Expr::new(Ty::Any, ExprKind::CallMethod(Box::new(obj), key, args)));
@@ -2554,11 +3125,49 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             return Ok(None);
         }
         let (params, ret) = self.m.signature(i, span)?;
-        if args.len() > params.len() || args.iter().any(|a| a.as_expression().is_none()) {
+        let rest = self.m.cands[i].rest;
+        let fixed = params.len() - rest as usize;
+        if (!rest && args.len() > params.len()) || args.iter().any(|a| a.as_expression().is_none()) {
             return Ok(None);
         }
         let start = self.pre.len();
         let mut out = Vec::with_capacity(params.len());
+        if rest {
+            // The extra arguments, in an array.
+            let mut extra = Vec::new();
+            for (k, a) in args.iter().enumerate() {
+                let mark = self.pre.len();
+                let x = self.expr(a.as_expression().unwrap())?;
+                if k < fixed {
+                    self.order(&mut out, mark);
+                    out.push(x);
+                } else {
+                    // Spills go in at `mark`: the earliest operands last.
+                    self.order(&mut extra, mark);
+                    self.order(&mut out, mark);
+                    extra.push(any(x));
+                }
+            }
+            while out.len() < fixed {
+                if params[out.len()] != Ty::Any {
+                    self.pre.truncate(start);
+                    return Ok(None);
+                }
+                out.push(undefined());
+            }
+            for (k, x) in out.iter_mut().enumerate() {
+                match (params[k], x.ty) {
+                    (Ty::Any, _) => *x = any(std::mem::replace(x, undefined())),
+                    (p, t) if p == t => {}
+                    _ => {
+                        self.pre.truncate(start);
+                        return Ok(None);
+                    }
+                }
+            }
+            out.push(Expr::new(Ty::Any, ExprKind::Array(extra)));
+            return Ok(Some(Expr::new(ret, ExprKind::Call(i, out))));
+        }
         for (k, &p) in params.iter().enumerate() {
             let mark = self.pre.len();
             let x = match args.get(k) {
@@ -2689,6 +3298,7 @@ fn box_returns(body: Vec<Stmt>) -> Vec<Stmt> {
                 Stmt::Switch { id, disc, cases: cases.into_iter().map(|(t, b)| (t, l(b))).collect() }
             }
             Stmt::Block(b) => Stmt::Block(l(b)),
+            Stmt::IterGuard { iter, next, loop_id, body } => Stmt::IterGuard { iter, next, loop_id, body: l(body) },
             Stmt::Try { body, catch, finally, exc } => {
                 Stmt::Try { body: l(body), catch: catch.map(|(p, b)| (p, l(b))), finally: finally.map(l), exc }
             }
@@ -2817,6 +3427,7 @@ fn completes(s: &Stmt) -> bool {
         Stmt::Await { target, .. } => !matches!(target, ir::AwaitTarget::Return),
         Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Throw(_) => false,
         Stmt::Block(b) => completes_list(b),
+        Stmt::IterGuard { body, .. } => completes_list(body),
         Stmt::If(_, a, b) => completes_list(a) || completes_list(b),
         Stmt::Loop { id, test, body, .. } => {
             let infinite = matches!(test, None | Some(Expr { kind: ExprKind::Bool(true), .. }));
@@ -2835,6 +3446,7 @@ fn breaks_to(list: &[Stmt], id: ir::LoopId) -> bool {
     list.iter().any(|s| match s {
         Stmt::Break(t) => *t == id,
         Stmt::Block(b) => breaks_to(b, id),
+        Stmt::IterGuard { body, .. } => breaks_to(body, id),
         Stmt::If(_, a, b) => breaks_to(a, id) || breaks_to(b, id),
         Stmt::Loop { body, .. } => breaks_to(body, id),
         Stmt::Switch { cases, .. } => cases.iter().any(|(_, b)| breaks_to(b, id)),
@@ -2874,4 +3486,23 @@ fn describe_expr(e: &Expression) -> &'static str {
         Expression::Super(_) => "super",
         _ => "this expression kind",
     }
+}
+
+fn has_spread(args: &[Argument]) -> bool {
+    args.iter().any(|a| matches!(a, Argument::SpreadElement(_)))
+}
+
+/// An array literal from its parts: holes (`None`), and values that are
+/// spread (`Some(true)`) or not.
+fn array_parts(parts: Vec<Option<bool>>, values: Vec<Expr>) -> Expr {
+    let mut values = values.into_iter();
+    let parts = parts
+        .into_iter()
+        .map(|p| match p {
+            None => ir::ArrPart::Hole,
+            Some(true) => ir::ArrPart::Spread(values.next().unwrap()),
+            Some(false) => ir::ArrPart::Value(values.next().unwrap()),
+        })
+        .collect();
+    Expr::new(Ty::Any, ExprKind::ArrayParts(parts))
 }

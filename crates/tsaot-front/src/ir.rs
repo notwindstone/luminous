@@ -155,6 +155,8 @@ pub struct Func {
     pub has_this: bool,
     /// `async`: compiled as a resumable step function over a heap frame.
     pub is_async: bool,
+    /// The last parameter collects the remaining arguments in an array.
+    pub rest: bool,
     /// In functions that suspend: holds the return value while `finally`
     /// blocks run on the way out (`Any`).
     pub ret_slot: Option<LocalId>,
@@ -207,6 +209,16 @@ pub enum Stmt {
         catch: Option<(Option<LocalId>, Vec<Stmt>)>,
         finally: Option<Vec<Stmt>>,
         exc: Option<LocalId>,
+    },
+    /// `body`, after which nothing more is read from the iterator in local
+    /// `iter`: when `body` completes abruptly (by an exception, or a jump or
+    /// `return` leaving it; not a `continue` of loop `loop_id`), the
+    /// iterator is closed unless it is done (`undefined`).
+    IterGuard {
+        iter: LocalId,
+        next: LocalId,
+        loop_id: Option<LoopId>,
+        body: Vec<Stmt>,
     },
 }
 
@@ -289,6 +301,40 @@ pub enum ExprKind {
     Object(Vec<(AtomId, Expr)>),
     /// Array literal without holes or spreads.
     Array(Vec<Expr>),
+    /// Array literal with holes or spreads.
+    ArrayParts(Vec<ArrPart>),
+    /// Object literal with spreads or computed keys, defined in order.
+    ObjectParts(Vec<ObjPart>),
+    /// `f(...args)` / `obj.m(...args)`: the arguments as an array, and
+    /// `this` (`Undefined` for plain calls).
+    CallSpread(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `new F(...args)`, the arguments as an array.
+    NewSpread(Box<Expr>, Box<Expr>),
+    /// Start iterating a value (`GetIterator`, sync): the iterator and its
+    /// `next` method go to locals `iter` and `next` (`next`: the atom).
+    /// An array with the shape of a fresh one is iterated directly instead
+    /// (while array iteration is the original one): `iter` is the array and `next` the
+    /// index (an int). Evaluates to `undefined`.
+    IterOpen(Box<Expr>, LocalId, LocalId, AtomId),
+    /// The `for`-`in` iterator of a value.
+    ForInIterator(Box<Expr>),
+    /// The next value of the iterator in local `iter` (with `next` from
+    /// `IterOpen`, or a `for`-`in` iterator without one). When the iterator is
+    /// done, or throws, `iter` becomes `undefined`; the value is then
+    /// `undefined`.
+    IterStep(LocalId, Option<LocalId>),
+    /// Close the iterator in `iter` unless it is `undefined` (done), and
+    /// make it `undefined`. Evaluates to `undefined`.
+    IterClose(LocalId, LocalId),
+    /// ToObject.
+    ToObject(Box<Expr>),
+    /// ToPropertyKey.
+    ToPropKey(Box<Expr>),
+    /// Append a value to the array in a local (array rest; `undefined`).
+    ArrayPush(LocalId, Box<Expr>),
+    /// A new object with the own enumerable properties of the source but
+    /// the given keys (object rest).
+    ObjectRest(Box<Expr>, Vec<Expr>),
     /// Initialization of a local by its declaration (no TDZ check).
     InitLocal(LocalId, Box<Expr>),
     /// The receiver of a method.
@@ -310,6 +356,23 @@ pub enum AwaitTarget {
     Init(LocalId),
     /// `return await e;`
     Return,
+}
+
+/// An element of an array literal.
+#[derive(Debug, Clone)]
+pub enum ArrPart {
+    Value(Expr),
+    Spread(Expr),
+    Hole,
+}
+
+/// A property of an object literal.
+#[derive(Debug, Clone)]
+pub enum ObjPart {
+    Field(AtomId, Expr),
+    /// `[key]: value` (the key is converted when the property is defined).
+    Computed(Expr, Expr),
+    Spread(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +586,8 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
         | Global(_)
         | GlobalOrUndefined(_)
         | This
+        | IterStep(..)
+        | IterClose(..)
         | Closure(..) => {}
         SetLocal(_, a)
         | InitLocal(_, a)
@@ -535,7 +600,43 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
         | GetProp(a, _)
         | Length(a, _)
         | DeleteProp(a, _)
+        | IterOpen(a, ..)
+        | ForInIterator(a)
+        | ToObject(a)
+        | ToPropKey(a)
+        | ArrayPush(_, a)
         | Void(a) => visit(a, f),
+        ArrayParts(parts) => {
+            for p in parts {
+                if let ArrPart::Value(x) | ArrPart::Spread(x) = p {
+                    visit(x, f);
+                }
+            }
+        }
+        ObjectParts(parts) => {
+            for p in parts {
+                match p {
+                    ObjPart::Field(_, x) | ObjPart::Spread(x) => visit(x, f),
+                    ObjPart::Computed(k, x) => {
+                        visit(k, f);
+                        visit(x, f);
+                    }
+                }
+            }
+        }
+        ObjectRest(a, xs) => {
+            visit(a, f);
+            xs.iter().for_each(|x| visit(x, f));
+        }
+        NewSpread(a, b) => {
+            visit(a, f);
+            visit(b, f);
+        }
+        CallSpread(a, b, c) => {
+            visit(a, f);
+            visit(b, f);
+            visit(c, f);
+        }
         TypedGet(_, a, b) => {
             visit(a, f);
             visit(b, f);
@@ -587,11 +688,12 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
 pub fn assigns_local(x: &Expr, l: LocalId) -> bool {
     let mut found = false;
     visit(x, &mut |e| {
-        if let ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } = e.kind
-            && m == l
-        {
-            found = true;
-        }
+        found |= match e.kind {
+            ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } => m == l,
+            ExprKind::IterStep(m, n) => m == l || n == Some(l),
+            ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) => m == l || n == l,
+            _ => false,
+        };
     });
     found
 }

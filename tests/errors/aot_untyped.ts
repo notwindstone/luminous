@@ -1,3 +1,5 @@
 // @error `aot` function `count` cannot be compiled natively
-// @error rest parameters are not supported yet
-const count = aot (...xs: number[]): number => xs.length;
+// @error `arguments` is not supported
+const count = aot function (): number {
+  return arguments.length;
+};

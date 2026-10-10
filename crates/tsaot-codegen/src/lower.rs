@@ -169,8 +169,9 @@ pub(crate) struct Env {
     pub cells: GlobalValue,
     pub strings: GlobalValue,
     pub atoms: GlobalValue,
-    /// `tsaot_ta_shapes`: the shape of a pristine typed array, by kind.
-    pub ta_shapes: GlobalValue,
+    /// `tsaot_shapes`: the shapes of a pristine typed array (by kind), then
+    /// of a pristine array.
+    pub shapes: GlobalValue,
     /// `tsaot_ics`: inline caches, and the next free one.
     pub ics: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
@@ -187,6 +188,15 @@ enum Scope {
     /// the handler and scope depths in effect around the `try`.
     Finally {
         body: Vec<Stmt>,
+        handlers: usize,
+        scopes: usize,
+    },
+    /// An iterator to close when a jump or return leaves its guard (but not
+    /// a `continue` of loop `loop_id`).
+    CloseIter {
+        iter: ir::LocalId,
+        next: ir::LocalId,
+        loop_id: Option<ir::LoopId>,
         handlers: usize,
         scopes: usize,
     },
@@ -744,13 +754,13 @@ impl<'a> Lower<'a> {
             }
             Stmt::Switch { id, disc, cases } => self.switch(*id, *disc, cases),
             Stmt::Break(id) => {
-                self.leave_to(*id);
+                self.leave_to(*id, false);
                 let (_, exit) = self.loops[id];
                 self.b.ins().jump(exit, &[]);
                 self.after_terminator();
             }
             Stmt::Continue(id) => {
-                self.leave_to(*id);
+                self.leave_to(*id, true);
                 let (cont, _) = self.loops[id];
                 self.b.ins().jump(cont.expect("continue targets a loop"), &[]);
                 self.after_terminator();
@@ -777,12 +787,13 @@ impl<'a> Lower<'a> {
                 self.after_terminator();
             }
             Stmt::Try { body, catch, finally, exc } => self.try_stmt(body, catch.as_ref(), finally.as_ref(), *exc),
+            Stmt::IterGuard { iter, next, loop_id, body } => self.iter_guard(*iter, *next, *loop_id, body),
         }
     }
 
     /// Return `v` (owned), running the `finally` blocks on the way out.
     fn return_value(&mut self, v: V) {
-        let v = if self.scopes.iter().any(|s| matches!(s, Scope::Finally { .. })) {
+        let v = if self.scopes.iter().any(|s| !matches!(s, Scope::Jump(_))) {
             match (self.ret_slot, v) {
                 (_, V::Void) => {
                     self.run_finally_until(0);
@@ -828,25 +839,43 @@ impl<'a> Lower<'a> {
     }
 
     /// Run the `finally` blocks between here and jump target `id`.
-    fn leave_to(&mut self, id: ir::LoopId) {
+    fn leave_to(&mut self, id: ir::LoopId, is_continue: bool) {
         let depth = self.scopes.iter().rposition(|s| matches!(s, Scope::Jump(t) if *t == id)).expect("jump target");
-        self.run_finally_until(depth + 1);
+        self.unwind(depth + 1, is_continue.then_some(id));
     }
 
     /// Run every `finally` in `scopes[depth..]`, innermost first, each with
     /// the handlers and scopes that surround its `try`.
     fn run_finally_until(&mut self, depth: usize) {
+        self.unwind(depth, None);
+    }
+
+    /// Leave `scopes[depth..]`, innermost first: run the `finally` blocks
+    /// and close the iterators (except for a `continue` of loop
+    /// `continued`), each with the handlers and scopes around it.
+    fn unwind(&mut self, depth: usize, continued: Option<ir::LoopId>) {
         let mut i = self.scopes.len();
         while i > depth {
             i -= 1;
-            if let Scope::Finally { body, handlers, scopes } = &self.scopes[i] {
-                let (body, handlers, scopes) = (body.clone(), *handlers, *scopes);
-                let saved_handlers = self.handlers.split_off(handlers);
-                let saved_scopes = self.scopes.split_off(scopes);
-                self.stmts(&body);
-                self.handlers.extend(saved_handlers);
-                self.scopes.extend(saved_scopes);
+            let (handlers, scopes) = match &self.scopes[i] {
+                Scope::Jump(_) => continue,
+                Scope::CloseIter { loop_id, .. } if continued.is_some() && *loop_id == continued => continue,
+                Scope::Finally { handlers, scopes, .. } | Scope::CloseIter { handlers, scopes, .. } => {
+                    (*handlers, *scopes)
+                }
+            };
+            let saved_handlers = self.handlers.split_off(handlers);
+            let saved_scopes = self.scopes.split_off(scopes);
+            match &saved_scopes[i - scopes] {
+                Scope::Finally { body, .. } => {
+                    let body = body.clone();
+                    self.stmts(&body);
+                }
+                Scope::CloseIter { iter, next, .. } => self.close_iter(*iter, *next),
+                Scope::Jump(_) => unreachable!(),
             }
+            self.handlers.extend(saved_handlers);
+            self.scopes.extend(saved_scopes);
         }
     }
 
@@ -1693,6 +1722,155 @@ impl<'a> Lower<'a> {
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
+            ExprKind::ArrayParts(parts) => {
+                let ctx = self.ctx;
+                let a = self.helper("JS_NewArray", &[ctx]);
+                self.check_value(a[1]);
+                let arr = V::Any(a[0], a[1]);
+                self.hold(arr);
+                for part in parts {
+                    let r = match part {
+                        ir::ArrPart::Value(x) => {
+                            // Takes ownership of the value.
+                            let (p, t) = self.expr(x).any();
+                            self.helper("tsaot_array_push", &[ctx, a[0], a[1], p, t])
+                        }
+                        ir::ArrPart::Spread(x) => {
+                            let v = self.expr(x);
+                            self.hold(v);
+                            let (p, t) = v.any();
+                            let r = self.helper("tsaot_array_spread", &[ctx, a[0], a[1], p, t]);
+                            self.release(v);
+                            self.free_v(v);
+                            r
+                        }
+                        ir::ArrPart::Hole => self.helper("tsaot_array_hole", &[ctx, a[0], a[1]]),
+                    };
+                    self.check_int(r[0]);
+                }
+                self.release(arr);
+                arr
+            }
+            ExprKind::ObjectParts(parts) => {
+                let ctx = self.ctx;
+                let o = self.helper("JS_NewObject", &[ctx]);
+                self.check_value(o[1]);
+                let obj = V::Any(o[0], o[1]);
+                self.hold(obj);
+                for part in parts {
+                    match part {
+                        ir::ObjPart::Field(a, x) => {
+                            let (p, t) = self.expr(x).any();
+                            let slot = self.values_slot(&[(o[0], o[1])]);
+                            let atom = self.atom(*a);
+                            let r = self.helper("tsaot_define_field", &[ctx, slot, atom, p, t]);
+                            self.check_int(r[0]);
+                        }
+                        ir::ObjPart::Computed(k, x) => {
+                            // The key is converted before the value is evaluated.
+                            let (kp, kt) = self.expr(k).any();
+                            self.hold(V::Any(kp, kt));
+                            let key = self.helper("JS_ToPropertyKey", &[ctx, kp, kt]);
+                            self.check_value(key[1]);
+                            self.release(V::Any(kp, kt));
+                            self.free((kp, kt));
+                            let key = V::Any(key[0], key[1]);
+                            self.hold(key);
+                            let (p, t) = self.expr(x).any();
+                            let slot = self.values_slot(&[(o[0], o[1]), key.any()]);
+                            let r = self.helper("tsaot_define_computed", &[ctx, slot, p, t]);
+                            self.check_int(r[0]);
+                            self.release(key);
+                            self.free_v(key);
+                        }
+                        ir::ObjPart::Spread(x) => {
+                            let v = self.expr(x);
+                            self.hold(v);
+                            let (p, t) = v.any();
+                            let r = self.helper("tsaot_object_spread", &[ctx, o[0], o[1], p, t]);
+                            self.check_int(r[0]);
+                            self.release(v);
+                            self.free_v(v);
+                        }
+                    }
+                }
+                self.release(obj);
+                obj
+            }
+            ExprKind::CallSpread(f, this, args) => {
+                let fv = self.expr(f);
+                self.hold(fv);
+                let tv = self.expr(this);
+                self.hold(tv);
+                let av = self.expr(args);
+                self.hold(av);
+                let slot = self.values_slot(&[fv.any(), tv.any(), av.any()]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_apply", &[ctx, slot]);
+                self.check_value(r[1]);
+                for v in [av, tv, fv] {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(r[0], r[1])
+            }
+            ExprKind::NewSpread(f, args) => {
+                let fv = self.expr(f);
+                self.hold(fv);
+                let av = self.expr(args);
+                self.hold(av);
+                let ((fp, ft), (ap, at)) = (fv.any(), av.any());
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_construct", &[ctx, fp, ft, ap, at]);
+                self.check_value(r[1]);
+                for v in [av, fv] {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(r[0], r[1])
+            }
+            ExprKind::IterOpen(x, iter, next, atom) => {
+                self.iter_open(x, *iter, *next, *atom);
+                self.konst(0, TAG_UNDEFINED)
+            }
+            ExprKind::ForInIterator(x) => self.convert(x, "JS_ForInIteratorObject"),
+            ExprKind::ToObject(x) => self.convert(x, "JS_ToObject"),
+            ExprKind::ToPropKey(x) => self.convert(x, "JS_ToPropertyKey"),
+            ExprKind::ArrayPush(arr, x) => {
+                // Takes ownership of the value.
+                let (p, t) = self.expr(x).any();
+                let (ap, at) = self.use_local(*arr).any();
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_array_push", &[ctx, ap, at, p, t]);
+                self.check_int(r[0]);
+                self.konst(0, TAG_UNDEFINED)
+            }
+            ExprKind::IterStep(iter, next) => self.iter_step(*iter, *next),
+            ExprKind::IterClose(iter, next) => {
+                self.close_iter(*iter, *next);
+                self.konst(0, TAG_UNDEFINED)
+            }
+            ExprKind::ObjectRest(src, keys) => {
+                let sv = self.expr(src);
+                self.hold(sv);
+                let mut held = vec![sv];
+                for k in keys {
+                    let v = self.expr(k);
+                    self.hold(v);
+                    held.push(v);
+                }
+                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let slot = self.values_slot(&vals);
+                let n = self.b.ins().iconst(I32, keys.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_object_rest", &[ctx, slot, n]);
+                self.check_value(r[1]);
+                for v in held.into_iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(r[0], r[1])
+            }
         }
     }
 
@@ -2306,6 +2484,256 @@ impl<'a> Lower<'a> {
         }
     }
 
+    // ---- iteration ----
+
+    /// `helper(ctx, x)` on an owned value, which it borrows: a new value.
+    fn convert(&mut self, x: &Expr, helper: &str) -> V {
+        let v = self.expr(x);
+        self.hold(v);
+        let (p, t) = v.any();
+        let ctx = self.ctx;
+        let r = self.helper(helper, &[ctx, p, t]);
+        self.check_value(r[1]);
+        self.release(v);
+        self.free_v(v);
+        V::Any(r[0], r[1])
+    }
+
+    /// See `ExprKind::IterOpen`.
+    fn iter_open(&mut self, x: &Expr, iter: ir::LocalId, next: ir::LocalId, atom: ir::AtomId) {
+        let (p, t) = self.expr(x).any();
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        let join = self.b.create_block();
+        // An array with the shape of a fresh one: iterated directly.
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let kind = self.b.ins().iconst(I32, TYPED_ARRAYS);
+        let pristine = self.pristine_shape(p, kind);
+        let check = self.b.create_block();
+        self.b.ins().brif(pristine, check, &[], slow, &[]);
+        // ...while array iteration is the original one.
+        self.b.switch_to_block(check);
+        let ctx = self.ctx;
+        let ok = self.helper("tsaot_array_iter_ok", &[ctx]);
+        self.b.ins().brif(ok[0], fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        self.set_local(iter, V::Any(p, t));
+        let zero = self.konst(0, TAG_INT);
+        self.set_local(next, zero);
+        self.b.ins().jump(join, &[]);
+        // Anything else: the iterator protocol.
+        self.b.switch_to_block(slow);
+        let v = V::Any(p, t);
+        self.hold(v);
+        let sync = self.b.ins().iconst(I32, 0);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, sync]);
+        self.check_value(it[1]);
+        self.release(v);
+        self.free_v(v);
+        self.set_local(iter, V::Any(it[0], it[1]));
+        let a = self.atom(atom);
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
+        self.check_value(m[1]);
+        self.set_local(next, V::Any(m[0], m[1]));
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+    }
+
+    /// See `ExprKind::IterStep`.
+    fn iter_step(&mut self, iter: ir::LocalId, next: Option<ir::LocalId>) -> V {
+        let (ip, it) = self.use_local(iter).any();
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let finished = self.b.create_block();
+        let failed = self.b.create_block();
+        self.b.set_cold_block(failed);
+        // Done already: no more calls, `undefined`.
+        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, it, TAG_UNDEFINED);
+        let step = self.b.create_block();
+        let u = self.konst(0, TAG_UNDEFINED);
+        let (up, ut) = u.any();
+        self.b.ins().brif(live, step, &[], join, &[BlockArg::Value(up), BlockArg::Value(ut)]);
+        self.b.switch_to_block(step);
+        let r = match next {
+            Some(n) => {
+                let (np, nt) = self.use_local(n).any();
+                let direct = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_INT);
+                let array = self.b.create_block();
+                let protocol = self.b.create_block();
+                self.b.ins().brif(direct, array, &[], protocol, &[]);
+                // An array iterated directly: index `next` until its length
+                // (read every time, as the array iterator does).
+                self.b.switch_to_block(array);
+                let idx = self.b.ins().ireduce(I32, np);
+                let idx = self.b.ins().uextend(I64, idx);
+                let len = self.array_length(ip);
+                let more = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                let get = self.b.create_block();
+                self.b.ins().brif(more, get, &[], finished, &[]);
+                self.b.switch_to_block(get);
+                let v = self.array_element(ip, it, idx);
+                let exc = self.b.ins().icmp_imm_s(IntCC::Equal, v.1, TAG_EXCEPTION);
+                let got = self.b.create_block();
+                self.b.ins().brif(exc, failed, &[], got, &[]);
+                self.b.switch_to_block(got);
+                let n1 = self.b.ins().iadd_imm_s(idx, 1);
+                let n1 = self.b.ins().ireduce(I32, n1);
+                let n1 = self.b.ins().uextend(I64, n1);
+                let int = self.b.ins().iconst(I64, TAG_INT);
+                self.def_local(n, V::Any(n1, int));
+                self.b.ins().jump(join, &[BlockArg::Value(v.0), BlockArg::Value(v.1)]);
+                // The iterator protocol.
+                self.b.switch_to_block(protocol);
+                let zero = self.b.ins().iconst(I32, 0);
+                let null = self.b.ins().iconst(self.ptr, 0);
+                let done_addr = self.done_slot();
+                let r = self.helper("JS_IteratorStep", &[ctx, ip, it, np, nt, zero, null, done_addr]);
+                (r, done_addr)
+            }
+            None => {
+                let done_addr = self.done_slot();
+                (self.helper("JS_ForInStep", &[ctx, ip, it, done_addr]), done_addr)
+            }
+        };
+        let (r, done_addr) = r;
+        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_EXCEPTION);
+        let ok = self.b.create_block();
+        self.b.ins().brif(exc, failed, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
+        self.b.ins().brif(done, finished, &[], join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        // Done, or thrown: the iterator is not closed after either.
+        self.b.switch_to_block(finished);
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.set_local(iter, u);
+        let (up, ut) = u.any();
+        self.b.ins().jump(join, &[BlockArg::Value(up), BlockArg::Value(ut)]);
+        self.b.switch_to_block(failed);
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.set_local(iter, u);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(join);
+        V::Any(rp, rt)
+    }
+
+    /// A stack slot for an `int` out-parameter; its address.
+    fn done_slot(&mut self) -> Value {
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        self.b.ins().stack_addr(self.ptr, slot, 0)
+    }
+
+    /// The length of array `p` (its first property), as a `u32` in an `I64`.
+    fn array_length(&mut self, p: Value) -> Value {
+        let prop = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_PROP);
+        let lp = self.b.ins().load(I64, Self::mem(), prop, 0);
+        let lt = self.b.ins().load(I64, Self::mem(), prop, TAG_OFFSET);
+        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
+        let i = self.b.ins().ireduce(I32, lp);
+        let i = self.b.ins().uextend(I64, i);
+        let d = self.b.ins().bitcast(F64, MemFlagsData::new(), lp);
+        let f = self.b.ins().fcvt_to_uint_sat(I64, d);
+        self.b.ins().select(is_int, i, f)
+    }
+
+    /// Element `idx` (an `I64` below 2^32) of array `(p, t)`: a new value,
+    /// or `JS_EXCEPTION`.
+    fn array_element(&mut self, p: Value, t: Value, idx: Value) -> (Value, Value) {
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let count = self.b.ins().uload32(Self::mem(), p, layout::OBJ_ARRAY_COUNT);
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+        let hit = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.ins().brif(inb, hit, &[], slow, &[]);
+        self.b.switch_to_block(hit);
+        let at = self.array_slot(p, idx);
+        let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+        let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+        self.dup((vp, vt));
+        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        // Holes and slow arrays: a property read.
+        self.b.switch_to_block(slow);
+        let d = self.b.ins().fcvt_from_uint(F64, idx);
+        let (kp, kt) = self.box_number(d);
+        let ctx = self.ctx;
+        let r = self.helper("JS_GetPropertyValue", &[ctx, p, t, kp, kt]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(join);
+        (rp, rt)
+    }
+
+    /// Close the iteration in `iter` unless it is done, leaving `undefined`
+    /// (`pending`: with an exception pending, which closing keeps; errors of
+    /// the closing itself are then ignored). Returns the closing's result.
+    fn close_raw(&mut self, iter: ir::LocalId, next: ir::LocalId, pending: bool) -> Value {
+        let (p, t) = self.use_local(iter).any();
+        let (np, nt) = self.use_local(next).any();
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, I32);
+        let zero = self.b.ins().iconst(I32, 0);
+        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, t, TAG_UNDEFINED);
+        let close = self.b.create_block();
+        self.b.ins().brif(live, close, &[], join, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(close);
+        let ctx = self.ctx;
+        let pending = self.b.ins().iconst(I32, pending as i64);
+        let direct = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_INT);
+        let array = self.b.create_block();
+        let protocol = self.b.create_block();
+        let closed = self.b.create_block();
+        let res = self.b.append_block_param(closed, I32);
+        self.b.ins().brif(direct, array, &[], protocol, &[]);
+        self.b.switch_to_block(array);
+        let idx = self.b.ins().ireduce(I32, np);
+        let a = self.helper("tsaot_array_iter_close", &[ctx, p, t, idx, pending]);
+        self.b.ins().jump(closed, &[BlockArg::Value(a[0])]);
+        self.b.switch_to_block(protocol);
+        let c = self.helper("JS_IteratorCloseCompletion", &[ctx, p, t, pending]);
+        self.b.ins().jump(closed, &[BlockArg::Value(c[0])]);
+        self.b.switch_to_block(closed);
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.set_local(iter, u);
+        self.b.ins().jump(join, &[BlockArg::Value(res)]);
+        self.b.switch_to_block(join);
+        r
+    }
+
+    /// Close the iteration (normal completion) unless it is done.
+    fn close_iter(&mut self, iter: ir::LocalId, next: ir::LocalId) {
+        let r = self.close_raw(iter, next, false);
+        self.check_int(r);
+    }
+
+    /// `IterGuard`: `body`, closing the iterator when it completes abruptly.
+    fn iter_guard(&mut self, iter: ir::LocalId, next: ir::LocalId, loop_id: Option<ir::LoopId>, body: &[Stmt]) {
+        let handler = self.b.create_block();
+        self.b.set_cold_block(handler);
+        let outer = self.handlers.last().copied().unwrap_or(self.exc_exit);
+        let (handlers, scopes) = (self.handlers.len(), self.scopes.len());
+        self.scopes.push(Scope::CloseIter { iter, next, loop_id, handlers, scopes });
+        self.handlers.push(handler);
+        self.stmts(body);
+        self.handlers.pop();
+        self.scopes.pop();
+        let after = self.b.create_block();
+        if !self.is_filled() {
+            self.b.ins().jump(after, &[]);
+        }
+        // An exception: close with it pending, then propagate it.
+        self.b.switch_to_block(handler);
+        self.clear_flag();
+        self.close_raw(iter, next, true);
+        self.b.ins().jump(outer, &[]);
+        self.b.switch_to_block(after);
+    }
+
     // ---- inline caches ----
 
     /// The address of a new inline cache (a `TsaotIC`).
@@ -2385,7 +2813,7 @@ impl<'a> Lower<'a> {
     /// the shape of a fresh one, so its `length` is its element count.
     fn pristine_shape(&mut self, p: Value, kind: Value) -> Value {
         let shape = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_SHAPE);
-        let table = self.b.ins().symbol_value(self.ptr, self.env.ta_shapes);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let k = self.b.ins().uextend(I64, kind);
         let off = self.b.ins().imul_imm_s(k, 8);
         let at = self.b.ins().iadd(table, off);

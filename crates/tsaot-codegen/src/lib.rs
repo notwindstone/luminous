@@ -159,6 +159,25 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_Throw", &[P, W, W], &[W, W]),
         ("tsaot_set_elem", &[P, P], &[Int]),
         ("tsaot_ic_get", &[P, W, W, Int, P], &[W, W]),
+        ("JS_GetIteratorObject", &[P, W, W, Int], &[W, W]),
+        ("JS_ForInIteratorObject", &[P, W, W], &[W, W]),
+        ("JS_IteratorStep", &[P, W, W, W, W, Int, P, P], &[W, W]),
+        ("JS_ForInStep", &[P, W, W, P], &[W, W]),
+        ("JS_IteratorCloseCompletion", &[P, W, W, Int], &[Int]),
+        ("JS_ToObject", &[P, W, W], &[W, W]),
+        ("JS_ToPropertyKey", &[P, W, W], &[W, W]),
+        ("JS_NewArray", &[P], &[W, W]),
+        ("tsaot_array_push", &[P, W, W, W, W], &[Int]),
+        ("tsaot_array_hole", &[P, W, W], &[Int]),
+        ("tsaot_array_spread", &[P, W, W, W, W], &[Int]),
+        ("tsaot_apply", &[P, P], &[W, W]),
+        ("tsaot_construct", &[P, W, W, W, W], &[W, W]),
+        ("tsaot_rest", &[P, Int, P, Int], &[W, W]),
+        ("tsaot_object_rest", &[P, P, Int], &[W, W]),
+        ("tsaot_define_computed", &[P, P, W, W], &[Int]),
+        ("tsaot_object_spread", &[P, W, W, W, W], &[Int]),
+        ("tsaot_array_iter_close", &[P, W, W, Int, Int], &[Int]),
+        ("tsaot_array_iter_ok", &[P], &[Int]),
         ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
@@ -242,7 +261,7 @@ impl<'m> Codegen<'m> {
         }
         let mut data = Vec::new();
         for name in
-            ["tsaot_stack_limit", "tsaot_unwinding", "tsaot_cells", "tsaot_strings", "tsaot_atoms", "tsaot_ta_shapes"]
+            ["tsaot_stack_limit", "tsaot_unwinding", "tsaot_cells", "tsaot_strings", "tsaot_atoms", "tsaot_shapes"]
         {
             data.push(module.declare_data(name, Linkage::Import, true, false)?);
         }
@@ -263,7 +282,7 @@ impl<'m> Codegen<'m> {
     fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
         let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
-        let [stack_limit, unwinding, cells, strings, atoms, ta_shapes, ics] =
+        let [stack_limit, unwinding, cells, strings, atoms, shapes, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
         Env {
             helpers,
@@ -273,7 +292,7 @@ impl<'m> Codegen<'m> {
             cells,
             strings,
             atoms,
-            ta_shapes,
+            shapes,
             ics,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
@@ -433,10 +452,24 @@ impl<'m> Codegen<'m> {
             b.ins().jump(join, &[]);
             b.switch_to_block(join);
         };
+        if f.rest {
+            // The rest array; if it cannot be allocated, drop the frame.
+            let failed = b.create_block();
+            b.set_cold_block(failed);
+            let k = f.params.len() - 1;
+            params[k] = rest_arg(&mut b, env.helpers["tsaot_rest"], js_ctx, argc, argv, k, failed);
+            let cont = b.create_block();
+            b.ins().jump(cont, &[]);
+            b.switch_to_block(failed);
+            b.ins().call(env.helpers["JS_FreeValue"], &[js_ctx, frame[0], frame[1]]);
+            b.ins().jump(exception, &[]);
+            b.switch_to_block(cont);
+        }
         for (k, &t) in f.params.iter().enumerate() {
             let s = layout[k];
             let local_ty = f.locals[k];
             let (p, tag) = match (t, params[k]) {
+                (_, V::Any(p, tag)) if f.rest && k + 1 == f.params.len() => (p, tag),
                 (Ty::Any | Ty::Arr(_), _) => {
                     let (p, tag) = load_arg(&mut b, argc, argv, k);
                     dup_value(&mut b, p, tag);
@@ -564,9 +597,15 @@ impl<'m> Codegen<'m> {
                 params[k] = unbox_arg(&mut b, t, argv, k, decline);
             }
         }
+        // A rest parameter: a new array (before any other new reference, so
+        // that failing to allocate it leaks nothing).
+        if f.rest {
+            let k = f.params.len() - 1;
+            params[k] = rest_arg(&mut b, env.helpers["tsaot_rest"], js_ctx, argc, argv, k, exception);
+        }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {
-            if matches!(t, Ty::Any | Ty::Arr(_)) {
+            if matches!(t, Ty::Any | Ty::Arr(_)) && !(f.rest && k + 1 == f.params.len()) {
                 let (p, tag) = load_arg(&mut b, argc, argv, k);
                 let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, tag, 0);
                 let dup = b.create_block();
@@ -837,6 +876,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
                 }
             }
             Stmt::Block(b) => walk(b, f),
+            Stmt::IterGuard { body, .. } => walk(body, f),
             Stmt::Try { body, catch, finally, .. } => {
                 walk(body, f);
                 if let Some((_, c)) = catch {
@@ -849,4 +889,24 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
             Stmt::Break(_) | Stmt::Continue(_) | Stmt::NewBoxes(_) => {}
         }
     }
+}
+
+/// The rest parameter `k`: the arguments from `k` on, in a new array.
+fn rest_arg(
+    b: &mut FunctionBuilder,
+    rest: cranelift_codegen::ir::FuncRef,
+    js_ctx: Value,
+    argc: Value,
+    argv: Value,
+    k: usize,
+    exception: Block,
+) -> V {
+    let start = b.ins().iconst(I32, k as i64);
+    let call = b.ins().call(rest, &[js_ctx, argc, argv, start]);
+    let r = b.inst_results(call).to_vec();
+    let failed = b.ins().icmp_imm_s(IntCC::Equal, r[1], jsvalue::TAG_EXCEPTION);
+    let ok = b.create_block();
+    b.ins().brif(failed, exception, &[], ok, &[]);
+    b.switch_to_block(ok);
+    V::Any(r[0], r[1])
 }
