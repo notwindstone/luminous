@@ -236,6 +236,10 @@ impl<'m> Codegen<'m> {
         let mut params = Vec::new();
         let data = f.is_closure.then(|| raw[1]);
         let mut k = if f.is_closure { 2 } else { 1 };
+        let this = f.has_this.then(|| (raw[k], raw[k + 1]));
+        if f.has_this {
+            k += 2;
+        }
         for &t in &f.params {
             let n = clif_types(t).len();
             params.push(from_values(t, &raw[k..k + n]));
@@ -243,6 +247,7 @@ impl<'m> Codegen<'m> {
         }
         let exits = Exits { ret: Exit::Return, unwind: Exit::Return };
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
+        l.this = this;
         l.stack_check();
         let mut b = l.body(&f.body);
         b.seal_all_blocks();
@@ -292,6 +297,7 @@ impl<'m> Codegen<'m> {
         let raw = b.block_params(entry).to_vec();
         let (js_ctx, argc, argv) = (raw[0], raw[3], raw[4]);
         let data = f.is_closure.then(|| raw[5]);
+        let this = f.has_this.then(|| (raw[1], raw[2]));
 
         // Guards first (declining must not leak references): enough
         // arguments for every unboxed parameter, and their tags.
@@ -329,11 +335,15 @@ impl<'m> Codegen<'m> {
             // The body itself, with `return` jumping to the boxing code. It
             // needs no stack check: entries from JS are shallow.
             let exits = Exits { ret: Exit::Jump(boxing), unwind: Exit::Jump(exception) };
-            let l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
+            let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
+            l.this = this;
             l.body(&f.body)
         } else {
             let mut args = vec![js_ctx];
             args.extend(data);
+            if let Some((p, t)) = this {
+                args.extend([p, t]);
+            }
             for p in &params {
                 args.extend(p.values());
             }
@@ -386,6 +396,10 @@ fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
     if f.is_closure {
         // The closure's data slots.
         sig.params.push(AbiParam::new(ptr));
+    }
+    if f.has_this {
+        // The receiver (borrowed).
+        sig.params.extend([AbiParam::new(I64), AbiParam::new(I64)]);
     }
     for &t in &f.params {
         sig.params.extend(abi(t));
@@ -534,6 +548,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
             | Cell(_)
             | Global(_)
             | GlobalOrUndefined(_)
+            | This
             | Closure(..) => {}
             SetLocal(_, a)
             | InitLocal(_, a)

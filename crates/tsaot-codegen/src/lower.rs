@@ -198,6 +198,8 @@ pub(crate) struct Lower<'a> {
     exc_exit: Block,
     ret_block: Block,
     exits: Exits,
+    /// Methods: the receiver (borrowed).
+    pub(crate) this: Option<(Value, Value)>,
 }
 
 impl<'a> Lower<'a> {
@@ -252,6 +254,7 @@ impl<'a> Lower<'a> {
             exc_exit,
             ret_block,
             exits,
+            this: None,
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -949,6 +952,11 @@ impl<'a> Lower<'a> {
                 }
                 self.set_local(*l, v);
                 v
+            }
+            ExprKind::This => {
+                let (p, t) = self.this.expect("`this` in a method");
+                self.dup((p, t));
+                V::Any(p, t)
             }
             ExprKind::InitLocal(l, x) => {
                 let v = self.expr(x);

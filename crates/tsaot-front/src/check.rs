@@ -51,12 +51,15 @@ impl FnNode<'_> {
 }
 
 /// Where a candidate is bound, which decides how the source is rewritten.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Site {
     /// `function f() {}`; `export_prefix` spans `export ` if present.
     Declaration { id: Span, export_prefix: Option<Span> },
     /// `const f = <init>` where `init` is an arrow or function expression.
     ConstInit { init: Span },
+    /// A method of top-level class `class`, installed over the original after
+    /// the class declaration (which ends at `stmt_end`).
+    Method { class: String, is_static: bool, key: String, stmt_end: u32 },
 }
 
 struct Param<'a> {
@@ -71,7 +74,10 @@ struct Param<'a> {
 pub struct Candidate<'a> {
     pub name: String,
     pub node: FnNode<'a>,
-    pub symbol: SymbolId,
+    /// The binding (none for methods).
+    pub symbol: Option<SymbolId>,
+    /// Methods: `this` is the receiver.
+    pub has_this: bool,
     pub site: Site,
     /// Whether other native functions may call this one directly. False for
     /// `const` bindings that may still be in their TDZ when native code runs.
@@ -162,8 +168,9 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
         }
     }
 
-    let mut widened: HashMap<SymbolId, HashSet<SymbolId>> = HashMap::new();
-    let mut ret_override: HashMap<SymbolId, Ty> = HashMap::new();
+    // Keyed by the function's position.
+    let mut widened: HashMap<u32, HashSet<SymbolId>> = HashMap::new();
+    let mut ret_override: HashMap<u32, Ty> = HashMap::new();
     // Fixpoint: a function is native only if all its native callees are, and
     // callers must agree with the callees' actual return types.
     loop {
@@ -258,6 +265,8 @@ fn collect_toplevel<'a>(
     // first statement that is not a pure declaration, nothing can observe
     // them in their TDZ.
     let mut pure_prefix = true;
+    let mut methods = Vec::new();
+    let mut method_rejects = Vec::new();
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
         if written(symbol) {
             let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false };
@@ -277,7 +286,16 @@ fn collect_toplevel<'a>(
             return;
         }
         match header(node) {
-            Ok((params, ret)) => out.push(Candidate { name, node, symbol, site, direct_callable, params, ret }),
+            Ok((params, ret)) => out.push(Candidate {
+                name,
+                node,
+                symbol: Some(symbol),
+                has_this: false,
+                site,
+                direct_callable,
+                params,
+                ret,
+            }),
             Err(r) => rejected.push((name, node.span(), r)),
         }
     };
@@ -364,12 +382,58 @@ fn collect_toplevel<'a>(
             Declaration::ClassDeclaration(c) => {
                 if let Some(id) = &c.id {
                     bind(id, BindingKind::Class, None, end, exported);
+                    if c.decorators.is_empty() && !c.declare {
+                        class_methods(c, &id.name, end, &mut methods, &mut method_rejects);
+                    }
                 }
                 pure_prefix = false;
             }
             // Pure type-level declarations; enums and namespaces emit code but
             // nothing that can call into this module.
             _ => {}
+        }
+    }
+    out.extend(methods);
+    rejected.extend(method_rejects);
+}
+
+/// Ordinary methods (static or not) of a top-level class.
+fn class_methods<'a>(
+    c: &'a Class<'a>,
+    class: &str,
+    stmt_end: u32,
+    out: &mut Vec<Candidate<'a>>,
+    rejected: &mut Vec<(String, Span, Reject)>,
+) {
+    for el in &c.body.body {
+        let ClassElement::MethodDefinition(m) = el else { continue };
+        if m.kind != MethodDefinitionKind::Method
+            || m.computed
+            || !m.decorators.is_empty()
+            || m.r#type != MethodDefinitionType::MethodDefinition
+            || m.value.body.is_none()
+        {
+            continue;
+        }
+        let key = match &m.key {
+            PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            _ => continue,
+        };
+        let node = FnNode::Function(&m.value);
+        let site = Site::Method { class: class.to_string(), is_static: m.r#static, key: key.clone(), stmt_end };
+        match header(node) {
+            Ok((params, ret)) => out.push(Candidate {
+                name: key,
+                node,
+                symbol: None,
+                has_this: true,
+                site,
+                direct_callable: false,
+                params,
+                ret,
+            }),
+            Err(r) => rejected.push((format!("{class}.{key}"), node.span(), r)),
         }
     }
 }
@@ -448,9 +512,9 @@ struct ModuleCx<'m, 'a> {
     cands: &'m [Candidate<'a>],
     state: Vec<State>,
     /// Per function: locals that must be `Any`.
-    widened: &'m mut HashMap<SymbolId, HashSet<SymbolId>>,
+    widened: &'m mut HashMap<u32, HashSet<SymbolId>>,
     /// Actual return types that differ from the annotation.
-    ret_override: &'m mut HashMap<SymbolId, Ty>,
+    ret_override: &'m mut HashMap<u32, Ty>,
     ret_changed: bool,
     strings: Vec<String>,
     string_ids: HashMap<String, ir::StrId>,
@@ -469,13 +533,14 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         }
         self.state[i] = State::InProgress;
         let c = &self.cands[i];
-        let (sym, node, name) = (c.symbol, c.node, c.name.clone());
+        let (sym, node, name, has_this) = (c.node.span().start, c.node, c.name.clone(), c.has_this);
         let params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)> =
             c.params.iter().map(|p| (p.symbol, p.ty, p.default)).collect();
         let caps = Rc::new(capture_info(node, self.scoping));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
             let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
+            fx.has_this = has_this;
             let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
                 (Err(e), Some(s)) if e.retry => {
@@ -489,11 +554,11 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                 // Callers assumed the annotated (or previously overridden)
                 // return type; check that it held.
                 let c = &self.cands[i];
-                let assumed = self.ret_override.get(&c.symbol).copied().or(c.ret);
+                let assumed = self.ret_override.get(&c.node.span().start).copied().or(c.ret);
                 if let Some(assumed) = assumed
                     && assumed != f.ret
                 {
-                    self.ret_override.insert(c.symbol, f.ret);
+                    self.ret_override.insert(c.node.span().start, f.ret);
                     self.ret_changed = true;
                 }
                 State::Done(f)
@@ -506,7 +571,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
     fn signature(&mut self, i: usize, call_span: Span) -> R<(Vec<Ty>, Ty)> {
         let params = self.cands[i].params.iter().map(|p| p.ty).collect();
         let c = &self.cands[i];
-        if let Some(ret) = self.ret_override.get(&c.symbol).copied().or(c.ret) {
+        if let Some(ret) = self.ret_override.get(&c.node.span().start).copied().or(c.ret) {
             // Callers may proceed optimistically, even while the callee is
             // still being checked (recursion). The fixpoint undoes this if
             // the callee turns out not to be native or to return otherwise.
@@ -568,12 +633,12 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             .iter()
             .map(|&sym| {
                 let b = &self.bindings[&sym];
-                let native = self.cands.iter().find(|c| c.symbol == sym);
+                let native = self.cands.iter().find(|c| c.symbol == Some(sym));
                 let init = match (b.kind, native) {
                     (BindingKind::Function | BindingKind::Import, _) => CellInit::Header,
-                    (_, Some(c)) => match c.site {
-                        Site::ConstInit { init } => CellInit::Wrap(init),
-                        Site::Declaration { .. } => CellInit::Header,
+                    (_, Some(c)) => match &c.site {
+                        Site::ConstInit { init } => CellInit::Wrap(*init),
+                        Site::Declaration { .. } | Site::Method { .. } => CellInit::Header,
                     },
                     (_, None) => match b.init {
                         Some(span) => CellInit::Wrap(span),
@@ -605,6 +670,8 @@ struct FnCx<'x, 'm, 'a> {
     /// This function (its span start, as in `CaptureInfo`).
     key: u32,
     is_closure: bool,
+    /// Methods: `this` is the receiver.
+    has_this: bool,
     locals: Vec<Ty>,
     mutable: Vec<bool>,
     boxed: Vec<bool>,
@@ -764,6 +831,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             caps,
             key,
             is_closure,
+            has_this: false,
             locals: Vec::new(),
             mutable: Vec::new(),
             boxed: Vec::new(),
@@ -874,6 +942,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             local_names: std::mem::take(&mut self.local_names),
             captures: std::mem::take(&mut self.captures),
             is_closure: self.is_closure,
+            has_this: self.has_this,
             body: prologue,
         })
     }
@@ -1336,6 +1405,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 self.closure(FnNode::Function(f), name)?
             }
             Expression::NumericLiteral(n) => Expr::num(n.value),
+            Expression::ThisExpression(_) if self.has_this => Expr::new(Ty::Any, ExprKind::This),
             Expression::BooleanLiteral(b) => Expr::new(Ty::Bool, ExprKind::Bool(b.value)),
             Expression::StringLiteral(s) => {
                 let id = self.m.string(s.value.as_str());
@@ -1833,7 +1903,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         match c.callee.without_parentheses() {
             Expression::Identifier(id) => {
                 let sym = self.resolve(id);
-                if let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == s))
+                if let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == Some(s)))
                     && !self.sym_local.contains_key(&sym.unwrap())
                     && let Some(e) = self.direct_call(i, &c.arguments, c.span)?
                 {
@@ -2148,6 +2218,8 @@ fn describe_expr(e: &Expression) -> &'static str {
         Expression::ChainExpression(_) => "optional chaining",
         Expression::ImportExpression(_) => "dynamic import",
         Expression::TaggedTemplateExpression(_) => "tagged template",
+        Expression::PrivateFieldExpression(_) | Expression::PrivateInExpression(_) => "private field",
+        Expression::Super(_) => "super",
         _ => "this expression kind",
     }
 }

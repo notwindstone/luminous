@@ -26,6 +26,8 @@ pub enum NativeSite {
     Declaration { id_span: (u32, u32), export_prefix: Option<(u32, u32)> },
     /// `const f = <init>` (byte span of the initializer).
     ConstInit { init_span: (u32, u32) },
+    /// A class method, installed after the class declaration ends.
+    Method { class: String, is_static: bool, key: String, stmt_end: u32 },
 }
 
 /// A natively compiled function, for source rewriting and reporting.
@@ -120,12 +122,18 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
         .iter()
         .map(|c| NativeDecl {
             name: c.name.clone(),
-            site: match c.site {
-                check::Site::Declaration { id, export_prefix } => NativeSite::Declaration {
+            site: match &c.site {
+                &check::Site::Declaration { id, export_prefix } => NativeSite::Declaration {
                     id_span: (id.start, id.end),
                     export_prefix: export_prefix.map(|s| (s.start, s.end)),
                 },
-                check::Site::ConstInit { init } => NativeSite::ConstInit { init_span: (init.start, init.end) },
+                &check::Site::ConstInit { init } => NativeSite::ConstInit { init_span: (init.start, init.end) },
+                check::Site::Method { class, is_static, key, stmt_end } => NativeSite::Method {
+                    class: class.clone(),
+                    is_static: *is_static,
+                    key: key.clone(),
+                    stmt_end: *stmt_end,
+                },
             },
             line: line(c.node.span().start),
         })

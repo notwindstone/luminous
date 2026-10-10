@@ -83,6 +83,8 @@ pub struct Func {
     /// boxes, in the order of its data slots.
     pub captures: Vec<LocalId>,
     pub is_closure: bool,
+    /// Methods: `this` is passed in (borrowed).
+    pub has_this: bool,
     pub body: Vec<Stmt>,
 }
 
@@ -200,6 +202,8 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     /// Initialization of a local by its declaration (no TDZ check).
     InitLocal(LocalId, Box<Expr>),
+    /// The receiver of a method.
+    This,
     /// A closure: function `ClosureId` capturing these boxed locals.
     Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).

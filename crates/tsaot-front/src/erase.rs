@@ -1,23 +1,34 @@
 //! Produces the interpreted half of a program: the whole module with types
-//! erased, where every natively compiled function's binding is re-pointed at
-//! its native entry stub. `__tsaot_bind(i, fallback)` returns the stub for
-//! native function `i`, which calls `fallback` when its arguments do not
-//! match the declared types.
+//! erased and rewritten so that it shares state with native code.
 //!
 //! ```ts
+//! let count = 0;
 //! function fib(n: number): number { ... }
 //! const sq = (x: number): number => x * x;
+//! class P { norm(): number { ... } }
+//! count++;
 //! ```
 //! becomes
 //! ```js
-//! import { __tsaot_bind } from "tsaot:native"; const fib = __tsaot_bind(0, __tsaot_fb_fib);
-//! function __tsaot_fb_fib(n) { ... }   // calls inside still go to `fib`
+//! import "tsaot:native"; import { __tsaot_bind, ... } from "tsaot:native";
+//! const fib = __tsaot_bind(0, __tsaot_fb_fib);      // first statement
+//! let count = __tsaot_init(0, 0);                    // cell initialized
+//! function __tsaot_fb_fib(n) { ... }                 // the fallback
 //! const sq = __tsaot_bind(1, (x) => x * x);
+//! class P { norm() { ... } };__tsaot_method(2, P, 0, "norm");
+//! __tsaot_m.count++;                                 // through the cell
 //! ```
-//! Declarations are bound in the first statement of the module body, so no
-//! code can observe them before they are initialized. The import is emitted
-//! even without native functions: initializing the `tsaot:native` module is
-//! what locks the `Math` and `Number` builtins.
+//! - `__tsaot_bind(i, fallback)` creates the function object of native
+//!   function `i`, which calls `fallback` when the arguments do not match the
+//!   declared types. Declarations are bound in the first statement of the
+//!   module body, so no code can observe them before they are initialized.
+//! - `__tsaot_method` replaces a class method the same way.
+//! - Module bindings that native code uses live in cells: `__tsaot_init`
+//!   stores the value when the declaration runs, and bindings that are
+//!   reassigned are accessed through `__tsaot_m` everywhere.
+//!
+//! The bare import is emitted even without native functions: initializing
+//! the `tsaot:native` module is what locks the `Math` and `Number` builtins.
 
 use std::path::Path;
 
@@ -42,6 +53,26 @@ pub fn fallback_name(name: &str) -> String {
 
 pub const INIT_FN: &str = "__tsaot_init";
 pub const CELLS_OBJ: &str = "__tsaot_m";
+pub const METHOD_FN: &str = "__tsaot_method";
+
+/// A JS string literal for `s`.
+fn js_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// Rewrite `source` so native functions are routed through their JS entries
 /// and module bindings shared with native code live in cells.
@@ -56,8 +87,8 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     let mut header = Vec::new();
 
     for (i, n) in a.natives.iter().enumerate() {
-        match n.site {
-            NativeSite::Declaration { id_span, export_prefix } => {
+        match &n.site {
+            &NativeSite::Declaration { id_span, export_prefix } => {
                 edits.push((id_span.0 as usize, id_span.1 as usize, fallback_name(&n.name)));
                 if let Some((s, e)) = export_prefix {
                     edits.push((s as usize, e as usize, String::new()));
@@ -65,9 +96,17 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
                 }
                 header.push(format!("const {} = {BIND_FN}({i}, {});", n.name, fallback_name(&n.name)));
             }
-            NativeSite::ConstInit { init_span: (s, e) } => {
+            &NativeSite::ConstInit { init_span: (s, e) } => {
                 prefixes.entry(s as usize).or_default().push(format!("{BIND_FN}({i}, "));
                 suffixes.entry(e as usize).or_default().push(")".into());
+            }
+            NativeSite::Method { class, is_static, key, stmt_end } => {
+                // Over the interpreted method, which becomes the fallback.
+                let key = js_string(key);
+                suffixes
+                    .entry(*stmt_end as usize)
+                    .or_default()
+                    .push(format!(";{METHOD_FN}({i}, {class}, {}, {key});", *is_static as u8));
             }
         }
     }
@@ -108,8 +147,9 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // The bare import is what initializes the native module (and so locks
     // the builtins) even when nothing else is needed: named imports that end
     // up unused are elided by type stripping.
-    let mut head =
-        format!("import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ} }} from \"{NATIVE_MODULE}\";");
+    let mut head = format!(
+        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN} }} from \"{NATIVE_MODULE}\";"
+    );
     for h in header {
         head.push(' ');
         head.push_str(&h);

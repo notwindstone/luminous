@@ -10,7 +10,7 @@
 use std::fmt::Write;
 
 use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue};
-use tsaot_front::erase::{BIND_FN, CELLS_OBJ, INIT_FN, NATIVE_MODULE};
+use tsaot_front::erase::{BIND_FN, CELLS_OBJ, INIT_FN, METHOD_FN, NATIVE_MODULE};
 use tsaot_front::ir;
 
 /// C init function name passed to `qjsc -M tsaot:native,<CNAME>`.
@@ -69,6 +69,7 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     }
 
     let n = m.funcs.len();
+    let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
     c.push_str("\nstatic const struct { JSCFunctionFast *fast; const char *name; int length; } tsaot_table[] = {\n");
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
@@ -148,7 +149,44 @@ JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
                                    tsaot_table[fn].length, fn, n, data);
 }}
 
-static JSValue tsaot_exports[3];
+/* {METHOD_FN}(i, Class, is_static, key): replace a class method with native
+ * function i; the interpreted method becomes its fallback. Same attributes
+ * as a class method: writable, configurable, not enumerable. */
+static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{{
+    int32_t i, is_static;
+    JSValue holder, fallback, stub;
+    JSAtom key;
+    int r;
+    if (argc < 4 || JS_ToInt32(ctx, &i, argv[0]) || JS_ToInt32(ctx, &is_static, argv[2]) ||
+        i < 0 || i >= {nall})
+        return JS_ThrowTypeError(ctx, "{METHOD_FN}: bad arguments");
+    holder = is_static ? JS_DupValue(ctx, argv[1]) : JS_GetPropertyStr(ctx, argv[1], "prototype");
+    if (JS_IsException(holder))
+        return holder;
+    key = JS_ValueToAtom(ctx, argv[3]);
+    if (key == JS_ATOM_NULL) {{
+        JS_FreeValue(ctx, holder);
+        return JS_EXCEPTION;
+    }}
+    fallback = JS_GetProperty(ctx, holder, key);
+    if (JS_IsException(fallback) || !JS_IsFunction(ctx, fallback)) {{
+        JS_FreeValue(ctx, fallback);
+        JS_FreeValue(ctx, holder);
+        JS_FreeAtom(ctx, key);
+        return JS_ThrowTypeError(ctx, "{METHOD_FN}: not a method");
+    }}
+    stub = JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback, tsaot_table[i].name,
+                                   tsaot_table[i].length, 0, 1, &fallback);
+    JS_FreeValue(ctx, fallback);
+    r = JS_IsException(stub) ? -1
+        : JS_DefinePropertyValue(ctx, holder, key, stub, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW);
+    JS_FreeValue(ctx, holder);
+    JS_FreeAtom(ctx, key);
+    return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}}
+
+static JSValue tsaot_exports[4];
 
 static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 {{
@@ -158,7 +196,9 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
     /* The module owns the state object: its finalizer releases the cells. */
     if (JS_SetModuleExport(ctx, m, "__tsaot_state", tsaot_exports[0]) < 0 ||
         JS_SetModuleExport(ctx, m, "{INIT_FN}", tsaot_exports[1]) < 0 ||
-        JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0)
+        JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0 ||
+        JS_SetModuleExport(ctx, m, "{METHOD_FN}",
+                           JS_NewCFunction(ctx, tsaot_method, "{METHOD_FN}", 4)) < 0)
         return -1;
     return 0;
 }}
@@ -177,6 +217,7 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     JS_AddModuleExport(ctx, m, "__tsaot_state");
     JS_AddModuleExport(ctx, m, "{INIT_FN}");
     JS_AddModuleExport(ctx, m, "{CELLS_OBJ}");
+    JS_AddModuleExport(ctx, m, "{METHOD_FN}");
     return m;
 }}
 "#
