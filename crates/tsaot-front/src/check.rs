@@ -1736,6 +1736,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 seq(xs)
             }
             Expression::CallExpression(c) => self.call(c)?,
+            Expression::ChainExpression(c) => self.chain(c)?,
             Expression::NewExpression(n) => {
                 let mut v = vec![any(self.expr(&n.callee)?)];
                 self.push_args(&mut v, &n.arguments)?;
@@ -1775,6 +1776,130 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::TSInstantiationExpression(a) => self.expr(&a.expression)?,
             other => return reject(span, format!("unsupported expression: {}", describe_expr(other))),
         })
+    }
+
+    /// An optional chain. Its links are evaluated from the base outwards;
+    /// at each `?.`, the value so far goes into a temporary, and if it is
+    /// nullish the whole rest of the chain is skipped (`undefined`).
+    fn chain(&mut self, c: &'a ChainExpression<'a>) -> R<Expr> {
+        enum Link<'a> {
+            Prop(&'a IdentifierName<'a>, bool),
+            Elem(&'a Expression<'a>, bool),
+            Call(&'a [Argument<'a>], bool),
+        }
+        let mut links = Vec::new();
+        let mut cur: &'a Expression<'a> = match &c.expression {
+            ChainElement::CallExpression(e) => {
+                links.push(Link::Call(&e.arguments, e.optional));
+                &e.callee
+            }
+            ChainElement::StaticMemberExpression(m) => {
+                links.push(Link::Prop(&m.property, m.optional));
+                &m.object
+            }
+            ChainElement::ComputedMemberExpression(m) => {
+                links.push(Link::Elem(&m.expression, m.optional));
+                &m.object
+            }
+            ChainElement::TSNonNullExpression(n) => &n.expression,
+            ChainElement::PrivateFieldExpression(p) => {
+                return reject(p.span, "private fields are not supported yet");
+            }
+        };
+        // Parentheses end a chain: `(a?.b).c` reads `c` of `undefined`.
+        loop {
+            cur = match cur {
+                Expression::StaticMemberExpression(m) => {
+                    links.push(Link::Prop(&m.property, m.optional));
+                    &m.object
+                }
+                Expression::ComputedMemberExpression(m) => {
+                    links.push(Link::Elem(&m.expression, m.optional));
+                    &m.object
+                }
+                Expression::CallExpression(e) => {
+                    links.push(Link::Call(&e.arguments, e.optional));
+                    &e.callee
+                }
+                Expression::TSNonNullExpression(n) => &n.expression,
+                _ => break,
+            };
+        }
+        links.reverse();
+        if matches!(cur, Expression::Super(_)) {
+            return reject(cur.span(), "`super` is not supported yet");
+        }
+
+        // Guards: (temporary, its value, what to evaluate before it).
+        let mut guards: Vec<(ir::LocalId, Expr, Vec<Expr>)> = Vec::new();
+        let mut val = self.expr(cur)?;
+        let mut mark = None;
+        let mut i = 0;
+        while i < links.len() {
+            let optional = match links[i] {
+                Link::Prop(_, o) | Link::Elem(_, o) | Link::Call(_, o) => o,
+            };
+            if optional {
+                let t = self.temp(Ty::Any);
+                guards.push((t, any(val), vec![]));
+                val = self.local(t);
+                mark.get_or_insert(self.pre.len());
+            }
+            let key = match links[i] {
+                Link::Prop(name, _) => Some(Key::Atom(self.m.atom(name.name.as_str()))),
+                Link::Elem(k, _) => Some(self.elem_key(k)?),
+                Link::Call(..) => None,
+            };
+            match (key, links.get(i + 1)) {
+                // A method call: the object is `this`.
+                (Some(key), Some(&Link::Call(args, call_optional))) => {
+                    if call_optional {
+                        let o = self.temp(Ty::Any);
+                        let m = self.temp(Ty::Any);
+                        let method = get_elem(self.local(o), key);
+                        guards.push((m, any(method), vec![set(o, any(val))]));
+                        mark.get_or_insert(self.pre.len());
+                        let mut v = vec![self.local(m), self.local(o)];
+                        self.push_args(&mut v, args)?;
+                        let (f, this) = (v.remove(0), v.remove(0));
+                        val = Expr::new(Ty::Any, ExprKind::CallThis(Box::new(f), Box::new(this), v));
+                    } else {
+                        val = self.call_method(any(val), key, args)?;
+                    }
+                    i += 2;
+                    continue;
+                }
+                (Some(Key::Atom(a)), _) if matches!(links[i], Link::Prop(n, _) if n.name == "length") => {
+                    val = Expr::new(Ty::Any, ExprKind::Length(Box::new(any(val)), a));
+                }
+                (Some(key), _) => val = get_elem(val, key),
+                (None, _) => {
+                    let Link::Call(args, _) = links[i] else { unreachable!() };
+                    val = self.call_value(any(val), args)?;
+                }
+            }
+            i += 1;
+        }
+        if mark.is_some_and(|m| self.pre.len() > m) {
+            return reject(c.span, "`await` inside an optional chain is not supported yet");
+        }
+        let mut result = val;
+        for (t, v, mut before) in guards.into_iter().rev() {
+            let nullish = Expr::new(
+                Ty::Bool,
+                ExprKind::AnyCompare(
+                    AnyCmpOp::Eq,
+                    Box::new(self.local(t)),
+                    Box::new(Expr::new(Ty::Any, ExprKind::Null)),
+                ),
+            );
+            let cond =
+                Expr::new(Ty::Any, ExprKind::Cond(Box::new(nullish), Box::new(undefined()), Box::new(any(result))));
+            before.push(set(t, v));
+            before.push(cond);
+            result = seq(before);
+        }
+        Ok(result)
     }
 
     fn template(&mut self, t: &'a TemplateLiteral<'a>) -> R<Expr> {
