@@ -837,7 +837,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
                 }
             }
             Stmt::Block(b) => walk(b, f),
-            Stmt::Try { body, catch, finally } => {
+            Stmt::Try { body, catch, finally, .. } => {
                 walk(body, f);
                 if let Some((_, c)) = catch {
                     walk(c, f);

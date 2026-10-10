@@ -216,6 +216,8 @@ pub(crate) struct Lower<'a> {
     /// Methods: the receiver (borrowed).
     pub(crate) this: Option<(Value, Value)>,
     async_cx: Option<AsyncCx>,
+    /// See `ir::Func::ret_slot`.
+    ret_slot: Option<ir::LocalId>,
 }
 
 impl<'a> Lower<'a> {
@@ -274,6 +276,7 @@ impl<'a> Lower<'a> {
             exits,
             this: None,
             async_cx: None,
+            ret_slot: f.ret_slot,
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -763,15 +766,7 @@ impl<'a> Lower<'a> {
                 } else {
                     v
                 };
-                if self.scopes.iter().any(|s| matches!(s, Scope::Finally { .. })) {
-                    self.hold(v);
-                    self.run_finally_until(0);
-                    self.release(v);
-                }
-                let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
-                let rb = self.ret_block;
-                self.b.ins().jump(rb, &args);
-                self.after_terminator();
+                self.return_value(v);
             }
             Stmt::Throw(e) => {
                 let (p, t) = self.expr(e).any();
@@ -781,8 +776,55 @@ impl<'a> Lower<'a> {
                 self.b.ins().jump(edge, &[]);
                 self.after_terminator();
             }
-            Stmt::Try { body, catch, finally } => self.try_stmt(body, catch.as_ref(), finally.as_ref()),
+            Stmt::Try { body, catch, finally, exc } => self.try_stmt(body, catch.as_ref(), finally.as_ref(), *exc),
         }
+    }
+
+    /// Return `v` (owned), running the `finally` blocks on the way out.
+    fn return_value(&mut self, v: V) {
+        let v = if self.scopes.iter().any(|s| matches!(s, Scope::Finally { .. })) {
+            match (self.ret_slot, v) {
+                (_, V::Void) => {
+                    self.run_finally_until(0);
+                    V::Void
+                }
+                (None, v) => {
+                    self.hold(v);
+                    self.run_finally_until(0);
+                    self.release(v);
+                    v
+                }
+                (Some(slot), v) => {
+                    // The finalizers may suspend: the value waits in a local.
+                    let (p, t) = self.boxed(v);
+                    self.set_local(slot, V::Any(p, t));
+                    self.run_finally_until(0);
+                    let (p, t) = self.take_local(slot);
+                    match self.ret {
+                        Ty::F64 => V::Num(self.number_of((p, t))),
+                        Ty::Bool => {
+                            let x = self.b.ins().ireduce(I8, p);
+                            V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0))
+                        }
+                        _ => V::Any(p, t),
+                    }
+                }
+            }
+        } else {
+            v
+        };
+        let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
+        let rb = self.ret_block;
+        self.b.ins().jump(rb, &args);
+        self.after_terminator();
+    }
+
+    /// Move the value out of a JS-valued local, leaving `undefined`.
+    fn take_local(&mut self, l: ir::LocalId) -> (Value, Value) {
+        let v = self.use_local(l).any();
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.def_local(l, u);
+        v
     }
 
     /// Run the `finally` blocks between here and jump target `id`.
@@ -813,6 +855,7 @@ impl<'a> Lower<'a> {
         body: &[Stmt],
         catch: Option<&(Option<ir::LocalId>, Vec<Stmt>)>,
         finally: Option<&Vec<Stmt>>,
+        exc_slot: Option<ir::LocalId>,
     ) {
         let join = self.b.create_block();
         let fin_handler = finally.map(|_| {
@@ -872,10 +915,20 @@ impl<'a> Lower<'a> {
             let ctx = self.ctx;
             let exc = self.helper("JS_GetException", &[ctx]);
             let exc = V::Any(exc[0], exc[1]);
-            self.hold(exc);
-            self.stmts(f);
-            self.release(exc);
-            let (p, t) = exc.any();
+            let (p, t) = match exc_slot {
+                // The finalizer may suspend: the exception waits in a local.
+                Some(slot) => {
+                    self.set_local(slot, exc);
+                    self.stmts(f);
+                    self.take_local(slot)
+                }
+                None => {
+                    self.hold(exc);
+                    self.stmts(f);
+                    self.release(exc);
+                    exc.any()
+                }
+            };
             self.helper("JS_Throw", &[ctx, p, t]);
             let edge = self.throw_edge();
             self.b.ins().jump(edge, &[]);
@@ -2664,6 +2717,8 @@ impl Lower<'_> {
         let slots = self.async_cx.as_ref().unwrap().slots;
         let st = self.b.ins().iconst(I32, state as i64);
         let ctx = self.ctx;
+        // Only locals survive a suspension.
+        debug_assert!(self.temps.is_empty(), "values held across an await");
         // Takes ownership of the value.
         let r = self.helper("tsaot_await", &[ctx, slots, p, t, st]);
         self.check_int(r[0]);
@@ -2703,15 +2758,7 @@ impl Lower<'_> {
                 } else {
                     v
                 };
-                if self.scopes.iter().any(|s| matches!(s, Scope::Finally { .. })) {
-                    self.hold(v);
-                    self.run_finally_until(0);
-                    self.release(v);
-                }
-                let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
-                let rb = self.ret_block;
-                self.b.ins().jump(rb, &args);
-                self.after_terminator();
+                self.return_value(v);
             }
         }
     }

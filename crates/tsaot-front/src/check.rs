@@ -684,6 +684,9 @@ struct FnCx<'x, 'm, 'a> {
     /// Methods: `this` is the receiver.
     has_this: bool,
     is_async: bool,
+    is_generator: bool,
+    /// Functions that suspend: where a return value waits for `finally`s.
+    ret_slot: Option<ir::LocalId>,
     locals: Vec<Ty>,
     mutable: Vec<bool>,
     boxed: Vec<bool>,
@@ -851,6 +854,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_closure,
             has_this: false,
             is_async: false,
+            is_generator: false,
+            ret_slot: None,
             locals: Vec::new(),
             mutable: Vec::new(),
             boxed: Vec::new(),
@@ -890,6 +895,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             if self.caps.captured.contains(&sym) {
                 boxed_params.push((sym, l));
             }
+        }
+        if self.suspends() {
+            self.ret_slot = Some(self.temp(Ty::Any));
         }
         // Closures: locals bound to the captured boxes.
         if self.is_closure {
@@ -974,8 +982,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_closure: self.is_closure,
             has_this: self.has_this,
             is_async: self.is_async,
+            ret_slot: self.ret_slot,
             body: prologue,
         })
+    }
+
+    /// Whether the function can suspend (`await`, `yield`): then only its
+    /// locals survive across suspension points.
+    fn suspends(&self) -> bool {
+        self.is_async || self.is_generator
     }
 
     /// A local for `sym`: boxed if a closure captures it.
@@ -1189,15 +1204,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     Ok(Stmt::Loop { id, test, post_test: false, body, update: None, per_iteration: vec![] })
                 })?
             }
-            Statement::DoWhileStatement(w) => self.lp(label, JumpKind::Loop, |cx, id| {
-                let body = cx.body(&w.body)?;
-                let mark = cx.pre.len();
-                let test = cx.cond(&w.test)?;
-                if cx.pre.len() > mark {
-                    return reject(w.test.span(), "`await` in a `do`-`while` condition is not supported yet");
-                }
-                Ok(Stmt::Loop { id, test: Some(test), post_test: true, body, update: None, per_iteration: vec![] })
-            })?,
+            Statement::DoWhileStatement(w) => {
+                let started = self.temp(Ty::Bool);
+                let lp = self.lp(label, JumpKind::Loop, |cx, id| {
+                    let body = cx.body(&w.body)?;
+                    let test = cx.loop_test(Some(&w.test))?;
+                    if test.pre.is_empty() {
+                        let test = test.test;
+                        return Ok(Stmt::Loop { id, test, post_test: true, body, update: None, per_iteration: vec![] });
+                    }
+                    // The condition awaits: it is checked at the start of
+                    // every iteration but the first (where `continue` goes).
+                    Ok(cx.deferred_loop(id, started, Vec::new(), test, body, vec![]))
+                })?;
+                Stmt::Block(vec![Stmt::Expr(set(started, Expr::new(Ty::Bool, ExprKind::Bool(false)))), lp])
+            }
             Statement::ForStatement(f) => {
                 // `for (let i ...)` captured by closures: each iteration gets
                 // its own binding (fresh boxes, copied at each iteration).
@@ -1228,19 +1249,23 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     }
                 }
                 let test = self.loop_test(f.test.as_ref())?;
+                let started = self.temp(Ty::Bool);
                 let lp = self.lp(label, JumpKind::Loop, |cx, id| {
-                    let (test, mut body) = test.build(id);
-                    body.extend(cx.body(&f.body)?);
+                    let body = cx.body(&f.body)?;
                     let mark = cx.pre.len();
                     let update = f.update.as_ref().map(|u| cx.expr(u)).transpose()?;
-                    if cx.pre.len() > mark {
-                        return reject(
-                            f.update.as_ref().unwrap().span(),
-                            "`await` in a `for` update is not supported yet",
-                        );
+                    if cx.pre.len() == mark {
+                        let (test, mut first) = test.build(id);
+                        first.extend(body);
+                        return Ok(Stmt::Loop { id, test, post_test: false, body: first, update, per_iteration });
                     }
-                    Ok(Stmt::Loop { id, test, post_test: false, body, update, per_iteration })
+                    // The update awaits: it runs at the start of every
+                    // iteration but the first, followed by the test.
+                    let mut update_stmts = cx.pre.split_off(mark);
+                    update_stmts.extend(update.map(Stmt::Expr));
+                    Ok(cx.deferred_loop(id, started, update_stmts, test, body, per_iteration))
                 })?;
+                block.push(Stmt::Expr(set(started, Expr::new(Ty::Bool, ExprKind::Bool(false)))));
                 block.push(lp);
                 Stmt::Block(block)
             }
@@ -1255,7 +1280,6 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     return reject(r.span, "`return` inside `finally` is not supported");
                 }
                 if let Some(Expression::AwaitExpression(aw)) = r.argument.as_ref().map(|a| a.without_parentheses()) {
-                    self.await_allowed(aw.span)?;
                     let value = any(self.expr(&aw.argument)?);
                     self.returns.push(Ty::Any);
                     return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
@@ -1273,20 +1297,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     /// An expression statement; `await` is supported here, as `await e;` and
     /// `x = await e;`.
-    /// `await` suspends with only locals live: not while a `finally` block
-    /// holds the pending exception or return value.
-    fn await_allowed(&self, span: Span) -> R<()> {
-        if self.in_finally > 0 {
-            return reject(span, "`await` inside `finally` is not supported yet");
-        }
-        Ok(())
-    }
-
     fn expr_stmt(&mut self, e: &'a Expression<'a>) -> R<Stmt> {
         match e.without_parentheses() {
             Expression::UpdateExpression(u) => Ok(Stmt::Expr(self.update(u, false)?)),
             Expression::AwaitExpression(aw) => {
-                self.await_allowed(aw.span)?;
                 let value = any(self.expr(&aw.argument)?);
                 Ok(Stmt::Await { value, target: ir::AwaitTarget::Discard })
             }
@@ -1311,7 +1325,6 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     self.widen_request = Some(sym);
                     return Err(Reject { span: a.span, msg: "retry".into(), retry: true });
                 }
-                self.await_allowed(aw.span)?;
                 let value = any(self.expr(&aw.argument)?);
                 Ok(Stmt::Await { value, target: ir::AwaitTarget::Set(l) })
             }
@@ -1325,6 +1338,37 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mark = self.pre.len();
         let test = test.map(|t| self.cond(t)).transpose()?;
         Ok(LoopTest { pre: self.pre.split_off(mark), test })
+    }
+
+    /// A loop whose condition (`do`-`while`) or update (`for`) awaits. They
+    /// run at the start of the body, from the second iteration on (`started`)
+    /// for `update`, and for the test too where `update` is not empty or the
+    /// loop is a `do`-`while` (a `for` test runs every time).
+    fn deferred_loop(
+        &mut self,
+        id: ir::LoopId,
+        started: ir::LocalId,
+        update: Vec<Stmt>,
+        test: LoopTest,
+        body: Vec<Stmt>,
+        per_iteration: Vec<ir::LocalId>,
+    ) -> Stmt {
+        let is_do_while = update.is_empty();
+        let mut test_stmts = test.pre;
+        if let Some(t) = test.test {
+            let not = Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(t)));
+            test_stmts.push(Stmt::If(not, vec![Stmt::Break(id)], vec![]));
+        }
+        let mut first = Vec::new();
+        if is_do_while {
+            first.push(Stmt::If(self.local(started), test_stmts, vec![]));
+        } else {
+            first.push(Stmt::If(self.local(started), update, vec![]));
+            first.extend(test_stmts);
+        }
+        first.push(Stmt::Expr(set(started, Expr::new(Ty::Bool, ExprKind::Bool(true)))));
+        first.extend(body);
+        Stmt::Loop { id, test: None, post_test: false, body: first, update: None, per_iteration }
     }
 
     fn lp(
@@ -1359,7 +1403,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn switch(&mut self, sw: &'a SwitchStatement<'a>) -> R<Stmt> {
         let d = any(self.expr(&sw.discriminant)?);
         let disc = self.temp(Ty::Any);
-        let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(disc, Box::new(d))));
+        let init = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(disc, Box::new(d))));
         // The case clauses form one block.
         let all: Vec<&Statement> = sw.cases.iter().flat_map(|c| c.consequent.iter()).collect();
         let mut prologue = Vec::new();
@@ -1367,20 +1411,51 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             prologue.extend(self.block_prologue(std::slice::from_ref(s))?);
         }
         let label = self.label.take();
+        // Tests are checked first: if any awaits, the matching case is
+        // selected by an `if` chain beforehand (in the same order).
+        let mark = self.pre.len();
+        let mut tests = Vec::new();
+        let mut awaits = false;
+        for c in &sw.cases {
+            let m = self.pre.len();
+            let test = c.test.as_ref().map(|t| self.expr(t).map(any)).transpose()?;
+            awaits |= self.pre.len() > m;
+            tests.push((self.pre.split_off(m), test));
+        }
+        debug_assert_eq!(self.pre.len(), mark);
+        let mut select = Vec::new();
+        let disc = if awaits {
+            let sel = self.temp(Ty::Any);
+            let none = any(Expr::num(-1.0));
+            select.push(Stmt::Expr(set(sel, none)));
+            let mut chain: Vec<Stmt> = Vec::new();
+            for (i, (pre, test)) in tests.iter_mut().enumerate().rev() {
+                let Some(t) = test.take() else { continue };
+                let hit = Expr::new(
+                    Ty::Bool,
+                    ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(disc)), Box::new(t)),
+                );
+                let mut arm = std::mem::take(pre);
+                arm.push(Stmt::If(hit, vec![Stmt::Expr(set(sel, any(Expr::num(i as f64))))], chain));
+                chain = arm;
+                *test = Some(any(Expr::num(i as f64)));
+            }
+            select.extend(chain);
+            sel
+        } else {
+            disc
+        };
         let sw_stmt = self.lp(label, JumpKind::Switch, |cx, id| {
             let mut cases = Vec::new();
-            for c in &sw.cases {
-                let mark = cx.pre.len();
-                let test = c.test.as_ref().map(|t| cx.expr(t).map(any)).transpose()?;
-                if cx.pre.len() > mark {
-                    return reject(c.span, "`await` in a `case` test is not supported yet");
-                }
+            for (c, (_, test)) in sw.cases.iter().zip(tests) {
                 cases.push((test, cx.stmts(&c.consequent)?));
             }
             Ok(Stmt::Switch { id, disc, cases })
         })?;
-        let mut out = vec![set];
+        // Declarations in the case block exist before the tests run.
+        let mut out = vec![init];
         out.extend(prologue);
+        out.extend(select);
         out.push(sw_stmt);
         Ok(Stmt::Block(out))
     }
@@ -1426,7 +1501,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Some(r?)
             }
         };
-        Ok(Stmt::Try { body, catch, finally })
+        // The exception waits here while a finalizer that may suspend runs.
+        let exc = (finally.is_some() && self.suspends()).then(|| self.temp(Ty::Any));
+        Ok(Stmt::Try { body, catch, finally, exc })
     }
 
     fn var_decl(&mut self, v: &'a VariableDeclaration<'a>) -> R<Vec<Stmt>> {
@@ -1444,7 +1521,6 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             };
             let sym = id.symbol_id.get().unwrap();
             if let Some(Expression::AwaitExpression(aw)) = d.init.as_ref().map(|i| i.without_parentheses()) {
-                self.await_allowed(aw.span)?;
                 let value = any(self.expr(&aw.argument)?);
                 let l = match self.sym_local.get(&sym) {
                     Some(&l) if is_var || self.boxed[l] => l,
@@ -1549,7 +1625,6 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::AwaitExpression(aw) => {
                 // Hoisted into a statement that runs before the current one,
                 // with no expression temporaries live across the suspension.
-                self.await_allowed(aw.span)?;
                 let value = any(self.expr(&aw.argument)?);
                 let t = self.temp(Ty::Any);
                 self.pre.push(Stmt::Await { value, target: ir::AwaitTarget::Set(t) });
@@ -2489,8 +2564,8 @@ fn box_returns(body: Vec<Stmt>) -> Vec<Stmt> {
                 Stmt::Switch { id, disc, cases: cases.into_iter().map(|(t, b)| (t, l(b))).collect() }
             }
             Stmt::Block(b) => Stmt::Block(l(b)),
-            Stmt::Try { body, catch, finally } => {
-                Stmt::Try { body: l(body), catch: catch.map(|(p, b)| (p, l(b))), finally: finally.map(l) }
+            Stmt::Try { body, catch, finally, exc } => {
+                Stmt::Try { body: l(body), catch: catch.map(|(p, b)| (p, l(b))), finally: finally.map(l), exc }
             }
             other => other,
         }
@@ -2624,7 +2699,7 @@ fn completes(s: &Stmt) -> bool {
         }
         // Conservative: a switch may complete.
         Stmt::Switch { .. } => true,
-        Stmt::Try { body, catch, finally } => {
+        Stmt::Try { body, catch, finally, .. } => {
             (completes_list(body) || catch.as_ref().is_some_and(|(_, c)| completes_list(c)))
                 && finally.as_ref().is_none_or(|f| completes_list(f))
         }
@@ -2638,7 +2713,7 @@ fn breaks_to(list: &[Stmt], id: ir::LoopId) -> bool {
         Stmt::If(_, a, b) => breaks_to(a, id) || breaks_to(b, id),
         Stmt::Loop { body, .. } => breaks_to(body, id),
         Stmt::Switch { cases, .. } => cases.iter().any(|(_, b)| breaks_to(b, id)),
-        Stmt::Try { body, catch, finally } => {
+        Stmt::Try { body, catch, finally, .. } => {
             breaks_to(body, id)
                 || catch.as_ref().is_some_and(|(_, c)| breaks_to(c, id))
                 || finally.as_ref().is_some_and(|f| breaks_to(f, id))

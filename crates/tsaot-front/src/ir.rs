@@ -155,6 +155,9 @@ pub struct Func {
     pub has_this: bool,
     /// `async`: compiled as a resumable step function over a heap frame.
     pub is_async: bool,
+    /// In functions that suspend: holds the return value while `finally`
+    /// blocks run on the way out (`Any`).
+    pub ret_slot: Option<LocalId>,
     pub body: Vec<Stmt>,
 }
 
@@ -196,11 +199,14 @@ pub enum Stmt {
     /// `throw e` (`Any`).
     Throw(Expr),
     /// `try { body } catch (param) { handler } finally { finalizer }`. The
-    /// finalizer contains no `return`, `break` or `continue`.
+    /// finalizer contains no `return`, `break` or `continue`. In functions
+    /// that suspend, `exc` holds the exception while the finalizer runs on
+    /// the exception path (it may suspend: only locals survive that).
     Try {
         body: Vec<Stmt>,
         catch: Option<(Option<LocalId>, Vec<Stmt>)>,
         finally: Option<Vec<Stmt>>,
+        exc: Option<LocalId>,
     },
 }
 
