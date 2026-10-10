@@ -85,7 +85,7 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Vec<u8>> {
     let mut module = ObjectModule::new(builder);
 
     let mut cg = Codegen::new(&mut module, m)?;
-    for (i, f) in m.funcs.iter().enumerate() {
+    for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
         cg.define(i, f).with_context(|| format!("compiling `{}`", f.name))?;
         cg.define_fast(i, f).with_context(|| format!("compiling the entry of `{}`", f.name))?;
     }
@@ -129,6 +129,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_new_array", &[P, Int, P], &[W, W]),
         ("tsaot_throw_uninitialized", &[P, Int], &[]),
         ("tsaot_stack_overflow", &[P], &[]),
+        ("tsaot_throw_uninitialized_atom", &[P, Int], &[]),
+        ("tsaot_box_new", &[P, P], &[W, W]),
+        ("tsaot_make_closure", &[P, Int, Int, P], &[W, W]),
         ("tsaot_pow", &[D, D], &[D]),
         ("tsaot_toint32_slow", &[D], &[Int]),
         ("fmod", &[D, D], &[D]),
@@ -153,6 +156,7 @@ struct Codegen<'m> {
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
     data: [DataId; 5],
+    closure_base: usize,
     fctx: FunctionBuilderContext,
 }
 
@@ -160,13 +164,13 @@ impl<'m> Codegen<'m> {
     fn new(module: &'m mut ObjectModule, m: &ir::Module) -> Result<Self> {
         let ptr = module.target_config().pointer_type();
         let mut funcs = Vec::new();
-        for (i, f) in m.funcs.iter().enumerate() {
+        for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
             let sig = native_signature(module, f);
             funcs.push(module.declare_function(&symbol_name(i), Linkage::Export, &sig)?);
         }
         let fast_sig = fast_signature(module);
         let mut fast_funcs = Vec::new();
-        for i in 0..m.funcs.len() {
+        for i in 0..m.funcs.len() + m.closures.len() {
             fast_funcs.push(module.declare_function(&fast_symbol_name(i), Linkage::Export, &fast_sig)?);
         }
         let mut helpers = HashMap::new();
@@ -203,6 +207,7 @@ impl<'m> Codegen<'m> {
             fast_funcs,
             helpers,
             data: data.try_into().unwrap(),
+            closure_base: m.funcs.len(),
             fctx: FunctionBuilderContext::new(),
         })
     }
@@ -212,7 +217,7 @@ impl<'m> Codegen<'m> {
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
         let [stack_limit, unwinding, cells, strings, atoms] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
-        Env { helpers, funcs, stack_limit, unwinding, cells, strings, atoms }
+        Env { helpers, funcs, stack_limit, unwinding, cells, strings, atoms, closure_base: self.closure_base }
     }
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
@@ -229,13 +234,15 @@ impl<'m> Codegen<'m> {
         let raw = b.block_params(entry).to_vec();
         let js_ctx = raw[0];
         let mut params = Vec::new();
-        let mut k = 1;
+        let data = f.is_closure.then(|| raw[1]);
+        let mut k = if f.is_closure { 2 } else { 1 };
         for &t in &f.params {
             let n = clif_types(t).len();
             params.push(from_values(t, &raw[k..k + n]));
             k += n;
         }
-        let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, Exits { ret: Exit::Return, unwind: Exit::Return });
+        let exits = Exits { ret: Exit::Return, unwind: Exit::Return };
+        let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
         l.stack_check();
         let mut b = l.body(&f.body);
         b.seal_all_blocks();
@@ -284,6 +291,7 @@ impl<'m> Codegen<'m> {
         b.switch_to_block(entry);
         let raw = b.block_params(entry).to_vec();
         let (js_ctx, argc, argv) = (raw[0], raw[3], raw[4]);
+        let data = f.is_closure.then(|| raw[5]);
 
         // Guards first (declining must not leak references): enough
         // arguments for every unboxed parameter, and their tags.
@@ -321,10 +329,11 @@ impl<'m> Codegen<'m> {
             // The body itself, with `return` jumping to the boxing code. It
             // needs no stack check: entries from JS are shallow.
             let exits = Exits { ret: Exit::Jump(boxing), unwind: Exit::Jump(exception) };
-            let l = Lower::new(b, env, js_ctx, ptr, f, &params, exits);
+            let l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
             l.body(&f.body)
         } else {
             let mut args = vec![js_ctx];
+            args.extend(data);
             for p in &params {
                 args.extend(p.values());
             }
@@ -374,6 +383,10 @@ fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
     let ptr = module.target_config().pointer_type();
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr));
+    if f.is_closure {
+        // The closure's data slots.
+        sig.params.push(AbiParam::new(ptr));
+    }
     for &t in &f.params {
         sig.params.extend(abi(t));
     }
@@ -520,8 +533,10 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
             | Str(_)
             | Cell(_)
             | Global(_)
-            | GlobalOrUndefined(_) => {}
+            | GlobalOrUndefined(_)
+            | Closure(..) => {}
             SetLocal(_, a)
+            | InitLocal(_, a)
             | Unary(_, a)
             | Truthy(a)
             | Box(a)
@@ -591,7 +606,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
                     walk(fin, f);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::NewBoxes(_) => {}
         }
     }
 }

@@ -135,7 +135,21 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
     let mut marks = MarkedFunctions { marked: &stripped.marked, found: Vec::new() };
     marks.visit_program(program);
     for m in marks.found {
-        if out.native.iter().any(|c| c.node.span() == m.span) {
+        if out.native.iter().any(|c| c.node.span() == m.span) || out.closure_spans.contains(&m.span) {
+            continue;
+        }
+        // A nested function is compiled together with its enclosing
+        // top-level function: report why that one is not native.
+        let enclosing =
+            out.rejected.iter().find(|r| r.1 != m.span && r.1.start <= m.span.start && m.span.end <= r.1.end);
+        if let Some((name, _, reason)) = enclosing {
+            errors.push(
+                OxcDiagnostic::error(format!("`aot` function inside `{name}` cannot be compiled natively"))
+                    .with_labels([
+                        LabeledSpan::new_primary_with_span(Some(reason.msg.clone()), reason.span),
+                        LabeledSpan::new_with_span(Some("marked here".into()), m.span),
+                    ]),
+            );
             continue;
         }
         errors.push(match out.rejected.iter().find(|r| r.1 == m.span) {

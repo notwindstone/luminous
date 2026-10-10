@@ -43,10 +43,15 @@ pub type StrId = usize;
 pub type AtomId = usize;
 /// Index into `Module::cells` (module-level bindings used by native code).
 pub type CellId = usize;
+/// Index into `Module::closures`.
+pub type ClosureId = usize;
 
 #[derive(Debug, Clone, Default)]
 pub struct Module {
+    /// Module-level functions (`FuncId`s `0..funcs.len()`).
     pub funcs: Vec<Func>,
+    /// Closures created by native code (`ClosureId`s).
+    pub closures: Vec<Func>,
     /// String constants.
     pub strings: Vec<String>,
     /// Property and global variable names, interned as engine atoms.
@@ -58,8 +63,10 @@ pub struct Module {
 
 #[derive(Debug, Clone)]
 pub struct Func {
-    /// JS name of the function (the module-level binding).
+    /// JS name of the function (`.name` of its function object).
     pub name: String,
+    /// JS `.length`: parameters before the first one with a default.
+    pub js_length: usize,
     /// ABI types of the parameters. Locals `0..params.len()` are the
     /// parameters; a local may be `Any` where its parameter is not, in
     /// which case the incoming value is boxed on entry.
@@ -67,6 +74,15 @@ pub struct Func {
     pub ret: Ty,
     /// Types of all locals, including parameters and hidden temporaries.
     pub locals: Vec<Ty>,
+    /// Locals captured by closures. They live in heap boxes shared with the
+    /// closures, are always `Any`, and are checked for their TDZ.
+    pub boxed: Vec<bool>,
+    /// Names of the boxed locals (for TDZ errors).
+    pub local_names: Vec<Option<AtomId>>,
+    /// Closures only: the boxed locals bound to the closure's captured
+    /// boxes, in the order of its data slots.
+    pub captures: Vec<LocalId>,
+    pub is_closure: bool,
     pub body: Vec<Stmt>,
 }
 
@@ -83,6 +99,9 @@ pub enum Stmt {
         post_test: bool,
         body: Vec<Stmt>,
         update: Option<Expr>,
+        /// Boxed loop variables (`for (let ...)` captured by closures): each
+        /// iteration gets fresh boxes, holding the previous values.
+        per_iteration: Vec<LocalId>,
     },
     /// `switch (local) { case ...: }`: cases are compared with `===` in
     /// order; `None` is `default`. Bodies fall through. `break` targets `id`.
@@ -91,6 +110,8 @@ pub enum Stmt {
         disc: LocalId,
         cases: Vec<(Option<Expr>, Vec<Stmt>)>,
     },
+    /// Fresh, uninitialized boxes for these boxed locals (entering their scope).
+    NewBoxes(Vec<LocalId>),
     Break(LoopId),
     Continue(LoopId),
     Return(Option<Expr>),
@@ -177,6 +198,10 @@ pub enum ExprKind {
     Object(Vec<(AtomId, Expr)>),
     /// Array literal without holes or spreads.
     Array(Vec<Expr>),
+    /// Initialization of a local by its declaration (no TDZ check).
+    InitLocal(LocalId, Box<Expr>),
+    /// A closure: function `ClosureId` capturing these boxed locals.
+    Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).
     Void(Box<Expr>),
 }

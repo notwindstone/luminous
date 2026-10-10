@@ -40,6 +40,10 @@ JSValue tsaot_call(JSContext *ctx, JSValue *fthis, int argc, JSValue *argv);
 JSValue tsaot_global_or_undefined(JSContext *ctx, JSAtom name);
 int tsaot_define_field(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue val);
 JSValue tsaot_new_array(JSContext *ctx, int count, JSValue *values);
+JSValue tsaot_box_new(JSContext *ctx, JSValue **slot);
+void tsaot_throw_uninitialized_atom(JSContext *ctx, JSAtom name);
+/* Defined by the generated glue. */
+JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data);
 
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);

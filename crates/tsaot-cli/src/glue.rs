@@ -64,15 +64,15 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     )
     .unwrap();
 
-    for (i, f) in m.funcs.iter().enumerate() {
+    for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
         writeln!(c, "extern JSCFunctionFast tsaot_fast_{i}; /* {} */", f.name.replace("*/", "* /")).unwrap();
     }
 
     let n = m.funcs.len();
     // Trailing sentinels keep arrays non-empty.
     c.push_str("\nstatic const struct { JSCFunctionFast *fast; const char *name; int length; } tsaot_table[] = {\n");
-    for (i, f) in m.funcs.iter().enumerate() {
-        writeln!(c, "    {{ tsaot_fast_{i}, {}, {} }},", c_str(&f.name), f.params.len()).unwrap();
+    for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
+        writeln!(c, "    {{ tsaot_fast_{i}, {}, {} }},", c_str(&f.name), f.js_length).unwrap();
     }
     c.push_str("    { NULL, NULL, 0 },\n};\n\n");
 
@@ -131,6 +131,21 @@ static JSValue tsaot_bind(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         return JS_ThrowRangeError(ctx, "{BIND_FN}: bad index");
     return JS_NewCFunctionDataFast(ctx, tsaot_table[i].fast, tsaot_fallback, tsaot_table[i].name,
                                    tsaot_table[i].length, 0, 1, &argv[1]);
+}}
+
+/* Closures never decline (all their parameters are JS values), but if the
+ * engine calls their regular function anyway, go to the native entry. */
+static JSValue tsaot_closure_slow(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                  int magic, JSValueConst *data)
+{{
+    return tsaot_table[magic].fast(ctx, this_val, argc, argv, data);
+}}
+
+/* A closure of native function `fn` over `data` (borrowed). */
+JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
+{{
+    return JS_NewCFunctionDataFast(ctx, tsaot_table[fn].fast, tsaot_closure_slow, tsaot_table[fn].name,
+                                   tsaot_table[fn].length, fn, n, data);
 }}
 
 static JSValue tsaot_exports[3];

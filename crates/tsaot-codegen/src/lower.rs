@@ -124,6 +124,13 @@ pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
 enum LVar {
     One(Variable),
     Two(Variable, Variable),
+    /// Captured by closures: the box object (owned unless the box comes
+    /// from the closure's own captures) and a pointer to its value slot.
+    Boxed {
+        obj: (Variable, Variable),
+        slot: Variable,
+        owned: bool,
+    },
 }
 
 /// Where lowered code goes when it leaves the body.
@@ -152,6 +159,8 @@ pub(crate) struct Env {
     pub cells: GlobalValue,
     pub strings: GlobalValue,
     pub atoms: GlobalValue,
+    /// `FuncId` of closure 0.
+    pub closure_base: usize,
 }
 
 /// An exception edge: its block, the temporaries to free there, the handler.
@@ -175,6 +184,7 @@ pub(crate) struct Lower<'a> {
     ptr: Type,
     ret: Ty,
     locals: Vec<Ty>,
+    names: Vec<Option<ir::AtomId>>,
     vars: Vec<LVar>,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
@@ -193,6 +203,8 @@ pub(crate) struct Lower<'a> {
 impl<'a> Lower<'a> {
     /// Set up lowering of a body with locals typed `locals`, the first ones
     /// being the parameters (`params`, already in `b`'s current block).
+    /// Closures also get `closure_data`, their function object's data slots.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         mut b: FunctionBuilder<'a>,
         env: Env,
@@ -200,12 +212,19 @@ impl<'a> Lower<'a> {
         ptr: Type,
         f: &ir::Func,
         params: &[V],
+        closure_data: Option<Value>,
         exits: Exits,
     ) -> Self {
         let vars: Vec<LVar> = f
             .locals
             .iter()
-            .map(|&t| match t {
+            .enumerate()
+            .map(|(i, &t)| match t {
+                _ if f.boxed[i] => LVar::Boxed {
+                    obj: (b.declare_var(I64), b.declare_var(I64)),
+                    slot: b.declare_var(I64),
+                    owned: !f.captures.contains(&i),
+                },
                 Ty::Any => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
@@ -223,6 +242,7 @@ impl<'a> Lower<'a> {
             ptr,
             ret: f.ret,
             locals: f.locals.clone(),
+            names: f.local_names.clone(),
             vars,
             loops: HashMap::new(),
             temps: Vec::new(),
@@ -234,6 +254,16 @@ impl<'a> Lower<'a> {
             exits,
         };
         for (i, &t) in f.locals.iter().enumerate() {
+            if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
+                // Boxes are created when their scope is entered (or come
+                // from the closure, below).
+                let zero = l.b.ins().iconst(I64, 0);
+                let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
+                l.b.def_var(op, zero);
+                l.b.def_var(ot, undef);
+                l.b.def_var(slot, zero);
+                continue;
+            }
             let v = match params.get(i) {
                 // A widened parameter is boxed on entry.
                 Some(&p) => match (t, p) {
@@ -251,6 +281,20 @@ impl<'a> Lower<'a> {
                 None => l.zero(t),
             };
             l.def_local(i, v);
+        }
+        // A closure's data slots hold, per captured variable, its box object
+        // and the address of the box's value (as a non-reference value).
+        if let Some(data) = closure_data {
+            for (k, &cl) in f.captures.iter().enumerate() {
+                let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[cl] else { unreachable!() };
+                let at = (2 * k * SIZE) as i32;
+                let p = l.b.ins().load(I64, Self::mem(), data, at);
+                let t = l.b.ins().load(I64, Self::mem(), data, at + TAG_OFFSET);
+                let s = l.b.ins().load(I64, Self::mem(), data, at + SIZE as i32);
+                l.b.def_var(op, p);
+                l.b.def_var(ot, t);
+                l.b.def_var(slot, s);
+            }
         }
         l
     }
@@ -304,25 +348,97 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// The local's value, borrowed.
+    /// The local's value, borrowed. Boxed locals are checked for their TDZ.
     fn use_local(&mut self, l: ir::LocalId) -> V {
         match (self.vars[l], self.locals[l]) {
             (LVar::One(v), Ty::F64) => V::Num(self.b.use_var(v)),
             (LVar::One(v), Ty::Bool) => V::Bool(self.b.use_var(v)),
             (LVar::Two(p, t), _) => V::Any(self.b.use_var(p), self.b.use_var(t)),
+            (LVar::Boxed { .. }, _) => {
+                let (p, t) = self.load_box(l);
+                self.check_tdz(l, t);
+                V::Any(p, t)
+            }
             _ => unreachable!(),
+        }
+    }
+
+    fn box_slot(&mut self, l: ir::LocalId) -> Value {
+        let LVar::Boxed { slot, .. } = self.vars[l] else { unreachable!() };
+        self.b.use_var(slot)
+    }
+
+    /// The value in a boxed local's box, borrowed, without a TDZ check.
+    fn load_box(&mut self, l: ir::LocalId) -> (Value, Value) {
+        let slot = self.box_slot(l);
+        let p = self.b.ins().load(I64, Self::mem(), slot, 0);
+        let t = self.b.ins().load(I64, Self::mem(), slot, TAG_OFFSET);
+        (p, t)
+    }
+
+    fn store_box(&mut self, l: ir::LocalId, (p, t): (Value, Value)) {
+        let slot = self.box_slot(l);
+        self.b.ins().store(Self::mem(), p, slot, 0);
+        self.b.ins().store(Self::mem(), t, slot, TAG_OFFSET);
+    }
+
+    /// ReferenceError if a boxed local is still uninitialized.
+    fn check_tdz(&mut self, l: ir::LocalId, t: Value) {
+        let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNINITIALIZED);
+        let throw = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.set_cold_block(throw);
+        self.b.ins().brif(uninit, throw, &[], cont, &[]);
+        self.b.switch_to_block(throw);
+        let atom = self.atom(self.names[l].expect("boxed locals are named"));
+        let ctx = self.ctx;
+        self.helper("tsaot_throw_uninitialized_atom", &[ctx, atom]);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(cont);
+    }
+
+    /// Fresh, uninitialized boxes for boxed locals (their scope is entered).
+    fn new_boxes(&mut self, ls: &[ir::LocalId], copy_values: bool) {
+        for &l in ls {
+            let LVar::Boxed { obj: (op, ot), slot, owned } = self.vars[l] else { unreachable!() };
+            debug_assert!(owned);
+            let old_obj = (self.b.use_var(op), self.b.use_var(ot));
+            let old_val = if copy_values { Some(self.load_box(l)) } else { None };
+            let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let out_addr = self.b.ins().stack_addr(self.ptr, out, 0);
+            let ctx = self.ctx;
+            let r = self.helper("tsaot_box_new", &[ctx, out_addr]);
+            self.check_value(r[1]);
+            let new_slot = self.b.ins().stack_load(self.ptr, I64, out, 0);
+            self.b.def_var(op, r[0]);
+            self.b.def_var(ot, r[1]);
+            self.b.def_var(slot, new_slot);
+            if let Some(v) = old_val {
+                // A new binding for the next iteration, with the same value.
+                self.dup(v);
+                self.store_box(l, v);
+            }
+            self.free(old_obj);
         }
     }
 
     fn free_all_locals(&mut self) {
         for l in 0..self.locals.len() {
-            if self.locals[l] == Ty::Any {
-                let (p, t) = self.use_local(l).any();
-                self.free((p, t));
+            match self.vars[l] {
+                LVar::Boxed { obj: (op, ot), owned: true, .. } => {
+                    let obj = (self.b.use_var(op), self.b.use_var(ot));
+                    self.free(obj);
+                }
+                LVar::Boxed { .. } => {}
+                _ if self.locals[l] == Ty::Any => {
+                    let (p, t) = self.use_local(l).any();
+                    self.free((p, t));
+                }
+                _ => {}
             }
         }
     }
-
     // ---- reference counting ----
 
     fn is_refcounted(&mut self, t: Value) -> Value {
@@ -500,6 +616,7 @@ impl<'a> Lower<'a> {
     fn stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Expr(e) => self.effect(e),
+            Stmt::NewBoxes(ls) => self.new_boxes(ls, false),
             Stmt::Block(b) => self.stmts(b),
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
@@ -519,7 +636,9 @@ impl<'a> Lower<'a> {
                 }
                 self.b.switch_to_block(join);
             }
-            Stmt::Loop { id, test, post_test, body, update } => {
+            Stmt::Loop { id, test, post_test, body, update, per_iteration } => {
+                // Each iteration gets its own bindings for captured loop variables.
+                self.new_boxes(per_iteration, true);
                 let header = self.b.create_block();
                 let body_b = self.b.create_block();
                 let cont = self.b.create_block();
@@ -547,6 +666,7 @@ impl<'a> Lower<'a> {
                 }
 
                 self.b.switch_to_block(cont);
+                self.new_boxes(per_iteration, true);
                 if let Some(u) = update {
                     self.effect(u);
                 }
@@ -767,6 +887,10 @@ impl<'a> Lower<'a> {
                 let v = self.expr(x);
                 self.set_local(*l, v);
             }
+            ExprKind::InitLocal(l, x) => {
+                let v = self.expr(x);
+                self.init_local(*l, v);
+            }
             _ => {
                 let v = self.expr(e);
                 self.free_v(v);
@@ -774,14 +898,33 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Store an owned value in a local, freeing its previous value.
+    /// Store an owned value in a local, freeing its previous value. Boxed
+    /// locals are checked for their TDZ first.
     fn set_local(&mut self, l: ir::LocalId, v: V) {
-        if self.locals[l] == Ty::Any {
+        if let LVar::Boxed { .. } = self.vars[l] {
+            let old = self.load_box(l);
+            self.hold(v);
+            self.check_tdz(l, old.1);
+            self.release(v);
+            self.store_box(l, v.any());
+            self.free(old);
+        } else if self.locals[l] == Ty::Any {
             let old = self.use_local(l).any();
             self.def_local(l, v);
             self.free(old);
         } else {
             self.def_local(l, v);
+        }
+    }
+
+    /// A local's initialization by its declaration (no TDZ check).
+    fn init_local(&mut self, l: ir::LocalId, v: V) {
+        if let LVar::Boxed { .. } = self.vars[l] {
+            let old = self.load_box(l);
+            self.store_box(l, v.any());
+            self.free(old);
+        } else {
+            self.set_local(l, v);
         }
     }
 
@@ -806,6 +949,34 @@ impl<'a> Lower<'a> {
                 }
                 self.set_local(*l, v);
                 v
+            }
+            ExprKind::InitLocal(l, x) => {
+                let v = self.expr(x);
+                if let V::Any(p, t) = v {
+                    self.dup((p, t));
+                }
+                self.init_local(*l, v);
+                v
+            }
+            ExprKind::Closure(cid, boxes) => {
+                // Data slots: per captured variable, its box object and the
+                // address of its value (borrowed: the function dups them).
+                let mut vals = Vec::new();
+                for &bl in boxes {
+                    let LVar::Boxed { obj: (op, ot), .. } = self.vars[bl] else { unreachable!() };
+                    let obj = (self.b.use_var(op), self.b.use_var(ot));
+                    let slot = self.box_slot(bl);
+                    let tag = self.b.ins().iconst(I64, TAG_FLOAT64);
+                    vals.push(obj);
+                    vals.push((slot, tag));
+                }
+                let data = self.values_slot(&vals);
+                let index = self.b.ins().iconst(I32, (self.env.closure_base + cid) as i64);
+                let n = self.b.ins().iconst(I32, vals.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_make_closure", &[ctx, index, n, data]);
+                self.check_value(r[1]);
+                V::Any(r[0], r[1])
             }
             ExprKind::Update { local, delta, prefix } => {
                 let old = self.use_local(*local).num();

@@ -9,6 +9,7 @@
 //! checker does not lower yet.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use oxc::ast::ast::*;
 use oxc::semantic::{Scoping, SymbolId};
@@ -139,6 +140,8 @@ pub struct Outcome<'a> {
     pub native: Vec<Candidate<'a>>,
     pub module: ir::Module,
     pub cells: Vec<CellInfo>,
+    /// Spans of the nested functions compiled as closures.
+    pub closure_spans: Vec<Span>,
     /// Rejected candidates with the reason they stay interpreted.
     pub rejected: Vec<(String, Span, Reject)>,
 }
@@ -179,6 +182,8 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
             atom_ids: HashMap::new(),
             cells: Vec::new(),
             cell_ids: HashMap::new(),
+            closures: Vec::new(),
+            closure_spans: Vec::new(),
         };
         for i in 0..candidates.len() {
             cx.ensure(i);
@@ -198,11 +203,13 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
             let cells = cx.cell_infos();
             let module = ir::Module {
                 funcs,
+                closures: std::mem::take(&mut cx.closures),
                 strings: cx.strings,
                 atoms: cx.atoms,
                 cells: cells.iter().map(|c| c.name.clone()).collect(),
             };
-            return Outcome { native: candidates, module, cells, rejected };
+            let closure_spans = std::mem::take(&mut cx.closure_spans);
+            return Outcome { native: candidates, module, cells, closure_spans, rejected };
         }
         let mut reasons: HashMap<usize, Reject> = HashMap::new();
         for &i in &failed {
@@ -451,6 +458,8 @@ struct ModuleCx<'m, 'a> {
     atom_ids: HashMap<String, ir::AtomId>,
     cells: Vec<SymbolId>,
     cell_ids: HashMap<SymbolId, ir::CellId>,
+    closures: Vec<ir::Func>,
+    closure_spans: Vec<Span>,
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
@@ -459,23 +468,15 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             return;
         }
         self.state[i] = State::InProgress;
-        let sym = self.cands[i].symbol;
+        let c = &self.cands[i];
+        let (sym, node, name) = (c.symbol, c.node, c.name.clone());
+        let params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)> =
+            c.params.iter().map(|p| (p.symbol, p.ty, p.default)).collect();
+        let caps = Rc::new(capture_info(node, self.scoping));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
-            let mut fx = FnCx {
-                m: self,
-                locals: Vec::new(),
-                mutable: Vec::new(),
-                sym_local: HashMap::new(),
-                widened,
-                widen_request: None,
-                jumps: Vec::new(),
-                next_loop: 0,
-                label: None,
-                returns: Vec::new(),
-                in_finally: 0,
-            };
-            let r = fx.function(i);
+            let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
+            let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
                 (Err(e), Some(s)) if e.retry => {
                     self.widened.entry(sym).or_default().insert(s);
@@ -599,10 +600,19 @@ enum JumpKind {
 
 struct FnCx<'x, 'm, 'a> {
     m: &'x mut ModuleCx<'m, 'a>,
+    /// Which variables closures capture, for the whole top-level function.
+    caps: Rc<CaptureInfo>,
+    /// This function (its span start, as in `CaptureInfo`).
+    key: u32,
+    is_closure: bool,
     locals: Vec<Ty>,
     mutable: Vec<bool>,
+    boxed: Vec<bool>,
+    local_names: Vec<Option<ir::AtomId>>,
+    /// Closures: locals bound to the captured boxes, in data order.
+    captures: Vec<ir::LocalId>,
     /// Locals that have been declared so far in program order. A reference to
-    /// a local symbol not in here would hit its TDZ.
+    /// an unboxed local symbol not in here would hit its TDZ.
     sym_local: HashMap<SymbolId, ir::LocalId>,
     /// Locals known to need type `Any` (from previous attempts).
     widened: HashSet<SymbolId>,
@@ -615,6 +625,86 @@ struct FnCx<'x, 'm, 'a> {
     returns: Vec<Ty>,
     /// Depth of `finally` blocks being checked (no jumps out of them).
     in_finally: usize,
+    /// Name for the next anonymous closure (`const f = () => ...`).
+    name_hint: Option<String>,
+}
+
+/// Variables captured by nested functions within one top-level function.
+#[derive(Default)]
+struct CaptureInfo {
+    /// Declared in one function, referenced from a nested one.
+    captured: HashSet<SymbolId>,
+    /// Per function (span start): captured variables of enclosing functions
+    /// it uses, directly or through its own nested functions, in order.
+    free: HashMap<u32, Vec<SymbolId>>,
+}
+
+fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
+    use oxc::ast_visit::{Visit, walk};
+    use oxc::syntax::scope::ScopeFlags;
+    struct V<'s> {
+        scoping: &'s Scoping,
+        collect_refs: bool,
+        stack: Vec<u32>,
+        owner: HashMap<SymbolId, u32>,
+        info: CaptureInfo,
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+            // A declaration's name belongs to the enclosing function.
+            if it.is_declaration()
+                && let (Some(id), Some(&cur)) = (&it.id, self.stack.last())
+            {
+                self.owner.entry(id.symbol_id.get().unwrap()).or_insert(cur);
+            }
+            self.stack.push(it.span.start);
+            walk::walk_function(self, it, flags);
+            self.stack.pop();
+        }
+        fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+            self.stack.push(it.span.start);
+            walk::walk_arrow_function_expression(self, it);
+            self.stack.pop();
+        }
+        fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+            if !self.collect_refs
+                && let (Some(sym), Some(&cur)) = (it.symbol_id.get(), self.stack.last())
+            {
+                self.owner.entry(sym).or_insert(cur);
+            }
+        }
+        fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+            if !self.collect_refs {
+                return;
+            }
+            let Some(sym) = it.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id()) else {
+                return;
+            };
+            let Some(&owner) = self.owner.get(&sym) else { return };
+            if self.stack.last() == Some(&owner) {
+                return;
+            }
+            self.info.captured.insert(sym);
+            for &f in self.stack.iter().rev() {
+                if f == owner {
+                    break;
+                }
+                let free = self.info.free.entry(f).or_default();
+                if !free.contains(&sym) {
+                    free.push(sym);
+                }
+            }
+        }
+    }
+    let mut v = V { scoping, collect_refs: false, stack: Vec::new(), owner: HashMap::new(), info: Default::default() };
+    for pass in [false, true] {
+        v.collect_refs = pass;
+        match node {
+            FnNode::Function(f) => v.visit_function(f, ScopeFlags::Function),
+            FnNode::Arrow(a) => v.visit_arrow_function_expression(a),
+        }
+    }
+    v.info
 }
 
 /// `e` as a JS value.
@@ -661,41 +751,97 @@ enum Place {
     Elem(ir::LocalId, ir::LocalId),
 }
 
-impl FnCx<'_, '_, '_> {
-    fn function(&mut self, i: usize) -> R<ir::Func> {
-        let c = &self.m.cands[i];
-        let (node, name) = (c.node, c.name.clone());
-        let params: Vec<(SymbolId, Ty, Option<&Expression>)> =
-            c.params.iter().map(|p| (p.symbol, p.ty, p.default)).collect();
+impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
+    fn new(
+        m: &'x mut ModuleCx<'m, 'a>,
+        caps: Rc<CaptureInfo>,
+        key: u32,
+        is_closure: bool,
+        widened: HashSet<SymbolId>,
+    ) -> Self {
+        FnCx {
+            m,
+            caps,
+            key,
+            is_closure,
+            locals: Vec::new(),
+            mutable: Vec::new(),
+            boxed: Vec::new(),
+            local_names: Vec::new(),
+            captures: Vec::new(),
+            sym_local: HashMap::new(),
+            widened,
+            widen_request: None,
+            jumps: Vec::new(),
+            next_loop: 0,
+            label: None,
+            returns: Vec::new(),
+            in_finally: 0,
+            name_hint: None,
+        }
+    }
+
+    fn function(
+        &mut self,
+        node: FnNode<'a>,
+        name: String,
+        params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)>,
+    ) -> R<ir::Func> {
         let mut abi = Vec::new();
+        let mut prologue = Vec::new();
+        let mut boxed_params = Vec::new();
         for &(sym, ty, _) in &params {
             let local_ty = if self.widened.contains(&sym) { Ty::Any } else { ty };
-            self.declare(sym, local_ty, true);
+            let l = self.temp(local_ty);
+            self.sym_local.insert(sym, l);
             abi.push(ty);
+            if self.caps.captured.contains(&sym) {
+                boxed_params.push((sym, l));
+            }
+        }
+        // Closures: locals bound to the captured boxes.
+        if self.is_closure {
+            let free = self.caps.free.get(&self.key).cloned().unwrap_or_default();
+            for sym in free {
+                let l = self.declare_boxed(sym);
+                self.captures.push(l);
+            }
+        }
+        // Captured parameters move into boxes.
+        let mut new_boxes = Vec::new();
+        let mut inits = Vec::new();
+        for (sym, p) in boxed_params {
+            let b = self.declare_boxed(sym);
+            new_boxes.push(b);
+            inits.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, Box::new(any(self.local(p)))))));
+        }
+        if !new_boxes.is_empty() {
+            prologue.push(Stmt::NewBoxes(new_boxes));
+            prologue.extend(inits);
         }
         // Default parameter values, in order (each may see the previous ones).
-        let mut prologue = Vec::new();
-        for (k, &(_, _, default)) in params.iter().enumerate() {
+        for &(sym, _, default) in &params {
             if let Some(d) = default {
+                let l = self.sym_local[&sym];
                 let v = any(self.expr(d)?);
                 let missing = Expr::new(
                     Ty::Bool,
-                    ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(k)), Box::new(undefined())),
+                    ExprKind::AnyCompare(AnyCmpOp::StrictEq, Box::new(self.local(l)), Box::new(undefined())),
                 );
-                let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(k, Box::new(v))));
+                let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(l, Box::new(v))));
                 prologue.push(Stmt::If(missing, vec![set], vec![]));
             }
         }
         let body = match node {
             FnNode::Function(f) => {
                 let body = f.body.as_ref().unwrap();
-                self.hoist_vars(&body.statements)?;
-                self.stmts(&body.statements)?
+                prologue.extend(self.hoist_vars(&body.statements)?);
+                self.block(&body.statements)?
             }
             FnNode::Arrow(a) => match &a.body {
                 ArrowFunctionBody::FunctionBody(b) => {
-                    self.hoist_vars(&b.statements)?;
-                    self.stmts(&b.statements)?
+                    prologue.extend(self.hoist_vars(&b.statements)?);
+                    self.block(&b.statements)?
                 }
                 body => {
                     // Concise body: `(x) => expr` returns `expr`.
@@ -717,20 +863,50 @@ impl FnCx<'_, '_, '_> {
         // Values returned from a function of type `Any` must be boxed.
         let body = if ret == Ty::Any { box_returns(body) } else { body };
         prologue.extend(body);
-        Ok(ir::Func { name, params: abi, ret, locals: std::mem::take(&mut self.locals), body: prologue })
+        let js_length = params.iter().take_while(|p| p.2.is_none()).count();
+        Ok(ir::Func {
+            name,
+            js_length,
+            params: abi,
+            ret,
+            locals: std::mem::take(&mut self.locals),
+            boxed: std::mem::take(&mut self.boxed),
+            local_names: std::mem::take(&mut self.local_names),
+            captures: std::mem::take(&mut self.captures),
+            is_closure: self.is_closure,
+            body: prologue,
+        })
     }
 
+    /// A local for `sym`: boxed if a closure captures it.
     fn declare(&mut self, sym: SymbolId, ty: Ty, mutable: bool) -> ir::LocalId {
+        if self.caps.captured.contains(&sym) {
+            let l = self.declare_boxed(sym);
+            self.mutable[l] = mutable;
+            return l;
+        }
         let id = self.temp(ty);
         self.mutable[id] = mutable;
         self.sym_local.insert(sym, id);
         id
     }
 
+    fn declare_boxed(&mut self, sym: SymbolId) -> ir::LocalId {
+        let l = self.temp(Ty::Any);
+        self.boxed[l] = true;
+        let name = self.m.scoping.symbol_name(sym).to_string();
+        self.local_names[l] = Some(self.m.atom(&name));
+        self.mutable[l] = !self.m.scoping.symbol_flags(sym).is_const_variable();
+        self.sym_local.insert(sym, l);
+        l
+    }
+
     /// A hidden local.
     fn temp(&mut self, ty: Ty) -> ir::LocalId {
         self.locals.push(ty);
         self.mutable.push(true);
+        self.boxed.push(false);
+        self.local_names.push(None);
         self.locals.len() - 1
     }
 
@@ -751,8 +927,8 @@ impl FnCx<'_, '_, '_> {
     }
 
     /// `var` declarations are function-scoped: declare them up front, as
-    /// `Any` locals holding `undefined`.
-    fn hoist_vars(&mut self, stmts: &[Statement]) -> R<()> {
+    /// `Any` locals holding `undefined` (in boxes, if captured).
+    fn hoist_vars(&mut self, stmts: &'a [Statement<'a>]) -> R<Vec<Stmt>> {
         struct Vars(Vec<SymbolId>);
         impl<'a> oxc::ast_visit::Visit<'a> for Vars {
             fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
@@ -773,17 +949,83 @@ impl FnCx<'_, '_, '_> {
         for s in stmts {
             oxc::ast_visit::Visit::visit_statement(&mut v, s);
         }
+        let mut boxes = Vec::new();
         for sym in v.0 {
             if !self.sym_local.contains_key(&sym) {
-                self.declare(sym, Ty::Any, true);
+                let l = self.declare(sym, Ty::Any, true);
+                if self.boxed[l] {
+                    boxes.push(l);
+                }
             }
         }
-        Ok(())
+        let mut out = Vec::new();
+        if !boxes.is_empty() {
+            out.push(Stmt::NewBoxes(boxes.clone()));
+            for l in boxes {
+                out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(l, Box::new(undefined())))));
+            }
+        }
+        Ok(out)
     }
 
     // ---- statements ----
 
-    fn stmts(&mut self, list: &[Statement]) -> R<Vec<Stmt>> {
+    /// A block: fresh boxes for its captured lexical declarations, hoisted
+    /// function declarations, then its statements.
+    fn block(&mut self, list: &'a [Statement<'a>]) -> R<Vec<Stmt>> {
+        let mut out = self.block_prologue(list)?;
+        out.extend(self.stmts(list)?);
+        Ok(out)
+    }
+
+    fn block_prologue(&mut self, list: &'a [Statement<'a>]) -> R<Vec<Stmt>> {
+        let mut boxes = Vec::new();
+        let mut funcs = Vec::new();
+        for s in list {
+            let decl = match s {
+                Statement::ExportDeclaration(_) => None,
+                s => s.as_declaration(),
+            };
+            match decl {
+                Some(Declaration::VariableDeclaration(v)) if v.kind != VariableDeclarationKind::Var => {
+                    for d in &v.declarations {
+                        for id in d.id.get_binding_identifiers() {
+                            let sym = id.symbol_id.get().unwrap();
+                            if self.caps.captured.contains(&sym) {
+                                boxes.push(self.declare_boxed(sym));
+                            }
+                        }
+                    }
+                }
+                Some(Declaration::FunctionDeclaration(f)) if f.body.is_some() => {
+                    let id = f.id.as_ref().unwrap();
+                    let sym = id.symbol_id.get().unwrap();
+                    let l = self.declare(sym, Ty::Any, true);
+                    if self.boxed[l] {
+                        boxes.push(l);
+                    }
+                    funcs.push((l, f));
+                }
+                Some(Declaration::ClassDeclaration(c)) => {
+                    return reject(c.span, "classes inside functions are not supported yet");
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        if !boxes.is_empty() {
+            out.push(Stmt::NewBoxes(boxes));
+        }
+        // Function declarations are initialized when the block is entered.
+        for (l, f) in funcs {
+            let name = f.id.as_ref().unwrap().name.to_string();
+            let c = self.closure(FnNode::Function(f), name)?;
+            out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(l, Box::new(c)))));
+        }
+        Ok(out)
+    }
+
+    fn stmts(&mut self, list: &'a [Statement<'a>]) -> R<Vec<Stmt>> {
         let mut out = Vec::with_capacity(list.len());
         for s in list {
             if let Some(s) = self.stmt(s)? {
@@ -793,7 +1035,7 @@ impl FnCx<'_, '_, '_> {
         Ok(out)
     }
 
-    fn body(&mut self, s: &Statement) -> R<Vec<Stmt>> {
+    fn body(&mut self, s: &'a Statement<'a>) -> R<Vec<Stmt>> {
         Ok(match self.stmt(s)? {
             Some(Stmt::Block(b)) => b,
             Some(s) => vec![s],
@@ -801,7 +1043,7 @@ impl FnCx<'_, '_, '_> {
         })
     }
 
-    fn stmt(&mut self, s: &Statement) -> R<Option<Stmt>> {
+    fn stmt(&mut self, s: &'a Statement<'a>) -> R<Option<Stmt>> {
         let label = self.label.take();
         if label.is_some()
             && !matches!(s, Statement::WhileStatement(_) | Statement::DoWhileStatement(_) | Statement::ForStatement(_))
@@ -810,8 +1052,11 @@ impl FnCx<'_, '_, '_> {
         }
         Ok(Some(match s {
             Statement::EmptyStatement(_) => return Ok(None),
+            // Hoisted to the start of the block.
+            Statement::FunctionDeclaration(f) if f.body.is_some() => return Ok(None),
+            Statement::FunctionDeclaration(_) => return Ok(None),
             Statement::ExpressionStatement(e) => Stmt::Expr(self.expr(&e.expression)?),
-            Statement::BlockStatement(b) => Stmt::Block(self.stmts(&b.body)?),
+            Statement::BlockStatement(b) => Stmt::Block(self.block(&b.body)?),
             Statement::VariableDeclaration(v) => Stmt::Block(self.var_decl(v)?),
             Statement::IfStatement(i) => {
                 let test = self.cond(&i.test)?;
@@ -825,27 +1070,52 @@ impl FnCx<'_, '_, '_> {
             Statement::WhileStatement(w) => {
                 let test = self.cond(&w.test)?;
                 self.lp(label, JumpKind::Loop, |cx, id| {
-                    Ok(Stmt::Loop { id, test: Some(test), post_test: false, body: cx.body(&w.body)?, update: None })
+                    Ok(Stmt::Loop {
+                        id,
+                        test: Some(test),
+                        post_test: false,
+                        body: cx.body(&w.body)?,
+                        update: None,
+                        per_iteration: vec![],
+                    })
                 })?
             }
             Statement::DoWhileStatement(w) => self.lp(label, JumpKind::Loop, |cx, id| {
                 let body = cx.body(&w.body)?;
                 let test = cx.cond(&w.test)?;
-                Ok(Stmt::Loop { id, test: Some(test), post_test: true, body, update: None })
+                Ok(Stmt::Loop { id, test: Some(test), post_test: true, body, update: None, per_iteration: vec![] })
             })?,
             Statement::ForStatement(f) => {
-                let init = match &f.init {
-                    None => vec![],
-                    Some(ForStatementInit::VariableDeclaration(v)) => self.var_decl(v)?,
-                    Some(init) => vec![Stmt::Expr(self.expr(init.to_expression())?)],
-                };
+                // `for (let i ...)` captured by closures: each iteration gets
+                // its own binding (fresh boxes, copied at each iteration).
+                let mut per_iteration = Vec::new();
+                let mut block = Vec::new();
+                if let Some(ForStatementInit::VariableDeclaration(v)) = &f.init
+                    && v.kind != VariableDeclarationKind::Var
+                {
+                    for d in &v.declarations {
+                        for id in d.id.get_binding_identifiers() {
+                            let sym = id.symbol_id.get().unwrap();
+                            if self.caps.captured.contains(&sym) {
+                                per_iteration.push(self.declare_boxed(sym));
+                            }
+                        }
+                    }
+                }
+                if !per_iteration.is_empty() {
+                    block.push(Stmt::NewBoxes(per_iteration.clone()));
+                }
+                match &f.init {
+                    None => {}
+                    Some(ForStatementInit::VariableDeclaration(v)) => block.extend(self.var_decl(v)?),
+                    Some(init) => block.push(Stmt::Expr(self.expr(init.to_expression())?)),
+                }
                 let test = f.test.as_ref().map(|t| self.cond(t)).transpose()?;
                 let lp = self.lp(label, JumpKind::Loop, |cx, id| {
                     let body = cx.body(&f.body)?;
                     let update = f.update.as_ref().map(|u| cx.expr(u)).transpose()?;
-                    Ok(Stmt::Loop { id, test, post_test: false, body, update })
+                    Ok(Stmt::Loop { id, test, post_test: false, body, update, per_iteration })
                 })?;
-                let mut block = init;
                 block.push(lp);
                 Stmt::Block(block)
             }
@@ -899,10 +1169,16 @@ impl FnCx<'_, '_, '_> {
         }
     }
 
-    fn switch(&mut self, sw: &SwitchStatement) -> R<Stmt> {
+    fn switch(&mut self, sw: &'a SwitchStatement<'a>) -> R<Stmt> {
         let d = any(self.expr(&sw.discriminant)?);
         let disc = self.temp(Ty::Any);
         let set = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(disc, Box::new(d))));
+        // The case clauses form one block.
+        let all: Vec<&Statement> = sw.cases.iter().flat_map(|c| c.consequent.iter()).collect();
+        let mut prologue = Vec::new();
+        for s in all {
+            prologue.extend(self.block_prologue(std::slice::from_ref(s))?);
+        }
         let label = self.label.take();
         let sw_stmt = self.lp(label, JumpKind::Switch, |cx, id| {
             let mut cases = Vec::new();
@@ -912,31 +1188,49 @@ impl FnCx<'_, '_, '_> {
             }
             Ok(Stmt::Switch { id, disc, cases })
         })?;
-        Ok(Stmt::Block(vec![set, sw_stmt]))
+        let mut out = vec![set];
+        out.extend(prologue);
+        out.push(sw_stmt);
+        Ok(Stmt::Block(out))
     }
 
-    fn try_stmt(&mut self, t: &TryStatement) -> R<Stmt> {
-        let body = self.stmts(&t.block.body)?;
+    fn try_stmt(&mut self, t: &'a TryStatement<'a>) -> R<Stmt> {
+        let body = self.block(&t.block.body)?;
         let catch = match &t.handler {
             None => None,
             Some(h) => {
+                let mut handler = Vec::new();
                 let param = match &h.param {
                     None => None,
                     Some(p) => {
                         let BindingPattern::BindingIdentifier(id) = &p.pattern else {
                             return reject(p.span, "destructuring `catch` parameters are not supported yet");
                         };
-                        Some(self.declare(id.symbol_id.get().unwrap(), Ty::Any, true))
+                        let sym = id.symbol_id.get().unwrap();
+                        if self.caps.captured.contains(&sym) {
+                            // The exception goes to a plain local, then to a box.
+                            let raw = self.temp(Ty::Any);
+                            let b = self.declare_boxed(sym);
+                            handler.push(Stmt::NewBoxes(vec![b]));
+                            handler.push(Stmt::Expr(Expr::new(
+                                Ty::Any,
+                                ExprKind::InitLocal(b, Box::new(self.local(raw))),
+                            )));
+                            Some(raw)
+                        } else {
+                            Some(self.declare(sym, Ty::Any, true))
+                        }
                     }
                 };
-                Some((param, self.stmts(&h.body.body)?))
+                handler.extend(self.block(&h.body.body)?);
+                Some((param, handler))
             }
         };
         let finally = match &t.finalizer {
             None => None,
             Some(f) => {
                 self.in_finally += 1;
-                let r = self.stmts(&f.body);
+                let r = self.block(&f.body);
                 self.in_finally -= 1;
                 Some(r?)
             }
@@ -944,7 +1238,7 @@ impl FnCx<'_, '_, '_> {
         Ok(Stmt::Try { body, catch, finally })
     }
 
-    fn var_decl(&mut self, v: &VariableDeclaration) -> R<Vec<Stmt>> {
+    fn var_decl(&mut self, v: &'a VariableDeclaration<'a>) -> R<Vec<Stmt>> {
         let (mutable, is_var) = match v.kind {
             VariableDeclarationKind::Let => (true, false),
             VariableDeclarationKind::Const => (false, false),
@@ -961,35 +1255,86 @@ impl FnCx<'_, '_, '_> {
                 // Hoisted: just an assignment, if there is an initializer.
                 let l = self.sym_local[&sym];
                 if let Some(init) = &d.init {
+                    self.name_hint = Some(id.name.to_string());
                     let v = self.expr(init)?;
                     out.push(Stmt::Expr(self.set_local(Some(sym), l, v, d.span)?));
                 }
                 continue;
             }
-            // The initializer is checked before the binding exists, so a
-            // self-reference is rejected exactly like the TDZ would throw.
+            // The initializer is checked before an unboxed binding exists, so
+            // a self-reference is rejected exactly like the TDZ would throw.
+            // (Boxed bindings exist already and check their TDZ at runtime.)
+            self.name_hint = Some(id.name.to_string());
             let init = match &d.init {
                 Some(init) => self.expr(init)?,
                 None => undefined(),
             };
-            let ty = if init.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { init.ty };
-            let local = self.declare(sym, ty, mutable);
-            out.push(Stmt::Expr(Expr::new(ty, ExprKind::SetLocal(local, Box::new(coerce(init, ty))))));
+            self.name_hint = None;
+            let local = match self.sym_local.get(&sym) {
+                Some(&l) if self.boxed[l] => l,
+                _ => {
+                    let ty = if init.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { init.ty };
+                    self.declare(sym, ty, mutable)
+                }
+            };
+            let ty = self.locals[local];
+            out.push(Stmt::Expr(Expr::new(ty, ExprKind::InitLocal(local, Box::new(coerce(init, ty))))));
         }
         Ok(out)
     }
 
+    /// A nested function, compiled natively as a closure over the boxes of
+    /// the variables it captures.
+    fn closure(&mut self, node: FnNode<'a>, name: String) -> R<Expr> {
+        let key = node.span().start;
+        let (params, _) = header(node)?;
+        // There is no interpreted fallback to decline to: every parameter is
+        // a JS value.
+        let params: Vec<(SymbolId, Ty, Option<&'a Expression<'a>>)> =
+            params.into_iter().map(|p| (p.symbol, Ty::Any, p.default)).collect();
+        let caps = self.caps.clone();
+        let widened = self.widened.clone();
+        let mut inner = FnCx::new(&mut *self.m, caps, key, true, widened);
+        let r = inner.function(node, name, params);
+        let request = inner.widen_request;
+        let f = match r {
+            Ok(f) => f,
+            Err(e) => {
+                if e.retry {
+                    self.widen_request = request;
+                }
+                return Err(e);
+            }
+        };
+        let mut boxes = Vec::new();
+        for sym in self.caps.free.get(&key).cloned().unwrap_or_default() {
+            match self.sym_local.get(&sym) {
+                Some(&l) if self.boxed[l] => boxes.push(l),
+                _ => return reject(node.span(), "closure captures a variable that is not in scope here"),
+            }
+        }
+        self.m.closures.push(f);
+        self.m.closure_spans.push(node.span());
+        Ok(Expr::new(Ty::Any, ExprKind::Closure(self.m.closures.len() - 1, boxes)))
+    }
     // ---- expressions ----
 
     /// An expression used as a condition: converted with JS truthiness.
-    fn cond(&mut self, e: &Expression) -> R<Expr> {
+    fn cond(&mut self, e: &'a Expression<'a>) -> R<Expr> {
         let x = self.expr(e)?;
         Ok(truthy(x))
     }
 
-    fn expr(&mut self, e: &Expression) -> R<Expr> {
+    fn expr(&mut self, e: &'a Expression<'a>) -> R<Expr> {
         let span = e.span();
+        // Only the expression right after a binding is named by it.
+        let name_hint = self.name_hint.take();
         Ok(match e {
+            Expression::ArrowFunctionExpression(a) => self.closure(FnNode::Arrow(a), name_hint.unwrap_or_default())?,
+            Expression::FunctionExpression(f) => {
+                let name = f.id.as_ref().map(|id| id.name.to_string()).or(name_hint).unwrap_or_default();
+                self.closure(FnNode::Function(f), name)?
+            }
             Expression::NumericLiteral(n) => Expr::num(n.value),
             Expression::BooleanLiteral(b) => Expr::new(Ty::Bool, ExprKind::Bool(b.value)),
             Expression::StringLiteral(s) => {
@@ -1081,7 +1426,7 @@ impl FnCx<'_, '_, '_> {
         })
     }
 
-    fn template(&mut self, t: &TemplateLiteral) -> R<Expr> {
+    fn template(&mut self, t: &'a TemplateLiteral<'a>) -> R<Expr> {
         // `a${x}b` is "a" + ToString(x) + "b": strings concatenate exactly.
         let mut acc: Option<Expr> = None;
         let mut push = |cx: &mut Self, part: Expr| {
@@ -1107,7 +1452,7 @@ impl FnCx<'_, '_, '_> {
         Ok(acc.unwrap())
     }
 
-    fn object(&mut self, o: &ObjectExpression) -> R<Expr> {
+    fn object(&mut self, o: &'a ObjectExpression<'a>) -> R<Expr> {
         let mut props = Vec::new();
         for p in &o.properties {
             let ObjectPropertyKind::ObjectProperty(p) = p else {
@@ -1135,14 +1480,14 @@ impl FnCx<'_, '_, '_> {
     }
 
     /// A property key: an atom for constant names.
-    fn key(&mut self, e: &Expression) -> R<Key> {
+    fn key(&mut self, e: &'a Expression<'a>) -> R<Key> {
         Ok(match e.without_parentheses() {
             Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
             other => Key::Value(Box::new(any(self.expr(other)?))),
         })
     }
 
-    fn args(&mut self, args: &[Argument]) -> R<Vec<Expr>> {
+    fn args(&mut self, args: &'a [Argument<'a>]) -> R<Vec<Expr>> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
             match a.as_expression() {
@@ -1153,7 +1498,7 @@ impl FnCx<'_, '_, '_> {
         Ok(out)
     }
 
-    fn resolve(&self, id: &IdentifierReference) -> Option<SymbolId> {
+    fn resolve(&self, id: &'a IdentifierReference<'a>) -> Option<SymbolId> {
         let scoping = self.m.scoping;
         id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id())
     }
@@ -1163,7 +1508,7 @@ impl FnCx<'_, '_, '_> {
         scoping.symbol_scope_id(sym) == scoping.root_scope_id()
     }
 
-    fn ident(&mut self, id: &IdentifierReference) -> R<Expr> {
+    fn ident(&mut self, id: &'a IdentifierReference<'a>) -> R<Expr> {
         match self.resolve(id) {
             Some(sym) => {
                 if let Some(&l) = self.sym_local.get(&sym) {
@@ -1198,7 +1543,7 @@ impl FnCx<'_, '_, '_> {
 
     /// Resolve an assignment target, evaluating its object and key (in
     /// order) into temporaries. Returns the setup expressions and the place.
-    fn place(&mut self, t: &SimpleAssignmentTarget) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+    fn place(&mut self, t: &'a SimpleAssignmentTarget<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         Ok(match t {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => match self.resolve(id) {
                 Some(sym) => {
@@ -1249,7 +1594,7 @@ impl FnCx<'_, '_, '_> {
         })
     }
 
-    fn place_expr(&mut self, e: &Expression) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+    fn place_expr(&mut self, e: &'a Expression<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         match e.without_parentheses() {
             Expression::Identifier(_)
             | Expression::StaticMemberExpression(_)
@@ -1280,7 +1625,7 @@ impl FnCx<'_, '_, '_> {
         }
     }
 
-    fn place_ident(&mut self, id: &IdentifierReference) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+    fn place_ident(&mut self, id: &'a IdentifierReference<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         match self.resolve(id) {
             Some(sym) if self.sym_local.contains_key(&sym) => {
                 let l = self.sym_local[&sym];
@@ -1320,7 +1665,7 @@ impl FnCx<'_, '_, '_> {
         })
     }
 
-    fn assign(&mut self, a: &AssignmentExpression) -> R<Expr> {
+    fn assign(&mut self, a: &'a AssignmentExpression<'a>) -> R<Expr> {
         let Some(target) = a.left.as_simple_assignment_target() else {
             return reject(a.span, "destructuring assignment is not supported yet");
         };
@@ -1351,7 +1696,7 @@ impl FnCx<'_, '_, '_> {
         Ok(seq(setup))
     }
 
-    fn update(&mut self, u: &UpdateExpression) -> R<Expr> {
+    fn update(&mut self, u: &'a UpdateExpression<'a>) -> R<Expr> {
         let (mut setup, place, sym) = self.place(&u.argument)?;
         let inc = u.operator == UpdateOperator::Increment;
         if let Place::Local(l) = place
@@ -1383,7 +1728,7 @@ impl FnCx<'_, '_, '_> {
         Ok(seq(setup))
     }
 
-    fn unary(&mut self, u: &UnaryExpression) -> R<Expr> {
+    fn unary(&mut self, u: &'a UnaryExpression<'a>) -> R<Expr> {
         if u.operator == UnaryOperator::Typeof
             && let Expression::Identifier(id) = u.argument.without_parentheses()
             && self.resolve(id).is_none()
@@ -1433,7 +1778,7 @@ impl FnCx<'_, '_, '_> {
         })
     }
 
-    fn binary(&mut self, b: &BinaryExpression) -> R<Expr> {
+    fn binary(&mut self, b: &'a BinaryExpression<'a>) -> R<Expr> {
         use BinaryOperator as B;
         let x = self.expr(&b.left)?;
         let y = self.expr(&b.right)?;
@@ -1481,7 +1826,7 @@ impl FnCx<'_, '_, '_> {
         Ok(arith(op, x, y))
     }
 
-    fn call(&mut self, c: &CallExpression) -> R<Expr> {
+    fn call(&mut self, c: &'a CallExpression<'a>) -> R<Expr> {
         if c.optional {
             return reject(c.span, "optional calls are not supported yet");
         }
@@ -1548,7 +1893,7 @@ impl FnCx<'_, '_, '_> {
     /// A direct machine call to native function `i`, if the arguments fit
     /// its parameters exactly (otherwise the call goes through its JS entry,
     /// which guards the types and may fall back to the interpreter).
-    fn direct_call(&mut self, i: usize, args: &[Argument], span: Span) -> R<Option<Expr>> {
+    fn direct_call(&mut self, i: usize, args: &'a [Argument<'a>], span: Span) -> R<Option<Expr>> {
         if !self.m.cands[i].direct_callable {
             return Ok(None);
         }
@@ -1618,8 +1963,8 @@ fn box_returns(body: Vec<Stmt>) -> Vec<Stmt> {
         match st {
             Stmt::Return(e) => Stmt::Return(Some(e.map_or_else(undefined, any))),
             Stmt::If(c, a, b) => Stmt::If(c, l(a), l(b)),
-            Stmt::Loop { id, test, post_test, body, update } => {
-                Stmt::Loop { id, test, post_test, body: l(body), update }
+            Stmt::Loop { id, test, post_test, body, update, per_iteration } => {
+                Stmt::Loop { id, test, post_test, body: l(body), update, per_iteration }
             }
             Stmt::Switch { id, disc, cases } => {
                 Stmt::Switch { id, disc, cases: cases.into_iter().map(|(t, b)| (t, l(b))).collect() }
@@ -1749,7 +2094,7 @@ fn completes_list(list: &[Stmt]) -> bool {
 
 fn completes(s: &Stmt) -> bool {
     match s {
-        Stmt::Expr(_) => true,
+        Stmt::Expr(_) | Stmt::NewBoxes(_) => true,
         Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Throw(_) => false,
         Stmt::Block(b) => completes_list(b),
         Stmt::If(_, a, b) => completes_list(a) || completes_list(b),

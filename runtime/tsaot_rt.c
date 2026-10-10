@@ -119,6 +119,56 @@ JSValue tsaot_new_array(JSContext *ctx, int count, JSValue *values)
     return JS_NewArrayFrom(ctx, count, values);
 }
 
+/* ---- boxes: variables captured by closures ---- */
+
+static JSClassID tsaot_box_class;
+
+typedef struct TsaotBox {
+    JSValue value;
+} TsaotBox;
+
+static void tsaot_box_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    TsaotBox *b = JS_GetOpaque(val, tsaot_box_class);
+    if (b) {
+        JS_FreeValueRT(rt, b->value);
+        js_free_rt(rt, b);
+    }
+}
+
+static void tsaot_box_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    TsaotBox *b = JS_GetOpaque(val, tsaot_box_class);
+    if (b)
+        JS_MarkValue(rt, b->value, mark_func);
+}
+
+/* A new box holding an uninitialized binding; *slot receives the address
+   of its value, which stays valid as long as the box object lives. */
+JSValue tsaot_box_new(JSContext *ctx, JSValue **slot)
+{
+    TsaotBox *b = js_malloc(ctx, sizeof(*b));
+    JSValue obj;
+    if (!b)
+        return JS_EXCEPTION;
+    b->value = JS_UNINITIALIZED;
+    obj = JS_NewObjectClass(ctx, tsaot_box_class);
+    if (JS_IsException(obj)) {
+        js_free(ctx, b);
+        return obj;
+    }
+    JS_SetOpaque(obj, b);
+    *slot = &b->value;
+    return obj;
+}
+
+void tsaot_throw_uninitialized_atom(JSContext *ctx, JSAtom name)
+{
+    const char *s = JS_AtomToCString(ctx, name);
+    JS_ThrowReferenceError(ctx, "%s is not initialized", s ? s : "lexical variable");
+    JS_FreeCString(ctx, s);
+}
+
 /* ---- module state: cells, string constants, atoms ---- */
 
 static JSClassID tsaot_state_class;
@@ -207,6 +257,12 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
     for (i = 0; i < tsaot_ncells; i++)
         tsaot_cells[i] = JS_UNINITIALIZED;
 
+    {
+        JSClassDef box_def = { "TsaotBox", .finalizer = tsaot_box_finalizer, .gc_mark = tsaot_box_mark };
+        JS_NewClassID(rt, &tsaot_box_class);
+        if (JS_NewClass(rt, tsaot_box_class, &box_def) < 0)
+            return -1;
+    }
     JS_NewClassID(rt, &tsaot_state_class);
     if (JS_NewClass(rt, tsaot_state_class, &def) < 0)
         return -1;
