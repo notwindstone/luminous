@@ -1305,6 +1305,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             body: prologue,
         };
         ir::scalar_replace(&mut func);
+        ir::number_locals(&mut func);
         Ok(func)
     }
 

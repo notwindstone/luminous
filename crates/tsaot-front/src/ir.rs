@@ -1053,7 +1053,6 @@ pub fn scalar_replace(f: &mut Func) {
     let field = |l: LocalId, k: AtomId| -> Option<LocalId> {
         fields[l].as_ref().map(|m| m.iter().find(|&&(m, _)| m == k).expect("a literal key").1)
     };
-    let first_new = n;
     visit_stmts_mut(&mut f.body, &mut |e| {
         let init = matches!(e.kind, ExprKind::InitLocal(..));
         let new = match &mut e.kind {
@@ -1087,8 +1086,6 @@ pub fn scalar_replace(f: &mut Func) {
         };
         e.kind = new;
     });
-    let new: Vec<LocalId> = (first_new..f.locals.len()).collect();
-    retype_numbers(f, &new);
 }
 
 /// A number written to an `Any` local `l` that `retype_numbers` can turn
@@ -1120,8 +1117,9 @@ fn number_operand(l: LocalId, x: Expr) -> Expr {
 }
 
 /// The `Any` locals among `cands` that only ever hold numbers (every write
-/// is a `number_write`) become `F64` locals; their reads are boxed.
-fn retype_numbers(f: &mut Func, cands: &[LocalId]) {
+/// is a `number_write`) become `F64` locals; their reads are boxed. Whether
+/// any did.
+fn retype_numbers(f: &mut Func, cands: &[LocalId]) -> bool {
     let mut ok: Vec<bool> = (0..f.locals.len()).map(|l| cands.contains(&l)).collect();
     visit_stmts(&f.body, &mut |e| {
         if let ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v) = &e.kind
@@ -1131,7 +1129,7 @@ fn retype_numbers(f: &mut Func, cands: &[LocalId]) {
         }
     });
     if !ok.iter().any(|&b| b) {
-        return;
+        return false;
     }
     for (l, &ok) in ok.iter().enumerate() {
         if ok {
@@ -1175,4 +1173,86 @@ fn retype_numbers(f: &mut Func, cands: &[LocalId]) {
         };
         e.kind = ExprKind::Box(Box::new(num));
     });
+    true
+}
+
+/// Generic arithmetic on two boxed numbers becomes number arithmetic (the
+/// same operation: both operands are numbers). Whether anything changed.
+fn simplify_boxed_arith(f: &mut Func) -> bool {
+    let mut changed = false;
+    loop {
+        let mut again = false;
+        visit_stmts_mut(&mut f.body, &mut |e| {
+            let ExprKind::AnyBinary(op, x, y) = &mut e.kind else { return };
+            let (ExprKind::Box(a), ExprKind::Box(b)) = (&x.kind, &y.kind) else { return };
+            if !a.ty.is_number() || !b.ty.is_number() {
+                return;
+            }
+            let op = *op;
+            let take = |x: &mut Box<Expr>| match std::mem::replace(&mut x.kind, ExprKind::Undefined) {
+                ExprKind::Box(inner) => *inner,
+                _ => unreachable!(),
+            };
+            let (a, b) = (take(x), take(y));
+            let (bop, ty) = match op {
+                AnyBinOp::Add => (BinOp::Add, Ty::F64),
+                AnyBinOp::Sub => (BinOp::Sub, Ty::F64),
+                AnyBinOp::Mul => (BinOp::Mul, Ty::F64),
+                AnyBinOp::Div => (BinOp::Div, Ty::F64),
+                AnyBinOp::Rem => (BinOp::Rem, Ty::F64),
+                AnyBinOp::Pow => (BinOp::Pow, Ty::F64),
+                AnyBinOp::Shr => (BinOp::Shr, Ty::F64),
+                AnyBinOp::Shl => (BinOp::Shl, Ty::I32),
+                AnyBinOp::Sar => (BinOp::Sar, Ty::I32),
+                AnyBinOp::BitAnd => (BinOp::BitAnd, Ty::I32),
+                AnyBinOp::BitOr => (BinOp::BitOr, Ty::I32),
+                AnyBinOp::BitXor => (BinOp::BitXor, Ty::I32),
+            };
+            let num = Expr::new(ty, ExprKind::Binary(bop, Box::new(a), Box::new(b)));
+            e.kind = ExprKind::Box(Box::new(num));
+            again = true;
+        });
+        if !again {
+            return changed;
+        }
+        changed = true;
+    }
+}
+
+/// Untyped locals that only ever hold numbers become number locals (see
+/// `retype_numbers`), and arithmetic on boxed numbers number arithmetic,
+/// until neither changes anything. Candidates are declared (an `InitLocal`
+/// precedes every read of them) and used only as plain locals.
+pub fn number_locals(f: &mut Func) {
+    let n = f.locals.len();
+    let mut special = vec![false; n];
+    stmt_locals(&f.body, &mut |l| special[l] = true);
+    let mut declared = vec![false; n];
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, _) => declared[*l] = true,
+        ExprKind::IterOpen(_, a, b, _) | ExprKind::IterClose(a, b) => {
+            special[*a] = true;
+            special[*b] = true;
+        }
+        ExprKind::IterStep(a, b) => {
+            special[*a] = true;
+            b.iter().for_each(|&b| special[b] = true);
+        }
+        ExprKind::ForInGet(a, ..)
+        | ExprKind::AsyncIterResult(_, a)
+        | ExprKind::IterCloseQuiet(a)
+        | ExprKind::ArrayPush(a, _) => special[*a] = true,
+        ExprKind::Closure(_, ls) => ls.iter().for_each(|&l| special[l] = true),
+        _ => {}
+    });
+    let cands: Vec<LocalId> = (f.params.len()..n)
+        .filter(|&l| !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l) && !special[l] && declared[l])
+        .collect();
+    loop {
+        let simplified = simplify_boxed_arith(f);
+        let cands: Vec<LocalId> = cands.iter().copied().filter(|&l| f.locals[l] == Ty::Any).collect();
+        if !retype_numbers(f, &cands) && !simplified {
+            return;
+        }
+    }
 }

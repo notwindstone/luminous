@@ -260,6 +260,8 @@ pub(crate) struct Lower<'a> {
     bounded: Vec<ir::LocalId>,
     /// Int locals that need no range checks (see `small_ints`).
     small: Vec<bool>,
+    /// Int locals always in the int32 range (see `i32_locals`).
+    i32_range: Vec<bool>,
 }
 
 impl<'a> Lower<'a> {
@@ -279,6 +281,7 @@ impl<'a> Lower<'a> {
     ) -> Self {
         let ints = int_locals(f);
         let small = small_ints(f, &ints);
+        let i32_range = i32_locals(f, &ints);
         let vars: Vec<LVar> = f
             .locals
             .iter()
@@ -329,6 +332,7 @@ impl<'a> Lower<'a> {
             rem_of: HashMap::new(),
             bounded: Vec::new(),
             small,
+            i32_range,
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -445,7 +449,7 @@ impl<'a> Lower<'a> {
             (LVar::Int(v), t) => {
                 let i = self.b.use_var(v);
                 let d = self.int_f64(i);
-                if t == Ty::I32 {
+                if t == Ty::I32 || self.i32_range[l] {
                     self.i32s.insert(d);
                 }
                 V::Num(d)
@@ -1636,6 +1640,28 @@ impl<'a> Lower<'a> {
                         self.b.ins().icmp_imm_s(cc, t, tag)
                     }
                     _ => self.b.ins().iconst(I8, (*op == AnyCmpOp::StrictNe) as i64),
+                };
+                self.drop_operand(v, owned);
+                V::Bool(r)
+            }
+            ExprKind::AnyCompare(op @ (AnyCmpOp::Eq | AnyCmpOp::Ne), x, y)
+                if matches!(x.kind, ExprKind::Undefined | ExprKind::Null)
+                    || matches!(y.kind, ExprKind::Undefined | ExprKind::Null) =>
+            {
+                // Loose equality with `undefined` / `null`: the value is one of
+                // them (no object is "HTMLDDA": only a test harness API makes
+                // one, which this runtime never calls).
+                let other = if matches!(y.kind, ExprKind::Undefined | ExprKind::Null) { x } else { y };
+                let (v, owned) = self.operand(other, &[]);
+                let eq = *op == AnyCmpOp::Eq;
+                let r = match v {
+                    V::Any(_, t) => {
+                        let u = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNDEFINED);
+                        let n = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_NULL);
+                        let nullish = self.b.ins().bor(u, n);
+                        if eq { nullish } else { self.b.ins().bxor_imm_u(nullish, 1) }
+                    }
+                    _ => self.b.ins().iconst(I8, !eq as i64),
                 };
                 self.drop_operand(v, owned);
                 V::Bool(r)
@@ -3953,6 +3979,23 @@ fn int_locals(f: &ir::Func) -> Vec<bool> {
             return ints;
         }
     }
+}
+
+/// Of the int locals, those always in the int32 range: assigned only int32
+/// literals and int32 values (bitwise results, `int`s), never stepped.
+fn i32_locals(f: &ir::Func, ints: &[bool]) -> Vec<bool> {
+    let mut i32s = ints.to_vec();
+    ir::visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => {
+            let lit = int_literal(x, INT_EXACT as f64).is_some_and(|c| i32::try_from(c).is_ok());
+            if !(x.ty == Ty::I32 || lit) {
+                i32s[*l] = false;
+            }
+        }
+        ExprKind::Update { local, .. } => i32s[*local] = false,
+        _ => {}
+    });
+    i32s
 }
 
 pub(crate) fn frame_layout(f: &ir::Func) -> (Vec<usize>, Option<usize>, usize) {
