@@ -344,7 +344,7 @@ impl Lower {
         closure_data: Option<Value>,
         exits: Exits,
     ) -> Self {
-        let ints = int_locals(f);
+        let ints = int_locals(f, &predicted_params(f, &env.params));
         let small = small_ints(f, &ints);
         let i32_range = i32_locals(f, &ints);
         let vars: Vec<LVar> = f
@@ -5396,15 +5396,19 @@ fn static_trips(before: &[Stmt], test: Option<&Expr>, body: &[Stmt], update: Opt
 }
 
 /// The `F64` locals that only ever hold integers, which are kept in `i64`s:
-/// locals (not parameters, not boxed) only assigned integer literals, `int`
+/// locals (not parameters, not boxed, not `bound_elsewhere`) only assigned
+/// integer literals, `int`
 /// values (`I32`: bitwise results, `int` locals and calls), other
 /// such locals, and themselves or such locals plus or minus small integers
 /// (`x++`, `x += 2`, `j = i + 1`). A step past 2^53 rounds the result as `f64` arithmetic would,
 /// so the value is always exactly the double JS computes; with small steps
 /// rounding keeps it far from the `i64` limits.
-fn int_locals(f: &ir::Func) -> Vec<bool> {
+fn int_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
     let n = f.locals.len();
     let mut ints: Vec<bool> = (0..n).map(|i| i >= f.params.len() && !f.boxed[i] && f.locals[i] == Ty::F64).collect();
+    for &l in bound_elsewhere {
+        ints[l] = false;
+    }
     loop {
         let mut changed = false;
         ir::visit_stmts(&f.body, &mut |e| {
@@ -5428,6 +5432,18 @@ fn int_locals(f: &ir::Func) -> Vec<bool> {
             return ints;
         }
     }
+}
+
+/// The parameters of the bodies predicted calls inline (`Pred`), which
+/// `inline_method` binds to the arguments, not an assignment of the IR.
+fn predicted_params(f: &ir::Func, params: &[Vec<Ty>]) -> Vec<ir::LocalId> {
+    let mut out = Vec::new();
+    ir::visit_stmts(&f.body, &mut |e| {
+        if let ExprKind::Predicted { func, locals, .. } = &e.kind {
+            out.extend(locals.iter().take(params[*func].len()));
+        }
+    });
+    out
 }
 
 /// Of the int locals, those always in the int32 range: assigned only int32
