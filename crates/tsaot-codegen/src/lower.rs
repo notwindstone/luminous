@@ -1550,6 +1550,15 @@ impl<'a> Lower<'a> {
                 }
                 other => other,
             },
+            ExprKind::IntOf(x) => {
+                // An int32 is not reference-counted: nothing to free.
+                let (p, _) = self.expr(x).any();
+                let i = self.b.ins().ireduce(I32, p);
+                let i = self.b.ins().sextend(I64, i);
+                let d = self.int_f64(i);
+                self.i32s.insert(d);
+                V::Num(d)
+            }
             ExprKind::AnyUnary(op, x) => {
                 let v = self.expr(x).any();
                 let (p, t) = self.unary_any(*op, v);

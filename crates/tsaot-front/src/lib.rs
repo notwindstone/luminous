@@ -11,12 +11,16 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use oxc::allocator::Allocator;
-use oxc::ast::ast::{ArrowFunctionBody, ArrowFunctionExpression, Function, FunctionBody};
+use oxc::ast::ast::{
+    ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression, AssignmentOperator, Expression,
+    ExpressionStatement, ForStatement, Function, FunctionBody, SimpleAssignmentTarget, UpdateExpression,
+    UpdateOperator,
+};
 use oxc::ast_visit::{Visit, walk};
 use oxc::diagnostics::{LabeledSpan, OxcDiagnostic};
 use oxc::parser::Parser;
 use oxc::semantic::SemanticBuilder;
-use oxc::span::{SourceType, Span};
+use oxc::span::{GetSpan, SourceType, Span};
 use oxc::syntax::scope::ScopeFlags;
 
 /// How a native function's binding is rewritten in the interpreted module.
@@ -88,6 +92,40 @@ pub struct Rejected {
     pub reason: String,
 }
 
+/// Compilation options.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// `++`, `--`, `+=`, `-=`, `*=` on bindings declared `int` wrap like
+    /// `x = (x + 1) | 0`, in native and interpreted code alike. Without it,
+    /// they must provably stay int32s.
+    pub int_wrapping: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { int_wrapping: true }
+    }
+}
+
+/// A wrapping update of an `int` binding, rewritten in interpreted code.
+#[derive(Debug, Clone)]
+pub struct IntWrap {
+    /// The whole expression.
+    pub span: (u32, u32),
+    /// The target identifier.
+    pub target: (u32, u32),
+    pub name: String,
+    pub kind: IntWrapKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum IntWrapKind {
+    /// `++x` / `x++` (`used`: whether the value of a postfix one is).
+    Update { inc: bool, prefix: bool, used: bool },
+    /// `x op= rhs` (`op`: `+`, `-` or `*`), with the span of `rhs`.
+    Compound { op: char, rhs: (u32, u32) },
+}
+
 #[derive(Debug)]
 pub struct Analysis {
     /// The source with `aot` markers blanked out; same byte offsets as the
@@ -100,13 +138,14 @@ pub struct Analysis {
     pub cell_refs: Vec<CellRef>,
     pub rejected: Vec<Rejected>,
     pub classes: Vec<ClassDecl>,
+    pub int_wraps: Vec<IntWrap>,
 }
 
 fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
     erase::render(diags, source, path)
 }
 
-pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
+pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, String> {
     let stripped = marker::strip(original);
     let source = stripped.source;
 
@@ -128,7 +167,7 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
     let scoping = sem.semantic.into_scoping();
 
     let mut errors = builtins::check(program, &scoping);
-    let out = check::check(program, &scoping);
+    let out = check::check(program, &scoping, opts.int_wrapping);
     // Violated `int` annotations are type errors.
     for (_, _, r) in out.rejected.iter().filter(|r| r.2.hard) {
         errors.push(OxcDiagnostic::error(r.msg.clone()).with_label(r.span));
@@ -237,7 +276,87 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
         .iter()
         .map(|u| ClassDecl { index: u.class, body_start: out.classes[u.class].body_start, vars: u.vars.clone() })
         .collect();
-    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected, classes })
+    let mut wraps = IntWraps { scoping: &scoping, ints: &out.int_syms, unused: Vec::new(), out: Vec::new() };
+    if opts.int_wrapping && !out.int_syms.is_empty() {
+        wraps.visit_program(program);
+    }
+    let int_wraps = wraps.out;
+    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected, classes, int_wraps })
+}
+
+/// Collects the updates of `int` bindings that wrap.
+struct IntWraps<'s> {
+    scoping: &'s oxc::semantic::Scoping,
+    ints: &'s HashSet<oxc::semantic::SymbolId>,
+    /// Updates whose value is not used (statements, `for` updates).
+    unused: Vec<Span>,
+    out: Vec<IntWrap>,
+}
+
+impl IntWraps<'_> {
+    fn int_target(&self, t: &SimpleAssignmentTarget) -> Option<String> {
+        let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = t else { return None };
+        let sym = self.scoping.get_reference(id.reference_id.get()?).symbol_id()?;
+        self.ints.contains(&sym).then(|| id.name.to_string())
+    }
+
+    fn mark_unused(&mut self, e: &Expression) {
+        match e.without_parentheses() {
+            Expression::UpdateExpression(u) => self.unused.push(u.span),
+            Expression::SequenceExpression(s) => s.expressions.iter().for_each(|e| self.mark_unused(e)),
+            _ => {}
+        }
+    }
+}
+
+impl<'a> Visit<'a> for IntWraps<'_> {
+    fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        self.mark_unused(&it.expression);
+        walk::walk_expression_statement(self, it);
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        if let Some(u) = &it.update {
+            self.mark_unused(u);
+        }
+        walk::walk_for_statement(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+        if let Some(name) = self.int_target(&it.argument) {
+            let used = !self.unused.contains(&it.span);
+            let t = it.argument.span();
+            self.out.push(IntWrap {
+                span: (it.span.start, it.span.end),
+                target: (t.start, t.end),
+                name,
+                kind: IntWrapKind::Update { inc: it.operator == UpdateOperator::Increment, prefix: it.prefix, used },
+            });
+        }
+        walk::walk_update_expression(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        let op = match it.operator {
+            AssignmentOperator::Addition => Some('+'),
+            AssignmentOperator::Subtraction => Some('-'),
+            AssignmentOperator::Multiplication => Some('*'),
+            _ => None,
+        };
+        if let Some(op) = op
+            && let Some(t) = it.left.as_simple_assignment_target()
+            && let Some(name) = self.int_target(t)
+        {
+            let (t, r) = (t.span(), it.right.span());
+            self.out.push(IntWrap {
+                span: (it.span.start, it.span.end),
+                target: (t.start, t.end),
+                name,
+                kind: IntWrapKind::Compound { op, rhs: (r.start, r.end) },
+            });
+        }
+        walk::walk_assignment_expression(self, it);
+    }
 }
 
 /// Collects interpreted references to bindings that live in mutable cells.

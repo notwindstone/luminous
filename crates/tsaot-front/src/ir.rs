@@ -390,6 +390,9 @@ pub enum ExprKind {
     Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).
     Void(Box<Expr>),
+    /// A JS value that is an int32 (a bitwise operator applied to a number
+    /// and anything else), as an `I32`.
+    IntOf(Box<Expr>),
 }
 
 /// What a `Stmt::Yield` does.
@@ -675,6 +678,7 @@ macro_rules! visitor {
                 | PrivateIn(a, _)
                 | SuperGet(_, a)
                 | ArrayPush(_, a)
+                | IntOf(a)
                 | Void(a) => $name(a, f),
                 ArrayParts(parts) => {
                     for p in parts {

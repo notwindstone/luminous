@@ -1,4 +1,5 @@
-// @error `a` is an `int`, but this value may leave the int32 range
+// @flags --no-int-wrapping
+// @error `a` is an `int`, but this value may leave the int32 range (with `--no-int-wrapping`
 // @error `b` is an `int`, but this value is a number that may not be an int32
 // @error `i` is an `int`, but this value may leave the int32 range
 // @error `u` is an `int`, but this value is a number that may not be an int32

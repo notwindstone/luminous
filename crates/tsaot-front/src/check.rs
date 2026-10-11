@@ -186,9 +186,12 @@ pub struct Outcome<'a> {
     /// Top-level classes, and those that native code needs data from.
     pub classes: Vec<ClassInfo>,
     pub class_uses: Vec<ClassUse>,
+    /// Bindings declared `int` (anywhere in the module).
+    pub int_syms: HashSet<SymbolId>,
 }
 
-pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> {
+pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping, int_wrapping: bool) -> Outcome<'a> {
+    let int_syms = int_symbols(program);
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
     let mut consts = HashMap::new();
@@ -217,6 +220,8 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
     loop {
         let mut cx = ModuleCx {
             scoping,
+            int_syms: &int_syms,
+            int_wrapping,
             consts: &consts,
             bindings: &bindings,
             cands: &candidates,
@@ -264,7 +269,16 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
                 homes: 2 * classes.len(),
             };
             let closure_spans = std::mem::take(&mut cx.closure_spans);
-            return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
+            return Outcome {
+                native: candidates,
+                module,
+                cells,
+                closure_spans,
+                rejected,
+                classes,
+                class_uses,
+                int_syms,
+            };
         }
         let mut reasons: HashMap<usize, Reject> = HashMap::new();
         for &i in &failed {
@@ -654,6 +668,9 @@ enum State {
 
 struct ModuleCx<'m, 'a> {
     scoping: &'a Scoping,
+    /// Bindings declared `int`, and whether their `++`, `+=`... wrap.
+    int_syms: &'m HashSet<SymbolId>,
+    int_wrapping: bool,
     consts: &'m HashMap<SymbolId, ConstVal>,
     bindings: &'m HashMap<SymbolId, Binding>,
     cands: &'m [Candidate<'a>],
@@ -1322,9 +1339,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let name = self.sym_local.iter().find(|&(_, &m)| m == l).map(|(&s, _)| self.m.scoping.symbol_name(s));
         let what = name.map_or("an `int`".to_string(), |n| format!("`{n}` is an `int`"));
         let why = match (&v.kind, v.ty) {
-            (ExprKind::Update { .. } | ExprKind::Binary(BinOp::Add | BinOp::Sub, ..), _) => {
-                "may leave the int32 range (only a `for` counter bounded by an int, as in \
-                 `i < n`, steps by one)"
+            (ExprKind::Update { .. } | ExprKind::Binary(BinOp::Add | BinOp::Sub, ..), _) if !self.m.int_wrapping => {
+                "may leave the int32 range (with `--no-int-wrapping`, only a `for` counter \
+                 bounded by an int, as in `i < n`, steps by one)"
+            }
+            (ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul, ..), _) => {
+                "may leave the int32 range (only `++`, `--`, `+=`, `-=` and `*=` wrap)"
             }
             (_, Ty::F64 | Ty::MaybeF64) => "is a number that may not be an int32",
             _ => "is not a number",
@@ -1363,6 +1383,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mut assigned = false;
         ir::visit_stmts(body, &mut |e| assigned |= ir::assigns_local(e, l));
         (!assigned).then_some((l, up))
+    }
+
+    /// Whether `++`, `+=`, `-=`, `*=` on this binding wrap like `| 0`.
+    fn wraps(&self, sym: Option<SymbolId>) -> bool {
+        self.m.int_wrapping && sym.is_some_and(|s| self.m.int_syms.contains(&s))
     }
 
     /// A returned value in a function annotated to return `int`.
@@ -3192,7 +3217,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     if b.is_none_or(|b| b.kind == BindingKind::Const || b.kind == BindingKind::Import) {
                         return reject(id.span, format!("assignment to constant `{}`", id.name));
                     }
-                    (vec![], Place::Cell(self.m.cell(sym, id.span)?), None)
+                    (vec![], Place::Cell(self.m.cell(sym, id.span)?), Some(sym))
                 } else {
                     return reject(id.span, format!("`{}` is not a local variable or module binding", id.name));
                 }
@@ -3332,7 +3357,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 self.flush_setup(&mut setup, mark);
             }
             let [cur] = cur;
-            arith(op, cur, rhs)
+            let v = arith(op, cur, rhs);
+            if self.wraps(sym) && matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) { wrap(v) } else { v }
         };
         // An object held in a named local is used in place, unless the value
         // may reassign the local (or awaits run in between): then the object
@@ -3360,6 +3386,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn update(&mut self, u: &'a UpdateExpression<'a>, used: bool) -> R<Expr> {
         let (mut setup, place, sym) = self.place(&u.argument)?;
         let inc = u.operator == UpdateOperator::Increment;
+        let counter = matches!(place, Place::Local(l) if self.int_counter == Some((l, inc)));
+        if self.wraps(sym) && !counter {
+            // `x = (x ± 1) | 0`; the old value is `(x ∓ 1) | 0` after that, as
+            // the interpreted code computes it (see `erase`).
+            let d = if inc { 1.0 } else { -1.0 };
+            let cur = self.read(&place, u.span)?;
+            let new = wrap(arith(AnyBinOp::Add, cur, Expr::num(d)));
+            let w = self.write(&place, sym, new, u.span)?;
+            setup.push(if u.prefix || !used { w } else { wrap(arith(AnyBinOp::Sub, w, Expr::num(d))) });
+            return Ok(seq(setup));
+        }
         if let Place::Local(l) = place
             && self.locals[l] == Ty::I32
         {
@@ -3757,6 +3794,42 @@ impl LoopTest {
     }
 }
 
+/// `x | 0`.
+fn wrap(x: Expr) -> Expr {
+    arith(AnyBinOp::BitOr, x, Expr::num(0.0))
+}
+
+/// Whether a type annotation is `int`.
+fn is_int_annotation(a: Option<&oxc::allocator::Box<TSTypeAnnotation>>) -> bool {
+    a.and_then(|a| ts_type(&a.type_annotation)) == Some(Ty::I32)
+}
+
+/// The bindings declared `int`: variables and parameters.
+pub fn int_symbols(program: &Program) -> HashSet<SymbolId> {
+    struct Ints(HashSet<SymbolId>);
+    impl<'a> oxc::ast_visit::Visit<'a> for Ints {
+        fn visit_variable_declarator(&mut self, d: &VariableDeclarator<'a>) {
+            if let BindingPattern::BindingIdentifier(id) = &d.id
+                && is_int_annotation(d.type_annotation.as_ref())
+            {
+                self.0.extend(id.symbol_id.get());
+            }
+            oxc::ast_visit::walk::walk_variable_declarator(self, d);
+        }
+        fn visit_formal_parameter(&mut self, p: &FormalParameter<'a>) {
+            if let BindingPattern::BindingIdentifier(id) = &p.pattern
+                && is_int_annotation(p.type_annotation.as_ref())
+            {
+                self.0.extend(id.symbol_id.get());
+            }
+            oxc::ast_visit::walk::walk_formal_parameter(self, p);
+        }
+    }
+    let mut v = Ints(HashSet::new());
+    oxc::ast_visit::Visit::visit_program(&mut v, program);
+    v.0
+}
+
 /// An int32 literal (`5`, `-5`; not `-0`).
 fn int_literal(e: &Expr) -> Option<i32> {
     let v = match &e.kind {
@@ -3832,7 +3905,11 @@ fn arith(op: AnyBinOp, x: Expr, y: Expr) -> Expr {
         };
         return Expr::new(ty, ExprKind::Binary(op, Box::new(x), Box::new(y)));
     }
-    Expr::new(Ty::Any, ExprKind::AnyBinary(op, Box::new(any(x)), Box::new(any(y))))
+    let int32 = matches!(op, AnyBinOp::Shl | AnyBinOp::Sar | AnyBinOp::BitAnd | AnyBinOp::BitOr | AnyBinOp::BitXor)
+        && (num(x.ty) || num(y.ty));
+    let v = Expr::new(Ty::Any, ExprKind::AnyBinary(op, Box::new(any(x)), Box::new(any(y))));
+    // With a number operand, a BigInt one throws: the result is an int32.
+    if int32 { Expr::new(Ty::I32, ExprKind::IntOf(Box::new(v))) } else { v }
 }
 
 /// JS truthiness as a `Bool`.

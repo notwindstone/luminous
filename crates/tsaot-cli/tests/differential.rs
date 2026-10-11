@@ -1,7 +1,8 @@
 //! Differential tests: every case in `tests/cases` is built twice, with native
 //! compilation and fully interpreted, and both executables must print exactly
 //! the same output. `// @native a b` and `// @interpreted c` header lines pin
-//! down which functions the checker is expected to compile natively.
+//! down which functions the checker is expected to compile natively. `// @flags
+//! ...` passes options to the compiler.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,7 +31,8 @@ fn directive(src: &str, tag: &str) -> Vec<String> {
 
 fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
     let src = std::fs::read_to_string(case).unwrap();
-    let report = tsaot().arg("report").arg(case).output().unwrap();
+    let flags = directive(&src, "flags");
+    let report = tsaot().arg("report").args(&flags).arg(case).output().unwrap();
     if !report.status.success() {
         return Err(format!("report failed: {}", String::from_utf8_lossy(&report.stderr)));
     }
@@ -52,10 +54,11 @@ fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
     }
 
     let stem = case.file_stem().unwrap().to_string_lossy();
+    let flags_all = flags;
     let mut outputs = Vec::new();
     for (suffix, flags) in [("native", &[][..]), ("interp", &["--no-native"][..])] {
         let exe = out_dir.join(format!("{stem}-{suffix}"));
-        let b = tsaot().arg("build").args(flags).arg(case).arg("-o").arg(&exe).output().unwrap();
+        let b = tsaot().arg("build").args(flags).args(&flags_all).arg(case).arg("-o").arg(&exe).output().unwrap();
         if !b.status.success() {
             return Err(format!("build ({suffix}) failed: {}", String::from_utf8_lossy(&b.stderr)));
         }
@@ -136,7 +139,8 @@ fn compile_errors() {
         let src = std::fs::read_to_string(case).unwrap();
         let expected = src.lines().filter_map(|l| l.strip_prefix("// @error ")).collect::<Vec<_>>();
         assert!(!expected.is_empty(), "{name}: no `// @error` lines");
-        let out = tsaot().arg("report").arg(case).output().unwrap();
+        let flags = directive(&src, "flags");
+        let out = tsaot().arg("report").args(&flags).arg(case).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         let missing: Vec<_> = expected.iter().filter(|e| !stderr.contains(*e)).collect();
         if out.status.success() || !missing.is_empty() {

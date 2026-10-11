@@ -16,6 +16,10 @@ const RT_H: &str = include_str!("../../../runtime/tsaot_rt.h");
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Make `++`, `--`, `+=`, `-=`, `*=` on `int` variables compile errors
+    /// unless they provably stay int32s, instead of wrapping like `| 0`.
+    #[arg(long, global = true)]
+    no_int_wrapping: bool,
 }
 
 #[derive(Subcommand)]
@@ -82,15 +86,17 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let fopts = tsaot_front::Options { int_wrapping: !cli.no_int_wrapping };
+    match cli.cmd {
         Cmd::Build { input, output, opts } => {
             let output = output.unwrap_or_else(|| input.with_extension(""));
-            build(&input, &output, &opts)
+            build(&input, &output, &opts, &fopts)
         }
         Cmd::Run { input, opts, args } => {
             let dir = tempdir()?;
             let exe = dir.join("a.out");
-            let r = build(&input, &exe, &opts).and_then(|()| {
+            let r = build(&input, &exe, &opts, &fopts).and_then(|()| {
                 let status = Command::new(&exe).args(&args).status()?;
                 Ok(status.code().unwrap_or(1))
             });
@@ -98,12 +104,12 @@ fn real_main() -> Result<()> {
             std::process::exit(r?);
         }
         Cmd::Report { input } => {
-            let (_, analysis) = analyze(&input)?;
+            let (_, analysis) = analyze(&input, &fopts)?;
             print_report(&input, &analysis);
             Ok(())
         }
         Cmd::EmitJs { input, no_native } => {
-            let (_, mut analysis) = analyze(&input)?;
+            let (_, mut analysis) = analyze(&input, &fopts)?;
             if no_native {
                 disable_native(&mut analysis);
             }
@@ -111,7 +117,7 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         Cmd::Ir { input } => {
-            let (_, analysis) = analyze(&input)?;
+            let (_, analysis) = analyze(&input, &fopts)?;
             for (i, f) in analysis.module.funcs.iter().enumerate() {
                 println!("// tsaot_fn_{i}\n{f:#?}\n");
             }
@@ -120,9 +126,9 @@ fn real_main() -> Result<()> {
     }
 }
 
-fn analyze(input: &Path) -> Result<(String, Analysis)> {
+fn analyze(input: &Path, fopts: &tsaot_front::Options) -> Result<(String, Analysis)> {
     let src = std::fs::read_to_string(input).with_context(|| format!("reading {}", input.display()))?;
-    let analysis = tsaot_front::analyze(&src, input).map_err(anyhow::Error::msg)?;
+    let analysis = tsaot_front::analyze(&src, input, fopts).map_err(anyhow::Error::msg)?;
     Ok((src, analysis))
 }
 
@@ -200,9 +206,9 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn build(input: &Path, output: &Path, opts: &BuildOpts) -> Result<()> {
+fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
-    let (_, mut analysis) = analyze(input)?;
+    let (_, mut analysis) = analyze(input, fopts)?;
     if opts.no_native {
         disable_native(&mut analysis);
     }

@@ -316,11 +316,18 @@ function isPrime(n: int): boolean {
 - **Proven, not assumed.** A value assigned to an `int` must be one by
   construction: an int32 literal, another `int`, a bitwise result (`|`,
   `&`, `^`, `~`, `<<`, `>>`; not `>>>`, which is unsigned), `Math.imul`,
-  `Math.clz32`, `Math.min`/`max` of `int`s, a call to a function returning
-  `int`, or a `for` loop counter stepped by one under a bound that keeps it
-  in range (`i < n` with `n` an `int`). Anything else (`a + b`, `n / 2`) is a
-  compile error that suggests `(a + b) | 0`. The `| 0` makes wrapping
-  explicit, and every engine computes it the same way.
+  `Math.clz32`, `Math.min`/`max` of `int`s, or a call to a function returning
+  `int`. Anything else (`count = count + 1.5`, `n / 2`) is a compile error
+  that suggests `(...) | 0`, which makes wrapping explicit (every engine
+  computes it the same way).
+- **Updates wrap.** `++`, `--`, `+=`, `-=` and `*=` on an `int` binding wrap
+  like `| 0`: `count++` is `count = (count + 1) | 0`, and `count += 1.5` is
+  `count = (count + 1.5) | 0`. The interpreted half of the program is
+  rewritten the same way, so native and interpreted code agree. Under Bun or
+  Node, which ignore the annotation, results differ only once a value
+  overflows. With `--no-int-wrapping`, these updates must provably stay in
+  range instead: only a `for` counter stepped by one under an int bound
+  (`i < n` with `n` an `int`) qualifies, and anything else is a compile error.
 - **Checked at the boundary.** Interpreted code can pass anything. A native
   function whose `int` argument is not an int32 (`1.5`, `"1"`, `-0`,
   `2 ** 31`) declines the call, and the interpreted version runs instead,
