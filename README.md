@@ -293,6 +293,46 @@ Known observable differences:
   static block first in its body (handing them to native code), which shows
   in the class's `toString()`.
 
+## The `int` type
+
+`type int = number` declares an integer type that the compiler checks:
+an `int` variable, parameter or return value always holds an int32 (never
+`-0`). TypeScript sees a plain `number`, so the program runs unchanged with
+`tsc`, Bun or Node; tsaot keeps `int`s in machine registers.
+
+```ts
+type int = number;
+
+function isPrime(n: int): boolean {
+  if (n < 2) return false;
+  if (n % 2 === 0) return n === 2;
+  for (let d: int = 3; d * d <= n; d = (d + 2) | 0) {
+    if (n % d === 0) return false;
+  }
+  return true;
+}
+```
+
+- **Proven, not assumed.** A value assigned to an `int` must be one by
+  construction: an int32 literal, another `int`, a bitwise result (`|`,
+  `&`, `^`, `~`, `<<`, `>>`; not `>>>`, which is unsigned), `Math.imul`,
+  `Math.clz32`, `Math.min`/`max` of `int`s, a call to a function returning
+  `int`, or a `for` loop counter stepped by one under a bound that keeps it
+  in range (`i < n` with `n` an `int`). Anything else (`a + b`, `n / 2`) is a
+  compile error that suggests `(a + b) | 0`. The `| 0` makes wrapping
+  explicit, and every engine computes it the same way.
+- **Checked at the boundary.** Interpreted code can pass anything. A native
+  function whose `int` argument is not an int32 (`1.5`, `"1"`, `-0`,
+  `2 ** 31`) declines the call, and the interpreted version runs instead,
+  with ordinary JS semantics.
+- Arithmetic on `int`s is exact: `a + b` and `a * b` are computed in 64-bit
+  integers, and the double result is rounded only where JS would round it.
+  So comparisons such as `d * d <= n` and `%` (`-4 % 2` is `-0`, `x % 0` is
+  `NaN`) need no floating point.
+- `type double = number` is accepted as a plain alias of `number`. A
+  captured `int` variable is an ordinary JS value; its annotation is not
+  checked.
+
 ## Getting started
 
 Requires Nix with flakes (or rustc ≥ 1.88, clang, cmake and ninja on `PATH`).
@@ -324,21 +364,20 @@ the same program built with `--no-native`, i.e. plain QuickJS-NG bytecode.
 
 | benchmark    | what it stresses                                   | interpreted | native  | speedup |
 |--------------|----------------------------------------------------|------------:|--------:|--------:|
-| mandelbrot   | float loops                                        |      858 ms |   35 ms |   24.4× |
-| fib          | recursive calls                                    |      415 ms |   35 ms |   12.0× |
-| integrate    | libm calls (`sin`, `exp`, `sqrt`)                  |     4.13 s  |  476 ms |    8.7× |
-| arrays       | `Uint8Array` sieve, `Float64Array` dot, `number[]` |     3.74 s  |  669 ms |    5.6× |
-| primes       | `%`, loops                                         |     3.97 s  |  911 ms |    4.4× |
-| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)               |     3.53 s  |  1.12 s |    3.2× |
-| boundary     | 5M tiny native calls *from interpreted code*       |      510 ms |  359 ms |    1.4× |
+| mandelbrot   | float loops                                        |      932 ms |   35 ms |   26.4× |
+| xorshift     | bitwise ops (`^`, `<<`, `>>`, `>>>`)               |     3.69 s  |  242 ms |   15.2× |
+| fib          | recursive calls                                    |      506 ms |   36 ms |   13.9× |
+| integrate    | libm calls (`sin`, `exp`, `sqrt`)                  |     4.13 s  |  414 ms |   10.0× |
+| arrays       | `Uint8Array` sieve, `Float64Array` dot, `number[]` |     3.77 s  |  629 ms |    6.0× |
+| primes       | `%`, loops                                         |     4.37 s  |  925 ms |    4.7× |
+| boundary     | 5M tiny native calls *from interpreted code*       |      636 ms |  375 ms |    1.7× |
 
 In `boundary`, the interpreted loop around the calls dominates.
 
 ## Roadmap
 
-- **Int32 representation selection** beyond counters and steps: integer
-  arithmetic in general (`%`, bitwise code, parameters). This is the biggest
-  remaining win for `primes` and `xorshift`.
+- **`int` fields and elements**: `{ value: int }`, `int[]` (checked reads),
+  and `int` parameters of closures.
 - Shapes for class instances (inline property access), and calls to methods
   of known classes without the engine.
 - **Multi-module programs** (`import` between `.ts` files).

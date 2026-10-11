@@ -21,7 +21,7 @@ mod lower;
 use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, anyhow};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F64, I8, I32, I64};
 use cranelift_codegen::ir::{AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -232,6 +232,8 @@ struct Codegen<'m> {
     /// Inline caches allocated so far (`tsaot_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
+    /// Parameter types, by `FuncId`.
+    params: std::rc::Rc<Vec<Vec<Ty>>>,
     fctx: FunctionBuilderContext,
 }
 
@@ -298,6 +300,7 @@ impl<'m> Codegen<'m> {
         // Defined here, once all sites are known (`define_ics`).
         data.push(module.declare_data("tsaot_ics", Linkage::Export, true, false)?);
         Ok(Codegen {
+            params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             module,
             funcs,
             fast_funcs,
@@ -328,6 +331,7 @@ impl<'m> Codegen<'m> {
             ics,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
+            params: self.params.clone(),
         }
     }
 
@@ -516,6 +520,12 @@ impl<'m> Codegen<'m> {
                     (b.ins().bitcast(I64, MemFlagsData::new(), d), b.ins().iconst(I64, jsvalue::TAG_FLOAT64))
                 }
                 (_, V::Bool(x)) => (b.ins().uextend(I64, x), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
+                (_, V::Int(i)) if local_ty == Ty::Any => {
+                    let i = b.ins().ireduce(I32, i);
+                    (b.ins().uextend(I64, i), b.ins().iconst(I64, jsvalue::TAG_INT))
+                }
+                // An int local's frame slot: the raw i64 (see `spill_locals`).
+                (_, V::Int(i)) => (i, b.ins().iconst(I64, jsvalue::TAG_FLOAT64)),
                 _ => unreachable!(),
             };
             store(&mut b, s, p, tag);
@@ -694,6 +704,10 @@ impl<'m> Codegen<'m> {
             Ty::Void => (b.ins().iconst(I64, 0), b.ins().iconst(I64, jsvalue::TAG_UNDEFINED)),
             Ty::Bool => (b.ins().uextend(I64, rv[0]), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
             Ty::F64 => box_number(&mut b, rv[0]),
+            Ty::I32 => {
+                let i = b.ins().ireduce(I32, rv[0]);
+                (b.ins().uextend(I64, i), b.ins().iconst(I64, jsvalue::TAG_INT))
+            }
             Ty::Any | Ty::Arr(_) => (rv[0], rv[1]),
             // The checker boxes these returns.
             Ty::MaybeF64 => unreachable!("MaybeF64 return type"),
@@ -823,6 +837,40 @@ fn unbox_arg(b: &mut FunctionBuilder, t: Ty, argv: Value, k: usize, decline: Blo
             b.ins().jump(join, &[BlockArg::Value(d)]);
             b.switch_to_block(join);
             V::Num(v)
+        }
+        // An int32: an int, or a double that is one exactly (not -0).
+        Ty::I32 => {
+            let is_int = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_INT);
+            let int_blk = b.create_block();
+            let not_int = b.create_block();
+            let float_blk = b.create_block();
+            let join = b.create_block();
+            let v = b.append_block_param(join, I64);
+            b.ins().brif(is_int, int_blk, &[], not_int, &[]);
+            b.switch_to_block(int_blk);
+            let i = b.ins().load(I32, mem, argv, at);
+            let i = b.ins().sextend(I64, i);
+            b.ins().jump(join, &[BlockArg::Value(i)]);
+            b.switch_to_block(not_int);
+            let is_float = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_FLOAT64);
+            b.ins().brif(is_float, float_blk, &[], decline, &[]);
+            b.switch_to_block(float_blk);
+            let d = b.ins().load(F64, mem, argv, at);
+            let i = b.ins().fcvt_to_sint_sat(I32, d);
+            let back = b.ins().fcvt_from_sint(F64, i);
+            let same = b.ins().fcmp(FloatCC::Equal, back, d);
+            // -0 converts to 0 and back to +0, which compares equal: check
+            // the bits.
+            let bits = b.ins().bitcast(I64, MemFlagsData::new(), d);
+            let negzero = b.ins().icmp_imm_s(IntCC::Equal, bits, i64::MIN);
+            let ok = b.ins().band_not(same, negzero);
+            let i = b.ins().sextend(I64, i);
+            let exact = b.create_block();
+            b.ins().brif(ok, exact, &[], decline, &[]);
+            b.switch_to_block(exact);
+            b.ins().jump(join, &[BlockArg::Value(i)]);
+            b.switch_to_block(join);
+            V::Int(v)
         }
         Ty::Bool => {
             let is_bool = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_BOOL);

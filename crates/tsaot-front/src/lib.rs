@@ -129,6 +129,10 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
 
     let mut errors = builtins::check(program, &scoping);
     let out = check::check(program, &scoping);
+    // Violated `int` annotations are type errors.
+    for (_, _, r) in out.rejected.iter().filter(|r| r.2.hard) {
+        errors.push(OxcDiagnostic::error(r.msg.clone()).with_label(r.span));
+    }
 
     let line = |pos: u32| source[..pos as usize].matches('\n').count() as u32 + 1;
     let natives: Vec<NativeDecl> = out

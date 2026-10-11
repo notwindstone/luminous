@@ -29,17 +29,25 @@ pub struct Reject {
     /// It calls a function that turned out not to be native (once that one
     /// is interpreted, the call goes through its binding instead).
     callee: bool,
+    /// An error in the program (a violated `int` annotation), not a reason
+    /// to stay interpreted.
+    pub hard: bool,
 }
 
 type R<T> = Result<T, Reject>;
 
 fn reject<T>(span: Span, msg: impl Into<String>) -> R<T> {
-    Err(Reject { span, msg: msg.into(), retry: false, callee: false })
+    Err(Reject { span, msg: msg.into(), retry: false, callee: false, hard: false })
+}
+
+/// A violated `int` annotation: a compile error.
+fn int_error<T>(span: Span, msg: impl Into<String>) -> R<T> {
+    Err(Reject { span, msg: msg.into(), retry: false, callee: false, hard: true })
 }
 
 fn callee_failed<T>(span: Span, name: &str) -> R<T> {
     let msg = format!("calls `{name}`, which is not compiled natively");
-    Err(Reject { span, msg, retry: false, callee: true })
+    Err(Reject { span, msg, retry: false, callee: true, hard: false })
 }
 
 /// The syntax of a candidate function.
@@ -196,7 +204,7 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
             rejected.push((
                 c.name,
                 span,
-                Reject { span, msg: "module uses `eval`".into(), retry: false, callee: false },
+                Reject { span, msg: "module uses `eval`".into(), retry: false, callee: false, hard: false },
             ));
         }
     }
@@ -316,7 +324,13 @@ fn collect_toplevel<'a>(
     let mut method_rejects = Vec::new();
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
         if written(symbol) {
-            let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false, callee: false };
+            let r = Reject {
+                span: node.span(),
+                msg: format!("`{name}` is reassigned"),
+                retry: false,
+                callee: false,
+                hard: false,
+            };
             rejected.push((name, node.span(), r));
             return;
         }
@@ -328,7 +342,13 @@ fn collect_toplevel<'a>(
             },
         };
         if body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use no aot")) {
-            let r = Reject { span: node.span(), msg: "marked \"use no aot\"".into(), retry: false, callee: false };
+            let r = Reject {
+                span: node.span(),
+                msg: "marked \"use no aot\"".into(),
+                retry: false,
+                callee: false,
+                hard: false,
+            };
             rejected.push((name, node.span(), r));
             return;
         }
@@ -570,7 +590,13 @@ fn ts_type(t: &TSType) -> Option<Ty> {
         // Typed arrays (or a user type of the same name: either way, the
         // entry checks the class).
         TSType::TSTypeReference(r) => match &r.type_name {
-            TSTypeName::IdentifierReference(id) => ArrKind::from_name(id.name.as_str()).map(Ty::Arr),
+            TSTypeName::IdentifierReference(id) => match id.name.as_str() {
+                // `type int = number` / `type double = number`: `int` is
+                // checked to hold int32 values.
+                "int" => Some(Ty::I32),
+                "double" => Some(Ty::F64),
+                name => ArrKind::from_name(name).map(Ty::Arr),
+            },
             _ => None,
         },
         _ => None,
@@ -600,7 +626,7 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     for p in &params.items {
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::Bool | Ty::Arr(_)))
+            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_)))
                 if p.initializer.is_none()
                     && !p.optional
                     && matches!(p.pattern, BindingPattern::BindingIdentifier(_)) =>
@@ -661,6 +687,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         self.state[i] = State::InProgress;
         let c = &self.cands[i];
         let (sym, node, name, has_this) = (c.node.span().start, c.node, c.name.clone(), c.has_this);
+        let ret_annot = c.ret;
         let params: Vec<ParamSpec<'a>> = c.params.iter().map(|p| (p.pattern, p.ty, p.default)).collect();
         let rest = c.rest;
         let class = c.class;
@@ -671,6 +698,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             fx.rest = rest;
             fx.class = class;
             fx.has_this = has_this;
+            fx.ret_int = ret_annot == Some(Ty::I32);
             let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
                 (Err(e), Some(s)) if e.retry => {
@@ -861,6 +889,11 @@ struct FnCx<'x, 'm, 'a> {
     /// Label attached to the loop statement about to be checked.
     label: Option<String>,
     returns: Vec<Ty>,
+    /// The function is annotated to return `int`.
+    ret_int: bool,
+    /// While checking a `for` update: the `int` loop counter it may step
+    /// (`true`: up), proven to stay in range by the loop test.
+    int_counter: Option<(ir::LocalId, bool)>,
     /// Depth of `finally` blocks being checked (no jumps out of them).
     in_finally: usize,
     /// Statements to run before the current statement: `await`s hoisted out
@@ -952,7 +985,7 @@ fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
 fn any(e: Expr) -> Expr {
     match e.ty {
         Ty::Any => e,
-        Ty::F64 | Ty::Bool | Ty::MaybeF64 => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
+        Ty::F64 | Ty::I32 | Ty::Bool | Ty::MaybeF64 => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
         // Already a JSValue.
         Ty::Arr(_) => Expr { ty: Ty::Any, ..e },
         Ty::Void => Expr::new(Ty::Any, ExprKind::Void(Box::new(e))),
@@ -964,12 +997,19 @@ fn undefined() -> Expr {
 }
 
 fn join(a: Ty, b: Ty) -> Ty {
-    if a == b { a } else { Ty::Any }
+    match (a, b) {
+        _ if a == b => a,
+        (Ty::I32, Ty::F64) | (Ty::F64, Ty::I32) => Ty::F64,
+        _ => Ty::Any,
+    }
 }
 
 fn coerce(e: Expr, ty: Ty) -> Expr {
-    if e.ty == ty {
+    if e.ty == ty || (ty == Ty::F64 && e.ty == Ty::I32) {
         e
+    } else if ty == Ty::I32 {
+        debug_assert!(int_literal(&e).is_some(), "an int local assigned a non-int");
+        Expr { ty: Ty::I32, ..e }
     } else {
         debug_assert_eq!(ty, Ty::Any);
         any(e)
@@ -1040,6 +1080,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             next_loop: 0,
             label: None,
             returns: Vec::new(),
+            ret_int: false,
+            int_counter: None,
             in_finally: 0,
             name_hint: None,
             pre: Vec::new(),
@@ -1147,6 +1189,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     // Concise body: `(x) => expr` returns `expr`.
                     let e = body.as_expression().expect("concise arrow body is an expression");
                     let x = self.expr(e)?;
+                    let x = if self.ret_int { self.int_return(Some(x), e.span())? } else { x };
                     self.returns.push(x.ty);
                     let mut body = std::mem::take(&mut self.pre);
                     body.push(Stmt::Return(Some(x)));
@@ -1239,14 +1282,101 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     fn set_local(&mut self, sym: Option<SymbolId>, l: ir::LocalId, v: Expr, span: Span) -> R<Expr> {
         let ty = self.locals[l];
+        if ty == Ty::I32 {
+            let v = self.int_value(l, v, span)?;
+            return Ok(Expr::new(Ty::I32, ExprKind::SetLocal(l, Box::new(v))));
+        }
+        if ty == Ty::F64 && v.ty == Ty::I32 {
+            return Ok(Expr::new(Ty::F64, ExprKind::SetLocal(l, Box::new(v))));
+        }
         if v.ty != ty && ty != Ty::Any {
             // A local of an unboxed type gets another type: make it `Any`
             // and check the function again.
             let Some(sym) = sym else { unreachable!("hidden locals are `Any`") };
             self.widen_request = Some(sym);
-            return Err(Reject { span, msg: "retry".into(), retry: true, callee: false });
+            return Err(Reject { span, msg: "retry".into(), retry: true, callee: false, hard: false });
         }
         Ok(Expr::new(ty, ExprKind::SetLocal(l, Box::new(coerce(v, ty)))))
+    }
+
+    /// `v` as the new value of `int` local `l`: an int (an `int` value,
+    /// a literal, or the loop counter's `l + 1` / `l - 1`), or an error.
+    fn int_value(&self, l: ir::LocalId, v: Expr, span: Span) -> R<Expr> {
+        if v.ty == Ty::I32 {
+            return Ok(v);
+        }
+        if let Some(c) = int_literal(&v) {
+            return Ok(Expr::new(Ty::I32, ExprKind::Num(c as f64)));
+        }
+        if let ExprKind::Binary(op @ (BinOp::Add | BinOp::Sub), x, y) = &v.kind
+            && matches!(x.kind, ExprKind::Local(m) if m == l)
+            && int_literal(y) == Some(1)
+            && self.int_counter == Some((l, *op == BinOp::Add))
+        {
+            return Ok(Expr { ty: Ty::I32, ..v });
+        }
+        int_error(span, self.not_int(l, &v))
+    }
+
+    fn not_int(&self, l: ir::LocalId, v: &Expr) -> String {
+        let name = self.sym_local.iter().find(|&(_, &m)| m == l).map(|(&s, _)| self.m.scoping.symbol_name(s));
+        let what = name.map_or("an `int`".to_string(), |n| format!("`{n}` is an `int`"));
+        let why = match (&v.kind, v.ty) {
+            (ExprKind::Update { .. } | ExprKind::Binary(BinOp::Add | BinOp::Sub, ..), _) => {
+                "may leave the int32 range (only a `for` counter bounded by an int, as in \
+                 `i < n`, steps by one)"
+            }
+            (_, Ty::F64 | Ty::MaybeF64) => "is a number that may not be an int32",
+            _ => "is not a number",
+        };
+        format!("{what}, but this value {why}; convert it with `| 0` if wrapping is intended")
+    }
+
+    /// The `int` loop counter of a `for` loop with this test and body, if
+    /// its update may step it: `i < n` (`n` an int) for `i++`, `i > n` for
+    /// `i--`, with no other assignment to `i` in the body. The test bounds
+    /// `i` whenever the update runs.
+    fn int_counter_of(&self, test: &LoopTest, body: &[Stmt]) -> Option<(ir::LocalId, bool)> {
+        if !test.pre.is_empty() {
+            return None;
+        }
+        let ExprKind::Compare(op, x, y) = &test.test.as_ref()?.kind else { return None };
+        let ExprKind::Local(l) = x.kind else { return None };
+        if self.locals[l] != Ty::I32 {
+            return None;
+        }
+        let bound = y.ty == Ty::I32 || int_literal(y).is_some();
+        let lit = int_literal(y);
+        let up = match op {
+            CmpOp::Lt => bound,
+            CmpOp::Le => lit.is_some_and(|k| k < i32::MAX),
+            _ => false,
+        };
+        let down = match op {
+            CmpOp::Gt => bound,
+            CmpOp::Ge => lit.is_some_and(|k| k > i32::MIN),
+            _ => false,
+        };
+        if !up && !down {
+            return None;
+        }
+        let mut assigned = false;
+        ir::visit_stmts(body, &mut |e| assigned |= ir::assigns_local(e, l));
+        (!assigned).then_some((l, up))
+    }
+
+    /// A returned value in a function annotated to return `int`.
+    fn int_return(&self, v: Option<Expr>, span: Span) -> R<Expr> {
+        match v {
+            Some(v) if v.ty == Ty::I32 => Ok(v),
+            Some(v) if int_literal(&v).is_some() => {
+                Ok(Expr::new(Ty::I32, ExprKind::Num(int_literal(&v).unwrap() as f64)))
+            }
+            _ => int_error(
+                span,
+                "the function returns `int`, but this value may not be an int32; convert it with `| 0` if wrapping is intended",
+            ),
+        }
     }
 
     /// `var` declarations are function-scoped: declare them up front, as
@@ -1468,7 +1598,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let lp = self.lp(label, JumpKind::Loop, |cx, id| {
                     let body = cx.body(&f.body)?;
                     let mark = cx.pre.len();
-                    let update = f.update.as_ref().map(|u| cx.expr(u)).transpose()?;
+                    let counter = cx.int_counter_of(&test, &body);
+                    let outer = std::mem::replace(&mut cx.int_counter, counter);
+                    let update = f.update.as_ref().map(|u| cx.expr(u)).transpose();
+                    cx.int_counter = outer;
+                    let update = update?;
                     if cx.pre.len() == mark {
                         let (test, mut first) = test.build(id);
                         first.extend(body);
@@ -1500,7 +1634,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     self.returns.push(Ty::Any);
                     return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
                 }
-                let arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
+                let mut arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
+                if self.ret_int {
+                    arg = Some(self.int_return(arg, r.span)?);
+                }
                 self.returns.push(arg.as_ref().map_or(Ty::Void, |a| a.ty));
                 Stmt::Return(arg)
             }
@@ -1540,7 +1677,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 if self.locals[l] != Ty::Any {
                     self.widen_request = Some(sym);
-                    return Err(Reject { span: a.span, msg: "retry".into(), retry: true, callee: false });
+                    return Err(Reject { span: a.span, msg: "retry".into(), retry: true, callee: false, hard: false });
                 }
                 let value = any(self.expr(&aw.argument)?);
                 Ok(Stmt::Await { value, target: ir::AwaitTarget::Set(l) })
@@ -1800,15 +1937,33 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Some(init) => self.expr(init)?,
                 None => undefined(),
             };
+            let declared = d.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
             self.name_hint = None;
             let local = match self.sym_local.get(&sym) {
                 Some(&l) if self.boxed[l] => l,
                 _ => {
-                    let ty = if init.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { init.ty };
+                    let ty = if declared == Some(Ty::I32) {
+                        Ty::I32
+                    } else if init.ty == Ty::Void || self.widened.contains(&sym) {
+                        Ty::Any
+                    } else if init.ty == Ty::I32 {
+                        // Inferred: any number may be assigned later.
+                        Ty::F64
+                    } else {
+                        init.ty
+                    };
                     self.declare(sym, ty, mutable)
                 }
             };
             let ty = self.locals[local];
+            let init = if ty == Ty::I32 {
+                if d.init.is_none() {
+                    return int_error(d.span, "an `int` variable needs an initializer");
+                }
+                self.int_value(local, init, d.span)?
+            } else {
+                init
+            };
             // Each declarator's hoisted `await`s run after the previous
             // declarator is initialized.
             out.extend(self.pre.drain(base..));
@@ -2055,7 +2210,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 l
             }
             _ => {
-                let ty = if v.ty == Ty::Void || self.widened.contains(&sym) { Ty::Any } else { v.ty };
+                let ty = if v.ty == Ty::Void || self.widened.contains(&sym) {
+                    Ty::Any
+                } else {
+                    if v.ty == Ty::I32 { Ty::F64 } else { v.ty }
+                };
                 self.declare(sym, ty, kind != BindKind::Const)
             }
         };
@@ -2815,7 +2974,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
             other => {
                 let k = self.expr(other)?;
-                Key::Value(Box::new(if k.ty == Ty::F64 { k } else { any(k) }))
+                Key::Value(Box::new(if k.ty.is_number() { k } else { any(k) }))
             }
         })
     }
@@ -3202,6 +3361,16 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let (mut setup, place, sym) = self.place(&u.argument)?;
         let inc = u.operator == UpdateOperator::Increment;
         if let Place::Local(l) = place
+            && self.locals[l] == Ty::I32
+        {
+            if self.int_counter != Some((l, inc)) {
+                let probe = Expr::new(Ty::F64, ExprKind::Update { local: l, delta: 0.0, prefix: true });
+                return int_error(u.span, self.not_int(l, &probe));
+            }
+            let delta = if inc { 1.0 } else { -1.0 };
+            return Ok(Expr::new(Ty::I32, ExprKind::Update { local: l, delta, prefix: u.prefix }));
+        }
+        if let Place::Local(l) = place
             && self.locals[l] == Ty::F64
         {
             let delta = if inc { 1.0 } else { -1.0 };
@@ -3212,7 +3381,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         {
             // `++` on a boolean local makes it a number.
             self.widen_request = sym;
-            return Err(Reject { span: u.span, msg: "retry".into(), retry: true, callee: false });
+            return Err(Reject { span: u.span, msg: "retry".into(), retry: true, callee: false, hard: false });
         }
         let cur = self.read(&place, u.span)?;
         if num(cur.ty) {
@@ -3278,20 +3447,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let x = self.expr(&u.argument)?;
         let dynamic = |op: AnyUnOp, x: Expr| Expr::new(Ty::Any, ExprKind::AnyUnary(op, Box::new(any(x))));
         Ok(match (u.operator, x.ty) {
-            (UnaryOperator::UnaryNegation, Ty::F64 | Ty::MaybeF64) => {
+            (UnaryOperator::UnaryNegation, Ty::F64 | Ty::I32 | Ty::MaybeF64) => {
                 Expr::new(Ty::F64, ExprKind::Unary(UnOp::Neg, Box::new(to_f64(x))))
             }
             (UnaryOperator::UnaryNegation, _) => dynamic(AnyUnOp::Neg, x),
-            (UnaryOperator::UnaryPlus, Ty::F64 | Ty::MaybeF64) => to_f64(x),
+            (UnaryOperator::UnaryPlus, Ty::F64 | Ty::I32 | Ty::MaybeF64) => to_f64(x),
             (UnaryOperator::UnaryPlus, _) => dynamic(AnyUnOp::Plus, x),
-            (UnaryOperator::BitwiseNot, Ty::F64 | Ty::MaybeF64) => {
-                Expr::new(Ty::F64, ExprKind::Unary(UnOp::BitNot, Box::new(to_f64(x))))
+            (UnaryOperator::BitwiseNot, Ty::F64 | Ty::I32 | Ty::MaybeF64) => {
+                Expr::new(Ty::I32, ExprKind::Unary(UnOp::BitNot, Box::new(to_f64(x))))
             }
             (UnaryOperator::BitwiseNot, _) => dynamic(AnyUnOp::BitNot, x),
             (UnaryOperator::LogicalNot, _) => Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(truthy(x)))),
-            (UnaryOperator::Typeof, Ty::F64 | Ty::Bool) => {
+            (UnaryOperator::Typeof, Ty::F64 | Ty::I32 | Ty::Bool) => {
                 // Statically known; still evaluate the operand.
-                let name = if x.ty == Ty::F64 { "number" } else { "boolean" };
+                let name = if x.ty == Ty::Bool { "boolean" } else { "number" };
                 let id = self.m.string(name);
                 seq(vec![x, Expr::new(Ty::Any, ExprKind::Str(id))])
             }
@@ -3328,7 +3497,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     (Ty::Bool, Ty::Bool) => equality,
                     // `undefined` compares like NaN, except that it equals
                     // itself (and `null`, loosely): never against a number.
-                    (a, b) if num(a) && num(b) => !equality || a == Ty::F64 || b == Ty::F64,
+                    (a, b) if num(a) && num(b) => !equality || a.is_number() || b.is_number(),
                     _ => false,
                 };
             if unboxed {
@@ -3532,7 +3701,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             for (k, x) in out.iter_mut().enumerate() {
                 match (params[k], x.ty) {
                     (Ty::Any, _) => *x = any(std::mem::replace(x, undefined())),
-                    (p, t) if p == t => {}
+                    (p, _) if let Some(y) = fit(p, x) => *x = y,
                     _ => {
                         self.pre.truncate(start);
                         return Ok(None);
@@ -3555,7 +3724,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.order(&mut out, mark);
             out.push(match (p, x.ty) {
                 (Ty::Any, _) => any(x),
-                (p, t) if p == t => x,
+                (p, _) if let Some(y) = fit(p, &x) => y,
                 // An unproven argument for an unboxed parameter: the caller
                 // checks the arguments again.
                 _ => {
@@ -3588,10 +3757,35 @@ impl LoopTest {
     }
 }
 
+/// An int32 literal (`5`, `-5`; not `-0`).
+fn int_literal(e: &Expr) -> Option<i32> {
+    let v = match &e.kind {
+        ExprKind::Num(v) => *v,
+        ExprKind::Unary(UnOp::Neg, x) => match x.kind {
+            ExprKind::Num(v) => -v,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let ok = v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64 && !(v == 0.0 && v.is_sign_negative());
+    ok.then_some(v as i32)
+}
+
+/// `x` as an argument for a parameter of ABI type `p`, if it is one without
+/// a check: `int` arguments are ints, number ones any number.
+fn fit(p: Ty, x: &Expr) -> Option<Expr> {
+    match (p, x.ty) {
+        _ if p == x.ty => Some(x.clone()),
+        (Ty::F64, Ty::I32) => Some(x.clone()),
+        (Ty::I32, _) => int_literal(x).map(|c| Expr::new(Ty::I32, ExprKind::Num(c as f64))),
+        _ => None,
+    }
+}
+
 /// `obj[key]`: on a typed array with a number key, its element.
 fn get_elem(obj: Expr, key: Key) -> Expr {
     match (obj.ty, key) {
-        (Ty::Arr(kind), Key::Value(k)) if k.ty == Ty::F64 => {
+        (Ty::Arr(kind), Key::Value(k)) if k.ty.is_number() => {
             Expr::new(Ty::MaybeF64, ExprKind::TypedGet(kind, Box::new(obj), k))
         }
         (_, Key::Atom(a)) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), a)),
@@ -3602,7 +3796,7 @@ fn get_elem(obj: Expr, key: Key) -> Expr {
 /// `obj[key] = v` (evaluates to `v`).
 fn set_elem(obj: Expr, key: Expr, v: Expr) -> Expr {
     match obj.ty {
-        Ty::Arr(kind) if key.ty == Ty::F64 && num(v.ty) => {
+        Ty::Arr(kind) if key.ty.is_number() && num(v.ty) => {
             Expr::new(v.ty, ExprKind::TypedSet(kind, Box::new(obj), Box::new(key), Box::new(v)))
         }
         _ => Expr::new(Ty::Any, ExprKind::SetElem(Box::new(any(obj)), Box::new(key), Box::new(any(v)))),
@@ -3631,7 +3825,12 @@ fn arith(op: AnyBinOp, x: Expr, y: Expr) -> Expr {
             AnyBinOp::BitOr => BinOp::BitOr,
             AnyBinOp::BitXor => BinOp::BitXor,
         };
-        return Expr::new(Ty::F64, ExprKind::Binary(op, Box::new(x), Box::new(y)));
+        // ToInt32 results; `>>>` is a uint32.
+        let ty = match op {
+            BinOp::Shl | BinOp::Sar | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => Ty::I32,
+            _ => Ty::F64,
+        };
+        return Expr::new(ty, ExprKind::Binary(op, Box::new(x), Box::new(y)));
     }
     Expr::new(Ty::Any, ExprKind::AnyBinary(op, Box::new(any(x)), Box::new(any(y))))
 }
@@ -3651,7 +3850,7 @@ fn any_or_num(x: Expr) -> Expr {
 /// Whether values of type `t` are numbers in arithmetic (`MaybeF64`'s
 /// `undefined` converts to NaN, which it is).
 fn num(t: Ty) -> bool {
-    matches!(t, Ty::F64 | Ty::MaybeF64)
+    matches!(t, Ty::F64 | Ty::I32 | Ty::MaybeF64)
 }
 
 /// A `num` value converted with ToNumber: the same bits.
@@ -3695,7 +3894,9 @@ fn math_call(f: MathFn, mut args: Vec<Expr>, span: Span) -> R<Expr> {
         let mut it = args.into_iter();
         let mut acc = it.next().unwrap();
         for a in it {
-            acc = Expr::new(Ty::F64, ExprKind::Math(f, vec![acc, a]));
+            // The min / max of int32s is one of them.
+            let ty = if acc.ty == Ty::I32 && a.ty == Ty::I32 { Ty::I32 } else { Ty::F64 };
+            acc = Expr::new(ty, ExprKind::Math(f, vec![acc, a]));
         }
         return Ok(acc);
     }

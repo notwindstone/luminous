@@ -27,6 +27,18 @@ pub enum Ty {
     /// `MAYBE_F64_UNDEFINED`, which no other value of this type has. Both
     /// are NaN in arithmetic, as JS converts `undefined` to.
     MaybeF64,
+    /// A number known to be an int32 (never -0): the `int` type, and the
+    /// results of bitwise operators. A subtype of `F64` wherever numbers
+    /// are expected; represented as a sign-extended `i64` in locals, block
+    /// parameters, arguments and returns.
+    I32,
+}
+
+impl Ty {
+    /// `F64` or `I32`: a number that is never `undefined`.
+    pub fn is_number(self) -> bool {
+        matches!(self, Ty::F64 | Ty::I32)
+    }
 }
 
 /// The bit pattern of `undefined` as a `Ty::MaybeF64`.
@@ -98,6 +110,7 @@ impl fmt::Display for Ty {
             Ty::Any => "any",
             Ty::Arr(k) => k.name(),
             Ty::MaybeF64 => "number | undefined",
+            Ty::I32 => "int",
         })
     }
 }
@@ -574,6 +587,7 @@ impl MathFn {
     pub fn ret(self) -> Ty {
         match self {
             MathFn::IsNaN | MathFn::IsFinite | MathFn::IsInteger | MathFn::IsSafeInteger => Ty::Bool,
+            MathFn::Imul | MathFn::Clz32 => Ty::I32,
             _ => Ty::F64,
         }
     }
@@ -1059,11 +1073,11 @@ pub fn scalar_replace(f: &mut Func) {
 fn number_write(l: LocalId, v: &Expr) -> bool {
     let operand = |x: &Expr| match &x.kind {
         ExprKind::Local(m) => *m == l,
-        ExprKind::Box(e) => e.ty == Ty::F64,
+        ExprKind::Box(e) => e.ty.is_number(),
         _ => false,
     };
     match &v.kind {
-        ExprKind::Box(e) => e.ty == Ty::F64,
+        ExprKind::Box(e) => e.ty.is_number(),
         ExprKind::AnyUnary(AnyUnOp::Inc | AnyUnOp::Dec, x) => matches!(x.kind, ExprKind::Local(m) if m == l),
         ExprKind::AnyBinary(AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul | AnyBinOp::Div, a, b) => {
             operand(a) && operand(b)

@@ -71,6 +71,9 @@ const PROP_THROW: i64 = 1 << 14;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum V {
     Num(Value),
+    /// An `I32` value as a sign-extended `i64`: only where values cross a
+    /// call, a return or a block boundary (see `Lower::abi`).
+    Int(Value),
     Bool(Value),
     Any(Value, Value),
     Void,
@@ -98,7 +101,7 @@ impl V {
     /// As Cranelift values (block arguments, returns).
     pub(crate) fn values(self) -> Vec<Value> {
         match self {
-            V::Num(v) | V::Bool(v) => vec![v],
+            V::Num(v) | V::Bool(v) | V::Int(v) => vec![v],
             V::Any(p, t) => vec![p, t],
             V::Void => vec![],
         }
@@ -108,6 +111,7 @@ impl V {
 /// Cranelift types of a value of type `t`.
 pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
     match t {
+        Ty::I32 => vec![I64],
         Ty::F64 | Ty::MaybeF64 => vec![F64],
         Ty::Bool => vec![I8],
         Ty::Any | Ty::Arr(_) => vec![I64, I64],
@@ -123,6 +127,7 @@ pub(crate) fn is_js(t: Ty) -> bool {
 /// Rebuild a `V` of type `t` from Cranelift values.
 pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
     match t {
+        Ty::I32 => V::Int(vs[0]),
         Ty::F64 | Ty::MaybeF64 => V::Num(vs[0]),
         Ty::Bool => V::Bool(vs[0]),
         Ty::Any | Ty::Arr(_) => V::Any(vs[0], vs[1]),
@@ -184,6 +189,8 @@ pub(crate) struct Env {
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
+    /// Parameter types, by `FuncId`.
+    pub params: std::rc::Rc<Vec<Vec<Ty>>>,
 }
 
 /// An exception edge: its block, the temporaries to free there, the handler.
@@ -238,6 +245,14 @@ pub(crate) struct Lower<'a> {
     /// `f64` values that are exact integers by construction (int locals,
     /// integral constants), and their `i64` value.
     int_of: HashMap<Value, Value>,
+    /// Of those, the ones in the int32 range.
+    i32s: std::collections::HashSet<Value>,
+    /// Products of two int32s: their exact `i64` value (the `f64` may be
+    /// rounded, which cannot change how it compares to an int32).
+    wide_of: HashMap<Value, Value>,
+    /// `%` results: their integer value (the `f64` may be -0 for 0), valid
+    /// when the flag (the divisor was not 0) is set; else the `f64` is NaN.
+    rem_of: HashMap<Value, (Value, Value)>,
     /// Int locals whose current update cannot pass 2^53: loop counters
     /// below a constant bound (see `bounded_counter`).
     bounded: Vec<ir::LocalId>,
@@ -267,7 +282,7 @@ impl<'a> Lower<'a> {
             .iter()
             .enumerate()
             .map(|(i, &t)| match t {
-                _ if ints[i] => LVar::Int(b.declare_var(I64)),
+                _ if ints[i] || t == Ty::I32 => LVar::Int(b.declare_var(I64)),
                 _ if f.boxed[i] => LVar::Boxed {
                     obj: (b.declare_var(I64), b.declare_var(I64)),
                     slot: b.declare_var(I64),
@@ -306,6 +321,9 @@ impl<'a> Lower<'a> {
             async_cx: None,
             ret_slot: f.ret_slot,
             int_of: HashMap::new(),
+            i32s: Default::default(),
+            wide_of: HashMap::new(),
+            rem_of: HashMap::new(),
             bounded: Vec::new(),
             small,
         };
@@ -324,6 +342,11 @@ impl<'a> Lower<'a> {
                 // A widened parameter is boxed on entry.
                 Some(&p) => match (t, p) {
                     (Ty::Any, V::Num(d)) => {
+                        let (p, t) = l.box_number(d);
+                        V::Any(p, t)
+                    }
+                    (Ty::Any, V::Int(i)) => {
+                        let d = l.int_f64(i);
                         let (p, t) = l.box_number(d);
                         V::Any(p, t)
                     }
@@ -369,6 +392,7 @@ impl<'a> Lower<'a> {
     fn zero(&mut self, t: Ty) -> V {
         match t {
             Ty::F64 | Ty::MaybeF64 => V::Num(self.b.ins().f64const(0.0)),
+            Ty::I32 => V::Int(self.b.ins().iconst(I64, 0)),
             Ty::Bool => V::Bool(self.b.ins().iconst(I8, 0)),
             Ty::Any | Ty::Arr(_) => self.konst(0, TAG_UNDEFINED),
             Ty::Void => V::Void,
@@ -398,9 +422,10 @@ impl<'a> Lower<'a> {
             (LVar::One(var), V::Num(x) | V::Bool(x)) => self.b.def_var(var, x),
             // Only ever an integer (by `int_locals`).
             (LVar::Int(var), V::Num(x)) => {
-                let i = self.b.ins().fcvt_to_sint_sat(I64, x);
+                let i = self.int_of_num(x);
                 self.b.def_var(var, i)
             }
+            (LVar::Int(var), V::Int(i)) => self.b.def_var(var, i),
             (LVar::Two(p, t), V::Any(x, y)) => {
                 self.b.def_var(p, x);
                 self.b.def_var(t, y);
@@ -414,9 +439,13 @@ impl<'a> Lower<'a> {
         match (self.vars[l], self.locals[l]) {
             (LVar::One(v), Ty::F64 | Ty::MaybeF64) => V::Num(self.b.use_var(v)),
             (LVar::One(v), Ty::Bool) => V::Bool(self.b.use_var(v)),
-            (LVar::Int(v), _) => {
+            (LVar::Int(v), t) => {
                 let i = self.b.use_var(v);
-                V::Num(self.int_f64(i))
+                let d = self.int_f64(i);
+                if t == Ty::I32 {
+                    self.i32s.insert(d);
+                }
+                V::Num(d)
             }
             (LVar::Two(p, t), _) => V::Any(self.b.use_var(p), self.b.use_var(t)),
             (LVar::Boxed { .. }, _) => {
@@ -648,11 +677,13 @@ impl<'a> Lower<'a> {
         self.free_all_locals();
         if is_async {
             // The value the promise resolves to.
-            let (p, t) = match from_values(self.ret, &rv) {
+            let ret = self.ret;
+            let (p, t) = match self.unabi(ret, &rv) {
                 V::Num(d) => self.box_number(d),
                 V::Bool(x) => (self.b.ins().uextend(I64, x), self.b.ins().iconst(I64, TAG_BOOL)),
                 V::Any(p, t) => (p, t),
                 V::Void => (self.b.ins().iconst(I64, 0), self.b.ins().iconst(I64, TAG_UNDEFINED)),
+                V::Int(_) => unreachable!("converted by unabi"),
             };
             self.b.ins().return_(&[p, t]);
         } else {
@@ -854,7 +885,7 @@ impl<'a> Lower<'a> {
                     self.run_finally_until(0);
                     let (p, t) = self.take_local(slot);
                     match self.ret {
-                        Ty::F64 => V::Num(self.number_of((p, t))),
+                        Ty::F64 | Ty::I32 => V::Num(self.number_of((p, t))),
                         Ty::Bool => {
                             let x = self.b.ins().ireduce(I8, p);
                             V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0))
@@ -866,7 +897,8 @@ impl<'a> Lower<'a> {
         } else {
             v
         };
-        let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
+        let ret = self.ret;
+        let args: Vec<BlockArg> = self.abi(ret, v).into_iter().map(BlockArg::Value).collect();
         let rb = self.ret_block;
         self.b.ins().jump(rb, &args);
         self.after_terminator();
@@ -1118,6 +1150,85 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// An `f64` that holds an integer as that `i64` (exact by construction,
+    /// else converted).
+    fn int_of_num(&mut self, d: Value) -> Value {
+        match self.int_of.get(&d) {
+            Some(&i) => i,
+            None => self.b.ins().fcvt_to_sint_sat(I64, d),
+        }
+    }
+
+    /// Values of type `ty` as they cross a block, call or return: `I32`
+    /// ones as `i64`s.
+    fn abi(&mut self, ty: Ty, v: V) -> Vec<Value> {
+        match (ty, v) {
+            (Ty::I32, V::Num(d)) => vec![self.int_of_num(d)],
+            _ => v.values(),
+        }
+    }
+
+    /// The inverse of `abi`.
+    fn unabi(&mut self, ty: Ty, vs: &[Value]) -> V {
+        match from_values(ty, vs) {
+            V::Int(i) => {
+                let d = self.int_f64(i);
+                self.i32s.insert(d);
+                V::Num(d)
+            }
+            v => v,
+        }
+    }
+
+    /// Integers to compare `a` and `c` by, when that agrees with comparing
+    /// the doubles: both exact, or an int32 against a rounded product of
+    /// int32s (a rounded product is past 2^53, far from any int32). `%`
+    /// results may be -0 for 0, which compares the same.
+    /// Also the flags under which they are valid (else a `%` result is NaN).
+    fn int_pair(&self, a: Value, c: Value) -> Option<(Value, Value, Vec<Value>)> {
+        let exact = |v: &Value| match self.rem_of.get(v) {
+            Some(&(i, ok)) => Some((i, Some(ok))),
+            None => self.int_of.get(v).map(|&i| (i, None)),
+        };
+        let small = |v: &Value| self.i32s.contains(v) || self.rem_of.contains_key(v);
+        let (x, y) = match (exact(&a), exact(&c)) {
+            (Some(x), Some(y)) => (x, y),
+            (None, Some(y)) if small(&c) => ((*self.wide_of.get(&a)?, None), y),
+            (Some(x), None) if small(&a) => (x, (*self.wide_of.get(&c)?, None)),
+            _ => return None,
+        };
+        Some((x.0, y.0, x.1.into_iter().chain(y.1).collect()))
+    }
+
+    /// `a % c` for int32s `a` (`x`) and `y`: the integer remainder,
+    /// with the dividend's sign (`-4 % 2` is -0); NaN for `% 0`.
+    fn int_rem(&mut self, x: Value, y: Value, a: Value) -> Value {
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, F64);
+        let r_param = self.b.append_block_param(join, I64);
+        let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
+        self.b.ins().brif(nonzero, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        // 32-bit division is much faster than 64-bit (Cranelift defines
+        // INT32_MIN % -1 as 0).
+        let (x32, y32) = (self.b.ins().ireduce(I32, x), self.b.ins().ireduce(I32, y));
+        let r = self.b.ins().srem(x32, y32);
+        let r = self.b.ins().sextend(I64, r);
+        let rf = self.b.ins().fcvt_from_sint(F64, r);
+        let rf = self.b.ins().fcopysign(rf, a);
+        self.b.ins().jump(join, &[BlockArg::Value(rf), BlockArg::Value(r)]);
+        self.b.switch_to_block(slow);
+        let nan = self.b.ins().f64const(f64::NAN);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
+        self.b.switch_to_block(join);
+        self.rem_of.insert(res, (r_param, nonzero));
+        res
+    }
+
     /// An int local's value as an `f64` (exact: see `int_locals`).
     fn int_f64(&mut self, i: Value) -> Value {
         let d = self.b.ins().fcvt_from_sint(F64, i);
@@ -1178,18 +1289,19 @@ impl<'a> Lower<'a> {
         if let Some(c) = int_step(l, x) {
             let LVar::Int(var) = self.vars[l] else { unreachable!() };
             let cur = self.b.use_var(var);
-            if self.small[l] {
+            if self.small[l] || self.locals[l] == Ty::I32 {
                 return self.b.ins().iadd_imm_s(cur, c);
             }
             return self.int_add(cur, c);
         }
-        match (&x.kind, &self.vars) {
-            (ExprKind::Local(m), vars) => match vars[*m] {
-                LVar::Int(var) => self.b.use_var(var),
-                _ => unreachable!("int local assigned a non-int local"),
-            },
-            _ => unreachable!("int local assigned a non-int value"),
+        if let ExprKind::Local(m) = x.kind
+            && let LVar::Int(var) = self.vars[m]
+        {
+            return self.b.use_var(var);
         }
+        // An int by the checker (an `int` local's value) or by `int_locals`.
+        let d = self.expr(x).num();
+        self.int_of_num(d)
     }
 
     pub(crate) fn expr(&mut self, e: &Expr) -> V {
@@ -1199,6 +1311,9 @@ impl<'a> Lower<'a> {
                 if let Some(c) = int_literal(e, INT_EXACT as f64) {
                     let i = self.b.ins().iconst(I64, c);
                     self.int_of.insert(d, i);
+                    if i32::try_from(c).is_ok() {
+                        self.i32s.insert(d);
+                    }
                 }
                 V::Num(d)
             }
@@ -1263,7 +1378,7 @@ impl<'a> Lower<'a> {
             ExprKind::Update { local, delta, prefix } => {
                 if let LVar::Int(var) = self.vars[*local] {
                     let old = self.b.use_var(var);
-                    let new = if self.small[*local] || self.bounded.contains(local) {
+                    let new = if self.small[*local] || self.bounded.contains(local) || self.locals[*local] == Ty::I32 {
                         self.b.ins().iadd_imm_s(old, *delta as i64)
                     } else {
                         self.int_add(old, *delta as i64)
@@ -1285,7 +1400,10 @@ impl<'a> Lower<'a> {
                     UnOp::BitNot => {
                         let i = self.toint32(v.num());
                         let r = self.b.ins().bnot(i);
-                        V::Num(self.b.ins().fcvt_from_sint(F64, r))
+                        let r = self.b.ins().sextend(I64, r);
+                        let d = self.int_f64(r);
+                        self.i32s.insert(d);
+                        V::Num(d)
                     }
                 }
             }
@@ -1300,6 +1418,7 @@ impl<'a> Lower<'a> {
                         r
                     }
                     V::Void => self.b.ins().iconst(I8, 0),
+                    V::Int(_) => unreachable!("an ABI value"),
                 })
             }
             ExprKind::Binary(op, x, y) => {
@@ -1311,7 +1430,8 @@ impl<'a> Lower<'a> {
                 let a = self.expr(x);
                 let c = self.expr(y);
                 V::Bool(match (a, c) {
-                    (V::Num(a), V::Num(c)) if self.int_of.contains_key(&a) && self.int_of.contains_key(&c) => {
+                    (V::Num(a), V::Num(c)) if self.int_pair(a, c).is_some() => {
+                        let (ia, ic, valid) = self.int_pair(a, c).unwrap();
                         let cc = match op {
                             CmpOp::Lt => IntCC::SignedLessThan,
                             CmpOp::Le => IntCC::SignedLessThanOrEqual,
@@ -1320,7 +1440,16 @@ impl<'a> Lower<'a> {
                             CmpOp::Eq => IntCC::Equal,
                             CmpOp::Ne => IntCC::NotEqual,
                         };
-                        self.b.ins().icmp(cc, self.int_of[&a], self.int_of[&c])
+                        let r = self.b.ins().icmp(cc, ia, ic);
+                        // A NaN `%` result: only `!=` holds.
+                        valid.into_iter().fold(r, |r, ok| {
+                            if *op == CmpOp::Ne {
+                                let nan = self.b.ins().bxor_imm_u(ok, 1);
+                                self.b.ins().bor(r, nan)
+                            } else {
+                                self.b.ins().band(r, ok)
+                            }
+                        })
                     }
                     (V::Num(a), V::Num(c)) => {
                         let cc = match op {
@@ -1354,21 +1483,22 @@ impl<'a> Lower<'a> {
                 for (blk, arm) in [(tb, x), (eb, y)] {
                     self.b.switch_to_block(blk);
                     let v = self.expr(arm);
-                    let args: Vec<BlockArg> = v.values().into_iter().map(BlockArg::Value).collect();
+                    let args: Vec<BlockArg> = self.abi(e.ty, v).into_iter().map(BlockArg::Value).collect();
                     self.b.ins().jump(join, &args);
                 }
                 self.b.switch_to_block(join);
                 let params = self.b.block_params(join).to_vec();
-                from_values(e.ty, &params)
+                self.unabi(e.ty, &params)
             }
             ExprKind::Call(id, args) => {
                 let mut vals = Vec::new();
                 let mut held = Vec::new();
-                for a in args {
+                let tys = self.env.params.clone();
+                for (a, &t) in args.iter().zip(&tys[*id]) {
                     let v = self.expr(a);
                     self.hold(v);
                     held.push(v);
-                    vals.extend(v.values());
+                    vals.extend(self.abi(t, v));
                 }
                 // The callee takes ownership of its arguments.
                 for v in held.into_iter().rev() {
@@ -1379,7 +1509,7 @@ impl<'a> Lower<'a> {
                 let call = self.b.ins().call(self.env.funcs[*id], &call_args);
                 let results = self.b.inst_results(call).to_vec();
                 self.check_flag();
-                from_values(e.ty, &results)
+                self.unabi(e.ty, &results)
             }
             ExprKind::Math(f, args) => {
                 let vals: Vec<Value> = args.iter().map(|a| self.expr(a).num()).collect();
@@ -2281,7 +2411,7 @@ impl<'a> Lower<'a> {
         for t in clif_types(ty) {
             self.b.append_block_param(join, t);
         }
-        let keep: Vec<BlockArg> = a.values().into_iter().map(BlockArg::Value).collect();
+        let keep: Vec<BlockArg> = self.abi(ty, a).into_iter().map(BlockArg::Value).collect();
         match op {
             LogicalOp::And => self.b.ins().brif(truth, rhs, &[], join, &keep),
             LogicalOp::Or | LogicalOp::Nullish => self.b.ins().brif(truth, join, &keep, rhs, &[]),
@@ -2289,11 +2419,11 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(rhs);
         self.free_v(a);
         let c = self.expr(y);
-        let args: Vec<BlockArg> = c.values().into_iter().map(BlockArg::Value).collect();
+        let args: Vec<BlockArg> = self.abi(ty, c).into_iter().map(BlockArg::Value).collect();
         self.b.ins().jump(join, &args);
         self.b.switch_to_block(join);
         let params = self.b.block_params(join).to_vec();
-        from_values(ty, &params)
+        self.unabi(ty, &params)
     }
 
     // ---- dynamic values ----
@@ -2721,6 +2851,34 @@ impl<'a> Lower<'a> {
     }
 
     fn binary(&mut self, op: BinOp, a: Value, c: Value) -> Value {
+        let ints = (self.i32s.contains(&a) && self.i32s.contains(&c)).then(|| (self.int_of[&a], self.int_of[&c]));
+        match (op, ints) {
+            // Exact: |a + b| <= 2^32.
+            (BinOp::Add, Some((x, y))) => {
+                let r = self.b.ins().iadd(x, y);
+                return self.int_f64(r);
+            }
+            (BinOp::Sub, Some((x, y))) => {
+                let r = self.b.ins().isub(x, y);
+                return self.int_f64(r);
+            }
+            // The `f64` product is the exact one rounded (past 2^53).
+            (BinOp::Mul, Some((x, y))) => {
+                let p = self.b.ins().imul(x, y);
+                let zero = self.b.ins().icmp_imm_s(IntCC::Equal, p, 0);
+                let neg = self.b.ins().bxor(x, y);
+                let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, neg, 0);
+                let negzero = self.b.ins().band(zero, neg);
+                let d = self.b.ins().fcvt_from_sint(F64, p);
+                // `-3 * 0` is -0.
+                let mz = self.b.ins().f64const(-0.0);
+                let d = self.b.ins().select(negzero, mz, d);
+                self.wide_of.insert(d, p);
+                return d;
+            }
+            (BinOp::Rem, Some((x, y))) => return self.int_rem(x, y, a),
+            _ => {}
+        }
         match op {
             BinOp::Add => self.b.ins().fadd(a, c),
             BinOp::Sub => self.b.ins().fsub(a, c),
@@ -2740,11 +2898,15 @@ impl<'a> Lower<'a> {
                     BinOp::Sar => self.b.ins().sshr(x, y),
                     BinOp::Shr => {
                         let r = self.b.ins().ushr(x, y);
-                        return self.b.ins().fcvt_from_uint(F64, r);
+                        let r = self.b.ins().uextend(I64, r);
+                        return self.int_f64(r);
                     }
                     _ => unreachable!(),
                 };
-                self.b.ins().fcvt_from_sint(F64, r)
+                let r = self.b.ins().sextend(I64, r);
+                let d = self.int_f64(r);
+                self.i32s.insert(d);
+                d
             }
         }
     }
@@ -3416,6 +3578,10 @@ impl<'a> Lower<'a> {
     fn boxed(&mut self, v: V) -> (Value, Value) {
         match v {
             V::Num(d) => self.box_number(d),
+            V::Int(i) => {
+                let d = self.int_f64(i);
+                self.box_number(d)
+            }
             V::Bool(x) => {
                 let p = self.b.ins().uextend(I64, x);
                 (p, self.b.ins().iconst(I64, TAG_BOOL))
@@ -3606,6 +3772,8 @@ fn bound_stmts(stmts: &[Stmt], times: f64, lit: &mut [f64], steps: &mut [f64]) {
             ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v) => {
                 if let Some(c) = int_literal(v, INT_EXACT as f64) {
                     lit[*l] = lit[*l].max(c.unsigned_abs() as f64);
+                } else if v.ty == Ty::I32 {
+                    lit[*l] = lit[*l].max(2_147_483_648.0);
                 } else if let Some(c) = int_step(*l, v) {
                     steps[*l] += c.unsigned_abs() as f64 * times;
                 } else {
@@ -3687,7 +3855,8 @@ fn static_trips(before: &[Stmt], test: Option<&Expr>, body: &[Stmt], update: Opt
 }
 
 /// The `F64` locals that only ever hold integers, which are kept in `i64`s:
-/// locals (not parameters, not boxed) only assigned integer literals, other
+/// locals (not parameters, not boxed) only assigned integer literals, `int`
+/// values (`I32`: bitwise results, `int` locals and calls), other
 /// such locals, and themselves plus or minus small integers (`x++`,
 /// `x += 2`). A step past 2^53 rounds the result as `f64` arithmetic would,
 /// so the value is always exactly the double JS computes; with small steps
@@ -3701,7 +3870,8 @@ fn int_locals(f: &ir::Func) -> Vec<bool> {
             let (l, ok) = match &e.kind {
                 ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => (
                     *l,
-                    int_literal(x, INT_EXACT as f64).is_some()
+                    x.ty == Ty::I32
+                        || int_literal(x, INT_EXACT as f64).is_some()
                         || int_step(*l, x).is_some()
                         || matches!(x.kind, ExprKind::Local(m) if ints[m]),
                 ),
