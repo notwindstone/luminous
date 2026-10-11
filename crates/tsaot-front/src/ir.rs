@@ -346,6 +346,10 @@ pub enum ExprKind {
     ToObject(Box<Expr>),
     /// ToPropertyKey.
     ToPropKey(Box<Expr>),
+    /// `obj[key]` in a `for`-`in` loop over the iterator in local `iter`
+    /// whose current key `key` may be (a direct read when it is, and obj has
+    /// the shape being enumerated).
+    ForInGet(LocalId, Box<Expr>, Box<Expr>),
     /// Private names of classes (`Module::privates` slots, filled when the
     /// class is defined): a field's value (`obj.#x`), its assignment (to
     /// the value), a method after the brand check, a getter's result, a
@@ -677,6 +681,10 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
         ObjectRest(a, xs) => {
             visit(a, f);
             xs.iter().for_each(|x| visit(x, f));
+        }
+        ForInGet(_, a, b) => {
+            visit(a, f);
+            visit(b, f);
         }
         PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) => {
             visit(a, f);

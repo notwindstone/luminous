@@ -837,6 +837,8 @@ struct FnCx<'x, 'm, 'a> {
     /// Methods (and the closures in them): their class, and whether the
     /// method is static.
     class: Option<(usize, bool)>,
+    /// Enclosing `for`-`in` loops: their key variable and iterator.
+    for_in_keys: Vec<(SymbolId, ir::LocalId)>,
     /// The last parameter is a rest parameter.
     rest: bool,
     /// Functions that suspend: where a return value waits for `finally`s.
@@ -1024,6 +1026,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_generator: false,
             ret_slot: None,
             rest: false,
+            for_in_keys: Vec::new(),
             class: None,
             locals: Vec::new(),
             mutable: Vec::new(),
@@ -2291,7 +2294,24 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 target => cx.assign_target(target.to_assignment_target(), v, &mut inner)?,
             }
-            inner.extend(cx.body(stmt_body)?);
+            // `obj[key]` with the key of a `for`-`in` may read it directly.
+            let key_sym = match left {
+                _ if is_of => None,
+                ForStatementLeft::VariableDeclaration(d) => match &d.declarations[0].id {
+                    BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+                    _ => None,
+                },
+                ForStatementLeft::AssignmentTargetIdentifier(id) => cx.resolve(id),
+                _ => None,
+            };
+            if let Some(sym) = key_sym {
+                cx.for_in_keys.push((sym, iter));
+            }
+            let r = cx.body(stmt_body);
+            if key_sym.is_some() {
+                cx.for_in_keys.pop();
+            }
+            inner.extend(r?);
             if is_of {
                 body.push(Stmt::IterGuard { iter, next: next.unwrap(), loop_id: Some(id), body: inner });
             } else {
@@ -2387,6 +2407,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::ComputedMemberExpression(m) => {
                 if m.optional {
                     return reject(span, "optional chaining is not supported yet");
+                }
+                if let Expression::Identifier(id) = m.expression.without_parentheses()
+                    && let Some(sym) = self.resolve(id)
+                    && let Some(&(_, iter)) = self.for_in_keys.iter().rev().find(|(s, _)| *s == sym)
+                {
+                    let mut obj = [any(self.expr(&m.object)?)];
+                    let mark = self.pre.len();
+                    let key = any(self.ident(id)?);
+                    self.order(&mut obj, mark);
+                    let [obj] = obj;
+                    return Ok(Expr::new(Ty::Any, ExprKind::ForInGet(iter, Box::new(obj), Box::new(key))));
                 }
                 let mut obj = [self.expr(&m.object)?];
                 let mark = self.pre.len();

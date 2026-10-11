@@ -490,7 +490,8 @@ int tsaot_lock_builtins(JSContext *ctx)
         "  fresh.push([], g.Array.prototype, g.Array.prototype[Symbol.iterator],\n"
         "             arrayIteratorProto, arrayIteratorProto.next, Symbol.iterator,\n"
         "             Object.getPrototypeOf(async function () {}),\n"
-        "             Object.getPrototypeOf(function* () {}));\n"
+        "             Object.getPrototypeOf(function* () {}),\n"
+        "             Object.getPrototypeOf(function* () {}).prototype.next);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
@@ -992,4 +993,19 @@ int tsaot_super_set(JSContext *ctx, JSValue *v, JSValue val)
 int tsaot_private_set(JSContext *ctx, JSValue *v, JSValue val)
 {
     return JS_PrivateSet(ctx, v[0], v[1], val);
+}
+
+/* obj[key] in a for-in: v = { iterator, obj, key } (borrowed). */
+JSValue tsaot_for_in_get(JSContext *ctx, JSValue *v)
+{
+    return JS_ForInGet(ctx, v[0], v[1], v[2]);
+}
+
+/* Whether an iteration with this iterator and `next` method can resume a
+ * native generator directly: the original %GeneratorPrototype%.next. */
+int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next)
+{
+    JSValue orig = tsaot_pins[TSAOT_PIN_GENERATOR_NEXT];
+    return JS_IsNativeGenerator(iter) && JS_VALUE_GET_TAG(next) == JS_VALUE_GET_TAG(orig) &&
+           JS_VALUE_GET_PTR(next) == JS_VALUE_GET_PTR(orig);
 }

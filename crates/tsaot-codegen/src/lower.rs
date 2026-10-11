@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::types::{F32, F64, I8, I32, I64};
+use cranelift_codegen::ir::types::{F32, F64, I8, I32, I64, I64X2};
 use cranelift_codegen::ir::{
     Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, Type, Value,
 };
@@ -1282,6 +1282,25 @@ impl<'a> Lower<'a> {
                 self.release(a);
                 V::Any(p, t)
             }
+            ExprKind::AnyCompare(op @ (AnyCmpOp::StrictEq | AnyCmpOp::StrictNe), x, y)
+                if matches!(x.kind, ExprKind::Undefined | ExprKind::Null)
+                    || matches!(y.kind, ExprKind::Undefined | ExprKind::Null) =>
+            {
+                // Strict equality with `undefined` / `null` is a tag test.
+                let (other, konst) =
+                    if matches!(y.kind, ExprKind::Undefined | ExprKind::Null) { (x, y) } else { (y, x) };
+                let (v, owned) = self.operand(other, &[]);
+                let tag = if let ExprKind::Null = konst.kind { TAG_NULL } else { TAG_UNDEFINED };
+                let r = match v {
+                    V::Any(_, t) => {
+                        let cc = if *op == AnyCmpOp::StrictEq { IntCC::Equal } else { IntCC::NotEqual };
+                        self.b.ins().icmp_imm_s(cc, t, tag)
+                    }
+                    _ => self.b.ins().iconst(I8, (*op == AnyCmpOp::StrictNe) as i64),
+                };
+                self.drop_operand(v, owned);
+                V::Bool(r)
+            }
             ExprKind::AnyCompare(op, x, y) => {
                 // Boxed numbers are compared unboxed (boxed only to go slow).
                 let a = self.unboxed_operand(x);
@@ -1446,7 +1465,8 @@ impl<'a> Lower<'a> {
                 let count = self.array_part(op_, ot, ok, slow);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
                 let hit = self.b.create_block();
-                self.b.ins().brif(inb, hit, &[], slow, &[]);
+                let beyond = self.b.create_block();
+                self.b.ins().brif(inb, hit, &[], beyond, &[]);
                 self.b.switch_to_block(hit);
                 let at = self.array_slot(op_, idx);
                 let old_p = self.b.ins().load(I64, Self::mem(), at, 0);
@@ -1454,6 +1474,21 @@ impl<'a> Lower<'a> {
                 self.b.ins().store(Self::mem(), vp, at, 0);
                 self.b.ins().store(Self::mem(), vt, at, TAG_OFFSET);
                 self.free((old_p, old_t));
+                self.b.ins().jump(join, &[]);
+                // Appending (index == count): the engine's append fast path,
+                // which takes the value unless it does not apply (-2).
+                self.b.switch_to_block(beyond);
+                let is_append = self.b.ins().icmp(IntCC::Equal, idx, count);
+                let append = self.b.create_block();
+                self.b.ins().brif(is_append, append, &[], slow, &[]);
+                self.b.switch_to_block(append);
+                let ctx = self.ctx;
+                let r = self.helper("JS_ArrayAppendFast", &[ctx, op_, ot, vp, vt]);
+                let na = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], -2);
+                let appended = self.b.create_block();
+                self.b.ins().brif(na, slow, &[], appended, &[]);
+                self.b.switch_to_block(appended);
+                self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 // Anything else: tsaot_set_elem takes the key and one
                 // reference to the value.
@@ -1950,6 +1985,18 @@ impl<'a> Lower<'a> {
                 self.free_v(key);
                 v
             }
+            ExprKind::ForInGet(iter, o, k) => {
+                let (obj, owned) = self.operand(o, &[k]);
+                let (key, key_owned) = self.operand(k, &[]);
+                let it = self.use_local(*iter).any();
+                let slot = self.values_slot(&[it, obj.any(), key.any()]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_for_in_get", &[ctx, slot]);
+                self.check_value(r[1]);
+                self.drop_operand(key, key_owned);
+                self.drop_operand(obj, owned);
+                V::Any(r[0], r[1])
+            }
             ExprKind::ToPropKey(x) => self.convert(x, "JS_ToPropertyKey"),
             ExprKind::ArrayPush(arr, x) => {
                 // Takes ownership of the value.
@@ -2021,9 +2068,12 @@ impl<'a> Lower<'a> {
         let size = (vals.len().max(1) * SIZE) as u32;
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 4));
         for (i, &(p, t)) in vals.iter().enumerate() {
+            // One 16-byte store per value: C code copies JSValues with
+            // 16-byte loads, which two 8-byte stores could not forward to.
             let off = (i * SIZE) as i32;
-            self.b.ins().stack_store(self.ptr, p, slot, off);
-            self.b.ins().stack_store(self.ptr, t, slot, off + TAG_OFFSET);
+            let v = self.b.ins().scalar_to_vector(I64X2, p);
+            let v = self.b.ins().insertlane(v, t, 1);
+            self.b.ins().stack_store(self.ptr, v, slot, off);
         }
         self.b.ins().stack_addr(self.ptr, slot, 0)
     }
@@ -2653,6 +2703,15 @@ impl<'a> Lower<'a> {
         let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
         self.check_value(m[1]);
         self.set_local(next, V::Any(m[0], m[1]));
+        // A native generator with the original `next`: resumed directly
+        // (`next` becomes `true`).
+        let ok = self.helper("tsaot_gen_iter_ok", &[ctx, it[0], it[1], m[0], m[1]]);
+        let generator = self.b.create_block();
+        self.b.ins().brif(ok[0], generator, &[], join, &[]);
+        self.b.switch_to_block(generator);
+        let one = self.b.ins().iconst(I64, 1);
+        let bool_tag = self.b.ins().iconst(I64, TAG_BOOL);
+        self.set_local(next, V::Any(one, bool_tag));
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
     }
@@ -2702,13 +2761,26 @@ impl<'a> Lower<'a> {
                 let int = self.b.ins().iconst(I64, TAG_INT);
                 self.def_local(n, V::Any(n1, int));
                 self.b.ins().jump(join, &[BlockArg::Value(v.0), BlockArg::Value(v.1)]);
-                // The iterator protocol.
+                // A native generator resumed directly, or the iterator protocol.
                 self.b.switch_to_block(protocol);
+                let done_addr = self.done_slot();
+                let resume = self.b.create_block();
+                let call = self.b.create_block();
+                let after = self.b.create_block();
+                let rp2 = self.b.append_block_param(after, I64);
+                let rt2 = self.b.append_block_param(after, I64);
+                let is_gen = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_BOOL);
+                self.b.ins().brif(is_gen, resume, &[], call, &[]);
+                self.b.switch_to_block(resume);
+                let r = self.helper("JS_NativeGeneratorNext", &[ctx, ip, it, done_addr]);
+                self.b.ins().jump(after, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(call);
                 let zero = self.b.ins().iconst(I32, 0);
                 let null = self.b.ins().iconst(self.ptr, 0);
-                let done_addr = self.done_slot();
                 let r = self.helper("JS_IteratorStep", &[ctx, ip, it, np, nt, zero, null, done_addr]);
-                (r, done_addr)
+                self.b.ins().jump(after, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(after);
+                (vec![rp2, rt2], done_addr)
             }
             None => {
                 let done_addr = self.done_slot();

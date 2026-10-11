@@ -7,9 +7,9 @@ machine code with [Cranelift](https://cranelift.dev):
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
 
-Whatever the compiler does not handle (`eval`, generators, private fields, and
-every function it cannot compile) keeps running in the QuickJS interpreter,
-linked into the same executable.
+Whatever the compiler does not handle (`eval`, async generators, class
+constructors, and every function it cannot compile) keeps running in the
+QuickJS interpreter, linked into the same executable.
 
 ```console
 $ tsaot report bench/primes.ts
@@ -128,8 +128,11 @@ regular call path's generated code alone.
   destructuring), CopyDataProperties (object spread and rest), property
   access with a receiver (`super`), private field access and brand checks,
   and reading a private name's value from a closure;
+- `JS_ForInGet`, `JS_ArrayAppendFast`: `for`-`in` over an object's shape
+  and in-place array growth (`xs[xs.length] = v`);
 - `JS_NewNativeGenerator`: generator objects whose body is native code,
-  driven by the engine's own `next` / `return` / `throw`;
+  driven by the engine's own `next` / `return` / `throw`, and resumed
+  directly by native `for`-`of` (`JS_NativeGeneratorNext`);
 - `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
   counts, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
@@ -172,7 +175,11 @@ regular call path's generated code alone.
   native generator objects are the engine's own.
 - **Iteration**: `for`-`of` and `for`-`in`; iterators are closed on `break`,
   `return` and exceptions as in JS. Arrays are iterated directly while array
-  iteration is the original one (checked when a loop starts).
+  iteration is the original one, and native generators are resumed directly
+  while `%GeneratorPrototype%.next` is the original one (both checked when a
+  loop starts). `for`-`in` walks the object's shape when it can (no index
+  keys, nothing enumerable on the prototype chain), and `obj[k]` with the
+  loop key reads the slot directly while the shape is unchanged.
 - **Destructuring** in declarations, parameters, `catch`, loop heads and
   assignments; **spread** in calls, `new`, and array and object literals;
   **rest** parameters and elements; **optional chaining**; computed keys in
@@ -324,8 +331,6 @@ In `boundary`, the interpreted loop around the calls dominates.
   remaining win for `primes`, `xorshift` and array indexing.
 - Shapes for class instances (inline property access), and calls to methods
   of known classes without the engine.
-- `for`-`of` (with a fast path for arrays), generators, destructuring, spread
-  and rest, optional chaining, private fields.
 - **Multi-module programs** (`import` between `.ts` files).
 - **Position-preserving type stripping**, so interpreter stack traces point
   at the original `.ts` lines.

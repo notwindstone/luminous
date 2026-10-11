@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,92 @@
+@@ -1052,6 +1059,103 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -60,6 +60,10 @@
 +                                         bool is_exception_pending);
 +JS_EXTERN JSValue JS_ForInIteratorObject(JSContext *ctx, JSValueConst obj);
 +JS_EXTERN JSValue JS_ForInStep(JSContext *ctx, JSValueConst enum_obj, int *pdone);
++/* obj[key] in a for-in over `enum_obj` (a JS_ForInIteratorObject), fast when
++   key is its current key and obj has the shape it enumerates. */
++JS_EXTERN JSValue JS_ForInGet(JSContext *ctx, JSValueConst enum_obj, JSValueConst obj,
++                              JSValueConst key);
 +JS_EXTERN int JS_CopyDataPropertiesExcluding(JSContext *ctx, JSValueConst target,
 +                                             JSValueConst source, JSValueConst excluded);
 +JS_EXTERN JSValue JS_GetPropertyReceiver(JSContext *ctx, JSValueConst obj, JSAtom prop,
@@ -77,6 +81,9 @@
 +/* An array iterator (values) positioned at `idx`, for code that iterated
 +   the array directly until it has to close the iterator. */
 +JS_EXTERN JSValue JS_NewArrayIteratorAt(JSContext *ctx, JSValueConst arr, uint32_t idx);
++/* arr[arr.length] = val for a fast array, as JS_SetPropertyValue does it;
++   -2 (val not taken) when that fast path does not apply. */
++JS_EXTERN int JS_ArrayAppendFast(JSContext *ctx, JSValueConst arr, JSValue val);
 +/* Generators whose body is native code: `step` runs it from where it
 +   stopped, given the resumption (next / return / throw: magic 0 / 1 / 2)
 +   and its value; it sets *pkind to 0 for a yielded value, 1 for an
@@ -87,6 +94,10 @@
 +                                      JSValueConst value, int *pkind);
 +JS_EXTERN JSValue JS_NewNativeGenerator(JSContext *ctx, JSValueConst func_obj,
 +                                        JSNativeGeneratorStep *step, JSValue frame);
++/* For native code iterating a native generator with the original `next`:
++   `next()` without the call through the iterator protocol. */
++JS_EXTERN bool JS_IsNativeGenerator(JSValueConst obj);
++JS_EXTERN JSValue JS_NativeGeneratorNext(JSContext *ctx, JSValueConst gen, int *pdone);
 +
 +/* Memory layout that natively compiled code reads directly, as byte offsets
 +   on 64-bit targets (checked by static assertions in quickjs.c). Offsets are
@@ -107,7 +118,7 @@
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1435,13 @@
+@@ -1342,6 +1446,13 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -123,7 +134,18 @@
                                         int length, int magic, int data_len,
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1207,6 +1207,25 @@
+@@ -922,6 +922,10 @@
+     bool is_array;
+     uint32_t array_length;
+     uint32_t idx;
++    /* JS_ForInIteratorObject: the keys are those of this shape
++       (referenced), from `idx`; `slot` is the last key's. */
++    JSShape *shape;
++    uint32_t slot;
+ } JSForInIterator;
+ 
+ typedef struct JSRegExp {
+@@ -1207,6 +1211,25 @@
      /* byte sizes: 40/48/72 */
  };
  
@@ -149,7 +171,7 @@
  typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
-@@ -6560,6 +6579,8 @@
+@@ -6560,6 +6583,8 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
@@ -158,7 +180,7 @@
      uint8_t length;
      uint8_t data_len;
      uint16_t magic;
-@@ -6608,6 +6629,11 @@
+@@ -6608,6 +6633,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -170,7 +192,7 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6679,8 @@
+@@ -6653,6 +6683,8 @@
          return JS_EXCEPTION;
      }
      s->func = func;
@@ -179,7 +201,7 @@
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6700,25 @@
+@@ -6672,6 +6704,25 @@
      return func_obj;
  }
  
@@ -205,7 +227,46 @@
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -16550,6 +16597,119 @@
+@@ -7036,6 +7087,8 @@
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
+     JS_FreeValueRT(rt, it->obj);
++    if (it->shape)
++        js_free_shape(rt, it->shape);
+     js_free_rt(rt, it);
+ }
+ 
+@@ -7045,6 +7098,8 @@
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
+     JS_MarkValue(rt, it->obj, mark_func);
++    if (it->shape)
++        mark_func(rt, &it->shape->header);
+ }
+ 
+ static void free_object(JSRuntime *rt, JSObject *p)
+@@ -10827,6 +10882,20 @@
+ }
+ 
+ /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
++
++int JS_ArrayAppendFast(JSContext *ctx, JSValueConst obj, JSValue val)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -2;
++    p = JS_VALUE_GET_OBJ(obj);
++    /* the conditions of the append fast path of JS_SetPropertyValue */
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || !p->extensible ||
++        p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
++        !ctx->std_array_prototype)
++        return -2;
++    return add_fast_array_element(ctx, p, val, JS_PROP_THROW);
++}
+ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                         JSValue prop, JSValue val, int flags)
+ {
+@@ -16550,6 +16619,119 @@
      return atom;
  }
  
@@ -325,7 +386,52 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -18047,6 +18207,29 @@
+@@ -16757,6 +16939,13 @@
+     return JS_EXCEPTION;
+ }
+ 
++/* A string key (not an integer index, a symbol or a private name). */
++static bool js_for_in_string_atom(JSRuntime *rt, JSAtom atom)
++{
++    return !__JS_AtomIsTaggedInt(atom) &&
++        rt->atom_array[atom]->atom_type == JS_ATOM_TYPE_STRING;
++}
++
+ static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
+ {
+     JSObject *p;
+@@ -16785,6 +16974,8 @@
+     it->is_array = false;
+     it->obj = obj;
+     it->idx = 0;
++    it->shape = NULL;
++    it->slot = 0;
+     p = JS_VALUE_GET_OBJ(enum_obj);
+     p->u.for_in_iterator = it;
+ 
+@@ -16906,7 +17097,20 @@
+     it = p->u.for_in_iterator;
+ 
+     for(;;) {
+-        if (it->is_array) {
++        if (it->shape) {
++            /* the keys of a shape: present while the object has it */
++            JSShapeProperty *prs;
++            if (it->idx >= it->shape->prop_count)
++                goto done;
++            prs = &get_shape_prop(it->shape)[it->idx];
++            prop = prs->atom;
++            it->slot = it->idx++;
++            if (prop == JS_ATOM_NULL || !(prs->flags & JS_PROP_ENUMERABLE) ||
++                !js_for_in_string_atom(ctx->rt, prop))
++                continue;
++            if (JS_VALUE_GET_OBJ(it->obj)->shape == it->shape)
++                break;
++        } else if (it->is_array) {
+             if (it->idx >= it->array_length)
+                 goto done;
+             prop = __JS_AtomFromUInt32(it->idx);
+@@ -18047,6 +18251,29 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -355,7 +461,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18731,12 @@
+@@ -18548,9 +18775,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -368,7 +474,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +18771,12 @@
+@@ -18585,9 +18815,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -381,7 +487,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +18787,21 @@
+@@ -18598,6 +18831,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -403,7 +509,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -21274,13 +21478,21 @@
+@@ -21274,13 +21522,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -426,7 +532,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21519,10 @@
+@@ -21307,7 +21563,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -438,7 +544,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21530,56 @@
+@@ -21315,6 +21574,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -495,7 +601,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21591,8 @@
+@@ -21326,6 +21635,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -504,7 +610,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +21707,30 @@
+@@ -21440,6 +21751,61 @@
      return JS_EXCEPTION;
  }
  
@@ -532,10 +638,41 @@
 +    return obj;
 +}
 +
++bool JS_IsNativeGenerator(JSValueConst obj)
++{
++    JSGeneratorData *s = JS_GetOpaque(obj, JS_CLASS_GENERATOR);
++    return s && s->native_step;
++}
++
++JSValue JS_NativeGeneratorNext(JSContext *ctx, JSValueConst gen, int *pdone)
++{
++    JSGeneratorData *s = JS_GetOpaque(gen, JS_CLASS_GENERATOR);
++    JSValue ret, done;
++    int kind = true; /* left as is when the generator completes */
++    ret = js_native_generator_next(ctx, s, JS_UNDEFINED, &kind, GEN_MAGIC_NEXT);
++    if (JS_IsException(ret) || kind != 2) {
++        *pdone = kind;
++        return ret;
++    }
++    /* an iterator result (from yield*): as JS_IteratorNext reads it */
++    done = JS_GetProperty(ctx, ret, JS_ATOM_done);
++    if (JS_IsException(done))
++        goto fail;
++    *pdone = JS_ToBoolFree(ctx, done);
++    done = JS_UNDEFINED;
++    if (!*pdone)
++        done = JS_GetProperty(ctx, ret, JS_ATOM_value);
++    JS_FreeValue(ctx, ret);
++    return done;
++ fail:
++    JS_FreeValue(ctx, ret);
++    return JS_EXCEPTION;
++}
++
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -44978,6 +45269,15 @@
+@@ -44978,6 +45344,15 @@
      return JS_EXCEPTION;
  }
  
@@ -551,7 +688,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56106,6 +56406,173 @@
+@@ -56106,6 +56481,262 @@
      return result_promise;
  }
  
@@ -632,9 +769,98 @@
 +    return JS_IteratorClose(ctx, iter, is_exception_pending);
 +}
 +
++/* Whether `atom` is an array index (only a string starting with a digit
++   can be one, if it is not already an integer atom). */
++static bool js_for_in_index_atom(JSContext *ctx, JSAtom atom, uint32_t *pidx)
++{
++    JSString *p;
++    int c;
++    if (__JS_AtomIsTaggedInt(atom))
++        return true;
++    p = ctx->rt->atom_array[atom];
++    if (p->len == 0)
++        return false;
++    c = string_get(p, 0);
++    return c >= '0' && c <= '9' && JS_AtomIsArrayIndex(ctx, pidx, atom);
++}
++
++/* Whether `obj` can be enumerated by walking its shape: an ordinary object
++   with a shared shape, no enumerable array index keys (which would come
++   first) and no enumerable keys on its prototype chain. */
++static bool js_for_in_by_shape(JSContext *ctx, JSObject *p)
++{
++    JSShape *sh = p->shape;
++    JSShapeProperty *prs;
++    uint32_t i, idx;
++
++    if (p->is_exotic || p->fast_array || !sh->is_hashed)
++        return false;
++    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++        if (prs->atom != JS_ATOM_NULL && (prs->flags & JS_PROP_ENUMERABLE) &&
++            js_for_in_index_atom(ctx, prs->atom, &idx))
++            return false;
++    }
++    for (p = sh->proto; p; p = p->shape->proto) {
++        if (p->is_exotic && !(p->class_id == JS_CLASS_ARRAY && p->fast_array && p->u.array.count == 0))
++            return false;
++        sh = p->shape;
++        for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++            if (prs->atom != JS_ATOM_NULL && (prs->flags & JS_PROP_ENUMERABLE) &&
++                (__JS_AtomIsTaggedInt(prs->atom) ||
++                 ctx->rt->atom_array[prs->atom]->atom_type == JS_ATOM_TYPE_STRING))
++                return false;
++        }
++    }
++    return true;
++}
++
 +JSValue JS_ForInIteratorObject(JSContext *ctx, JSValueConst obj)
 +{
-+    return build_for_in_iterator(ctx, js_dup(obj));
++    JSValue enum_obj;
++    JSForInIterator *it;
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || !js_for_in_by_shape(ctx, JS_VALUE_GET_OBJ(obj)))
++        return build_for_in_iterator(ctx, js_dup(obj));
++    p = JS_VALUE_GET_OBJ(obj);
++    it = js_malloc(ctx, sizeof(*it));
++    if (!it)
++        return JS_EXCEPTION;
++    enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
++    if (JS_IsException(enum_obj)) {
++        js_free(ctx, it);
++        return JS_EXCEPTION;
++    }
++    it->is_array = false;
++    it->obj = js_dup(obj);
++    it->idx = 0;
++    it->slot = 0;
++    it->shape = js_dup_shape(p->shape);
++    JS_VALUE_GET_OBJ(enum_obj)->u.for_in_iterator = it;
++    return enum_obj;
++}
++
++JSValue JS_ForInGet(JSContext *ctx, JSValueConst enum_obj, JSValueConst obj, JSValueConst key)
++{
++    JSForInIterator *it;
++    JSShapeProperty *prs;
++    JSObject *p;
++
++    /* `obj[key]` where key is the last key of a shape iteration and obj has
++       that shape: the property is in that slot */
++    if (JS_VALUE_GET_TAG(enum_obj) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(enum_obj)->class_id == JS_CLASS_FOR_IN_ITERATOR &&
++        JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(key) == JS_TAG_STRING) {
++        it = JS_VALUE_GET_OBJ(enum_obj)->u.for_in_iterator;
++        p = JS_VALUE_GET_OBJ(obj);
++        if (it->shape && p->shape == it->shape && it->slot < it->shape->prop_count) {
++            prs = &get_shape_prop(it->shape)[it->slot];
++            if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++                JS_VALUE_GET_PTR(key) == ctx->rt->atom_array[prs->atom])
++                return js_dup(p->prop[it->slot].u.value);
++        }
++    }
++    return JS_GetPropertyValue(ctx, obj, js_dup(key));
 +}
 +
 +JSValue JS_ForInStep(JSContext *ctx, JSValueConst enum_obj, int *pdone)
@@ -643,7 +869,7 @@
 +    sp[0] = unsafe_unconst(enum_obj);
 +    if (js_for_in_next(ctx, sp + 1))
 +        return JS_EXCEPTION;
-+    *pdone = JS_ToBool(ctx, sp[2]);
++    *pdone = JS_VALUE_GET_BOOL(sp[2]);
 +    return sp[1];
 +}
 +
