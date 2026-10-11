@@ -4445,11 +4445,25 @@ fn segment_runs<'a>(
 /// Native module code for these statements. The module bindings they
 /// declare are locals, unless code elsewhere uses them (then cells).
 fn segment<'a>(stmts: &'a [Statement<'a>], scoping: &Scoping, uses: &HashMap<SymbolId, Vec<u32>>) -> Candidate<'a> {
+    use oxc::ast_visit::Visit;
     let span = Span::new(stmts[0].span().start, stmts[stmts.len() - 1].span().end);
+    // The module bindings these statements declare (a symbol's own span
+    // may be another declaration of the name: `type T` and `const T`).
+    struct Declared<'s>(&'s Scoping, HashSet<SymbolId>);
+    impl<'a> Visit<'a> for Declared<'_> {
+        fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+            if let Some(sym) = it.symbol_id.get()
+                && self.0.symbol_scope_id(sym) == self.0.root_scope_id()
+            {
+                self.1.insert(sym);
+            }
+        }
+    }
+    let mut declared = Declared(scoping, HashSet::new());
+    stmts.iter().for_each(|s| declared.visit_statement(s));
     let mut cells = HashSet::new();
-    for (&sym, at) in uses {
-        let declared_here = scoping.symbol_span(sym).start >= span.start && scoping.symbol_span(sym).end <= span.end;
-        if declared_here && at.iter().any(|&p| p < span.start || p >= span.end) {
+    for sym in declared.1 {
+        if uses.get(&sym).is_some_and(|at| at.iter().any(|&p| p < span.start || p >= span.end)) {
             cells.insert(sym);
         }
     }

@@ -96,3 +96,14 @@ function wrapsInterpreted(): number {
 console.log("interpreted", slow(1), arrowSlow(2), wrapsInterpreted());
 const interpreted = "an ordinary identifier";
 console.log(interpreted);
+
+// A type and a value with the same name: one symbol, whose span is the
+// type's. The value, declared by native module code and used by an
+// interpreted function, lives in a cell.
+type Shared = { n: number; tag: string };
+const Shared: Shared = { n: 1, tag: "shared" };
+Shared.n += 41;
+interpreted function readShared2(): string {
+  return Shared.tag + " " + Shared.n;
+}
+console.log(readShared2());
