@@ -9,6 +9,7 @@
 //! Lowering may rely on these invariants without re-checking anything: the
 //! operand types of every node are the ones its documentation states.
 
+use std::collections::HashMap;
 use std::fmt;
 
 /// Machine-level value types. `F64` is a JS `number` known to be one.
@@ -415,6 +416,13 @@ pub enum ExprKind {
     /// are evaluated, then the JS value is converted with ToNumber (a BigInt
     /// throws, as mixing it with a number does). An `F64`.
     NumArith(BinOp, Box<Expr>, Box<Expr>),
+    /// An inlined call (see `inline_calls`): the callee's body, whose
+    /// `return`s give the value, over `locals` (the callee's, appended to
+    /// the caller's; its JS values are released after it).
+    Inline {
+        body: Vec<Stmt>,
+        locals: Vec<LocalId>,
+    },
 }
 
 /// What a `Stmt::Yield` does.
@@ -661,7 +669,7 @@ impl Expr {
 }
 
 macro_rules! visitor {
-    ($(#[$doc:meta])* $name:ident $($m:ident)?) => {
+    ($(#[$doc:meta])* $name:ident $stmts:ident $($m:ident)?) => {
         $(#[$doc])*
         pub fn $name(x: & $($m)? Expr, f: &mut impl FnMut(& $($m)? Expr)) {
             f(x);
@@ -683,6 +691,7 @@ macro_rules! visitor {
                 | IterCloseQuiet(_)
                 | SuperGetAtom(..)
                 | Closure(..) => {}
+                Inline { body, .. } => $stmts(body, f),
                 SetLocal(_, a)
                 | InitLocal(_, a)
                 | Unary(_, a)
@@ -816,12 +825,12 @@ macro_rules! visitor {
 
 visitor!(
     /// Visit `x` and every expression in it.
-    visit
+    visit visit_stmts
 );
 visitor!(
     /// Visit `x` and every expression in it, for rewriting (`f` sees a
     /// node before its children, which it may replace).
-    visit_mut mut
+    visit_mut visit_stmts_mut mut
 );
 
 /// Whether evaluating `x` may assign local `l` (only the function's own code
@@ -1527,6 +1536,150 @@ pub fn capture_values(m: &mut Module) {
             for (k, j) in caps {
                 mark_value_capture(m, k, j);
             }
+        }
+    }
+}
+
+/// IR nodes in a callee body (before inlining into it) that `inline_calls`
+/// inlines.
+const INLINE_SIZE: usize = 48;
+/// Callers stop growing by inlining at this many IR nodes.
+const INLINE_CALLER_LIMIT: usize = 4000;
+
+/// Whether calls to `f` can be inlined: a plain function (no closure data,
+/// `this`, rest array or suspension) without boxed locals, closures or
+/// loops. Its statements then run at most once per call, which keeps the
+/// caller's loop-based analyses (that count writes per iteration) sound.
+fn inlinable(f: &Func, size_limit: usize) -> bool {
+    fn stmts_ok(stmts: &[Stmt]) -> bool {
+        stmts.iter().all(|s| match s {
+            Stmt::Expr(_) | Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::If(_, a, b) => stmts_ok(a) && stmts_ok(b),
+            Stmt::Block(b) => stmts_ok(b),
+            _ => false,
+        })
+    }
+    if f.is_async || f.is_generator || f.is_closure || f.has_this || f.rest || f.ret_slot.is_some() {
+        return false;
+    }
+    if f.boxed.iter().any(|&b| b) || !stmts_ok(&f.body) {
+        return false;
+    }
+    let mut size = 0;
+    let mut ok = true;
+    visit_stmts(&f.body, &mut |e| {
+        size += 1;
+        match &e.kind {
+            ExprKind::Closure(..) | ExprKind::This => ok = false,
+            ExprKind::Inline { body, .. } => ok &= stmts_ok(body),
+            _ => {}
+        }
+    });
+    ok && size <= size_limit
+}
+
+fn ir_size(stmts: &[Stmt]) -> usize {
+    let mut n = 0;
+    visit_stmts(stmts, &mut |_| n += 1);
+    n
+}
+
+/// Renumber the locals of `e` (not its subexpressions) by `base`.
+fn shift_locals(e: &mut Expr, base: LocalId) {
+    match &mut e.kind {
+        ExprKind::Local(l)
+        | ExprKind::SetLocal(l, _)
+        | ExprKind::InitLocal(l, _)
+        | ExprKind::Update { local: l, .. }
+        | ExprKind::ForInGet(l, _, _)
+        | ExprKind::ArrayPush(l, _)
+        | ExprKind::AsyncIterResult(_, l)
+        | ExprKind::IterCloseQuiet(l) => *l += base,
+        ExprKind::IterOpen(_, l, m, _) | ExprKind::IterClose(l, m) => {
+            *l += base;
+            *m += base;
+        }
+        ExprKind::IterStep(l, m) => {
+            *l += base;
+            if let Some(m) = m {
+                *m += base;
+            }
+        }
+        ExprKind::Closure(_, caps) => caps.iter_mut().for_each(|l| *l += base),
+        ExprKind::Inline { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
+        _ => {}
+    }
+}
+
+/// Inlining, as JIT compilers inline small functions: a direct call of a
+/// small native function (`inlinable`) becomes its body, with its locals
+/// appended to the caller's (its parameters first, set from the
+/// arguments). A few rounds inline calls in the inlined bodies too.
+pub fn inline_calls(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    // Callees qualify by their own size; what they inlined comes along.
+    let small: Vec<bool> = m.funcs.iter().map(|f| inlinable(f, INLINE_SIZE)).collect();
+    for _ in 0..3 {
+        let callees: Vec<Option<Func>> =
+            m.funcs.iter().zip(&small).map(|(f, &s)| (s && inlinable(f, usize::MAX)).then(|| f.clone())).collect();
+        if callees.iter().all(Option::is_none) {
+            return;
+        }
+        for g in 0..nfuncs + m.closures.len() {
+            let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+            let mut budget = INLINE_CALLER_LIMIT.saturating_sub(ir_size(&f.body));
+            let mut added: Vec<Ty> = Vec::new();
+            let base0 = f.locals.len();
+            // First the calls become their argument assignments (calls in
+            // arguments are inlined in turn), then the bodies are added: a
+            // body is never searched for calls in the round that adds it.
+            let mut pending: HashMap<LocalId, FuncId> = HashMap::new();
+            visit_stmts_mut(&mut f.body, &mut |e| {
+                let ExprKind::Call(k, args) = &mut e.kind else { return };
+                let Some(callee) = callees[*k].as_ref() else { return };
+                if (g < nfuncs && *k == g) || args.len() != callee.params.len() {
+                    return;
+                }
+                // Arguments are of the parameters' ABI types; a parameter
+                // local may be `Any` (boxed on entry).
+                if !args.iter().zip(&callee.locals).all(|(a, &t)| a.ty == t || t == Ty::Any) {
+                    return;
+                }
+                let size = ir_size(&callee.body);
+                if size > budget {
+                    return;
+                }
+                budget -= size;
+                let base = base0 + added.len();
+                added.extend(&callee.locals);
+                // A placeholder local names a callee without any.
+                if callee.locals.is_empty() {
+                    added.push(Ty::Bool);
+                }
+                pending.insert(base, *k);
+                let body: Vec<Stmt> = std::mem::take(args)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let t = callee.locals[i];
+                        let a = if a.ty != t { Expr::new(Ty::Any, ExprKind::Box(Box::new(a))) } else { a };
+                        Stmt::Expr(Expr::new(t, ExprKind::InitLocal(base + i, Box::new(a))))
+                    })
+                    .collect();
+                let locals = (base..base + callee.locals.len().max(1)).collect();
+                e.kind = ExprKind::Inline { body, locals };
+            });
+            visit_stmts_mut(&mut f.body, &mut |e| {
+                let ExprKind::Inline { body, locals } = &mut e.kind else { return };
+                let Some(k) = locals.first().and_then(|b| pending.remove(b)) else { return };
+                let base = locals[0];
+                let mut inner = callees[k].as_ref().unwrap().body.clone();
+                visit_stmts_mut(&mut inner, &mut |x| shift_locals(x, base));
+                body.extend(inner);
+            });
+            f.boxed.extend(added.iter().map(|_| false));
+            f.local_names.extend(added.iter().map(|_| None));
+            f.locals.extend(added);
         }
     }
 }

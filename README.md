@@ -192,7 +192,8 @@ fast paths that keep the engine's semantics:
     later objects are made with it directly (as JSC's allocation profiles
     do);
   - `typeof`, `in`, `instanceof`, `new`;
-  - calls to any function: native functions directly; a callee only known
+  - calls to any function: native functions directly (small ones without
+    loops or closures are inlined, as JIT compilers inline them); a callee only known
     at run time (a method, a getter, a callback) is checked for being a
     native function and then entered through its native entry, skipping
     the engine's call path; interpreted ones through the engine;

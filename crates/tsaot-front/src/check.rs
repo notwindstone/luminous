@@ -291,6 +291,7 @@ pub fn check<'a>(
                 homes: 2 * classes.len(),
             };
             ir::capture_values(&mut module);
+            ir::inline_calls(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }

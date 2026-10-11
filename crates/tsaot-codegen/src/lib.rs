@@ -123,6 +123,9 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Vec<u8>> {
     let mut flags = settings::builder();
     flags.set("opt_level", &opts.opt_level)?;
     flags.set("is_pic", "true")?;
+    // Hot functions start on a cache line: their speed then does not
+    // depend on where the code before them happens to end.
+    flags.set("log2_min_function_alignment", "6")?;
     let isa = cranelift_native::builder()
         .map_err(|e| anyhow!("unsupported host: {e}"))?
         .finish(settings::Flags::new(flags))?;

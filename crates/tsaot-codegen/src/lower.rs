@@ -233,6 +233,9 @@ pub(crate) struct Lower<'a> {
     vars: Vec<LVar>,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
+    /// Inlined calls being lowered (innermost last): where their `return`s
+    /// go, and the value's type.
+    inline_rets: Vec<(Block, Ty)>,
     /// Owned values to free if an exception occurs now.
     temps: Vec<(Value, Value)>,
     /// Innermost-last exception handler blocks.
@@ -321,6 +324,7 @@ impl<'a> Lower<'a> {
             names: f.local_names.clone(),
             vars,
             loops: HashMap::new(),
+            inline_rets: Vec::new(),
             temps: Vec::new(),
             handlers: Vec::new(),
             scopes: Vec::new(),
@@ -857,6 +861,22 @@ impl<'a> Lower<'a> {
                 self.after_terminator();
             }
             Stmt::Return(e) => {
+                if let Some(&(join, ty)) = self.inline_rets.last() {
+                    // In an inlined call: its value.
+                    let v = match e {
+                        Some(e) => self.expr(e),
+                        None => V::Void,
+                    };
+                    let args: Vec<BlockArg> = if ty == Ty::Void {
+                        self.free_v(v);
+                        Vec::new()
+                    } else {
+                        self.abi(ty, v).into_iter().map(BlockArg::Value).collect()
+                    };
+                    self.b.ins().jump(join, &args);
+                    self.after_terminator();
+                    return;
+                }
                 let v = match e {
                     Some(e) => self.expr(e),
                     None => V::Void,
@@ -1456,6 +1476,35 @@ impl<'a> Lower<'a> {
                 let a = self.expr(x).num();
                 let c = self.expr(y).num();
                 V::Num(self.binary(*op, a, c))
+            }
+            ExprKind::Inline { body, locals } => {
+                let ty = e.ty;
+                let join = self.b.create_block();
+                for t in clif_types(ty) {
+                    self.b.append_block_param(join, t);
+                }
+                self.inline_rets.push((join, ty));
+                self.stmts(body);
+                if !self.is_filled() {
+                    // Falling off the end.
+                    let v = self.zero(ty);
+                    let args: Vec<BlockArg> = self.abi(ty, v).into_iter().map(BlockArg::Value).collect();
+                    self.b.ins().jump(join, &args);
+                }
+                self.inline_rets.pop();
+                self.b.switch_to_block(join);
+                let params = self.b.block_params(join).to_vec();
+                let v = self.unabi(ty, &params);
+                // The callee's JS values are released as its return would.
+                for &l in locals {
+                    if is_js(self.locals[l]) && !matches!(self.vars[l], LVar::Boxed { .. }) {
+                        let old = self.use_local(l).any();
+                        let u = self.konst(0, TAG_UNDEFINED);
+                        self.def_local(l, u);
+                        self.free(old);
+                    }
+                }
+                v
             }
             ExprKind::NumArith(op, x, y) => {
                 let a = self.expr(x);
