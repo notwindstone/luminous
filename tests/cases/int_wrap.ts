@@ -1,4 +1,4 @@
-// @native counts compound params loops captured bumpTotal
+// @native counts compound params loops captured bumpTotal assigns sumTo defaulted
 // @interpreted dynamic
 type int = number;
 
@@ -24,9 +24,10 @@ function compound(x: int, y: int): string {
   let m: int = x;
   m *= y;
   let f: int = 7;
-  f += 0.75;
+  f += 0.75 | 0;
   let big: int = 3;
-  big *= 1e10;
+  big *= 1410065408;
+  big = big * big + (x - y) * 3;
   let s: int = 1;
   const v = (s += 2147483647);
   return [a, b, m, f, big, s, v].join(",");
@@ -63,9 +64,31 @@ function bumpTotal(): number {
   return total;
 }
 
+function assigns(x: int, y: int): string {
+  let a: int = x + y;
+  let b: int = 0;
+  b = b + x * y;
+  let c: int = -x;
+  c = c - 1;
+  total = total + x;
+  const twice = (n: int): int => n + n;
+  const neg0: int = -0;
+  return [a, b, c, total, twice(x), Object.is(neg0, -0), twice(y)].join(",");
+}
+
+function sumTo(n: int): int {
+  let s: int = 0;
+  for (let i: int = 1; i <= n; i++) s = s + i * i * i;
+  return s * 2 + 1;
+}
+
+function defaulted(a: int, b: int = a + 2147483647): number {
+  return b;
+}
+
 function dynamic(...xs: number[]): number {
   let c: int = 2147483647;
-  for (const x of xs) c += x;
+  for (const x of xs) c += x | 0;
   c++;
   return arguments.length + c;
 }
@@ -79,6 +102,9 @@ console.log(bumpTotal(), total);
 total++;
 console.log(total, bumpTotal());
 console.log(dynamic(1, 2), dynamic());
+console.log(assigns(2147483647, 2), assigns(-2147483648, -1), assigns(46341, 46341));
+console.log(sumTo(10), sumTo(1000), sumTo(100000));
+console.log(defaulted(5), defaulted(5, 6));
 // Through the interpreted fallback (an argument that is not an int32).
 const loose = params as unknown as (n: unknown, k: unknown) => string;
 console.log(loose(1.5, 2), loose(2147483647, 0.5));

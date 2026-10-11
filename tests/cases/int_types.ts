@@ -108,7 +108,7 @@ async function asyncSum(n: int): Promise<number> {
 function captured(n: int): number {
   let k: int = n;
   const bump = () => {
-    k = k + 0.5;
+    k = k * 3 + 2147483647;
   };
   bump();
   return k;

@@ -1,22 +1,41 @@
-// @error `a` is an `int`, but this value may leave the int32 range (only `++`
-// @error `b` is an `int`, but this value is a number that may not be an int32
-// @error the function returns `int`, but this value may not be an int32
+// @error `a` is an `int`, but this value is not an integer
+// @error `b` is an `int`, but this value is not an integer
+// @error `c` is an `int`, but this value may not be an integer
+// @error `d` is an `int`, but this value may not be an integer
+// @error `e` is an `int`, but this value is not known to be an integer
+// @error `f` is an `int`, but this value is an integer literal out of the int32 range
+// @error the function returns `int`, but this value may not be an integer
+// @error the function returns `int`, but this value is `undefined`
+// @error `g` is an `int`, but this value is not known to be an integer
 type int = number;
 
-function plain(n: int): int {
-  let a: int = 0;
-  a = n * 2;
-  return a;
-}
-
-function divide(n: int): int {
+function fractions(n: int): number {
+  let a: int = n;
+  a = a + 1.5;
   let b: int = n;
-  b /= 2;
-  return b;
+  b += 0.5;
+  let c: int = n;
+  c /= 2;
+  let d: int = n;
+  d = d % 3;
+  return a + b + c + d;
 }
 
-function ret(n: int): int {
-  return n + 1;
+function untyped(xs: number[]): number {
+  let e: int = 0;
+  e = xs[0];
+  let f: int = 1e20;
+  return e + f;
 }
 
-console.log(plain(1), divide(2), ret(4));
+function ratio(n: int): int {
+  return Math.floor(n / 2);
+}
+
+function nothing(): int {
+  return;
+}
+
+const g: int = Number("5");
+
+console.log(fractions(1), untyped([1]), ratio(4), nothing(), g);

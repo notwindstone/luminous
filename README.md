@@ -313,21 +313,29 @@ function isPrime(n: int): boolean {
 }
 ```
 
-- **Proven, not assumed.** A value assigned to an `int` must be one by
-  construction: an int32 literal, another `int`, a bitwise result (`|`,
-  `&`, `^`, `~`, `<<`, `>>`; not `>>>`, which is unsigned), `Math.imul`,
-  `Math.clz32`, `Math.min`/`max` of `int`s, or a call to a function returning
-  `int`. Anything else (`count = count + 1.5`, `n / 2`) is a compile error
-  that suggests `(...) | 0`, which makes wrapping explicit (every engine
-  computes it the same way).
-- **Updates wrap.** `++`, `--`, `+=`, `-=` and `*=` on an `int` binding wrap
-  like `| 0`: `count++` is `count = (count + 1) | 0`, and `count += 1.5` is
-  `count = (count + 1.5) | 0`. The interpreted half of the program is
-  rewritten the same way, so native and interpreted code agree. Under Bun or
-  Node, which ignore the annotation, results differ only once a value
-  overflows. With `--no-int-wrapping`, these updates must provably stay in
-  range instead: only a `for` counter stepped by one under an int bound
-  (`i < n` with `n` an `int`) qualifies, and anything else is a compile error.
+- **Range wraps, kind is checked.** Every store into an `int` (initializer,
+  `=`, `+=` / `-=` / `*=` / `>>>=`, `++` / `--`, `return` from a function
+  annotated `int`, parameter default) must store an integer:
+  - an int32 is stored as is: an int32 literal, another `int`, a bitwise
+    result (`|`, `&`, `^`, `~`, `<<`, `>>`), `Math.imul`, `Math.clz32`,
+    `Math.min` / `max` of ints, a call to a function returning `int`;
+  - an integer that may not fit (`+`, `-`, `*` of integers, `>>>`) wraps
+    like `| 0`: `count++`, `count += n` and `count = count + n` all store
+    `(count + n) | 0`;
+  - anything else is a compile error: fractions (`count = count + 1.5`,
+    `count += 0.5`), `/`, `%`, `**`, most `Math` functions, values of
+    unknown type (`xs[i]`; write `xs[i] | 0`), out-of-range literals.
+
+  The check covers the whole module, native or not, and the interpreted
+  half of the program is rewritten to wrap the same stores, so native and
+  interpreted code always agree. Under Bun or Node, which ignore the
+  annotation, results differ only once a value overflows. Wrapping happens
+  at the store: within an expression, `+` and `*` are JS arithmetic
+  (`(a * b * c) | 0` is what JS computes, not a 32-bit multiply).
+
+  With `--no-int-wrapping`, integers that may not fit are compile errors
+  instead, except for a `for` counter stepped by one under an int bound
+  (`i < n` with `n` an `int`).
 - **Checked at the boundary.** Interpreted code can pass anything. A native
   function whose `int` argument is not an int32 (`1.5`, `"1"`, `-0`,
   `2 ** 31`) declines the call, and the interpreted version runs instead,
@@ -336,9 +344,9 @@ function isPrime(n: int): boolean {
   integers, and the double result is rounded only where JS would round it.
   So comparisons such as `d * d <= n` and `%` (`-4 % 2` is `-0`, `x % 0` is
   `NaN`) need no floating point.
-- `type double = number` is accepted as a plain alias of `number`. A
-  captured `int` variable is an ordinary JS value; its annotation is not
-  checked.
+- `type double = number` is accepted as a plain alias of `number`. An `int`
+  captured by a closure or declared at module level is checked and wrapped
+  like any other; native code keeps it as a JS value.
 
 ## Getting started
 

@@ -1,11 +1,11 @@
 // @flags --no-int-wrapping
 // @error `a` is an `int`, but this value may leave the int32 range (with `--no-int-wrapping`
-// @error `b` is an `int`, but this value is a number that may not be an int32
+// @error `b` is an `int`, but this value is not an integer
 // @error `i` is an `int`, but this value may leave the int32 range
-// @error `u` is an `int`, but this value is a number that may not be an int32
-// @error `s` is an `int`, but this value is not a number
+// @error `u` is an `int`, but this value may leave the int32 range
+// @error `s` is an `int`, but this value is not known to be an integer
 // @error an `int` variable needs an initializer
-// @error the function returns `int`, but this value may not be an int32
+// @error the function returns `int`, but this value may not be an integer
 // @error `n` is an `int`, but this value may leave the int32 range
 type int = number;
 

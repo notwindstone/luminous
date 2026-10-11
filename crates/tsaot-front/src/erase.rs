@@ -87,6 +87,39 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     let mut exports = Vec::new();
     let mut header = Vec::new();
 
+    // Stores into `int` bindings that wrap, as native code computes them:
+    // `x = (x + 1) | 0`, the old value of `x++` being `(x - 1) | 0` after
+    // it; `(value) | 0` for other stores.
+    let mut rewritten_targets = Vec::new();
+    for w in &a.int_wraps {
+        let (s, e) = (w.span.0 as usize, w.span.1 as usize);
+        if let IntWrapKind::Value = w.kind {
+            // Innermost: before any wrapper of the same initializer.
+            prefixes.entry(s).or_default().push("(".into());
+            suffixes.entry(e).or_default().push(") | 0".into());
+            continue;
+        }
+        // The binding may live in a cell.
+        let target = match a.cell_refs.iter().find(|r| r.span == w.target) {
+            Some(r) => format!("{CELLS_OBJ}.{}", a.cells[r.cell].name),
+            None => w.name.clone(),
+        };
+        rewritten_targets.push(w.target);
+        match w.kind {
+            IntWrapKind::Update { inc, prefix, used } => {
+                let (op, back) = if inc { ('+', '-') } else { ('-', '+') };
+                let set = format!("{target} = ({target} {op} 1) | 0");
+                let text =
+                    if prefix || !used { format!("({set})") } else { format!("({set}, ({target} {back} 1) | 0)") };
+                edits.push((s, e, text));
+            }
+            IntWrapKind::Value => unreachable!(),
+            IntWrapKind::Compound { op, rhs: (rs, re) } => {
+                edits.push((s, rs as usize, format!("({target} = ({target} {op} (")));
+                suffixes.entry(re as usize).or_default().push(")) | 0)".into());
+            }
+        }
+    }
     for (i, n) in a.natives.iter().enumerate() {
         match &n.site {
             &NativeSite::Declaration { id_span, export_prefix } => {
@@ -123,31 +156,6 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
             }
             CellInitSite::After(p) => {
                 suffixes.entry(p as usize).or_default().push(format!(";{INIT_FN}({k}, {});", c.name));
-            }
-        }
-    }
-    // Wrapping updates of `int` bindings, as native code computes them:
-    // `x = (x + 1) | 0`, the old value of `x++` being `(x - 1) | 0` after it.
-    let mut rewritten_targets = Vec::new();
-    for w in &a.int_wraps {
-        // The binding may live in a cell.
-        let target = match a.cell_refs.iter().find(|r| r.span == w.target) {
-            Some(r) => format!("{CELLS_OBJ}.{}", a.cells[r.cell].name),
-            None => w.name.clone(),
-        };
-        rewritten_targets.push(w.target);
-        let (s, e) = (w.span.0 as usize, w.span.1 as usize);
-        match w.kind {
-            IntWrapKind::Update { inc, prefix, used } => {
-                let (op, back) = if inc { ('+', '-') } else { ('-', '+') };
-                let set = format!("{target} = ({target} {op} 1) | 0");
-                let text =
-                    if prefix || !used { format!("({set})") } else { format!("({set}, ({target} {back} 1) | 0)") };
-                edits.push((s, e, text));
-            }
-            IntWrapKind::Compound { op, rhs: (rs, re) } => {
-                edits.push((s, rs as usize, format!("({target} = ({target} {op} (")));
-                suffixes.entry(re as usize).or_default().push(")) | 0)".into());
             }
         }
     }
