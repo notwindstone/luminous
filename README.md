@@ -214,10 +214,13 @@ regular call path's generated code alone.
   assignments; **spread** in calls, `new`, and array and object literals;
   **rest** parameters and elements; **optional chaining**; computed keys in
   object literals.
+- **Object literal methods, getters and setters** (`this` included;
+  generator and async methods too; `super` in them
+  is not supported yet).
 
 Not yet: `super()` and class constructors
-(which stay interpreted), getters, setters and methods in object literals,
-classes inside functions, `arguments`, and `this` in arrow functions. A
+(which stay interpreted), computed method and accessor names in object
+literals, classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `tsaot report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.

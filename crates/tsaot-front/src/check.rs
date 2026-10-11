@@ -2079,6 +2079,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A nested function, compiled natively as a closure over the boxes of
     /// the variables it captures.
     fn closure(&mut self, node: FnNode<'a>, name: String) -> R<Expr> {
+        self.closure_with(node, name, false)
+    }
+
+    /// A nested function; `method`: a method of an object literal, which
+    /// gets `this` (and has no class to resolve `super` in).
+    fn closure_with(&mut self, node: FnNode<'a>, name: String, method: bool) -> R<Expr> {
         let key = node.span().start;
         if self.m.interpreted.contains(&key) {
             return reject(node.span(), "contains a function marked `interpreted`");
@@ -2091,7 +2097,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let widened = self.widened.clone();
         let mut inner = FnCx::new(&mut *self.m, caps, key, true, widened);
         inner.rest = rest;
-        inner.class = self.class;
+        inner.class = if method { None } else { self.class };
+        inner.has_this = method;
         inner.ret_int = ret == Some(Ty::I32);
         let r = inner.function(node, name, params);
         let request = inner.widen_request;
@@ -3098,6 +3105,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Field(ir::AtomId),
             Computed,
             Spread,
+            /// A getter (false) or setter (true).
+            Accessor(ir::AtomId, bool),
         }
         let mut parts = Vec::new();
         let mut values = Vec::new();
@@ -3116,8 +3125,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 ObjectPropertyKind::ObjectProperty(p) => p,
             };
-            if p.kind != PropertyKind::Init || p.method {
-                return reject(p.span, "methods and accessors in object literals are not supported yet");
+            if p.computed && (p.kind != PropertyKind::Init || p.method) {
+                return reject(p.span, "computed methods and accessors in object literals are not supported yet");
             }
             if p.computed {
                 let Some(k) = p.key.as_expression() else {
@@ -3143,10 +3152,27 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             if name == "__proto__" {
                 return reject(p.span, "`__proto__` in object literals is not supported");
             }
+            let atom = self.m.atom(&name);
+            if p.kind != PropertyKind::Init || p.method {
+                // A method or accessor: a native closure with `this`, named as
+                // JS names it.
+                let Expression::FunctionExpression(f) = p.value.without_parentheses() else {
+                    return reject(p.span, "unsupported object literal member");
+                };
+                let (fname, part) = match p.kind {
+                    PropertyKind::Get => (format!("get {name}"), Part::Accessor(atom, false)),
+                    PropertyKind::Set => (format!("set {name}"), Part::Accessor(atom, true)),
+                    _ => (name.clone(), Part::Field(atom)),
+                };
+                let v = self.closure_with(FnNode::Function(f), fname, true)?;
+                values.push(v);
+                parts.push(part);
+                continue;
+            }
             let mark = self.pre.len();
             let v = any(self.expr(&p.value)?);
             push(self, v, &mut values, mark);
-            parts.push(Part::Field(self.m.atom(&name)));
+            parts.push(Part::Field(atom));
         }
         let mut values = values.into_iter();
         if parts.iter().all(|p| matches!(p, Part::Field(_))) {
@@ -3168,6 +3194,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     ir::ObjPart::Computed(k, values.next().unwrap())
                 }
                 Part::Spread => ir::ObjPart::Spread(values.next().unwrap()),
+                Part::Accessor(a, setter) => ir::ObjPart::Accessor(a, values.next().unwrap(), setter),
             })
             .collect();
         Ok(Expr::new(Ty::Any, ExprKind::ObjectParts(parts)))

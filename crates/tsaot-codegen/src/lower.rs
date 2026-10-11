@@ -2190,6 +2190,14 @@ impl<'a> Lower<'a> {
                             self.release(key);
                             self.free_v(key);
                         }
+                        ir::ObjPart::Accessor(a, x, setter) => {
+                            let (p, t) = self.expr(x).any();
+                            let slot = self.values_slot(&[(o[0], o[1])]);
+                            let atom = self.atom(*a);
+                            let s = self.b.ins().iconst(I32, *setter as i64);
+                            let r = self.helper("tsaot_define_accessor", &[ctx, slot, atom, p, t, s]);
+                            self.check_int(r[0]);
+                        }
                         ir::ObjPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);

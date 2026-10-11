@@ -102,6 +102,7 @@ int tsaot_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, Ts
 JSValue tsaot_call_getter(JSContext *ctx, void *getter, JSValue this_obj);
 JSValue tsaot_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAtom prop, TsaotIC *ic);
 int tsaot_call_setter(JSContext *ctx, void *setter, JSValue this_obj, JSValue val);
+int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn, int is_setter);
 
 /* Spread, rest and iteration. */
 int tsaot_array_push(JSContext *ctx, JSValue arr, JSValue v);

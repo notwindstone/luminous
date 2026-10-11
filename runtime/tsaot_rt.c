@@ -1311,3 +1311,16 @@ JSValue tsaot_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAto
         tsaot_ic_fill_proto(ctx, home, prop, TSAOT_IC_PROTO_GETTER, ic);
     return r;
 }
+
+/* `get name() {}` / `set name(v) {}` in an object literal: an enumerable,
+ * configurable accessor (merged with the other half if defined). Takes
+ * ownership of fn. */
+int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn, int is_setter)
+{
+    int flags = JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE |
+                JS_PROP_THROW | (is_setter ? JS_PROP_HAS_SET : JS_PROP_HAS_GET);
+    int r = JS_DefineProperty(ctx, *obj, prop, JS_UNDEFINED, is_setter ? JS_UNDEFINED : fn,
+                              is_setter ? fn : JS_UNDEFINED, flags);
+    JS_FreeValue(ctx, fn);
+    return r;
+}

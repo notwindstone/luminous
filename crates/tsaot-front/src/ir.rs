@@ -450,6 +450,8 @@ pub enum ArrPart {
 #[derive(Debug, Clone)]
 pub enum ObjPart {
     Field(AtomId, Expr),
+    /// `get name() {}` (false) / `set name(v) {}` (true): the function.
+    Accessor(AtomId, Expr, bool),
     /// `[key]: value` (the key is converted when the property is defined).
     Computed(Expr, Expr),
     Spread(Expr),
@@ -711,7 +713,7 @@ macro_rules! visitor {
                 ObjectParts(parts) => {
                     for p in parts {
                         match p {
-                            ObjPart::Field(_, x) | ObjPart::Spread(x) => $name(x, f),
+                            ObjPart::Field(_, x) | ObjPart::Spread(x) | ObjPart::Accessor(_, x, _) => $name(x, f),
                             ObjPart::Computed(k, x) => {
                                 $name(k, f);
                                 $name(x, f);
