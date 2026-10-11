@@ -76,17 +76,32 @@ int tsaot_array_iter_ok(JSContext *ctx);
 extern JSValue tsaot_pins[];
 extern void *tsaot_shapes[];
 
-/* Inline caches of own data properties, one per property access site in
- * native code (defined by it; absent without native code). */
+/* Inline caches, one per property access site in native code (defined by
+ * it; absent without native code): of an own data property (kind 0), or of
+ * a data property (1), getter (2) or setter (3) of the first or second
+ * prototype. */
 typedef struct TsaotIC {
-    void *shape; /* a referenced shape, or NULL */
+    void *shape; /* a referenced shape (of the object), or NULL */
     uint32_t slot;
-    uint32_t unused;
+    uint32_t kind;
+    void *proto_shape; /* kinds 1-3: the holder's shape (referenced) */
+    void *mid_shape;   /* a holder two levels up: the first prototype's shape */
 } TsaotIC;
+#define TSAOT_IC_OWN 0
+#define TSAOT_IC_PROTO_DATA 1
+#define TSAOT_IC_PROTO_GETTER 2
+#define TSAOT_IC_PROTO_SETTER 3
 extern TsaotIC tsaot_ics[] __attribute__((weak));
 extern const int32_t tsaot_nics __attribute__((weak));
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
+JSValue tsaot_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, TsaotIC *ic);
+int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic);
+JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
+int tsaot_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
+JSValue tsaot_call_getter(JSContext *ctx, void *getter, JSValue this_obj);
+JSValue tsaot_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAtom prop, TsaotIC *ic);
+int tsaot_call_setter(JSContext *ctx, void *setter, JSValue this_obj, JSValue val);
 
 /* Spread, rest and iteration. */
 int tsaot_array_push(JSContext *ctx, JSValue arr, JSValue v);

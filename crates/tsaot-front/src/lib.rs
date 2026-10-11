@@ -28,7 +28,8 @@ pub enum NativeSite {
     /// `const f = <init>` (byte span of the initializer).
     ConstInit { init_span: (u32, u32) },
     /// A class method, installed after the class declaration ends.
-    Method { class: String, is_static: bool, key: String, stmt_end: u32 },
+    /// `accessor`: 0 for a method, 1 for a getter, 2 for a setter.
+    Method { class: String, is_static: bool, key: String, stmt_end: u32, accessor: u8 },
     /// Module-level statements (byte span), replaced by a call of the native
     /// code.
     Segment { span: (u32, u32) },
@@ -188,11 +189,12 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
                     export_prefix: export_prefix.map(|s| (s.start, s.end)),
                 },
                 &check::Site::ConstInit { init } => NativeSite::ConstInit { init_span: (init.start, init.end) },
-                check::Site::Method { class, is_static, key, stmt_end } => NativeSite::Method {
+                check::Site::Method { class, is_static, key, stmt_end, accessor } => NativeSite::Method {
                     class: class.clone(),
                     is_static: *is_static,
                     key: key.clone(),
                     stmt_end: *stmt_end,
+                    accessor: *accessor,
                 },
                 check::Site::Segment { span } => NativeSite::Segment { span: (span.start, span.end) },
             },

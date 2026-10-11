@@ -378,6 +378,8 @@ pub enum ExprKind {
     /// `super[key]` in a method (home object: `Module::homes` slot), and
     /// its assignment (to the value).
     SuperGet(usize, Box<Expr>),
+    /// `super.name` (cached).
+    SuperGetAtom(usize, AtomId),
     SuperSet(usize, Box<Expr>, Box<Expr>),
     /// Append a value to the array in a local (array rest; `undefined`).
     ArrayPush(LocalId, Box<Expr>),
@@ -670,6 +672,7 @@ macro_rules! visitor {
                 | IterStep(..)
                 | IterClose(..)
                 | IterCloseQuiet(_)
+                | SuperGetAtom(..)
                 | Closure(..) => {}
                 SetLocal(_, a)
                 | InitLocal(_, a)

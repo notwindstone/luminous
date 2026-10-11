@@ -70,6 +70,7 @@ pub mod layout {
     pub const STRING_LEN: i32 = 0;
     pub const OBJ_CLASS_ID: i32 = 18;
     pub const OBJ_SHAPE: i32 = 24;
+    pub const SHAPE_PROTO: i32 = 48;
     pub const OBJ_PROP: i32 = 32;
     pub const OBJ_TYPED_ARRAY: i32 = 48;
     pub const OBJ_ARRAY_BUFFER: i32 = 48;
@@ -85,6 +86,7 @@ pub mod layout {
         ("STRING_LEN", STRING_LEN as i64),
         ("OBJ_CLASS_ID", OBJ_CLASS_ID as i64),
         ("OBJ_SHAPE", OBJ_SHAPE as i64),
+        ("SHAPE_PROTO", SHAPE_PROTO as i64),
         ("OBJ_PROP", OBJ_PROP as i64),
         ("OBJ_TYPED_ARRAY", OBJ_TYPED_ARRAY as i64),
         ("OBJ_ARRAY_BUFFER", OBJ_ARRAY_BUFFER as i64),
@@ -199,6 +201,13 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_iter_close_quiet", &[P, W, W], &[]),
         ("tsaot_yield_star", &[P, P, Int, P], &[W, W]),
         ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
+        ("tsaot_private_get_ic", &[P, W, W, W, W, P], &[W, W]),
+        ("tsaot_ic_get_proto", &[P, W, W, Int, P], &[W, W]),
+        ("tsaot_ic_set_proto", &[P, W, W, Int, W, W, P], &[Int]),
+        ("tsaot_call_getter", &[P, P, W, W], &[W, W]),
+        ("tsaot_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
+        ("tsaot_call_setter", &[P, P, W, W, W, W], &[Int]),
+        ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
@@ -342,12 +351,12 @@ impl<'m> Codegen<'m> {
         }
     }
 
-    /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, 16 bytes per
+    /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, `IC_SIZE` bytes per
     /// entry, zeroed) and its length `tsaot_nics`.
     fn define_ics(&mut self) -> Result<()> {
         let n = self.ics.get();
         let mut table = cranelift_module::DataDescription::new();
-        table.define_zeroinit(n.max(1) * 16);
+        table.define_zeroinit(n.max(1) * lower::IC_SIZE);
         table.set_align(8);
         self.module.define_data(self.data[8], &table)?;
         let count = self.module.declare_data("tsaot_nics", Linkage::Export, false, false)?;

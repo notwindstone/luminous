@@ -83,7 +83,8 @@ pub enum Site {
     ConstInit { init: Span },
     /// A method of top-level class `class`, installed over the original after
     /// the class declaration (which ends at `stmt_end`).
-    Method { class: String, is_static: bool, key: String, stmt_end: u32 },
+    /// `accessor`: 0 for a method, 1 for a getter, 2 for a setter.
+    Method { class: String, is_static: bool, key: String, stmt_end: u32, accessor: u8 },
     /// Module-level statements, replaced by a call of the native code.
     Segment { span: Span },
 }
@@ -579,8 +580,13 @@ fn class_methods<'a>(
 ) {
     for el in &c.body.body {
         let ClassElement::MethodDefinition(m) = el else { continue };
-        if m.kind != MethodDefinitionKind::Method
-            || m.computed
+        let accessor = match m.kind {
+            MethodDefinitionKind::Method => 0,
+            MethodDefinitionKind::Get => 1,
+            MethodDefinitionKind::Set => 2,
+            _ => continue,
+        };
+        if m.computed
             || !m.decorators.is_empty()
             || m.r#type != MethodDefinitionType::MethodDefinition
             || m.value.body.is_none()
@@ -593,10 +599,17 @@ fn class_methods<'a>(
             _ => continue,
         };
         let node = FnNode::Function(&m.value);
-        let site = Site::Method { class: class.to_string(), is_static: m.r#static, key: key.clone(), stmt_end };
+        let site =
+            Site::Method { class: class.to_string(), is_static: m.r#static, key: key.clone(), stmt_end, accessor };
+        // As JS names accessor functions.
+        let name = match accessor {
+            1 => format!("get {key}"),
+            2 => format!("set {key}"),
+            _ => key.clone(),
+        };
         match header(node) {
             Ok((params, rest, ret)) => out.push(Candidate {
-                name: key,
+                name,
                 node,
                 symbol: None,
                 has_this: true,
@@ -608,7 +621,7 @@ fn class_methods<'a>(
                 class: Some((index, m.r#static)),
                 cells: HashSet::new(),
             }),
-            Err(r) => rejected.push((format!("{class}.{key}"), node.span(), r)),
+            Err(r) => rejected.push((format!("{class}.{name}"), node.span(), r)),
         }
     }
 }
@@ -2178,6 +2191,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         Ok(Some((self.home(e.span())?, key)))
     }
 
+    /// Reading `super[key]`: through a cache when the key is a name.
+    fn super_get(&mut self, e: &'a MemberExpression<'a>, home: usize, key: Expr) -> Expr {
+        match e {
+            MemberExpression::StaticMemberExpression(s) => {
+                let atom = self.m.atom(s.property.name.as_str());
+                Expr::new(Ty::Any, ExprKind::SuperGetAtom(home, atom))
+            }
+            _ => Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(key))),
+        }
+    }
+
     /// `f.call(this, ...args)`: `this`, then `f` (from `this`, in a local),
     /// are evaluated before the arguments (into temporaries before any
     /// `await` in them).
@@ -2720,7 +2744,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
                 if let Some((home, key)) = self.super_key(e.as_member_expression().unwrap())? =>
             {
-                Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(key)))
+                self.super_get(e.as_member_expression().unwrap(), home, key)
             }
             Expression::PrivateFieldExpression(p) => {
                 if p.optional {
@@ -3734,7 +3758,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 if let Some((home, key)) = self.super_key(callee.as_member_expression().unwrap())? =>
             {
                 let this = Expr::new(Ty::Any, ExprKind::This);
-                let get = |_: &mut Self, _| Ok(Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(key))));
+                let member = callee.as_member_expression().unwrap();
+                let get = |cx: &mut Self, _| Ok(cx.super_get(member, home, key));
                 self.call_this(this, get, &c.arguments)
             }
             Expression::PrivateFieldExpression(p) => {

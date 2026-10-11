@@ -140,13 +140,14 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
                 prefixes.entry(s as usize).or_default().push(format!("{BIND_FN}({i}, "));
                 suffixes.entry(e as usize).or_default().push(")".into());
             }
-            NativeSite::Method { class, is_static, key, stmt_end } => {
-                // Over the interpreted method, which becomes the fallback.
+            NativeSite::Method { class, is_static, key, stmt_end, accessor } => {
+                // Over the interpreted method or accessor, which becomes the
+                // fallback.
                 let key = js_string(key);
                 suffixes
                     .entry(*stmt_end as usize)
                     .or_default()
-                    .push(format!(";{METHOD_FN}({i}, {class}, {}, {key});", *is_static as u8));
+                    .push(format!(";{METHOD_FN}({i}, {class}, {}, {key}, {accessor});", *is_static as u8));
             }
         }
     }

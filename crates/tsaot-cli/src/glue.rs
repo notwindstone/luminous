@@ -203,17 +203,20 @@ JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
                                JS_UNDEFINED, tsaot_table[fn].kind);
 }}
 
-/* {METHOD_FN}(i, Class, is_static, key): replace a class method with native
- * function i; the interpreted method becomes its fallback. Same attributes
- * as a class method: writable, configurable, not enumerable. */
+/* {METHOD_FN}(i, Class, is_static, key, accessor): replace a class method
+ * (accessor 0), getter (1) or setter (2) with native function i; the
+ * interpreted one becomes its fallback. A method keeps the attributes of a
+ * class method (writable, configurable, not enumerable); an accessor only
+ * has its getter or setter replaced. */
 static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {{
-    int32_t i, is_static;
+    int32_t i, is_static, accessor = 0;
     JSValue holder, fallback, stub;
+    JSPropertyDescriptor desc;
     JSAtom key;
     int r;
     if (argc < 4 || JS_ToInt32(ctx, &i, argv[0]) || JS_ToInt32(ctx, &is_static, argv[2]) ||
-        i < 0 || i >= {nall})
+        (argc > 4 && JS_ToInt32(ctx, &accessor, argv[4])) || i < 0 || i >= {nall})
         return JS_ThrowTypeError(ctx, "{METHOD_FN}: bad arguments");
     holder = is_static ? JS_DupValue(ctx, argv[1]) : JS_GetPropertyStr(ctx, argv[1], "prototype");
     if (JS_IsException(holder))
@@ -223,7 +226,20 @@ static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSV
         JS_FreeValue(ctx, holder);
         return JS_EXCEPTION;
     }}
-    fallback = JS_GetProperty(ctx, holder, key);
+    if (accessor) {{
+        r = JS_GetOwnProperty(ctx, &desc, holder, key);
+        fallback = JS_UNDEFINED;
+        if (r > 0) {{
+            fallback = JS_DupValue(ctx, accessor == 1 ? desc.getter : desc.setter);
+            JS_FreeValue(ctx, desc.value);
+            JS_FreeValue(ctx, desc.getter);
+            JS_FreeValue(ctx, desc.setter);
+        }} else if (r < 0) {{
+            fallback = JS_EXCEPTION;
+        }}
+    }} else {{
+        fallback = JS_GetProperty(ctx, holder, key);
+    }}
     if (JS_IsException(fallback) || !JS_IsFunction(ctx, fallback)) {{
         JS_FreeValue(ctx, fallback);
         JS_FreeValue(ctx, holder);
@@ -235,8 +251,16 @@ static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSV
                                                             1, &fallback),
                                fallback, tsaot_table[i].kind);
     JS_FreeValue(ctx, fallback);
-    r = JS_IsException(stub) ? -1
-        : JS_DefinePropertyValue(ctx, holder, key, stub, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW);
+    if (JS_IsException(stub)) {{
+        r = -1;
+    }} else if (accessor) {{
+        r = JS_DefineProperty(ctx, holder, key, JS_UNDEFINED, accessor == 1 ? stub : JS_UNDEFINED,
+                              accessor == 2 ? stub : JS_UNDEFINED,
+                              (accessor == 1 ? JS_PROP_HAS_GET : JS_PROP_HAS_SET) | JS_PROP_THROW);
+        JS_FreeValue(ctx, stub);
+    }} else {{
+        r = JS_DefinePropertyValue(ctx, holder, key, stub, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW);
+    }}
     JS_FreeValue(ctx, holder);
     JS_FreeAtom(ctx, key);
     return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
@@ -284,7 +308,7 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
         JS_SetModuleExport(ctx, m, "{INIT_FN}", tsaot_exports[1]) < 0 ||
         JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0 ||
         JS_SetModuleExport(ctx, m, "{METHOD_FN}",
-                           JS_NewCFunction(ctx, tsaot_method, "{METHOD_FN}", 4)) < 0)
+                           JS_NewCFunction(ctx, tsaot_method, "{METHOD_FN}", 5)) < 0)
         return -1;
     if (JS_SetModuleExport(ctx, m, "{CLASS_FN}", JS_NewCFunction(ctx, tsaot_class, "{CLASS_FN}", 3)) < 0)
         return -1;
