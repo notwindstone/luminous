@@ -289,9 +289,11 @@ pub fn check<'a>(
                 cells: cells.iter().map(|c| c.name.clone()).collect(),
                 privates: cx.privates.len(),
                 homes: 2 * classes.len(),
+                classes: class_tables(&classes, &candidates),
             };
             ir::capture_values(&mut module);
             ir::inline_calls(&mut module);
+            ir::predict_calls(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
@@ -501,7 +503,8 @@ fn collect_toplevel<'a>(
                     if c.decorators.is_empty() && !c.declare {
                         class_methods(c, &id.name, classes.len(), end, &mut methods, &mut method_rejects);
                     }
-                    classes.push(class_info(c, &id.name));
+                    let info = class_info(c, &id.name, classes);
+                    classes.push(info);
                 }
                 pure_prefix = false;
             }
@@ -533,6 +536,8 @@ pub struct ClassInfo {
     pub body_start: u32,
     /// Private names (with their `#`).
     pub privates: Vec<(String, PrivateKind)>,
+    /// `extends C` of an earlier top-level class `C`: its index.
+    pub superclass: Option<usize>,
 }
 
 /// A class whose private names or home object native code uses: it gets
@@ -546,7 +551,7 @@ pub struct ClassUse {
     pub vars: Vec<(String, usize)>,
 }
 
-fn class_info(c: &Class, name: &str) -> ClassInfo {
+fn class_info(c: &Class, name: &str, earlier: &[ClassInfo]) -> ClassInfo {
     let mut privates: Vec<(String, PrivateKind)> = Vec::new();
     for el in &c.body.body {
         let (key, kind) = match el {
@@ -568,7 +573,11 @@ fn class_info(c: &Class, name: &str) -> ClassInfo {
             None => privates.push((name, kind)),
         }
     }
-    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates }
+    let superclass = match c.heritage.as_ref().map(|h| h.expression.without_parentheses()) {
+        Some(Expression::Identifier(id)) => earlier.iter().rposition(|k| k.name == id.name.as_str()),
+        _ => None,
+    };
+    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates, superclass }
 }
 
 /// Ordinary methods (static or not) of a top-level class.
@@ -1318,6 +1327,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_generator: self.is_generator,
             rest: self.rest,
             ret_slot: self.ret_slot,
+            class: if self.has_this && !self.is_closure { self.class } else { None },
             body: prologue,
         };
         ir::scalar_replace(&mut func);
@@ -4525,4 +4535,16 @@ fn segment<'a>(stmts: &'a [Statement<'a>], scoping: &Scoping, uses: &HashMap<Sym
         class: None,
         cells,
     }
+}
+
+/// The classes' superclasses and native members, for `ir::predict_calls`.
+fn class_tables(classes: &[ClassInfo], cands: &[Candidate]) -> Vec<ir::ClassTable> {
+    let mut tables: Vec<ir::ClassTable> =
+        classes.iter().map(|c| ir::ClassTable { superclass: c.superclass, members: Vec::new() }).collect();
+    for (i, c) in cands.iter().enumerate() {
+        if let (Some((k, is_static)), Site::Method { key, accessor, .. }) = (c.class, &c.site) {
+            tables[k].members.push((key.clone(), *accessor, is_static, i));
+        }
+    }
+    tables
 }

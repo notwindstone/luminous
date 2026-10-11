@@ -271,6 +271,8 @@ struct Codegen<'m> {
     value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     /// The atoms `Promise` and `resolve`, if used.
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
+    /// Return types, by `FuncId`.
+    rets: std::rc::Rc<Vec<Ty>>,
     fctx: FunctionBuilderContext,
 }
 
@@ -339,6 +341,7 @@ impl<'m> Codegen<'m> {
         Ok(Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
+            rets: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect()),
             promise_resolve: m
                 .atoms
                 .iter()
@@ -361,6 +364,7 @@ impl<'m> Codegen<'m> {
         let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
         let fast_sig = func.import_signature(fast_signature(self.module));
+        let fast = self.fast_funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
         Env {
             helpers,
             funcs,
@@ -378,6 +382,8 @@ impl<'m> Codegen<'m> {
             params: self.params.clone(),
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
+            fast,
+            rets: self.rets.clone(),
             fast_sig,
         }
     }

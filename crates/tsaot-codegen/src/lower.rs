@@ -195,6 +195,10 @@ pub(crate) struct Env {
     pub value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     /// The atoms `Promise` and `resolve`, if used.
     pub promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
+    /// JS entries (`tsaot_fast_<i>`), by `FuncId`.
+    pub fast: Vec<FuncRef>,
+    /// Return types, by `FuncId`.
+    pub rets: std::rc::Rc<Vec<Ty>>,
     /// The signature of `JSCFunctionFast` entries.
     pub fast_sig: SigRef,
 }
@@ -236,6 +240,9 @@ pub(crate) struct Lower<'a> {
     /// Inlined calls being lowered (innermost last): where their `return`s
     /// go, and the value's type.
     inline_rets: Vec<(Block, Ty)>,
+    /// A prediction for the next call, getter or setter lowered (see
+    /// `ExprKind::Predicted`).
+    pred: Option<Pred>,
     /// Owned values to free if an exception occurs now.
     temps: Vec<(Value, Value)>,
     /// Innermost-last exception handler blocks.
@@ -325,6 +332,7 @@ impl<'a> Lower<'a> {
             vars,
             loops: HashMap::new(),
             inline_rets: Vec::new(),
+            pred: None,
             temps: Vec::new(),
             handlers: Vec::new(),
             scopes: Vec::new(),
@@ -1477,34 +1485,19 @@ impl<'a> Lower<'a> {
                 let c = self.expr(y).num();
                 V::Num(self.binary(*op, a, c))
             }
-            ExprKind::Inline { body, locals } => {
-                let ty = e.ty;
-                let join = self.b.create_block();
-                for t in clif_types(ty) {
-                    self.b.append_block_param(join, t);
+            ExprKind::Inline { body, locals } => self.inline_body(body, locals, e.ty),
+            ExprKind::Predicted { expr, func, body, locals } => {
+                // Taken first thing by the call, getter or setter `expr`
+                // lowers to (not by an update in place).
+                let taken = match &expr.kind {
+                    ExprKind::GetProp(..) | ExprKind::CallMethod(..) | ExprKind::CallThis(..) => true,
+                    ExprKind::SetProp(o, a, x) => self.prop_step(o, *a, x).is_none(),
+                    _ => false,
+                };
+                if taken {
+                    self.pred = Some(Pred { func: *func, body: body.clone(), locals: locals.clone() });
                 }
-                self.inline_rets.push((join, ty));
-                self.stmts(body);
-                if !self.is_filled() {
-                    // Falling off the end.
-                    let v = self.zero(ty);
-                    let args: Vec<BlockArg> = self.abi(ty, v).into_iter().map(BlockArg::Value).collect();
-                    self.b.ins().jump(join, &args);
-                }
-                self.inline_rets.pop();
-                self.b.switch_to_block(join);
-                let params = self.b.block_params(join).to_vec();
-                let v = self.unabi(ty, &params);
-                // The callee's JS values are released as its return would.
-                for &l in locals {
-                    if is_js(self.locals[l]) && !matches!(self.vars[l], LVar::Boxed { .. }) {
-                        let old = self.use_local(l).any();
-                        let u = self.konst(0, TAG_UNDEFINED);
-                        self.def_local(l, u);
-                        self.free(old);
-                    }
-                }
-                v
+                self.expr(expr)
             }
             ExprKind::NumArith(op, x, y) => {
                 let a = self.expr(x);
@@ -1813,9 +1806,10 @@ impl<'a> Lower<'a> {
                 v
             }
             ExprKind::GetProp(o, a) => {
+                let pred = self.pred.take();
                 let (obj, owned) = self.operand(o, &[]);
                 let (p, t) = obj.any();
-                let (rp, rt) = self.prop_get(p, t, *a);
+                let (rp, rt) = self.prop_get_from(p, t, None, *a, pred);
                 self.drop_operand(obj, owned);
                 V::Any(rp, rt)
             }
@@ -1824,6 +1818,7 @@ impl<'a> Lower<'a> {
                 self.prop_update(o, *a, step, true)
             }
             ExprKind::SetProp(o, a, x) => {
+                let pred = self.pred.take();
                 let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
@@ -1850,15 +1845,16 @@ impl<'a> Lower<'a> {
                 // The property's reference is dropped after the call.
                 let tag = self.b.ins().iconst(I64, TAG_OBJECT);
                 let argv = self.values_slot(&[(vp, vt)]);
-                let (sp, st) = self.call_linked((setter, tag), (p, t), 1, argv, true, |l| {
-                    l.dup((vp, vt));
-                    let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
-                    let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
-                    let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
-                    let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
-                    let zero = l.b.ins().iconst(I64, 0);
-                    (zero, l.b.ins().select(failed, exc, undef))
-                });
+                let (sp, st) =
+                    self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
+                        l.dup((vp, vt));
+                        let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
+                        let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+                        let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
+                        let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
+                        let zero = l.b.ins().iconst(I64, 0);
+                        (zero, l.b.ins().select(failed, exc, undef))
+                    });
                 self.free((vp, vt));
                 self.free((sp, st));
                 self.check_value(st);
@@ -2127,19 +2123,21 @@ impl<'a> Lower<'a> {
                 let fv = self.expr(f);
                 self.hold(fv);
                 let undef = self.konst(0, TAG_UNDEFINED);
-                self.call_values(fv, undef, args)
+                self.call_values(fv, undef, args, None)
             }
             ExprKind::CallThis(f, this, args) => {
+                let pred = self.pred.take();
                 let fv = self.expr(f);
                 self.hold(fv);
                 let tv = self.expr(this);
                 self.hold(tv);
-                let r = self.call_values(fv, tv, args);
+                let r = self.call_values(fv, tv, args, pred);
                 self.release(tv);
                 self.free_v(tv);
                 r
             }
             ExprKind::CallMethod(o, key, args) => {
+                let pred = self.pred.take();
                 // The method is read before the arguments are evaluated.
                 let mut later: Vec<&Expr> = args.iter().collect();
                 if let Key::Value(k) = key {
@@ -2161,7 +2159,7 @@ impl<'a> Lower<'a> {
                 self.check_value(m[1]);
                 let fv = V::Any(m[0], m[1]);
                 self.hold(fv);
-                let r = self.call_values(fv, obj, args);
+                let r = self.call_values(fv, obj, args, pred);
                 self.drop_operand(obj, owned);
                 r
             }
@@ -2496,7 +2494,7 @@ impl<'a> Lower<'a> {
             ExprKind::SuperGetAtom(home, a) => {
                 let (hp, ht) = self.table_value(self.env.homes, *home);
                 let this = self.this.expect("`super` in a method");
-                let (rp, rt) = self.prop_get_from(hp, ht, Some(this), *a);
+                let (rp, rt) = self.prop_get_from(hp, ht, Some(this), *a, None);
                 V::Any(rp, rt)
             }
             ExprKind::SuperGet(home, k) => {
@@ -2582,8 +2580,150 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// An inlined body (see `ExprKind::Inline`) of type `ty` over `locals`.
+    fn inline_body(&mut self, body: &[Stmt], locals: &[ir::LocalId], ty: Ty) -> V {
+        let join = self.b.create_block();
+        for t in clif_types(ty) {
+            self.b.append_block_param(join, t);
+        }
+        self.inline_rets.push((join, ty));
+        self.stmts(body);
+        if !self.is_filled() {
+            // Falling off the end.
+            let v = self.zero(ty);
+            let args: Vec<BlockArg> = self.abi(ty, v).into_iter().map(BlockArg::Value).collect();
+            self.b.ins().jump(join, &args);
+        }
+        self.inline_rets.pop();
+        self.b.switch_to_block(join);
+        let params = self.b.block_params(join).to_vec();
+        let v = self.unabi(ty, &params);
+        // The callee's JS values are released as its return would.
+        for &l in locals {
+            if is_js(self.locals[l]) && !matches!(self.vars[l], LVar::Boxed { .. }) {
+                let old = self.use_local(l).any();
+                let u = self.konst(0, TAG_UNDEFINED);
+                self.def_local(l, u);
+                self.free(old);
+            }
+        }
+        v
+    }
+
+    /// Whether `(fp, ft)` is native function `func` (by its JS entry).
+    fn is_native(&mut self, fp: Value, ft: Value, func: usize) -> Value {
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, I8);
+        let no = self.b.ins().iconst(I8, 0);
+        let obj = self.b.create_block();
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(no)]);
+        self.b.switch_to_block(obj);
+        let class = self.b.ins().uload16(I32, Self::mem(), fp, layout::OBJ_CLASS_ID);
+        let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
+        let data = self.b.create_block();
+        self.b.ins().brif(is_data, data, &[], join, &[BlockArg::Value(no)]);
+        self.b.switch_to_block(data);
+        let rec = self.b.ins().load(I64, Self::mem(), fp, layout::OBJ_FUNC_DATA);
+        let entry = self.b.ins().load(I64, Self::mem(), rec, layout::FDATA_FAST);
+        let want = self.b.ins().func_addr(self.ptr, self.env.fast[func]);
+        let same = self.b.ins().icmp(IntCC::Equal, entry, want);
+        self.b.ins().jump(join, &[BlockArg::Value(same)]);
+        self.b.switch_to_block(join);
+        r
+    }
+
+    /// For a prediction: whether function `(fp, ft)` is the predicted one
+    /// and `args` (JS values, borrowed) suit its parameters, as its entry
+    /// requires. `None` if they cannot.
+    fn pred_guard(&mut self, pred: &Pred, fp: Value, ft: Value, args: &[(Value, Value)]) -> Option<Value> {
+        let params = self.env.params[pred.func].clone();
+        let mut checks = Vec::new();
+        for (i, &pt) in params.iter().enumerate() {
+            match pt {
+                Ty::Any | Ty::Arr(_) => {}
+                Ty::F64 | Ty::MaybeF64 => checks.push((args.get(i)?.1, true)),
+                Ty::Bool => checks.push((args.get(i)?.1, false)),
+                _ => return None,
+            }
+        }
+        let mut ok = self.is_native(fp, ft, pred.func);
+        for (t, number) in checks {
+            let c = if number { self.is_number(t) } else { self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL) };
+            ok = self.b.ins().band(ok, c);
+        }
+        Some(ok)
+    }
+
+    /// The predicted function's body inline, with `this` the receiver `recv`
+    /// and `args` (JS values, borrowed) its arguments, which `pred_guard`
+    /// checked. Its result as a new JS value.
+    fn inline_method(&mut self, pred: &Pred, recv: (Value, Value), args: &[(Value, Value)]) -> (Value, Value) {
+        let params = self.env.params[pred.func].clone();
+        let ret = self.env.rets[pred.func];
+        for (i, &pt) in params.iter().enumerate() {
+            let l = pred.locals[i];
+            let v = match (pt, args.get(i)) {
+                (Ty::F64 | Ty::MaybeF64, Some(&a)) => V::Num(self.number_of(a)),
+                (Ty::Bool, Some(&(p, _))) => {
+                    let i = self.b.ins().ireduce(I32, p);
+                    V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, i, 0))
+                }
+                (_, Some(&(p, t))) => {
+                    self.dup((p, t));
+                    V::Any(p, t)
+                }
+                (_, None) => self.konst(0, TAG_UNDEFINED),
+            };
+            // The local may be `Any` where its parameter is not.
+            let v = if is_js(self.locals[l]) && !matches!(v, V::Any(..)) {
+                let (p, t) = self.boxed(v);
+                V::Any(p, t)
+            } else {
+                v
+            };
+            self.init_local(l, v);
+        }
+        let outer = self.this.replace(recv);
+        let v = self.inline_body(&pred.body, &pred.locals, ret);
+        self.this = outer;
+        self.boxed(v)
+    }
+
+    /// Call `f` through `call_linked`, or inline as `pred` predicts.
+    #[allow(clippy::too_many_arguments)]
+    fn call_or_inline(
+        &mut self,
+        pred: Option<&Pred>,
+        f: (Value, Value),
+        this: (Value, Value),
+        args: &[(Value, Value)],
+        argv: Value,
+        borrowed: bool,
+        generic: impl FnOnce(&mut Self) -> (Value, Value),
+    ) -> (Value, Value) {
+        let guard = pred.and_then(|p| self.pred_guard(p, f.0, f.1, args));
+        let (Some(pred), Some(ok)) = (pred, guard) else {
+            return self.call_linked(f, this, args.len(), argv, borrowed, generic);
+        };
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let inline = self.b.create_block();
+        let call = self.b.create_block();
+        self.b.ins().brif(ok, inline, &[], call, &[]);
+        self.b.switch_to_block(inline);
+        let (p, t) = self.inline_method(pred, this, args);
+        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+        self.b.switch_to_block(call);
+        let (p, t) = self.call_linked(f, this, args.len(), argv, borrowed, generic);
+        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+        self.b.switch_to_block(join);
+        (rp, rt)
+    }
+
     /// Call `f` (held) with `this` (borrowed) and `args`; frees `f`.
-    fn call_values(&mut self, f: V, this: V, args: &[Expr]) -> V {
+    fn call_values(&mut self, f: V, this: V, args: &[Expr], pred: Option<Pred>) -> V {
         let held: Vec<V> = args
             .iter()
             .map(|a| {
@@ -2598,7 +2738,8 @@ impl<'a> Lower<'a> {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, args.len() as i64);
         let ctx = self.ctx;
-        let (rp, rt) = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
+        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let (rp, rt) = self.call_or_inline(pred.as_ref(), f.any(), this.any(), &js_args, argv, false, |l| {
             let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
@@ -3762,12 +3903,19 @@ impl<'a> Lower<'a> {
     /// property, or a data property (a method) or getter of the direct
     /// prototype. A new reference.
     fn prop_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
-        self.prop_get_from(p, t, None, a)
+        self.prop_get_from(p, t, None, a, None)
     }
 
     /// `prop_get`, or with a receiver: `super.a` (`p`, `t`: the home object;
     /// only its prototypes are searched, and getters get the receiver).
-    fn prop_get_from(&mut self, p: Value, t: Value, receiver: Option<(Value, Value)>, a: ir::AtomId) -> (Value, Value) {
+    fn prop_get_from(
+        &mut self,
+        p: Value,
+        t: Value,
+        receiver: Option<(Value, Value)>,
+        a: ir::AtomId,
+        pred: Option<Pred>,
+    ) -> (Value, Value) {
         let ic = self.new_ic();
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
@@ -3812,7 +3960,7 @@ impl<'a> Lower<'a> {
         let (thp, tht) = receiver.unwrap_or((p, t));
         let tag = self.b.ins().iconst(I64, TAG_OBJECT);
         let none = self.b.ins().iconst(I64, 0);
-        let (gp, gt) = self.call_linked((g, tag), (thp, tht), 0, none, true, |l| {
+        let (gp, gt) = self.call_or_inline(pred.as_ref(), (g, tag), (thp, tht), &[], none, true, |l| {
             let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
             (r[0], r[1])
         });
@@ -4975,4 +5123,11 @@ impl Lower<'_> {
         }
         self.b.ins().jump(cx.resumes[0], &[]);
     }
+}
+
+/// A prediction for a call, getter or setter (see `ExprKind::Predicted`).
+pub(crate) struct Pred {
+    func: usize,
+    body: Vec<Stmt>,
+    locals: Vec<ir::LocalId>,
 }

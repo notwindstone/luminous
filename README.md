@@ -196,7 +196,11 @@ fast paths that keep the engine's semantics:
     loops or closures are inlined, as JIT compilers inline them); a callee only known
     at run time (a method, a getter, a callback) is checked for being a
     native function and then entered through its native entry, skipping
-    the engine's call path; interpreted ones through the engine;
+    the engine's call path; interpreted ones through the engine; where
+    the code says which native method, getter or setter a call should
+    reach (`this` of a class and its superclasses, `super.m()`, members of
+    an object literal in a local), a small one is inlined behind a check
+    that the function reached is that one (speculative inlining);
   - `-`, `*`, `/`, `%` and `**` between a number and a JS value: the JS
     value is converted inline, and the result is a number (a BigInt
     throws, as mixing it with a number does);

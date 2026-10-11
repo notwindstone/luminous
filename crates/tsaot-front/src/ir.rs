@@ -9,7 +9,7 @@
 //! Lowering may rely on these invariants without re-checking anything: the
 //! operand types of every node are the ones its documentation states.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Machine-level value types. `F64` is a JS `number` known to be one.
@@ -146,6 +146,16 @@ pub struct Module {
     /// Home object slots: for class `k`, its prototype (`2k`) and itself
     /// (`2k + 1`, for static methods).
     pub homes: usize,
+    /// Top-level classes (by home slot `k`).
+    pub classes: Vec<ClassTable>,
+}
+
+/// A top-level class: its superclass (if a top-level class) and its native
+/// members: (key, 0 for a method / 1 a getter / 2 a setter, static, function).
+#[derive(Debug, Clone, Default)]
+pub struct ClassTable {
+    pub superclass: Option<usize>,
+    pub members: Vec<(String, u8, bool, FuncId)>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +185,8 @@ pub struct Func {
     pub is_closure: bool,
     /// Methods: `this` is passed in (borrowed).
     pub has_this: bool,
+    /// Class methods: their class, and whether they are static.
+    pub class: Option<(usize, bool)>,
     /// `async`: compiled as a resumable step function over a heap frame.
     pub is_async: bool,
     /// The last parameter collects the remaining arguments in an array.
@@ -420,6 +432,18 @@ pub enum ExprKind {
     /// `return`s give the value, over `locals` (the callee's, appended to
     /// the caller's; its JS values are released after it).
     Inline {
+        body: Vec<Stmt>,
+        locals: Vec<LocalId>,
+    },
+    /// A method call (`CallMethod`, `CallThis`), getter read (`GetProp`) or
+    /// setter write (`SetProp`) predicted to reach native function `func`
+    /// (module functions, then closures; see `predict_calls`): when it does
+    /// (its entry is checked) and the arguments have its parameters' types,
+    /// its `body` runs inline over `locals` (parameters first), with `this`
+    /// the receiver.
+    Predicted {
+        expr: Box<Expr>,
+        func: usize,
         body: Vec<Stmt>,
         locals: Vec<LocalId>,
     },
@@ -692,6 +716,10 @@ macro_rules! visitor {
                 | SuperGetAtom(..)
                 | Closure(..) => {}
                 Inline { body, .. } => $stmts(body, f),
+                Predicted { expr, body, .. } => {
+                    $name(expr, f);
+                    $stmts(body, f);
+                }
                 SetLocal(_, a)
                 | InitLocal(_, a)
                 | Unary(_, a)
@@ -1551,6 +1579,12 @@ const INLINE_CALLER_LIMIT: usize = 4000;
 /// loops. Its statements then run at most once per call, which keeps the
 /// caller's loop-based analyses (that count writes per iteration) sound.
 fn inlinable(f: &Func, size_limit: usize) -> bool {
+    inline_ok(f, size_limit, false)
+}
+
+/// `inlinable`, or for `predict_calls` (`method`): also a method (with
+/// `this`) or a closure without captures.
+fn inline_ok(f: &Func, size_limit: usize, method: bool) -> bool {
     fn stmts_ok(stmts: &[Stmt]) -> bool {
         stmts.iter().all(|s| match s {
             Stmt::Expr(_) | Stmt::Return(_) | Stmt::Throw(_) => true,
@@ -1559,7 +1593,8 @@ fn inlinable(f: &Func, size_limit: usize) -> bool {
             _ => false,
         })
     }
-    if f.is_async || f.is_generator || f.is_closure || f.has_this || f.rest || f.ret_slot.is_some() {
+    let other = if method { !f.captures.is_empty() } else { f.is_closure || f.has_this };
+    if f.is_async || f.is_generator || other || f.rest || f.ret_slot.is_some() {
         return false;
     }
     if f.boxed.iter().any(|&b| b) || !stmts_ok(&f.body) {
@@ -1570,8 +1605,9 @@ fn inlinable(f: &Func, size_limit: usize) -> bool {
     visit_stmts(&f.body, &mut |e| {
         size += 1;
         match &e.kind {
-            ExprKind::Closure(..) | ExprKind::This => ok = false,
-            ExprKind::Inline { body, .. } => ok &= stmts_ok(body),
+            ExprKind::Closure(..) => ok = false,
+            ExprKind::This => ok &= method,
+            ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } => ok &= stmts_ok(body),
             _ => {}
         }
     });
@@ -1607,6 +1643,7 @@ fn shift_locals(e: &mut Expr, base: LocalId) {
         }
         ExprKind::Closure(_, caps) => caps.iter_mut().for_each(|l| *l += base),
         ExprKind::Inline { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
+        ExprKind::Predicted { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
         _ => {}
     }
 }
@@ -1677,6 +1714,220 @@ pub fn inline_calls(m: &mut Module) {
                 visit_stmts_mut(&mut inner, &mut |x| shift_locals(x, base));
                 body.extend(inner);
             });
+            f.boxed.extend(added.iter().map(|_| false));
+            f.local_names.extend(added.iter().map(|_| None));
+            f.locals.extend(added);
+        }
+    }
+}
+
+/// `receivers`: `this`, the locals holding known receivers, and the locals
+/// holding `super.key` (home, key).
+type Receivers = (Option<Recv>, HashMap<LocalId, Recv>, HashMap<LocalId, (usize, AtomId)>);
+
+/// What a receiver is known to be, for `predict_calls`.
+#[derive(Clone)]
+enum Recv {
+    /// An instance of a class (or the class itself: static).
+    Class(usize, bool),
+    /// An object literal: its members (key, 0 method / 1 getter / 2 setter,
+    /// closure), later ones first.
+    Literal(Vec<(AtomId, u8, ClosureId)>),
+}
+
+/// A member `key` of `kind` (0 method, 1 getter, 2 setter) found from class
+/// `c` up its superclasses.
+fn class_member(m: &Module, mut c: Option<usize>, is_static: bool, key: &str, kind: u8) -> Option<usize> {
+    while let Some(k) = c {
+        let t = m.classes.get(k)?;
+        if let Some(&(_, _, _, f)) = t.members.iter().find(|(n, a, s, _)| n == key && *a == kind && *s == is_static) {
+            return Some(f);
+        }
+        c = t.superclass;
+    }
+    None
+}
+
+/// A local's write, as `receivers` sees it.
+enum Write {
+    This,
+    Literal(Vec<(AtomId, u8, ClosureId)>),
+    Super(usize, AtomId),
+    Other,
+}
+
+fn write_of(x: &Expr) -> Write {
+    let closure = |v: &Expr| if let ExprKind::Closure(k, _) = v.kind { Some(k) } else { None };
+    match &x.kind {
+        ExprKind::This => Write::This,
+        ExprKind::SuperGetAtom(home, a) => Write::Super(*home, *a),
+        ExprKind::Object(props) => {
+            Write::Literal(props.iter().rev().filter_map(|(a, v)| Some((*a, 0, closure(v)?))).collect())
+        }
+        ExprKind::ObjectParts(parts) => {
+            let mut members = Vec::new();
+            for p in parts.iter().rev() {
+                match p {
+                    ObjPart::Field(a, v) => members.extend(closure(v).map(|k| (*a, 0, k))),
+                    ObjPart::Accessor(a, v, setter) => {
+                        members.extend(closure(v).map(|k| (*a, if *setter { 2 } else { 1 }, k)))
+                    }
+                    // Keys not known: nothing before it (here: after) is
+                    // predicted.
+                    ObjPart::Spread(_) | ObjPart::Computed(..) => break,
+                }
+            }
+            Write::Literal(members)
+        }
+        _ => Write::Other,
+    }
+}
+
+/// The receivers `predict_calls` knows in `f`: `this` of a class method,
+/// locals only ever assigned `this`, and locals assigned once an object
+/// literal; and the locals assigned only `super.key` (home, key).
+fn receivers(f: &Func) -> Receivers {
+    let this = f.class.filter(|_| f.has_this).map(|(c, s)| Recv::Class(c, s));
+    let mut writes: HashMap<LocalId, Vec<Write>> = HashMap::new();
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => writes.entry(*l).or_default().push(write_of(x)),
+        _ => {
+            for l in 0..f.locals.len() {
+                if local_refs(e, l).1 > 0 {
+                    writes.entry(l).or_default().push(Write::Other);
+                }
+            }
+        }
+    });
+    stmt_locals(&f.body, &mut |l| writes.entry(l).or_default().push(Write::Other));
+    let mut recv = HashMap::new();
+    let mut supers = HashMap::new();
+    for (l, ws) in writes {
+        if f.boxed[l] || f.captures.contains(&l) {
+            continue;
+        }
+        match &ws[..] {
+            ws if this.is_some() && ws.iter().all(|w| matches!(w, Write::This)) => {
+                recv.insert(l, this.clone().unwrap());
+            }
+            [Write::Literal(members)] => {
+                recv.insert(l, Recv::Literal(members.clone()));
+            }
+            [Write::Super(home, a), rest @ ..]
+                if rest.iter().all(|w| matches!(w, Write::Super(h, b) if h == home && b == a)) =>
+            {
+                supers.insert(l, (*home, *a));
+            }
+            _ => {}
+        }
+    }
+    (this, recv, supers)
+}
+
+fn func_at(m: &Module, g: usize) -> &Func {
+    if g < m.funcs.len() { &m.funcs[g] } else { &m.closures[g - m.funcs.len()] }
+}
+
+/// Speculative inlining of methods, getters and setters, as JIT compilers
+/// inline a callee they expect at a call site: where the code around a
+/// call says which native function it should reach (a method of `this`'s
+/// class or its superclasses, `super.m()`, a member of an object literal
+/// in a `const`-like local), the callee's body is attached for inlining
+/// (`ExprKind::Predicted`). Code generation checks that the function
+/// reached is that one, so a wrong prediction only costs the check.
+pub fn predict_calls(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    let total = nfuncs + m.closures.len();
+    let get = func_at;
+    let typed = |f: &Func| f.params.iter().all(|t| matches!(t, Ty::Any | Ty::F64 | Ty::MaybeF64 | Ty::Bool));
+    let small: Vec<bool> = (0..total).map(|g| inline_ok(get(m, g), INLINE_SIZE, true) && typed(get(m, g))).collect();
+    for _ in 0..2 {
+        let templates: Vec<Option<Func>> = (0..total)
+            .map(|g| (small[g] && inline_ok(get(m, g), usize::MAX, true)).then(|| get(m, g).clone()))
+            .collect();
+        for g in 0..total {
+            let (this, recv, supers) = receivers(get(m, g));
+            let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+            let mut body = std::mem::take(&mut f.body);
+            let base0 = f.locals.len();
+            let m_ref: &Module = m;
+            let resolve = |e: &Expr| -> Option<usize> {
+                let of = |o: &Expr| match &o.kind {
+                    ExprKind::This => this.clone(),
+                    ExprKind::Local(l) => recv.get(l).cloned(),
+                    _ => None,
+                };
+                let member = |r: Recv, a: AtomId, kind: u8| match r {
+                    Recv::Class(c, s) => class_member(m_ref, Some(c), s, &m_ref.atoms[a], kind),
+                    // The last definition of the key: a field, or this half
+                    // of an accessor.
+                    Recv::Literal(ms) => ms
+                        .iter()
+                        .find(|(b, k, _)| *b == a && (*k == kind || *k == 0))
+                        .filter(|(_, k, _)| *k == kind)
+                        .map(|(_, _, c)| nfuncs + c),
+                };
+                match &e.kind {
+                    ExprKind::CallMethod(o, Key::Atom(a), _) => member(of(o)?, *a, 0),
+                    ExprKind::GetProp(o, a) => member(of(o)?, *a, 1),
+                    ExprKind::SetProp(o, a, _) => member(of(o)?, *a, 2),
+                    ExprKind::CallThis(callee, _, _) => {
+                        let ExprKind::Local(l) = callee.kind else { return None };
+                        let &(home, a) = supers.get(&l)?;
+                        let c = m_ref.classes.get(home / 2)?.superclass;
+                        class_member(m_ref, c, home % 2 == 1, &m_ref.atoms[a], 0)
+                    }
+                    _ => None,
+                }
+            };
+            let mut budget = INLINE_CALLER_LIMIT.saturating_sub(ir_size(&body));
+            let mut added: Vec<Ty> = Vec::new();
+            // Attached bodies are set aside while the function is searched
+            // (their `this` is another receiver): by their first local.
+            let mut stash: HashMap<LocalId, Vec<Stmt>> = HashMap::new();
+            let mut pending: HashMap<LocalId, usize> = HashMap::new();
+            let mut wrapped: HashSet<*const Expr> = HashSet::new();
+            visit_stmts_mut(&mut body, &mut |e| {
+                if let ExprKind::Predicted { body, locals, .. } = &mut e.kind {
+                    if !body.is_empty() {
+                        stash.insert(locals[0], std::mem::take(body));
+                    }
+                    return;
+                }
+                if wrapped.contains(&(e as *const Expr)) {
+                    return;
+                }
+                let Some(k) = resolve(e) else { return };
+                let Some(t) = templates[k].as_ref() else { return };
+                let size = ir_size(&t.body);
+                if size > budget {
+                    return;
+                }
+                budget -= size;
+                let base = base0 + added.len();
+                added.extend(&t.locals);
+                if t.locals.is_empty() {
+                    added.push(Ty::Bool);
+                }
+                pending.insert(base, k);
+                let locals = (base..base + t.locals.len().max(1)).collect();
+                let ty = e.ty;
+                let expr = Box::new(std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined)));
+                wrapped.insert(&*expr as *const Expr);
+                *e = Expr { ty, kind: ExprKind::Predicted { expr, func: k, body: Vec::new(), locals } };
+            });
+            visit_stmts_mut(&mut body, &mut |e| {
+                let ExprKind::Predicted { body, locals, .. } = &mut e.kind else { return };
+                if let Some(b) = stash.remove(&locals[0]) {
+                    *body = b;
+                } else if let Some(k) = pending.remove(&locals[0]) {
+                    let mut inner = templates[k].as_ref().unwrap().body.clone();
+                    visit_stmts_mut(&mut inner, &mut |x| shift_locals(x, locals[0]));
+                    *body = inner;
+                }
+            });
+            let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+            f.body = body;
             f.boxed.extend(added.iter().map(|_| false));
             f.local_names.extend(added.iter().map(|_| None));
             f.locals.extend(added);
