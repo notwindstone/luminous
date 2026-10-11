@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,103 @@
+@@ -1052,6 +1059,105 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -94,6 +94,8 @@
 +                                      JSValueConst value, int *pkind);
 +JS_EXTERN JSValue JS_NewNativeGenerator(JSContext *ctx, JSValueConst func_obj,
 +                                        JSNativeGeneratorStep *step, JSValue frame);
++JS_EXTERN JSValue JS_NewNativeAsyncGenerator(JSContext *ctx, JSValueConst func_obj,
++                                             JSNativeGeneratorStep *step, JSValue frame);
 +/* For native code iterating a native generator with the original `next`:
 +   `next()` without the call through the iterator protocol. */
 +JS_EXTERN bool JS_IsNativeGenerator(JSValueConst obj);
@@ -118,7 +120,7 @@
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1446,13 @@
+@@ -1342,6 +1448,13 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -672,7 +674,204 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -44978,6 +45344,15 @@
+@@ -21672,6 +22038,12 @@
+     JSAsyncGeneratorStateEnum state;
+     JSAsyncFunctionState func_state;
+     struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
++    /* native body (tsaot): a step function over a frame, instead of
++       func_state; and how to resume it (GEN_MAGIC_x, value) */
++    JSNativeGeneratorStep *native_step;
++    JSValue native_frame;
++    int native_magic;
++    JSValue native_value;
+ } JSAsyncGeneratorData;
+ 
+ static void js_async_generator_free(JSRuntime *rt,
+@@ -21688,8 +22060,11 @@
+         JS_FreeValueRT(rt, req->resolving_funcs[1]);
+         js_free_rt(rt, req);
+     }
+-    if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
+-        s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
++    if (s->native_step) {
++        JS_FreeValueRT(rt, s->native_frame);
++        JS_FreeValueRT(rt, s->native_value);
++    } else if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
++               s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
+         async_func_free(rt, &s->func_state);
+     }
+     js_free_rt(rt, s);
+@@ -21718,8 +22093,11 @@
+             JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
+             JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
+         }
+-        if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
+-            s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
++        if (s->native_step) {
++            JS_MarkValue(rt, s->native_frame, mark_func);
++            JS_MarkValue(rt, s->native_value, mark_func);
++        } else if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED &&
++                   s->state != JS_ASYNC_GENERATOR_STATE_AWAITING_RETURN) {
+             async_func_mark(rt, &s->func_state, mark_func);
+         }
+     }
+@@ -21832,7 +22210,12 @@
+ {
+     if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
+         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+-        async_func_free(ctx->rt, &s->func_state);
++        if (s->native_step) {
++            JS_FreeValue(ctx, s->native_frame);
++            s->native_frame = JS_UNDEFINED;
++        } else {
++            async_func_free(ctx->rt, &s->func_state);
++        }
+     }
+ }
+ 
+@@ -21874,6 +22257,55 @@
+     return res;
+ }
+ 
++/* Run a native async generator from its pending resumption (state
++   EXECUTING) to its next suspension. The step function returns the value
++   and sets *kind: 0 or 1 to yield it, 3 to await it, 2 when the body
++   returned it. Returns true while awaiting (resume_next must stop). */
++static bool js_async_generator_native_step(JSContext *ctx,
++                                           JSAsyncGeneratorData *s)
++{
++    JSValue value, ret;
++    int kind;
++
++    for(;;) {
++        kind = 2;
++        value = s->native_value;
++        s->native_value = JS_UNDEFINED;
++        ret = s->native_step(ctx, s->native_frame, s->native_magic, value, &kind);
++        JS_FreeValue(ctx, value);
++        if (JS_IsException(ret)) {
++            value = JS_GetException(ctx);
++            js_async_generator_complete(ctx, s);
++            js_async_generator_reject(ctx, s, value);
++            JS_FreeValue(ctx, value);
++            return false;
++        }
++        switch(kind) {
++        case 0:
++        case 1:
++            s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD;
++            js_async_generator_resolve(ctx, s, ret, false);
++            JS_FreeValue(ctx, ret);
++            return false;
++        case 3:
++            if (js_async_generator_await(ctx, s, ret) < 0) {
++                /* throw it at the await */
++                JS_FreeValue(ctx, ret);
++                s->native_magic = GEN_MAGIC_THROW;
++                s->native_value = JS_GetException(ctx);
++                continue;
++            }
++            JS_FreeValue(ctx, ret);
++            return true;
++        default:
++            js_async_generator_complete(ctx, s);
++            js_async_generator_resolve(ctx, s, ret, true);
++            JS_FreeValue(ctx, ret);
++            return false;
++        }
++    }
++}
++
+ static void js_async_generator_resume_next(JSContext *ctx,
+                                            JSAsyncGeneratorData *s)
+ {
+@@ -21910,6 +22342,12 @@
+         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
+         case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
+             value = js_dup(next->result);
++            if (s->native_step) {
++                s->native_magic = next->completion_type;
++                s->native_value = value;
++                s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
++                goto resume_exec;
++            }
+             if (next->completion_type == GEN_MAGIC_THROW &&
+                 s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
+                 JS_Throw(ctx, value);
+@@ -21922,10 +22360,20 @@
+                     js_int32(next->completion_type);
+                 s->func_state.frame.cur_sp++;
+             exec_no_arg:
+-                s->func_state.throw_flag = false;
++                if (s->native_step) {
++                    s->native_magic = GEN_MAGIC_NEXT;
++                    s->native_value = JS_UNDEFINED;
++                } else {
++                    s->func_state.throw_flag = false;
++                }
+             }
+             s->state = JS_ASYNC_GENERATOR_STATE_EXECUTING;
+         resume_exec:
++            if (s->native_step) {
++                if (js_async_generator_native_step(ctx, s))
++                    goto done;
++                break;
++            }
+             func_ret = async_func_resume(ctx, &s->func_state);
+             if (JS_IsException(func_ret)) {
+                 value = JS_GetException(ctx);
+@@ -21999,6 +22447,12 @@
+         }
+     } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
+         /* restart function execution after await() */
++        if (s->native_step) {
++            s->native_magic = is_reject ? GEN_MAGIC_THROW : GEN_MAGIC_NEXT;
++            s->native_value = js_dup(arg);
++            js_async_generator_resume_next(ctx, s);
++            return JS_UNDEFINED;
++        }
+         s->func_state.throw_flag = is_reject;
+         if (is_reject) {
+             JS_Throw(ctx, js_dup(arg));
+@@ -22095,6 +22549,37 @@
+     return JS_EXCEPTION;
+ }
+ 
++/* An async generator object whose body is native code, as
++   JS_NewNativeGenerator. The step function also reports awaits (kind 3):
++   the engine resumes it with the settled value (GEN_MAGIC_NEXT) or the
++   rejection (GEN_MAGIC_THROW). */
++JSValue JS_NewNativeAsyncGenerator(JSContext *ctx, JSValueConst func_obj,
++                                   JSNativeGeneratorStep *step, JSValue frame)
++{
++    JSAsyncGeneratorData *s;
++    JSValue obj;
++
++    s = js_mallocz(ctx, sizeof(*s));
++    if (!s) {
++        JS_FreeValue(ctx, frame);
++        return JS_EXCEPTION;
++    }
++    s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
++    init_list_head(&s->queue);
++    s->native_step = step;
++    s->native_frame = frame;
++    s->native_value = JS_UNDEFINED;
++    obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
++    if (JS_IsException(obj)) {
++        js_async_generator_free(ctx->rt, s);
++        return obj;
++    }
++    s->generator = JS_VALUE_GET_OBJ(obj);
++    JS_SetOpaqueInternal(obj, s);
++    return obj;
++}
++
++
+ /* JS parser */
+ 
+ enum {
+@@ -44978,6 +45463,15 @@
      return JS_EXCEPTION;
  }
  
@@ -688,7 +887,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56106,6 +56481,262 @@
+@@ -56106,6 +56600,262 @@
      return result_promise;
  }
  

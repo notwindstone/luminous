@@ -1,7 +1,7 @@
 // @error `aot` function `gen` cannot be compiled natively
-// @error async generators are not supported yet
+// @error `arguments` is not supported
 async function* gen(n: number) {
   "use aot";
-  yield n;
+  yield n + arguments.length;
 }
 console.log(gen(1));

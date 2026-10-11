@@ -508,7 +508,8 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             arrayIteratorProto, arrayIteratorProto.next, Symbol.iterator,\n"
         "             Object.getPrototypeOf(async function () {}),\n"
         "             Object.getPrototypeOf(function* () {}),\n"
-        "             Object.getPrototypeOf(function* () {}).prototype.next);\n"
+        "             Object.getPrototypeOf(function* () {}).prototype.next,\n"
+        "             Object.getPrototypeOf(async function* () {}));\n"
         "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
@@ -831,8 +832,10 @@ static JSValue tsaot_gen_step(JSContext *ctx, JSValueConst frame, int magic, JSV
     JSValue io = value, r;
     r = tsaot_steps[f->fn](ctx, f->slots, f->state, &io, magic);
     if (JS_IsUninitialized(r)) {
-        f->state = JS_VALUE_GET_INT(r) >> 1;
-        *pkind = JS_VALUE_GET_INT(r) & 1;
+        /* suspended: 4 * state + kind (0: yield, 1: yield an iterator
+           result as is, 3: await) */
+        f->state = JS_VALUE_GET_INT(r) >> 2;
+        *pkind = JS_VALUE_GET_INT(r) & 3;
         return io;
     }
     *pkind = 2;
@@ -851,8 +854,92 @@ JSValue tsaot_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data)
         JS_FreeValue(ctx, frame);
         return r;
     }
-    f->state = JS_VALUE_GET_INT(r) >> 1;
+    f->state = JS_VALUE_GET_INT(r) >> 2;
     return JS_NewNativeGenerator(ctx, JS_GetFunctionOfData(func_data), tsaot_gen_step, frame);
+}
+
+/* tsaot_gen_new for an async generator. */
+JSValue tsaot_async_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data)
+{
+    TsaotFrame *f = JS_GetOpaque(frame, tsaot_frame_class);
+    JSValue io = JS_UNDEFINED, r;
+    r = tsaot_steps[f->fn](ctx, f->slots, 0, &io, 0);
+    if (JS_IsException(r)) {
+        JS_FreeValue(ctx, frame);
+        return r;
+    }
+    f->state = JS_VALUE_GET_INT(r) >> 2;
+    return JS_NewNativeAsyncGenerator(ctx, JS_GetFunctionOfData(func_data), tsaot_gen_step, frame);
+}
+
+/* `yield*` in an async generator, as the interpreter does it: resume the
+ * inner iterator (v = { iterator, next method, value }, the value taken) as
+ * the generator was resumed (`mode`: next / return / throw = 0 / 1 / 2; a
+ * returned value is already awaited). Sets *kind: 0 for an inner result to
+ * await, 2 for a value to return (no `return` method), 4 for the result of
+ * closing the iterator, to await before throwing (no `throw` method). */
+JSValue tsaot_async_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind)
+{
+    JSValue iter = v[0], received = v[2], method, r;
+    *kind = 0;
+    if (mode == 0) {
+        r = JS_Call(ctx, v[1], iter, 1, (JSValueConst *)&received);
+        JS_FreeValue(ctx, received);
+        return r;
+    }
+    method = JS_GetPropertyStr(ctx, iter, mode == 2 ? "throw" : "return");
+    if (JS_IsException(method)) {
+        JS_FreeValue(ctx, received);
+        return method;
+    }
+    if (!JS_IsUndefined(method) && !JS_IsNull(method)) {
+        r = JS_Call(ctx, method, iter, 1, (JSValueConst *)&received);
+        JS_FreeValue(ctx, method);
+        JS_FreeValue(ctx, received);
+        return r;
+    }
+    if (mode == 1) {
+        *kind = 2;
+        return received;
+    }
+    /* No `throw`: close the iterator (awaited), then a TypeError. */
+    JS_FreeValue(ctx, received);
+    method = JS_GetPropertyStr(ctx, iter, "return");
+    if (JS_IsException(method))
+        return method;
+    if (JS_IsUndefined(method) || JS_IsNull(method))
+        return tsaot_throw_iterator_throw(ctx), JS_EXCEPTION;
+    r = JS_Call(ctx, method, iter, 0, NULL);
+    JS_FreeValue(ctx, method);
+    *kind = 4;
+    return r;
+}
+
+/* An awaited inner result of `yield*` (taken): its value, and whether it
+ * is done (*done). TypeError if not an object. */
+JSValue tsaot_async_yield_star_result(JSContext *ctx, JSValue r, int *done)
+{
+    JSValue d, value;
+    if (!JS_IsObject(r)) {
+        JS_FreeValue(ctx, r);
+        return JS_ThrowTypeError(ctx, "not an object");
+    }
+    d = JS_GetPropertyStr(ctx, r, "done");
+    if (JS_IsException(d)) {
+        JS_FreeValue(ctx, r);
+        return d;
+    }
+    *done = JS_ToBool(ctx, d);
+    JS_FreeValue(ctx, d);
+    value = JS_GetPropertyStr(ctx, r, "value");
+    JS_FreeValue(ctx, r);
+    return value;
+}
+
+int tsaot_throw_iterator_throw(JSContext *ctx)
+{
+    JS_ThrowTypeError(ctx, "iterator does not have a throw method");
+    return -1;
 }
 
 /* One step of `yield*`, as the interpreter does it: resume the inner
@@ -923,7 +1010,8 @@ JSValue tsaot_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind)
 }
 
 /* Make the new function object `func` (returned) look like an async
- * function (kind 1) or generator function (kind 2): the same prototype as
+ * function (kind 1), generator function (kind 2) or async generator function
+ * (kind 3): the same prototype as
  * its interpreted `fallback`, or the intrinsic one for closures (no
  * fallback); generator functions also get their `prototype` object. */
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind)
@@ -933,14 +1021,15 @@ JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback,
     if (kind == 0 || JS_IsException(func))
         return func;
     if (JS_IsUndefined(fallback))
-        proto = JS_DupValue(ctx, tsaot_pins[kind == 1 ? TSAOT_PIN_ASYNC_FUNCTION_PROTO
-                                                      : TSAOT_PIN_GENERATOR_FUNCTION_PROTO]);
+        proto = JS_DupValue(ctx, tsaot_pins[kind == 1   ? TSAOT_PIN_ASYNC_FUNCTION_PROTO
+                                            : kind == 2 ? TSAOT_PIN_GENERATOR_FUNCTION_PROTO
+                                                        : TSAOT_PIN_ASYNC_GENERATOR_FUNCTION_PROTO]);
     else
         proto = JS_GetPrototype(ctx, fallback);
     if (JS_IsException(proto))
         goto fail;
     r = JS_SetPrototype(ctx, func, proto);
-    if (r < 0 || kind != 2) {
+    if (r < 0 || kind == 1) {
         JS_FreeValue(ctx, proto);
         if (r < 0)
             goto fail;
@@ -1025,4 +1114,52 @@ int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next)
     JSValue orig = tsaot_pins[TSAOT_PIN_GENERATOR_NEXT];
     return JS_IsNativeGenerator(iter) && JS_VALUE_GET_TAG(next) == JS_VALUE_GET_TAG(orig) &&
            JS_VALUE_GET_PTR(next) == JS_VALUE_GET_PTR(orig);
+}
+
+/* ---- for await ---- */
+
+/* An awaited iterator result of `for await` (borrowed): its value, and
+ * whether it is done (*done). */
+JSValue tsaot_for_await_result(JSContext *ctx, JSValue r, int *done)
+{
+    JSValue d;
+    if (!JS_IsObject(r))
+        return JS_ThrowTypeError(ctx, "iterator must return an object");
+    d = JS_GetPropertyStr(ctx, r, "done");
+    if (JS_IsException(d))
+        return d;
+    *done = JS_ToBool(ctx, d);
+    JS_FreeValue(ctx, d);
+    return JS_GetPropertyStr(ctx, r, "value");
+}
+
+/* TypeError unless `v` (borrowed) is an object. */
+int tsaot_check_object(JSContext *ctx, JSValue v)
+{
+    if (JS_IsObject(v))
+        return 0;
+    JS_ThrowTypeError(ctx, "not an object");
+    return -1;
+}
+
+/* Leaving a `for await` by an exception: call the iterator's `return`
+ * method (not awaited), ignoring what it does, as the interpreter does. */
+void tsaot_iter_close_quiet(JSContext *ctx, JSValue iter)
+{
+    JSValue method, r;
+    if (JS_IsUndefined(iter))
+        return;
+    method = JS_GetPropertyStr(ctx, iter, "return");
+    if (JS_IsException(method)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return;
+    }
+    if (JS_IsUndefined(method) || JS_IsNull(method))
+        return;
+    r = JS_Call(ctx, method, iter, 0, NULL);
+    JS_FreeValue(ctx, method);
+    if (JS_IsException(r))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    else
+        JS_FreeValue(ctx, r);
 }

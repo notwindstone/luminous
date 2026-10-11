@@ -657,14 +657,11 @@ type ParamSpec<'a> = (&'a BindingPattern<'a>, Ty, Option<&'a Expression<'a>>);
 type Header<'a> = (Vec<Param<'a>>, bool, Option<Ty>);
 
 fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
-    let (span, is_async, generator, this_param, params, return_type) = match node {
+    let (span, this_param, params, return_type) = match node {
         FnNode::Segment(..) => return Ok((Vec::new(), false, None)),
-        FnNode::Function(f) => (f.span, f.r#async, f.generator, f.this_param.is_some(), &f.params, &f.return_type),
-        FnNode::Arrow(a) => (a.span, a.r#async, false, false, &a.params, &a.return_type),
+        FnNode::Function(f) => (f.span, f.this_param.is_some(), &f.params, &f.return_type),
+        FnNode::Arrow(a) => (a.span, false, &a.params, &a.return_type),
     };
-    if generator && is_async {
-        return reject(span, "async generators are not supported yet");
-    }
     if this_param {
         return reject(span, "`this` parameters are not supported");
     }
@@ -1694,6 +1691,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 if let Some(Expression::AwaitExpression(aw)) = r.argument.as_ref().map(|a| a.without_parentheses()) {
                     let value = any(self.expr(&aw.argument)?);
                     self.returns.push(Ty::Any);
+                    if self.is_async && self.is_generator {
+                        // An async generator awaits what it returns (again).
+                        let t = self.temp(Ty::Any);
+                        self.pre.push(Stmt::Await { value, target: ir::AwaitTarget::Set(t) });
+                        let value = self.local(t);
+                        return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
+                    }
+                    return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
+                }
+                if self.is_async
+                    && self.is_generator
+                    && let Some(a) = &r.argument
+                {
+                    // An async generator awaits what it returns.
+                    let value = any(self.expr(a)?);
+                    self.returns.push(Ty::Any);
                     return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
                 }
                 let mut arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
@@ -2500,12 +2513,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     fn for_in_of(&mut self, s: &'a Statement<'a>, label: Option<String>) -> R<Stmt> {
         let (left, right, stmt_body, is_of) = match s {
-            Statement::ForOfStatement(f) => {
-                if f.r#await {
-                    return reject(f.span, "`for await` is not supported yet");
-                }
-                (&f.left, &f.right, &f.body, true)
-            }
+            Statement::ForOfStatement(f) if f.r#await => return self.for_await(f, label),
+            Statement::ForOfStatement(f) => (&f.left, &f.right, &f.body, true),
             Statement::ForInStatement(f) => (&f.left, &f.right, &f.body, false),
             _ => unreachable!(),
         };
@@ -2567,6 +2576,99 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Ok(Stmt::Loop { id, test: None, post_test: false, body, update: None, per_iteration: vec![] })
         })?;
         out.push(lp);
+        Ok(Stmt::Block(out))
+    }
+
+    /// `for await (x of v)`, as the interpreter runs it: each result of the
+    /// async iterator's `next` is awaited and must be an object; leaving
+    /// the loop early (`break`, `return`, a jump out) calls `return` and
+    /// awaits it; an exception calls `return` without awaiting it, ignoring
+    /// what that does.
+    fn for_await(&mut self, f: &'a ForOfStatement<'a>, label: Option<String>) -> R<Stmt> {
+        if !self.is_async {
+            return reject(f.span, "`for await` outside an async function");
+        }
+        let mut out = Vec::new();
+        let v = self.eval_into(&f.right, &mut out)?;
+        let iter = self.temp(Ty::Any);
+        let next = self.temp(Ty::Any);
+        let it = Expr::new(Ty::Any, ExprKind::AsyncIterator(Box::new(any(v))));
+        out.push(Stmt::Expr(set(iter, it)));
+        let next_atom = self.m.atom("next");
+        out.push(Stmt::Expr(set(next, Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(iter)), next_atom)))));
+        let lp = self.lp(label, JumpKind::Loop, |cx, id| {
+            let res = cx.temp(Ty::Any);
+            let done = cx.temp(Ty::Bool);
+            let value = cx.temp(Ty::Any);
+            let call =
+                Expr::new(Ty::Any, ExprKind::CallThis(Box::new(cx.local(next)), Box::new(cx.local(iter)), Vec::new()));
+            let result = Expr::new(Ty::Any, ExprKind::AsyncIterResult(Box::new(cx.local(res)), done));
+            let mut body = vec![
+                Stmt::Await { value: call, target: ir::AwaitTarget::Set(res) },
+                Stmt::Expr(set(value, result)),
+                // Done: nothing to close.
+                Stmt::If(cx.local(done), vec![Stmt::Expr(set(iter, undefined())), Stmt::Break(id)], vec![]),
+            ];
+            let v = cx.local(value);
+            match &f.left {
+                ForStatementLeft::VariableDeclaration(d) => {
+                    let kind = match d.kind {
+                        VariableDeclarationKind::Let => BindKind::Let,
+                        VariableDeclarationKind::Const => BindKind::Const,
+                        VariableDeclarationKind::Var => BindKind::Var,
+                        _ => return reject(d.span, "`using` declarations are not supported"),
+                    };
+                    cx.bind_pattern(&d.declarations[0].id, v, kind, &mut body)?;
+                }
+                target => cx.assign_target(target.to_assignment_target(), v, &mut body)?,
+            }
+            body.extend(cx.body(&f.body)?);
+            Ok(Stmt::Loop { id, test: None, post_test: false, body, update: None, per_iteration: vec![] })
+        })?;
+        // An exception: close quietly, then rethrow.
+        let exc = self.temp(Ty::Any);
+        let on_throw = vec![
+            Stmt::Expr(Expr::new(Ty::Any, ExprKind::IterCloseQuiet(iter))),
+            Stmt::Expr(set(iter, undefined())),
+            Stmt::Throw(self.local(exc)),
+        ];
+        // Leaving early: `return` (if any), awaited, must give an object.
+        let method = self.temp(Ty::Any);
+        let r = self.temp(Ty::Any);
+        let return_atom = self.m.atom("return");
+        let get_return = Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(iter)), return_atom));
+        let nullish = Expr::new(
+            Ty::Bool,
+            ExprKind::AnyCompare(
+                AnyCmpOp::Eq,
+                Box::new(self.local(method)),
+                Box::new(Expr::new(Ty::Any, ExprKind::Null)),
+            ),
+        );
+        let call_return = Expr::new(
+            Ty::Any,
+            ExprKind::CallThis(Box::new(self.local(method)), Box::new(self.local(iter)), Vec::new()),
+        );
+        let close = vec![
+            Stmt::Expr(set(method, get_return)),
+            Stmt::If(
+                nullish,
+                vec![],
+                vec![
+                    Stmt::Await { value: call_return, target: ir::AwaitTarget::Set(r) },
+                    Stmt::Expr(Expr::new(Ty::Any, ExprKind::CheckObject(Box::new(self.local(r))))),
+                ],
+            ),
+        ];
+        let not_done = Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(self.is_undefined(iter))));
+        let finally = vec![Stmt::If(not_done, close, vec![])];
+        let suspend_exc = self.temp(Ty::Any);
+        out.push(Stmt::Try {
+            body: vec![lp],
+            catch: Some((Some(exc), on_throw)),
+            finally: Some(finally),
+            exc: Some(suspend_exc),
+        });
         Ok(Stmt::Block(out))
     }
 

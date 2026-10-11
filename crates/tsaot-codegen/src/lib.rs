@@ -190,6 +190,13 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_super_set", &[P, P, W, W], &[Int]),
         ("tsaot_gen_start", &[P, Int, Int, P], &[W, W]),
         ("tsaot_gen_new", &[P, W, W, P], &[W, W]),
+        ("tsaot_async_gen_new", &[P, W, W, P], &[W, W]),
+        ("tsaot_async_yield_star", &[P, P, Int, P], &[W, W]),
+        ("tsaot_async_yield_star_result", &[P, W, W, P], &[W, W]),
+        ("tsaot_throw_iterator_throw", &[P], &[Int]),
+        ("tsaot_for_await_result", &[P, W, W, P], &[W, W]),
+        ("tsaot_check_object", &[P, W, W], &[Int]),
+        ("tsaot_iter_close_quiet", &[P, W, W], &[]),
         ("tsaot_yield_star", &[P, P, Int, P], &[W, W]),
         ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
@@ -550,7 +557,8 @@ impl<'m> Codegen<'m> {
         if f.is_generator {
             // The generator object, which takes the frame (after binding
             // the parameters).
-            let call = b.ins().call(env.helpers["tsaot_gen_new"], &[js_ctx, frame[0], frame[1], data]);
+            let new = if f.is_async { "tsaot_async_gen_new" } else { "tsaot_gen_new" };
+            let call = b.ins().call(env.helpers[new], &[js_ctx, frame[0], frame[1], data]);
             let r = b.inst_results(call).to_vec();
             b.ins().return_(&r);
         } else {

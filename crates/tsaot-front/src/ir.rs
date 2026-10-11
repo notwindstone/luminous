@@ -392,6 +392,17 @@ pub enum ExprKind {
     Closure(ClosureId, Vec<LocalId>),
     /// Discard the value (`void e`, statement-level use of a void call).
     Void(Box<Expr>),
+    /// The async iterator of a value (`Symbol.asyncIterator`, else its
+    /// sync iterator wrapped), for `for await`.
+    AsyncIterator(Box<Expr>),
+    /// An awaited iterator result of `for await`: its `value`, its `done`
+    /// going to the `Bool` local (TypeError if it is not an object).
+    AsyncIterResult(Box<Expr>, LocalId),
+    /// TypeError unless the value is an object (`undefined` otherwise).
+    CheckObject(Box<Expr>),
+    /// Call the `return` method of the iterator in the local, if any,
+    /// ignoring what happens (an exception is propagating).
+    IterCloseQuiet(LocalId),
     /// A JS value that is an int32 (a bitwise operator applied to a number
     /// and anything else), as an `I32`.
     IntOf(Box<Expr>),
@@ -658,6 +669,7 @@ macro_rules! visitor {
                 | This
                 | IterStep(..)
                 | IterClose(..)
+                | IterCloseQuiet(_)
                 | Closure(..) => {}
                 SetLocal(_, a)
                 | InitLocal(_, a)
@@ -682,6 +694,9 @@ macro_rules! visitor {
                 | SuperGet(_, a)
                 | ArrayPush(_, a)
                 | IntOf(a)
+                | AsyncIterator(a)
+                | AsyncIterResult(a, _)
+                | CheckObject(a)
                 | Void(a) => $name(a, f),
                 ArrayParts(parts) => {
                     for p in parts {
@@ -804,6 +819,7 @@ pub fn assigns_local(x: &Expr, l: LocalId) -> bool {
         found |= match e.kind {
             ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } => m == l,
             ExprKind::IterStep(m, n) => m == l || n == Some(l),
+            ExprKind::AsyncIterResult(_, m) => m == l,
             ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) => m == l || n == l,
             _ => false,
         };
@@ -999,6 +1015,7 @@ pub fn scalar_replace(f: &mut Func) {
             b.iter().for_each(|&b| ok[b] = false);
         }
         ExprKind::ForInGet(a, ..) => ok[*a] = false,
+        ExprKind::AsyncIterResult(_, a) | ExprKind::IterCloseQuiet(a) => ok[*a] = false,
         ExprKind::Closure(_, ls) => ls.iter().for_each(|&l| ok[l] = false),
         ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _) => {
             if let ExprKind::Local(l) = o.kind {

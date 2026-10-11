@@ -68,7 +68,8 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define TSAOT_PIN_ASYNC_FUNCTION_PROTO 18
 #define TSAOT_PIN_GENERATOR_FUNCTION_PROTO 19
 #define TSAOT_PIN_GENERATOR_NEXT 20
-#define TSAOT_PINS 21
+#define TSAOT_PIN_ASYNC_GENERATOR_FUNCTION_PROTO 21
+#define TSAOT_PINS 22
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
 int tsaot_array_iter_ok(JSContext *ctx);
@@ -105,6 +106,13 @@ int tsaot_super_set(JSContext *ctx, JSValue *v, JSValue val);
 JSValue tsaot_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots);
 JSValue tsaot_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data);
 JSValue tsaot_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind);
+JSValue tsaot_async_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data);
+JSValue tsaot_async_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind);
+JSValue tsaot_async_yield_star_result(JSContext *ctx, JSValue r, int *done);
+int tsaot_throw_iterator_throw(JSContext *ctx);
+JSValue tsaot_for_await_result(JSContext *ctx, JSValue r, int *done);
+int tsaot_check_object(JSContext *ctx, JSValue v);
+void tsaot_iter_close_quiet(JSContext *ctx, JSValue iter);
 
 /* Called once while the context is created. */
 int tsaot_lock_builtins(JSContext *ctx);

@@ -240,6 +240,8 @@ pub(crate) struct Lower<'a> {
     /// Methods: the receiver (borrowed).
     pub(crate) this: Option<(Value, Value)>,
     async_cx: Option<AsyncCx>,
+    /// An async generator: `await` suspends to the engine (kind 3).
+    async_gen: bool,
     /// See `ir::Func::ret_slot`.
     ret_slot: Option<ir::LocalId>,
     /// `f64` values that are exact integers by construction (int locals,
@@ -319,6 +321,7 @@ impl<'a> Lower<'a> {
             exits,
             this: None,
             async_cx: None,
+            async_gen: false,
             ret_slot: f.ret_slot,
             int_of: HashMap::new(),
             i32s: Default::default(),
@@ -1550,6 +1553,50 @@ impl<'a> Lower<'a> {
                 }
                 other => other,
             },
+            ExprKind::AsyncIterator(x) => {
+                let v = self.expr(x);
+                self.hold(v);
+                let (p, t) = v.any();
+                let ctx = self.ctx;
+                let is_async = self.b.ins().iconst(I32, 1);
+                let r = self.helper("JS_GetIteratorObject", &[ctx, p, t, is_async]);
+                self.check_value(r[1]);
+                self.release(v);
+                self.free_v(v);
+                V::Any(r[0], r[1])
+            }
+            ExprKind::AsyncIterResult(x, done) => {
+                let v = self.expr(x);
+                self.hold(v);
+                let (p, t) = v.any();
+                let ctx = self.ctx;
+                let done_addr = self.done_slot();
+                let r = self.helper("tsaot_for_await_result", &[ctx, p, t, done_addr]);
+                self.check_value(r[1]);
+                self.release(v);
+                self.free_v(v);
+                let d = self.b.ins().load(I32, Self::mem(), done_addr, 0);
+                let d = self.b.ins().icmp_imm_s(IntCC::NotEqual, d, 0);
+                self.set_local(*done, V::Bool(d));
+                V::Any(r[0], r[1])
+            }
+            ExprKind::CheckObject(x) => {
+                let v = self.expr(x);
+                self.hold(v);
+                let (p, t) = v.any();
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_check_object", &[ctx, p, t]);
+                self.check_int(r[0]);
+                self.release(v);
+                self.free_v(v);
+                self.konst(0, TAG_UNDEFINED)
+            }
+            ExprKind::IterCloseQuiet(l) => {
+                let (p, t) = self.use_local(*l).any();
+                let ctx = self.ctx;
+                self.helper("tsaot_iter_close_quiet", &[ctx, p, t]);
+                self.konst(0, TAG_UNDEFINED)
+            }
             ExprKind::IntOf(x) => {
                 // An int32 is not reference-counted: nothing to free.
                 let (p, _) = self.expr(x).any();
@@ -3983,6 +4030,7 @@ impl Lower<'_> {
         let start = self.b.create_block();
         self.b.switch_to_block(start);
         self.async_cx = Some(AsyncCx { slots, state, value, is_throw, layout, resumes: vec![start], dispatch });
+        self.async_gen = f.is_async && f.is_generator;
     }
 
     /// Move every local into the frame (suspending).
@@ -4024,6 +4072,18 @@ impl Lower<'_> {
     /// `await value`: register the continuation, spill, return "suspended";
     /// lowering continues at the resume point.
     fn await_stmt(&mut self, value: &Expr, target: ir::AwaitTarget) {
+        let (vp, vt) = if self.async_gen {
+            let v = self.expr(value).any();
+            self.await_value(v)
+        } else {
+            self.await_promise(value)
+        };
+        self.awaited(vp, vt, target);
+    }
+
+    /// `await` in an async function: register the continuation, spill,
+    /// return "suspended". The awaited value (a new reference).
+    fn await_promise(&mut self, value: &Expr) -> (Value, Value) {
         let resume = self.b.create_block();
         let state = {
             let cx = self.async_cx.as_mut().expect("await in an async function");
@@ -4063,6 +4123,11 @@ impl Lower<'_> {
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);
+        (vp, vt)
+    }
+
+    /// Deliver an awaited value (a new reference) to `target`.
+    fn awaited(&mut self, vp: Value, vt: Value, target: ir::AwaitTarget) {
         let v = V::Any(vp, vt);
         match target {
             ir::AwaitTarget::Discard => self.free((vp, vt)),
@@ -4080,8 +4145,28 @@ impl Lower<'_> {
         }
     }
 
+    /// `await` in an async generator: suspend for the engine to await `v`
+    /// (taken). The settled value (a new reference); a rejection is thrown.
+    fn await_value(&mut self, v: (Value, Value)) -> (Value, Value) {
+        self.suspend(Some(v), 3);
+        let ((vp, vt), mode) = self.resumption();
+        let throw = self.b.create_block();
+        let ok = self.b.create_block();
+        self.b.set_cold_block(throw);
+        let is_throw = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 2);
+        self.b.ins().brif(is_throw, throw, &[], ok, &[]);
+        self.b.switch_to_block(throw);
+        let ctx = self.ctx;
+        self.helper("JS_Throw", &[ctx, vp, vt]);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(ok);
+        (vp, vt)
+    }
+
     /// Suspend the generator: spill the locals and return to the runtime
-    /// what it yields (`kind` 0: a value, 1: an iterator result as is). It
+    /// what it yields (`kind` 0: a value, 1: an iterator result as is, 3: a
+    /// value to await, in an async generator). It
     /// continues at the returned block, with the resumption in the step
     /// function's parameters.
     fn suspend(&mut self, value: Option<(Value, Value)>, kind: i64) -> Block {
@@ -4097,7 +4182,7 @@ impl Lower<'_> {
             self.b.ins().store(Self::mem(), p, vptr, 0);
             self.b.ins().store(Self::mem(), t, vptr, TAG_OFFSET);
         }
-        let payload = self.b.ins().iconst(I64, 2 * state as i64 + kind);
+        let payload = self.b.ins().iconst(I64, 4 * state as i64 + kind);
         let suspended = self.b.ins().iconst(I64, TAG_UNINITIALIZED);
         self.b.ins().return_(&[payload, suspended]);
         self.b.switch_to_block(resume);
@@ -4124,9 +4209,14 @@ impl Lower<'_> {
             }
             ir::YieldKind::Value => {
                 let v = self.expr(value).any();
+                // An async generator yields the awaited value.
+                let v = if self.async_gen { self.await_value(v) } else { v };
                 self.suspend(Some(v), 0);
                 let (v, mode) = self.resumption();
                 self.resumed(v, mode, target);
+            }
+            ir::YieldKind::Delegate { iter, next, next_atom } if self.async_gen => {
+                self.async_yield_star(value, iter, next, next_atom, target)
             }
             ir::YieldKind::Delegate { iter, next, next_atom } => self.yield_star(value, iter, next, next_atom, target),
         }
@@ -4150,9 +4240,11 @@ impl Lower<'_> {
         self.b.switch_to_block(not_throw);
         let is_return = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 1);
         self.b.ins().brif(is_return, ret, &[], next, &[]);
-        // `return(v)`: as a `return v` here (running `finally` blocks).
+        // `return(v)`: as a `return v` here (running `finally` blocks; an
+        // async generator awaits the value first).
         self.b.switch_to_block(ret);
-        self.return_value(V::Any(vp, vt));
+        let (rp, rt) = if self.async_gen { self.await_value((vp, vt)) } else { (vp, vt) };
+        self.return_value(V::Any(rp, rt));
         self.b.switch_to_block(next);
         let v = V::Any(vp, vt);
         match target {
@@ -4230,6 +4322,130 @@ impl Lower<'_> {
             ir::AwaitTarget::Return => unreachable!("`return yield*` is hoisted"),
         }
     }
+    /// `yield*` in an async generator, as the interpreter's bytecode does it:
+    /// the inner (async) iterator is resumed as the generator is, each
+    /// result is awaited, and the values of the results not done are yielded
+    /// (without awaiting them again). A `return` awaits the value it gets
+    /// before passing it on, and again before returning.
+    fn async_yield_star(
+        &mut self,
+        value: &Expr,
+        iter: ir::LocalId,
+        next: ir::LocalId,
+        next_atom: ir::AtomId,
+        target: ir::AwaitTarget,
+    ) {
+        let (p, t) = self.expr(value).any();
+        let v = V::Any(p, t);
+        self.hold(v);
+        let ctx = self.ctx;
+        let is_async = self.b.ins().iconst(I32, 1);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, is_async]);
+        self.check_value(it[1]);
+        self.release(v);
+        self.free_v(v);
+        self.set_local(iter, V::Any(it[0], it[1]));
+        let a = self.atom(next_atom);
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
+        self.check_value(m[1]);
+        self.set_local(next, V::Any(m[0], m[1]));
+
+        // The loop: (mode, received value).
+        let head = self.b.create_block();
+        let mode = self.b.append_block_param(head, I32);
+        let rp = self.b.append_block_param(head, I64);
+        let rt = self.b.append_block_param(head, I64);
+        // A value to yield; the value of the `yield*`.
+        let yield_part = self.b.create_block();
+        let yp = self.b.append_block_param(yield_part, I64);
+        let yt = self.b.append_block_param(yield_part, I64);
+        let finish = self.b.create_block();
+        let fp = self.b.append_block_param(finish, I64);
+        let ft = self.b.append_block_param(finish, I64);
+        let zero = self.b.ins().iconst(I32, 0);
+        let (up, ut) = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(up), BlockArg::Value(ut)]);
+
+        self.b.switch_to_block(head);
+        let on_next = self.b.create_block();
+        let not_next = self.b.create_block();
+        let on_return = self.b.create_block();
+        let on_throw = self.b.create_block();
+        let is_next = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 0);
+        self.b.ins().brif(is_next, on_next, &[], not_next, &[]);
+        self.b.switch_to_block(not_next);
+        let is_return = self.b.ins().icmp_imm_s(IntCC::Equal, mode, 1);
+        self.b.ins().brif(is_return, on_return, &[], on_throw, &[]);
+
+        // Each mode separately: a mode does not survive the awaits.
+        for (blk, m) in [(on_next, 0), (on_return, 1), (on_throw, 2)] {
+            self.b.switch_to_block(blk);
+            let received = if m == 1 { self.await_value((rp, rt)) } else { (rp, rt) };
+            let (ip, itag) = self.use_local(iter).any();
+            let (np, nt) = self.use_local(next).any();
+            let slot = self.values_slot(&[(ip, itag), (np, nt), received]);
+            let kind_addr = self.done_slot();
+            let mv = self.b.ins().iconst(I32, m);
+            let r = self.helper("tsaot_async_yield_star", &[ctx, slot, mv, kind_addr]);
+            self.check_value(r[1]);
+            let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
+            let call_result = self.b.create_block();
+            let special = self.b.create_block();
+            let is_call = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+            self.b.ins().brif(is_call, call_result, &[], special, &[]);
+
+            self.b.switch_to_block(special);
+            if m == 1 {
+                // No `return` method: return the (awaited) value.
+                let (vp, vt) = self.await_value((r[0], r[1]));
+                self.return_value(V::Any(vp, vt));
+            } else if m == 2 {
+                // No `throw` method: the iterator was closed; await that,
+                // then throw.
+                let (cp, ct) = self.await_value((r[0], r[1]));
+                self.free((cp, ct));
+                let e = self.helper("tsaot_throw_iterator_throw", &[ctx]);
+                self.check_int(e[0]);
+                self.b.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            } else {
+                self.b.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            }
+
+            self.b.switch_to_block(call_result);
+            let (ap, at) = self.await_value((r[0], r[1]));
+            let done_addr = self.done_slot();
+            let val = self.helper("tsaot_async_yield_star_result", &[ctx, ap, at, done_addr]);
+            self.check_value(val[1]);
+            let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
+            let finished = self.b.create_block();
+            let args = [BlockArg::Value(val[0]), BlockArg::Value(val[1])];
+            self.b.ins().brif(done, finished, &[], yield_part, &args);
+            self.b.switch_to_block(finished);
+            if m == 1 {
+                let (vp, vt) = self.await_value((val[0], val[1]));
+                self.return_value(V::Any(vp, vt));
+            } else {
+                self.b.ins().jump(finish, &args);
+            }
+        }
+
+        // A result not done: its value is yielded, then the generator's
+        // resumption goes to the inner iterator.
+        self.b.switch_to_block(yield_part);
+        self.suspend(Some((yp, yt)), 0);
+        let ((vp, vt), mode) = self.resumption();
+        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vp), BlockArg::Value(vt)]);
+
+        self.b.switch_to_block(finish);
+        let v = V::Any(fp, ft);
+        match target {
+            ir::AwaitTarget::Discard => self.free((fp, ft)),
+            ir::AwaitTarget::Set(l) => self.set_local(l, v),
+            ir::AwaitTarget::Init(l) => self.init_local(l, v),
+            ir::AwaitTarget::Return => unreachable!("`return yield*` is hoisted"),
+        }
+    }
+
     /// The dispatch on the resume state.
     fn emit_dispatch(&mut self) {
         let Some(cx) = self.async_cx.take() else { return };

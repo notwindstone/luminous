@@ -77,12 +77,17 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     let nclasses = m.homes / 2;
     let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
-    // kind: 0 plain, 1 async, 2 generator (see tsaot_function_kind).
+    // kind: 0 plain, 1 async, 2 generator, 3 async generator (see
+    // tsaot_function_kind).
     c.push_str(
         "\nstatic const struct { JSCFunctionFast *fast; const char *name; int length, kind; } tsaot_table[] = {\n",
     );
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        let kind = if f.is_generator { 2 } else { f.is_async as u8 };
+        let kind = match (f.is_generator, f.is_async) {
+            (true, true) => 3,
+            (true, false) => 2,
+            (false, a) => a as u8,
+        };
         writeln!(c, "    {{ tsaot_fast_{i}, {}, {}, {kind} }},", c_str(&f.name), f.js_length).unwrap();
     }
     c.push_str("    { NULL, NULL, 0, 0 },\n};\n\n");

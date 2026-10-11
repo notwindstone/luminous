@@ -7,9 +7,9 @@ machine code with [Cranelift](https://cranelift.dev):
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
 
-Whatever the compiler does not handle (`eval`, async generators, class
-constructors, and every function it cannot compile) keeps running in the
-QuickJS interpreter, linked into the same executable.
+Whatever the compiler does not handle (`eval`, class constructors, and every
+function it cannot compile) keeps running in the QuickJS interpreter, linked
+into the same executable.
 
 ```console
 $ tsaot report bench/primes.ts
@@ -140,6 +140,9 @@ regular call path's generated code alone.
 - `JS_NewNativeGenerator`: generator objects whose body is native code,
   driven by the engine's own `next` / `return` / `throw`, and resumed
   directly by native `for`-`of` (`JS_NativeGeneratorNext`);
+- `JS_NewNativeAsyncGenerator`: the same for async generators. The step
+  function also reports awaits; the engine keeps the request queue, awaits,
+  and resumes it with the settled value;
 - `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
   counts, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
@@ -190,6 +193,11 @@ regular call path's generated code alone.
 - **Generators** (`function*`, generator methods and closures), with
   `yield`, `yield*` and the exact `next` / `return` / `throw` behavior:
   native generator objects are the engine's own.
+- **Async generators** (`async function*`, methods and closures) and
+  **`for await`**, with the interpreter's exact await points: `yield v`
+  awaits `v`, `return v` and `return(v)` await `v` before `finally` blocks
+  run, and `yield*` awaits each inner result. Requests queue up as in the
+  engine, which drives native async generator objects as its own.
 - **Iteration**: `for`-`of` and `for`-`in`; iterators are closed on `break`,
   `return` and exceptions as in JS. Arrays are iterated directly while array
   iteration is the original one, and native generators are resumed directly
@@ -202,7 +210,7 @@ regular call path's generated code alone.
   **rest** parameters and elements; **optional chaining**; computed keys in
   object literals.
 
-Not yet: async generators and `for await`, `super()` and class constructors
+Not yet: `super()` and class constructors
 (which stay interpreted), getters, setters and methods in object literals,
 classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
