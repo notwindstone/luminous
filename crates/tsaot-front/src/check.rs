@@ -1174,7 +1174,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // Parameters before the first default, not counting a rest one.
         let fixed = params.len() - self.rest as usize;
         let js_length = params[..fixed].iter().take_while(|p| p.2.is_none()).count();
-        Ok(ir::Func {
+        let mut func = ir::Func {
             name,
             js_length,
             params: abi,
@@ -1190,7 +1190,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             rest: self.rest,
             ret_slot: self.ret_slot,
             body: prologue,
-        })
+        };
+        ir::scalar_replace(&mut func);
+        Ok(func)
     }
 
     /// Whether the function can suspend (`await`, `yield`): then only its

@@ -133,6 +133,9 @@ pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
 #[derive(Clone, Copy)]
 enum LVar {
     One(Variable),
+    /// An `F64` local that only ever holds integers (see `int_locals`), as
+    /// an `i64`.
+    Int(Variable),
     Two(Variable, Variable),
     /// Captured by closures: the box object (owned unless the box comes
     /// from the closure's own captures) and a pointer to its value slot.
@@ -232,6 +235,14 @@ pub(crate) struct Lower<'a> {
     async_cx: Option<AsyncCx>,
     /// See `ir::Func::ret_slot`.
     ret_slot: Option<ir::LocalId>,
+    /// `f64` values that are exact integers by construction (int locals,
+    /// integral constants), and their `i64` value.
+    int_of: HashMap<Value, Value>,
+    /// Int locals whose current update cannot pass 2^53: loop counters
+    /// below a constant bound (see `bounded_counter`).
+    bounded: Vec<ir::LocalId>,
+    /// Int locals that need no range checks (see `small_ints`).
+    small: Vec<bool>,
 }
 
 impl<'a> Lower<'a> {
@@ -249,11 +260,14 @@ impl<'a> Lower<'a> {
         closure_data: Option<Value>,
         exits: Exits,
     ) -> Self {
+        let ints = int_locals(f);
+        let small = small_ints(f, &ints);
         let vars: Vec<LVar> = f
             .locals
             .iter()
             .enumerate()
             .map(|(i, &t)| match t {
+                _ if ints[i] => LVar::Int(b.declare_var(I64)),
                 _ if f.boxed[i] => LVar::Boxed {
                     obj: (b.declare_var(I64), b.declare_var(I64)),
                     slot: b.declare_var(I64),
@@ -291,6 +305,9 @@ impl<'a> Lower<'a> {
             this: None,
             async_cx: None,
             ret_slot: f.ret_slot,
+            int_of: HashMap::new(),
+            bounded: Vec::new(),
+            small,
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -379,6 +396,11 @@ impl<'a> Lower<'a> {
     fn def_local(&mut self, l: ir::LocalId, v: V) {
         match (self.vars[l], v) {
             (LVar::One(var), V::Num(x) | V::Bool(x)) => self.b.def_var(var, x),
+            // Only ever an integer (by `int_locals`).
+            (LVar::Int(var), V::Num(x)) => {
+                let i = self.b.ins().fcvt_to_sint_sat(I64, x);
+                self.b.def_var(var, i)
+            }
             (LVar::Two(p, t), V::Any(x, y)) => {
                 self.b.def_var(p, x);
                 self.b.def_var(t, y);
@@ -392,6 +414,10 @@ impl<'a> Lower<'a> {
         match (self.vars[l], self.locals[l]) {
             (LVar::One(v), Ty::F64 | Ty::MaybeF64) => V::Num(self.b.use_var(v)),
             (LVar::One(v), Ty::Bool) => V::Bool(self.b.use_var(v)),
+            (LVar::Int(v), _) => {
+                let i = self.b.use_var(v);
+                V::Num(self.int_f64(i))
+            }
             (LVar::Two(p, t), _) => V::Any(self.b.use_var(p), self.b.use_var(t)),
             (LVar::Boxed { .. }, _) => {
                 let (p, t) = self.load_box(l);
@@ -742,14 +768,25 @@ impl<'a> Lower<'a> {
                 }
 
                 self.b.switch_to_block(cont);
+                let counter = self.bounded_counter(test.as_ref().filter(|_| !post_test), body, update.as_ref());
+                self.bounded.extend(counter);
                 self.new_boxes(per_iteration, true);
                 if let Some(u) = update {
                     self.effect(u);
+                }
+                if counter.is_some() {
+                    self.bounded.pop();
                 }
                 match test {
                     Some(t) if *post_test => {
                         let v = self.expr(t).boolean();
                         self.b.ins().brif(v, header, &[], exit, &[]);
+                    }
+                    // Rotated: a copy of a cheap test at the bottom saves a
+                    // jump per iteration.
+                    Some(t) if is_cheap(t) => {
+                        let v = self.expr(t).boolean();
+                        self.b.ins().brif(v, body_b, &[], exit, &[]);
                     }
                     _ => {
                         self.b.ins().jump(header, &[]);
@@ -1028,6 +1065,14 @@ impl<'a> Lower<'a> {
     /// Evaluate for side effects only.
     fn effect(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Box(x) => self.effect(x),
+            ExprKind::SetProp(o, a, x) if self.prop_step(o, *a, x).is_some() => {
+                let step = self.prop_step(o, *a, x).unwrap();
+                self.prop_update(o, *a, step, false);
+            }
+            ExprKind::SetLocal(l, _) | ExprKind::InitLocal(l, _) if matches!(self.vars[*l], LVar::Int(_)) => {
+                self.expr(e);
+            }
             ExprKind::SetLocal(l, x) => {
                 let v = self.expr(x);
                 self.set_local(*l, v);
@@ -1073,9 +1118,90 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// An int local's value as an `f64` (exact: see `int_locals`).
+    fn int_f64(&mut self, i: Value) -> Value {
+        let d = self.b.ins().fcvt_from_sint(F64, i);
+        self.int_of.insert(d, i);
+        d
+    }
+
+    /// `x + c` for an int local `x`, rounded as `f64` arithmetic would past
+    /// 2^53.
+    fn int_add(&mut self, x: Value, c: i64) -> Value {
+        let r = self.b.ins().iadd_imm_s(x, c);
+        if c == 0 {
+            return r;
+        }
+        let over = if c > 0 {
+            self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, r, INT_EXACT)
+        } else {
+            self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r, -INT_EXACT)
+        };
+        let round = self.b.create_block();
+        self.b.set_cold_block(round);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, I64);
+        self.b.ins().brif(over, round, &[], join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(round);
+        let d = self.b.ins().fcvt_from_sint(F64, r);
+        let i = self.b.ins().fcvt_to_sint_sat(I64, d);
+        self.b.ins().jump(join, &[BlockArg::Value(i)]);
+        self.b.switch_to_block(join);
+        res
+    }
+
+    /// For a loop `for (...; i < K; i++)` (or `<=`, `--` with `>` / `>=`)
+    /// over an int local `i` that the body does not assign, with `K` an
+    /// integer literal: `i`. Its update then stays within K +/- 256, far
+    /// from 2^53.
+    fn bounded_counter(&self, test: Option<&Expr>, body: &[Stmt], update: Option<&Expr>) -> Option<ir::LocalId> {
+        let ExprKind::Compare(op, x, y) = &test?.kind else { return None };
+        let ExprKind::Local(l) = x.kind else { return None };
+        let ExprKind::Update { local, delta, .. } = update?.kind else { return None };
+        int_literal(y, (INT_EXACT >> 1) as f64)?;
+        let up = matches!(op, CmpOp::Lt | CmpOp::Le) && delta > 0.0;
+        let down = matches!(op, CmpOp::Gt | CmpOp::Ge) && delta < 0.0;
+        if local != l || !(up || down) || !matches!(self.vars[l], LVar::Int(_)) {
+            return None;
+        }
+        let mut assigned = false;
+        ir::visit_stmts(body, &mut |e| assigned |= ir::assigns_local(e, l));
+        (!assigned).then_some(l)
+    }
+
+    /// The new value of int local `l` assigned `x` (a form `int_locals`
+    /// accepts).
+    fn int_value(&mut self, l: ir::LocalId, x: &Expr) -> Value {
+        if let Some(c) = int_literal(x, INT_EXACT as f64) {
+            return self.b.ins().iconst(I64, c);
+        }
+        if let Some(c) = int_step(l, x) {
+            let LVar::Int(var) = self.vars[l] else { unreachable!() };
+            let cur = self.b.use_var(var);
+            if self.small[l] {
+                return self.b.ins().iadd_imm_s(cur, c);
+            }
+            return self.int_add(cur, c);
+        }
+        match (&x.kind, &self.vars) {
+            (ExprKind::Local(m), vars) => match vars[*m] {
+                LVar::Int(var) => self.b.use_var(var),
+                _ => unreachable!("int local assigned a non-int local"),
+            },
+            _ => unreachable!("int local assigned a non-int value"),
+        }
+    }
+
     pub(crate) fn expr(&mut self, e: &Expr) -> V {
         match &e.kind {
-            ExprKind::Num(v) => V::Num(self.b.ins().f64const(*v)),
+            ExprKind::Num(v) => {
+                let d = self.b.ins().f64const(*v);
+                if let Some(c) = int_literal(e, INT_EXACT as f64) {
+                    let i = self.b.ins().iconst(I64, c);
+                    self.int_of.insert(d, i);
+                }
+                V::Num(d)
+            }
             ExprKind::Bool(v) => V::Bool(self.b.ins().iconst(I8, *v as i64)),
             ExprKind::Undefined => self.konst(0, TAG_UNDEFINED),
             ExprKind::Null => self.konst(0, TAG_NULL),
@@ -1085,6 +1211,12 @@ impl<'a> Lower<'a> {
                     self.dup((p, t));
                 }
                 v
+            }
+            ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) if matches!(self.vars[*l], LVar::Int(_)) => {
+                let LVar::Int(var) = self.vars[*l] else { unreachable!() };
+                let i = self.int_value(*l, x);
+                self.b.def_var(var, i);
+                V::Num(self.int_f64(i))
             }
             ExprKind::SetLocal(l, x) => {
                 let v = self.expr(x);
@@ -1129,6 +1261,16 @@ impl<'a> Lower<'a> {
                 V::Any(r[0], r[1])
             }
             ExprKind::Update { local, delta, prefix } => {
+                if let LVar::Int(var) = self.vars[*local] {
+                    let old = self.b.use_var(var);
+                    let new = if self.small[*local] || self.bounded.contains(local) {
+                        self.b.ins().iadd_imm_s(old, *delta as i64)
+                    } else {
+                        self.int_add(old, *delta as i64)
+                    };
+                    self.b.def_var(var, new);
+                    return V::Num(self.int_f64(if *prefix { new } else { old }));
+                }
                 let old = self.use_local(*local).num();
                 let d = self.b.ins().f64const(*delta);
                 let new = self.b.ins().fadd(old, d);
@@ -1169,6 +1311,17 @@ impl<'a> Lower<'a> {
                 let a = self.expr(x);
                 let c = self.expr(y);
                 V::Bool(match (a, c) {
+                    (V::Num(a), V::Num(c)) if self.int_of.contains_key(&a) && self.int_of.contains_key(&c) => {
+                        let cc = match op {
+                            CmpOp::Lt => IntCC::SignedLessThan,
+                            CmpOp::Le => IntCC::SignedLessThanOrEqual,
+                            CmpOp::Gt => IntCC::SignedGreaterThan,
+                            CmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+                            CmpOp::Eq => IntCC::Equal,
+                            CmpOp::Ne => IntCC::NotEqual,
+                        };
+                        self.b.ins().icmp(cc, self.int_of[&a], self.int_of[&c])
+                    }
                     (V::Num(a), V::Num(c)) => {
                         let cc = match op {
                             CmpOp::Lt => FloatCC::LessThan,
@@ -1383,6 +1536,10 @@ impl<'a> Lower<'a> {
                 self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
                 V::Any(rp, rt)
+            }
+            ExprKind::SetProp(o, a, x) if self.prop_step(o, *a, x).is_some() => {
+                let step = self.prop_step(o, *a, x).unwrap();
+                self.prop_update(o, *a, step, true)
             }
             ExprKind::SetProp(o, a, x) => {
                 let (obj, owned) = self.operand(o, &[x]);
@@ -2522,6 +2679,17 @@ impl<'a> Lower<'a> {
     /// conversion that produces the int payload runs in parallel instead.
     /// Returns `(payload, tag)`.
     pub(crate) fn box_number(&mut self, d: Value) -> (Value, Value) {
+        if let Some(&i) = self.int_of.get(&d) {
+            let i32v = self.b.ins().ireduce(I32, i);
+            let back = self.b.ins().sextend(I64, i32v);
+            let is_int = self.b.ins().icmp(IntCC::Equal, back, i);
+            let int_payload = self.b.ins().uextend(I64, i32v);
+            let u = self.b.ins().bitcast(I64, MemFlagsData::new(), d);
+            let payload = self.b.ins().select(is_int, int_payload, u);
+            let int_tag = self.b.ins().iconst(I64, TAG_INT);
+            let float_tag = self.b.ins().iconst(I64, TAG_FLOAT64);
+            return (payload, self.b.ins().select(is_int, int_tag, float_tag));
+        }
         let b = &mut self.b;
         let u = b.ins().bitcast(I64, MemFlagsData::new(), d);
         // Unbiased exponent; negative exponents wrap to huge unsigned values.
@@ -2923,6 +3091,153 @@ impl<'a> Lower<'a> {
 
     // ---- inline caches ----
 
+    /// `o.k = o.k + y` / `o.k - y` / `o.k++` / `o.k--` (`x` is the value
+    /// assigned to `o.k`), with `o` a plain local or `this` and `y` a cheap
+    /// number: updated in place by `prop_update`.
+    fn prop_step<'e>(&self, o: &Expr, a: ir::AtomId, x: &'e Expr) -> Option<PropStep<'e>> {
+        let plain = match o.kind {
+            ExprKind::Local(l) => matches!(self.vars[l], LVar::Two(..)),
+            ExprKind::This => true,
+            _ => false,
+        };
+        let same = |g: &Expr| match &g.kind {
+            ExprKind::GetProp(o2, a2) => {
+                *a2 == a
+                    && std::mem::discriminant(&o.kind) == std::mem::discriminant(&o2.kind)
+                    && match (&o.kind, &o2.kind) {
+                        (ExprKind::Local(l), ExprKind::Local(m)) => l == m,
+                        _ => true,
+                    }
+            }
+            _ => false,
+        };
+        match &x.kind {
+            _ if !plain => None,
+            ExprKind::AnyUnary(op @ (AnyUnOp::Inc | AnyUnOp::Dec), g) if same(g) => Some(PropStep::Unary(*op)),
+            ExprKind::AnyBinary(op @ (AnyBinOp::Add | AnyBinOp::Sub), g, y) if same(g) => match &y.kind {
+                ExprKind::Box(n) if n.ty == Ty::F64 && is_cheap(n) => Some(PropStep::Binary(*op, y, n)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A `prop_step` update. An int or double data property of a cached
+    /// shape is updated in place (an int result that fits stays an int);
+    /// everything else goes through the engine. Returns the new value if
+    /// `want`ed, else `V::Void`.
+    fn prop_update(&mut self, o: &Expr, a: ir::AtomId, step: PropStep, want: bool) -> V {
+        let (p, t) = match o.kind {
+            ExprKind::Local(l) => self.use_local(l).any(),
+            _ => self.this.expect("`this` in a method"),
+        };
+        // Filled by the slow path's set: an own writable data property.
+        let ic = self.new_ic();
+        let get_ic = self.new_ic();
+        let join = self.b.create_block();
+        let (rp, rt) = if want {
+            (self.b.append_block_param(join, I64), self.b.append_block_param(join, I64))
+        } else {
+            let u = self.b.ins().iconst(I64, 0);
+            (u, u)
+        };
+        let result = |np: Value, nt: Value| if want { vec![BlockArg::Value(np), BlockArg::Value(nt)] } else { vec![] };
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let num = self.b.create_block();
+        let old_d = self.b.append_block_param(num, F64);
+
+        let at = self.ic_hit(p, t, ic, slow);
+        let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+        let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+        // The step, as a double and (when it is one) as an integer.
+        let (cd, ci) = match step {
+            PropStep::Unary(op) => {
+                let c = if op == AnyUnOp::Inc { 1 } else { -1 };
+                (self.b.ins().f64const(c as f64), Some(self.b.ins().iconst(I64, c)))
+            }
+            PropStep::Binary(op, _, n) => {
+                let d = self.expr(n).num();
+                let i = self.int_of.get(&d).copied();
+                if op == AnyBinOp::Sub { (self.b.ins().fneg(d), i.map(|i| self.b.ins().ineg(i))) } else { (d, i) }
+            }
+        };
+        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_INT);
+        let int_b = self.b.create_block();
+        let not_int = self.b.create_block();
+        self.b.ins().brif(is_int, int_b, &[], not_int, &[]);
+
+        self.b.switch_to_block(int_b);
+        let old_i = self.b.ins().ireduce(I32, vp);
+        let old_i = self.b.ins().sextend(I64, old_i);
+        // An int result that fits is stored as is; otherwise compute in double.
+        if let Some(ci) = ci {
+            let r = self.b.ins().iadd(old_i, ci);
+            let r32 = self.b.ins().ireduce(I32, r);
+            let back = self.b.ins().sextend(I64, r32);
+            let fits = self.b.ins().icmp(IntCC::Equal, back, r);
+            let store = self.b.create_block();
+            let wide = self.b.create_block();
+            self.b.ins().brif(fits, store, &[], wide, &[]);
+            self.b.switch_to_block(store);
+            let np = self.b.ins().uextend(I64, r32);
+            self.b.ins().store(Self::mem(), np, at, 0);
+            let it = self.b.ins().iconst(I64, TAG_INT);
+            self.b.ins().jump(join, &result(np, it));
+            self.b.switch_to_block(wide);
+        }
+        let as_d = self.b.ins().fcvt_from_sint(F64, old_i);
+        self.b.ins().jump(num, &[BlockArg::Value(as_d)]);
+
+        self.b.switch_to_block(not_int);
+        let is_f = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_FLOAT64);
+        let fd = self.b.ins().bitcast(F64, MemFlagsData::new(), vp);
+        self.b.ins().brif(is_f, num, &[BlockArg::Value(fd)], slow, &[]);
+
+        // Numbers: the old value is not a reference, nothing to free.
+        self.b.switch_to_block(num);
+        let nd = self.b.ins().fadd(old_d, cd);
+        let (np, nt) = self.box_number(nd);
+        self.b.ins().store(Self::mem(), np, at, 0);
+        self.b.ins().store(Self::mem(), nt, at, TAG_OFFSET);
+        self.b.ins().jump(join, &result(np, nt));
+
+        self.b.switch_to_block(slow);
+        let atom = self.atom(a);
+        let ctx = self.ctx;
+        let r = self.helper("tsaot_ic_get", &[ctx, p, t, atom, get_ic]);
+        self.check_value(r[1]);
+        let (np, nt) = match step {
+            PropStep::Unary(op) => self.unary_any(op, (r[0], r[1])),
+            PropStep::Binary(op, y, _) => {
+                let g = V::Any(r[0], r[1]);
+                self.hold(g);
+                let c = self.expr(y);
+                self.hold(c);
+                let v = self.binary_any(op, (r[0], r[1]), c.any());
+                self.release(c);
+                self.release(g);
+                v
+            }
+        };
+        let v = V::Any(np, nt);
+        if want {
+            self.hold(v);
+            // One reference for the property, one for the expression.
+            self.dup((np, nt));
+        }
+        let atom = self.atom(a);
+        let r = self.helper("tsaot_ic_set", &[ctx, p, t, atom, np, nt, ic]);
+        self.check_int(r[0]);
+        if want {
+            self.release(v);
+        }
+        self.b.ins().jump(join, &result(np, nt));
+
+        self.b.switch_to_block(join);
+        if want { V::Any(rp, rt) } else { V::Void }
+    }
+
     /// The address of a new inline cache (a `TsaotIC`).
     fn new_ic(&mut self) -> Value {
         let i = self.env.next_ic.get();
@@ -2956,6 +3271,7 @@ impl<'a> Lower<'a> {
     /// so, its value (`I64`; negative ones fail unsigned bounds checks).
     fn elem_index(&mut self, key: V) -> (Value, Value) {
         match key {
+            V::Num(d) if self.int_of.contains_key(&d) => (self.b.ins().iconst(I8, 1), self.int_of[&d]),
             V::Num(d) => {
                 let i = self.b.ins().fcvt_to_sint_sat(I64, d);
                 let back = self.b.ins().fcvt_from_sint(F64, i);
@@ -3116,6 +3432,9 @@ impl<'a> Lower<'a> {
     /// truncation; everything else (huge values, infinities, NaN) goes to the
     /// runtime.
     fn toint32(&mut self, x: Value) -> Value {
+        if let Some(&i) = self.int_of.get(&x) {
+            return self.b.ins().ireduce(I32, i);
+        }
         let ax = self.b.ins().fabs(x);
         let lim = self.b.ins().f64const(9_223_372_036_854_775_808.0);
         let small = self.b.ins().fcmp(FloatCC::LessThan, ax, lim);
@@ -3218,6 +3537,188 @@ impl V {
 /// Frame layout of an async function: per local, its first slot (boxed
 /// locals use two: the box object and the address of its value), then the
 /// slot of `this` (methods), and the total number of slots.
+/// See `Lower::prop_step`.
+#[derive(Clone, Copy)]
+enum PropStep<'e> {
+    Unary(AnyUnOp),
+    /// The operator, its boxed right operand and that operand's number.
+    Binary(AnyBinOp, &'e Expr, &'e Expr),
+}
+
+/// A small expression without calls or side effects, cheap to lower twice.
+fn is_cheap(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Local(_) => true,
+        ExprKind::Compare(_, x, y) | ExprKind::Binary(BinOp::Add | BinOp::Sub, x, y) => is_cheap(x) && is_cheap(y),
+        ExprKind::Unary(UnOp::Not, x) | ExprKind::Truthy(x) => is_cheap(x),
+        _ => false,
+    }
+}
+
+/// Largest integer step `int_step` takes on an int local: smaller than half
+/// the spacing of doubles near 2^62, so rounding stops an int local from
+/// growing well before it could overflow an `i64`.
+const INT_STEP_MAX: f64 = 256.0;
+/// 2^53: integers up to this magnitude are exact doubles.
+const INT_EXACT: i64 = 1 << 53;
+
+/// An integer literal that `int_locals` accepts (an exact double; not -0).
+fn int_literal(e: &Expr, limit: f64) -> Option<i64> {
+    match e.kind {
+        ExprKind::Num(c) if c.fract() == 0.0 && c.abs() <= limit && !(c == 0.0 && c.is_sign_negative()) => {
+            Some(c as i64)
+        }
+        _ => None,
+    }
+}
+
+/// `x + c` / `x - c` / `c + x` on local `l`, with `c` a small integer: the
+/// step `c` (negated for `-`).
+fn int_step(l: ir::LocalId, e: &Expr) -> Option<i64> {
+    let ExprKind::Binary(op, x, y) = &e.kind else { return None };
+    let local = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
+    match op {
+        BinOp::Add if local(x) => int_literal(y, INT_STEP_MAX),
+        BinOp::Add if local(y) => int_literal(x, INT_STEP_MAX),
+        BinOp::Sub if local(x) => int_literal(y, INT_STEP_MAX).map(|c| -c),
+        _ => None,
+    }
+}
+
+/// The int locals that provably stay below 2^52 in magnitude, so their
+/// steps need no range check: assigned only integer literals, and stepped
+/// only in code that runs a statically bounded number of times (loops
+/// `for (i = a; i < K; i++)` with literal `a` and `K`, and their nests).
+fn small_ints(f: &ir::Func, ints: &[bool]) -> Vec<bool> {
+    let n = f.locals.len();
+    let mut lit = vec![0.0f64; n];
+    let mut steps = vec![0.0f64; n];
+    bound_stmts(&f.body, 1.0, &mut lit, &mut steps);
+    (0..n).map(|l| ints[l] && lit[l] + steps[l] <= (1u64 << 52) as f64).collect()
+}
+
+/// For `small_ints`: the largest literal assigned to each local, and how far
+/// the steps executed `times` times (at most) can take it.
+fn bound_stmts(stmts: &[Stmt], times: f64, lit: &mut [f64], steps: &mut [f64]) {
+    let count = |e: &Expr, times: f64, lit: &mut [f64], steps: &mut [f64]| {
+        ir::visit(e, &mut |x| match &x.kind {
+            ExprKind::Update { local, delta, .. } => steps[*local] += delta.abs() * times,
+            ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v) => {
+                if let Some(c) = int_literal(v, INT_EXACT as f64) {
+                    lit[*l] = lit[*l].max(c.unsigned_abs() as f64);
+                } else if let Some(c) = int_step(*l, v) {
+                    steps[*l] += c.unsigned_abs() as f64 * times;
+                } else {
+                    steps[*l] = f64::INFINITY;
+                }
+            }
+            _ => {}
+        })
+    };
+    for (k, s) in stmts.iter().enumerate() {
+        match s {
+            Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => count(e, times, lit, steps),
+            Stmt::Await { value, .. } | Stmt::Yield { value, .. } => count(value, times, lit, steps),
+            Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::NewBoxes(_) => {}
+            Stmt::If(c, a, b) => {
+                count(c, times, lit, steps);
+                bound_stmts(a, times, lit, steps);
+                bound_stmts(b, times, lit, steps);
+            }
+            Stmt::Loop { test, post_test, body, update, .. } => {
+                let test_pre = test.as_ref().filter(|_| !post_test);
+                let trips = static_trips(&stmts[..k], test_pre, body, update.as_ref());
+                // The test runs once more than the body.
+                let inner = times * trips.map_or(f64::INFINITY, |t| t + 1.0);
+                test.iter().chain(update).for_each(|e| count(e, inner, lit, steps));
+                bound_stmts(body, inner, lit, steps);
+            }
+            Stmt::Switch { cases, .. } => {
+                for (c, body) in cases {
+                    c.iter().for_each(|e| count(e, times, lit, steps));
+                    bound_stmts(body, times, lit, steps);
+                }
+            }
+            Stmt::Block(body) | Stmt::IterGuard { body, .. } => bound_stmts(body, times, lit, steps),
+            Stmt::Try { body, catch, finally, .. } => {
+                bound_stmts(body, times, lit, steps);
+                catch.iter().for_each(|(_, c)| bound_stmts(c, times, lit, steps));
+                finally.iter().for_each(|c| bound_stmts(c, times, lit, steps));
+            }
+        }
+    }
+}
+
+/// The number of iterations of a loop `for (i = a; i < K; i += d)` (or
+/// `<=`, or counting down with `>` / `>=`) whose body does not assign `i`,
+/// with `i = a` (`a` an integer literal) the last assignment to `i` among
+/// the statements `before` the loop.
+fn static_trips(before: &[Stmt], test: Option<&Expr>, body: &[Stmt], update: Option<&Expr>) -> Option<f64> {
+    let ExprKind::Compare(op, x, y) = &test?.kind else { return None };
+    let ExprKind::Local(i) = x.kind else { return None };
+    let ExprKind::Update { local, delta, .. } = update?.kind else { return None };
+    let k = int_literal(y, (INT_EXACT >> 1) as f64)? as f64;
+    if local != i || delta == 0.0 {
+        return None;
+    }
+    let assigns = |s: &Stmt| {
+        let mut found = false;
+        ir::visit_stmts(std::slice::from_ref(s), &mut |e| found |= ir::assigns_local(e, i));
+        found
+    };
+    if body.iter().any(assigns) {
+        return None;
+    }
+    let a = match before.iter().rev().find(|s| assigns(s))? {
+        Stmt::Expr(Expr { kind: ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v), .. }) if *l == i => {
+            int_literal(v, (INT_EXACT >> 1) as f64)? as f64
+        }
+        _ => return None,
+    };
+    let d = delta.abs();
+    let span = match op {
+        CmpOp::Lt if delta > 0.0 => k - a,
+        CmpOp::Le if delta > 0.0 => k - a + 1.0,
+        CmpOp::Gt if delta < 0.0 => a - k,
+        CmpOp::Ge if delta < 0.0 => a - k + 1.0,
+        _ => return None,
+    };
+    Some((span / d).ceil().max(0.0))
+}
+
+/// The `F64` locals that only ever hold integers, which are kept in `i64`s:
+/// locals (not parameters, not boxed) only assigned integer literals, other
+/// such locals, and themselves plus or minus small integers (`x++`,
+/// `x += 2`). A step past 2^53 rounds the result as `f64` arithmetic would,
+/// so the value is always exactly the double JS computes; with small steps
+/// rounding keeps it far from the `i64` limits.
+fn int_locals(f: &ir::Func) -> Vec<bool> {
+    let n = f.locals.len();
+    let mut ints: Vec<bool> = (0..n).map(|i| i >= f.params.len() && !f.boxed[i] && f.locals[i] == Ty::F64).collect();
+    loop {
+        let mut changed = false;
+        ir::visit_stmts(&f.body, &mut |e| {
+            let (l, ok) = match &e.kind {
+                ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => (
+                    *l,
+                    int_literal(x, INT_EXACT as f64).is_some()
+                        || int_step(*l, x).is_some()
+                        || matches!(x.kind, ExprKind::Local(m) if ints[m]),
+                ),
+                ExprKind::Update { local, delta, .. } => (*local, delta.fract() == 0.0 && delta.abs() <= INT_STEP_MAX),
+                _ => return,
+            };
+            if ints[l] && !ok {
+                ints[l] = false;
+                changed = true;
+            }
+        });
+        if !changed {
+            return ints;
+        }
+    }
+}
+
 pub(crate) fn frame_layout(f: &ir::Func) -> (Vec<usize>, Option<usize>, usize) {
     let mut at = Vec::with_capacity(f.locals.len());
     let mut n = 0;
@@ -3266,6 +3767,7 @@ impl Lower<'_> {
                     self.b.def_var(vp, p);
                     self.b.def_var(vt, t);
                 }
+                LVar::Int(v) => self.b.def_var(v, p),
                 LVar::One(v) => {
                     let x = match self.locals[l] {
                         Ty::F64 | Ty::MaybeF64 => self.b.ins().bitcast(F64, MemFlagsData::new(), p),
@@ -3308,6 +3810,8 @@ impl Lower<'_> {
                     self.b.ins().store(Self::mem(), ft, slots, at + SIZE as i32 + TAG_OFFSET);
                     (self.b.use_var(op), self.b.use_var(ot))
                 }
+                // Not a JS value: only this function reads it back.
+                LVar::Int(v) => (self.b.use_var(v), self.b.ins().iconst(I64, TAG_FLOAT64)),
                 LVar::Two(vp, vt) => (self.b.use_var(vp), self.b.use_var(vt)),
                 LVar::One(v) => {
                     let x = self.b.use_var(v);

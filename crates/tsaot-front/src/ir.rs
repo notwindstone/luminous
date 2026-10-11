@@ -619,131 +619,161 @@ impl Expr {
     }
 }
 
-/// Visit `x` and every expression in it.
-pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
-    f(x);
-    use ExprKind::*;
-    match &x.kind {
-        Num(_)
-        | Bool(_)
-        | Local(_)
-        | Update { .. }
-        | Undefined
-        | Null
-        | Str(_)
-        | Cell(_)
-        | Global(_)
-        | GlobalOrUndefined(_)
-        | This
-        | IterStep(..)
-        | IterClose(..)
-        | Closure(..) => {}
-        SetLocal(_, a)
-        | InitLocal(_, a)
-        | Unary(_, a)
-        | Truthy(a)
-        | Box(a)
-        | AnyUnary(_, a)
-        | SetCell(_, a)
-        | SetGlobal(_, a)
-        | GetProp(a, _)
-        | Length(a, _)
-        | DeleteProp(a, _)
-        | IterOpen(a, ..)
-        | ForInIterator(a)
-        | ToObject(a)
-        | ToPropKey(a)
-        | PrivateField(a, _)
-        | PrivateMethod(a, _)
-        | PrivateGetter(a, _)
-        | PrivateIn(a, _)
-        | SuperGet(_, a)
-        | ArrayPush(_, a)
-        | Void(a) => visit(a, f),
-        ArrayParts(parts) => {
-            for p in parts {
-                if let ArrPart::Value(x) | ArrPart::Spread(x) = p {
-                    visit(x, f);
+macro_rules! visitor {
+    ($(#[$doc:meta])* $name:ident $($m:ident)?) => {
+        $(#[$doc])*
+        pub fn $name(x: & $($m)? Expr, f: &mut impl FnMut(& $($m)? Expr)) {
+            f(x);
+            use ExprKind::*;
+            match & $($m)? x.kind {
+                Num(_)
+                | Bool(_)
+                | Local(_)
+                | Update { .. }
+                | Undefined
+                | Null
+                | Str(_)
+                | Cell(_)
+                | Global(_)
+                | GlobalOrUndefined(_)
+                | This
+                | IterStep(..)
+                | IterClose(..)
+                | Closure(..) => {}
+                SetLocal(_, a)
+                | InitLocal(_, a)
+                | Unary(_, a)
+                | Truthy(a)
+                | Box(a)
+                | AnyUnary(_, a)
+                | SetCell(_, a)
+                | SetGlobal(_, a)
+                | GetProp(a, _)
+                | Length(a, _)
+                | DeleteProp(a, _)
+                | IterOpen(a, ..)
+                | ForInIterator(a)
+                | ToObject(a)
+                | ToPropKey(a)
+                | PrivateField(a, _)
+                | PrivateMethod(a, _)
+                | PrivateGetter(a, _)
+                | PrivateIn(a, _)
+                | SuperGet(_, a)
+                | ArrayPush(_, a)
+                | Void(a) => $name(a, f),
+                ArrayParts(parts) => {
+                    for p in parts {
+                        if let ArrPart::Value(x) | ArrPart::Spread(x) = p {
+                            $name(x, f);
+                        }
+                    }
                 }
-            }
-        }
-        ObjectParts(parts) => {
-            for p in parts {
-                match p {
-                    ObjPart::Field(_, x) | ObjPart::Spread(x) => visit(x, f),
-                    ObjPart::Computed(k, x) => {
-                        visit(k, f);
-                        visit(x, f);
+                ObjectParts(parts) => {
+                    for p in parts {
+                        match p {
+                            ObjPart::Field(_, x) | ObjPart::Spread(x) => $name(x, f),
+                            ObjPart::Computed(k, x) => {
+                                $name(k, f);
+                                $name(x, f);
+                            }
+                        }
+                    }
+                }
+                ObjectRest(a, xs) => {
+                    $name(a, f);
+                    for x in xs {
+                        $name(x, f);
+                    }
+                }
+                ForInGet(_, a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                NewSpread(a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                CallSpread(a, b, c) => {
+                    $name(a, f);
+                    $name(b, f);
+                    $name(c, f);
+                }
+                TypedGet(_, a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                TypedSet(_, a, b, c) => {
+                    $name(a, f);
+                    $name(b, f);
+                    $name(c, f);
+                }
+                Binary(_, a, b)
+                | Compare(_, a, b)
+                | Logical(_, a, b)
+                | AnyBinary(_, a, b)
+                | AnyCompare(_, a, b)
+                | SetProp(a, _, b)
+                | GetElem(a, b)
+                | DeleteElem(a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                Cond(a, b, c) | SetElem(a, b, c) => {
+                    $name(a, f);
+                    $name(b, f);
+                    $name(c, f);
+                }
+                Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => {
+                    for x in xs {
+                        $name(x, f);
+                    }
+                }
+                CallValue(a, xs) | New(a, xs) => {
+                    $name(a, f);
+                    for x in xs {
+                        $name(x, f);
+                    }
+                }
+                CallThis(a, b, xs) => {
+                    $name(a, f);
+                    $name(b, f);
+                    for x in xs {
+                        $name(x, f);
+                    }
+                }
+                CallMethod(a, k, xs) => {
+                    $name(a, f);
+                    if let Key::Value(k) = k {
+                        $name(k, f);
+                    }
+                    for x in xs {
+                        $name(x, f);
+                    }
+                }
+                Object(props) => {
+                    for (_, x) in props {
+                        $name(x, f);
                     }
                 }
             }
         }
-        ObjectRest(a, xs) => {
-            visit(a, f);
-            xs.iter().for_each(|x| visit(x, f));
-        }
-        ForInGet(_, a, b) => {
-            visit(a, f);
-            visit(b, f);
-        }
-        PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) => {
-            visit(a, f);
-            visit(b, f);
-        }
-        NewSpread(a, b) => {
-            visit(a, f);
-            visit(b, f);
-        }
-        CallSpread(a, b, c) => {
-            visit(a, f);
-            visit(b, f);
-            visit(c, f);
-        }
-        TypedGet(_, a, b) => {
-            visit(a, f);
-            visit(b, f);
-        }
-        TypedSet(_, a, b, c) => {
-            visit(a, f);
-            visit(b, f);
-            visit(c, f);
-        }
-        Binary(_, a, b)
-        | Compare(_, a, b)
-        | Logical(_, a, b)
-        | AnyBinary(_, a, b)
-        | AnyCompare(_, a, b)
-        | SetProp(a, _, b)
-        | GetElem(a, b)
-        | DeleteElem(a, b) => {
-            visit(a, f);
-            visit(b, f);
-        }
-        Cond(a, b, c) | SetElem(a, b, c) => {
-            visit(a, f);
-            visit(b, f);
-            visit(c, f);
-        }
-        Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => xs.iter().for_each(|x| visit(x, f)),
-        CallValue(a, xs) | New(a, xs) => {
-            visit(a, f);
-            xs.iter().for_each(|x| visit(x, f));
-        }
-        CallThis(a, b, xs) => {
-            visit(a, f);
-            visit(b, f);
-            xs.iter().for_each(|x| visit(x, f));
-        }
-        CallMethod(a, k, xs) => {
-            visit(a, f);
-            if let Key::Value(k) = k {
-                visit(k, f);
-            }
-            xs.iter().for_each(|x| visit(x, f));
-        }
-        Object(props) => props.iter().for_each(|(_, x)| visit(x, f)),
-    }
+    };
 }
+
+visitor!(
+    /// Visit `x` and every expression in it.
+    visit
+);
+visitor!(
+    /// Visit `x` and every expression in it, for rewriting (`f` sees a
+    /// node before its children, which it may replace).
+    visit_mut mut
+);
 
 /// Whether evaluating `x` may assign local `l` (only the function's own code
 /// assigns a local that is not captured).
@@ -758,4 +788,353 @@ pub fn assigns_local(x: &Expr, l: LocalId) -> bool {
         };
     });
     found
+}
+
+macro_rules! stmt_visitor {
+    ($(#[$doc:meta])* $stmts:ident $exprs:ident $iter:ident $($m:ident)?) => {
+        $(#[$doc])*
+        pub fn $stmts(stmts: & $($m)? [Stmt], f: &mut impl FnMut(& $($m)? Expr)) {
+            for s in stmts {
+                match s {
+                    Stmt::Expr(x) | Stmt::Throw(x) => $exprs(x, f),
+                    Stmt::Return(x) => x.$iter().for_each(|x| $exprs(x, f)),
+                    Stmt::Await { value, .. } | Stmt::Yield { value, .. } => $exprs(value, f),
+                    Stmt::If(c, a, b) => {
+                        $exprs(c, f);
+                        $stmts(a, f);
+                        $stmts(b, f);
+                    }
+                    Stmt::Loop { test, body, update, .. } => {
+                        test.$iter().for_each(|x| $exprs(x, f));
+                        $stmts(body, f);
+                        update.$iter().for_each(|x| $exprs(x, f));
+                    }
+                    Stmt::Switch { cases, .. } => {
+                        for (c, body) in cases {
+                            c.$iter().for_each(|x| $exprs(x, f));
+                            $stmts(body, f);
+                        }
+                    }
+                    Stmt::Block(body) | Stmt::IterGuard { body, .. } => $stmts(body, f),
+                    Stmt::Try { body, catch, finally, .. } => {
+                        $stmts(body, f);
+                        catch.$iter().for_each(|(_, c)| $stmts(c, f));
+                        finally.$iter().for_each(|c| $stmts(c, f));
+                    }
+                    Stmt::NewBoxes(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
+                }
+            }
+        }
+    };
+}
+
+stmt_visitor!(
+    /// Call `f` on every expression (and subexpression) in `stmts`.
+    visit_stmts visit iter
+);
+stmt_visitor!(
+    /// `visit_stmts` for rewriting (see `visit_mut`).
+    visit_stmts_mut visit_mut iter_mut mut
+);
+
+/// Calls `f` on the locals named by statements themselves (not by their
+/// expressions).
+fn stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+    let target = |t: &AwaitTarget, f: &mut dyn FnMut(LocalId)| {
+        if let AwaitTarget::Set(l) | AwaitTarget::Init(l) = t {
+            f(*l);
+        }
+    };
+    for s in stmts {
+        match s {
+            Stmt::Expr(_) | Stmt::Throw(_) | Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Await { target: t, .. } => target(t, f),
+            Stmt::Yield { kind, target: t, .. } => {
+                target(t, f);
+                if let YieldKind::Delegate { iter, next, .. } = kind {
+                    f(*iter);
+                    f(*next);
+                }
+            }
+            Stmt::If(_, a, b) => {
+                stmt_locals(a, f);
+                stmt_locals(b, f);
+            }
+            Stmt::Loop { body, per_iteration, .. } => {
+                per_iteration.iter().for_each(|&l| f(l));
+                stmt_locals(body, f);
+            }
+            Stmt::Switch { disc, cases, .. } => {
+                f(*disc);
+                cases.iter().for_each(|(_, body)| stmt_locals(body, f));
+            }
+            Stmt::NewBoxes(ls) => ls.iter().for_each(|&l| f(l)),
+            Stmt::Block(body) => stmt_locals(body, f),
+            Stmt::IterGuard { iter, next, body, .. } => {
+                f(*iter);
+                f(*next);
+                stmt_locals(body, f);
+            }
+            Stmt::Try { body, catch, finally, exc } => {
+                stmt_locals(body, f);
+                if let Some((param, c)) = catch {
+                    param.iter().for_each(|&l| f(l));
+                    stmt_locals(c, f);
+                }
+                finally.iter().for_each(|c| stmt_locals(c, f));
+                exc.iter().for_each(|&l| f(l));
+            }
+        }
+    }
+}
+
+/// Calls `f` on the expressions that are statements.
+fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
+    for s in stmts {
+        match s {
+            Stmt::Expr(e) => f(e),
+            Stmt::If(_, a, b) => {
+                top_exprs(a, f);
+                top_exprs(b, f);
+            }
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => top_exprs(body, f),
+            Stmt::Switch { cases, .. } => cases.iter().for_each(|(_, b)| top_exprs(b, f)),
+            Stmt::Try { body, catch, finally, .. } => {
+                top_exprs(body, f);
+                catch.iter().for_each(|(_, c)| top_exprs(c, f));
+                finally.iter().for_each(|c| top_exprs(c, f));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Scalar replacement: a local initialized with an object literal and only
+/// ever used as `local.key` (reads and writes of the literal's own keys)
+/// holds an object nothing else can observe, so each property becomes a
+/// local of its own. (Unboxed locals are only used after their declaration,
+/// which evaluates the literal.) It may be reassigned other literals with
+/// the same keys, in statements.
+pub fn scalar_replace(f: &mut Func) {
+    let n = f.locals.len();
+    let mut ok: Vec<bool> =
+        (0..n).map(|l| l >= f.params.len() && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)).collect();
+    let mut inits = vec![0; n];
+    // Reassignments with object literals, all of them / as statements.
+    let mut sets = vec![0; n];
+    let mut top_sets = vec![0; n];
+    top_exprs(&f.body, &mut |e| {
+        if let ExprKind::SetLocal(l, x) = &e.kind
+            && let ExprKind::Object(_) = x.kind
+        {
+            top_sets[*l] += 1;
+        }
+    });
+    let mut keys: Vec<Vec<AtomId>> = vec![Vec::new(); n];
+    let mut used: Vec<Vec<AtomId>> = vec![Vec::new(); n];
+    let mut as_object = vec![0; n];
+    let mut total = vec![0; n];
+    stmt_locals(&f.body, &mut |l| ok[l] = false);
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) => match &x.kind {
+            ExprKind::Object(props) => {
+                if let ExprKind::InitLocal(..) = e.kind {
+                    inits[*l] += 1;
+                } else {
+                    sets[*l] += 1;
+                    // Fields are assigned one by one: values must not read
+                    // the old ones.
+                    for (_, v) in props {
+                        visit(v, &mut |x| {
+                            if matches!(x.kind, ExprKind::Local(m) if m == *l) {
+                                ok[*l] = false;
+                            }
+                        });
+                    }
+                }
+                let mut ks: Vec<AtomId> = props.iter().map(|(k, _)| *k).collect();
+                if keys[*l].is_empty() {
+                    keys[*l] = ks.clone();
+                }
+                // Every literal has the same keys.
+                let mut have = keys[*l].clone();
+                ks.sort_unstable();
+                ks.dedup();
+                have.sort_unstable();
+                have.dedup();
+                if ks != have {
+                    ok[*l] = false;
+                }
+            }
+            _ => ok[*l] = false,
+        },
+        ExprKind::Update { local: l, .. } | ExprKind::ArrayPush(l, _) => ok[*l] = false,
+        ExprKind::IterOpen(_, a, b, _) | ExprKind::IterClose(a, b) => {
+            ok[*a] = false;
+            ok[*b] = false;
+        }
+        ExprKind::IterStep(a, b) => {
+            ok[*a] = false;
+            b.iter().for_each(|&b| ok[b] = false);
+        }
+        ExprKind::ForInGet(a, ..) => ok[*a] = false,
+        ExprKind::Closure(_, ls) => ls.iter().for_each(|&l| ok[l] = false),
+        ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _) => {
+            if let ExprKind::Local(l) = o.kind {
+                as_object[l] += 1;
+                used[l].push(*k);
+            }
+        }
+        ExprKind::Local(l) => total[*l] += 1,
+        _ => {}
+    });
+    // Per replaced local, its keys' new locals.
+    let mut fields: Vec<Option<Vec<(AtomId, LocalId)>>> = vec![None; n];
+    for l in 0..n {
+        if ok[l]
+            && inits[l] == 1
+            && sets[l] == top_sets[l]
+            && total[l] == as_object[l]
+            && used[l].iter().all(|k| keys[l].contains(k))
+        {
+            let mut map: Vec<(AtomId, LocalId)> = Vec::new();
+            for &k in &keys[l] {
+                if !map.iter().any(|&(m, _)| m == k) {
+                    map.push((k, f.locals.len()));
+                    f.locals.push(Ty::Any);
+                    f.boxed.push(false);
+                    f.local_names.push(None);
+                }
+            }
+            fields[l] = Some(map);
+        }
+    }
+    if fields.iter().all(Option::is_none) {
+        return;
+    }
+    let field = |l: LocalId, k: AtomId| -> Option<LocalId> {
+        fields[l].as_ref().map(|m| m.iter().find(|&&(m, _)| m == k).expect("a literal key").1)
+    };
+    let first_new = n;
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let init = matches!(e.kind, ExprKind::InitLocal(..));
+        let new = match &mut e.kind {
+            // (New locals are past `fields`.)
+            ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) if fields.get(*l).is_some_and(Option::is_some) => {
+                let ExprKind::Object(props) = std::mem::replace(&mut x.kind, ExprKind::Undefined) else {
+                    unreachable!()
+                };
+                let mut seq: Vec<Expr> = props
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let (fl, v) = (field(*l, k).unwrap(), Box::new(v));
+                        Expr::new(Ty::Any, if init { ExprKind::InitLocal(fl, v) } else { ExprKind::SetLocal(fl, v) })
+                    })
+                    .collect();
+                seq.push(Expr::new(Ty::Any, ExprKind::Undefined));
+                ExprKind::Seq(seq)
+            }
+            ExprKind::GetProp(o, k) => match o.kind {
+                ExprKind::Local(l) if fields[l].is_some() => ExprKind::Local(field(l, *k).unwrap()),
+                _ => return,
+            },
+            ExprKind::SetProp(o, k, v) => match o.kind {
+                ExprKind::Local(l) if fields[l].is_some() => {
+                    let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
+                    ExprKind::SetLocal(field(l, *k).unwrap(), Box::new(v))
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        e.kind = new;
+    });
+    let new: Vec<LocalId> = (first_new..f.locals.len()).collect();
+    retype_numbers(f, &new);
+}
+
+/// A number written to an `Any` local `l` that `retype_numbers` can turn
+/// into an `F64` one: a boxed number, `l` plus or minus one, or `+ - * /`
+/// on `l` and boxed numbers.
+fn number_write(l: LocalId, v: &Expr) -> bool {
+    let operand = |x: &Expr| match &x.kind {
+        ExprKind::Local(m) => *m == l,
+        ExprKind::Box(e) => e.ty == Ty::F64,
+        _ => false,
+    };
+    match &v.kind {
+        ExprKind::Box(e) => e.ty == Ty::F64,
+        ExprKind::AnyUnary(AnyUnOp::Inc | AnyUnOp::Dec, x) => matches!(x.kind, ExprKind::Local(m) if m == l),
+        ExprKind::AnyBinary(AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul | AnyBinOp::Div, a, b) => {
+            operand(a) && operand(b)
+        }
+        _ => false,
+    }
+}
+
+/// `number_write` operand `x` of local `l`, as an `F64` expression.
+fn number_operand(l: LocalId, x: Expr) -> Expr {
+    match x.kind {
+        ExprKind::Box(e) => *e,
+        ExprKind::Local(m) if m == l => Expr::new(Ty::F64, ExprKind::Local(l)),
+        _ => unreachable!("not a number operand"),
+    }
+}
+
+/// The `Any` locals among `cands` that only ever hold numbers (every write
+/// is a `number_write`) become `F64` locals; their reads are boxed.
+fn retype_numbers(f: &mut Func, cands: &[LocalId]) {
+    let mut ok: Vec<bool> = (0..f.locals.len()).map(|l| cands.contains(&l)).collect();
+    visit_stmts(&f.body, &mut |e| {
+        if let ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v) = &e.kind
+            && !number_write(*l, v)
+        {
+            ok[*l] = false;
+        }
+    });
+    if !ok.iter().any(|&b| b) {
+        return;
+    }
+    for (l, &ok) in ok.iter().enumerate() {
+        if ok {
+            f.locals[l] = Ty::F64;
+        }
+    }
+    let undefined = || Expr::new(Ty::Any, ExprKind::Undefined);
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let init = matches!(e.kind, ExprKind::InitLocal(..));
+        let num = match &mut e.kind {
+            // (Reads inside rewritten writes are `F64` already.)
+            ExprKind::Local(l) if ok[*l] && e.ty == Ty::Any => Expr::new(Ty::F64, ExprKind::Local(*l)),
+            ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v) if ok[*l] && e.ty == Ty::Any => {
+                let l = *l;
+                let v = std::mem::replace(&mut **v, undefined());
+                let kind = match v.kind {
+                    ExprKind::AnyUnary(op, _) => {
+                        ExprKind::Update { local: l, delta: if op == AnyUnOp::Inc { 1.0 } else { -1.0 }, prefix: true }
+                    }
+                    ExprKind::AnyBinary(op, a, b) => {
+                        let op = match op {
+                            AnyBinOp::Add => BinOp::Add,
+                            AnyBinOp::Sub => BinOp::Sub,
+                            AnyBinOp::Mul => BinOp::Mul,
+                            _ => BinOp::Div,
+                        };
+                        let x = Expr::new(
+                            Ty::F64,
+                            ExprKind::Binary(op, Box::new(number_operand(l, *a)), Box::new(number_operand(l, *b))),
+                        );
+                        if init { ExprKind::InitLocal(l, Box::new(x)) } else { ExprKind::SetLocal(l, Box::new(x)) }
+                    }
+                    _ => {
+                        let x = number_operand(l, v);
+                        if init { ExprKind::InitLocal(l, Box::new(x)) } else { ExprKind::SetLocal(l, Box::new(x)) }
+                    }
+                };
+                Expr::new(Ty::F64, kind)
+            }
+            _ => return,
+        };
+        e.kind = ExprKind::Box(Box::new(num));
+    });
 }

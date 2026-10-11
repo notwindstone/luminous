@@ -142,6 +142,16 @@ regular call path's generated code alone.
 - **Numbers and booleans**, unboxed: all operators, `Math.*`, the
   `Number.is*` predicates and constants, and module-level literal `const`s
   (folded).
+- **Integer locals**: a `number` local only ever assigned integer literals
+  and stepped by small integers (`i++`, `n += 2`) lives in a machine
+  integer, exact past 2^53 (it rounds as doubles do there). Comparisons,
+  array indexes and bitwise operators use the integer directly, and the
+  range check disappears when loop trip counts bound the value statically.
+- **Objects that do not escape**: a local initialized with an object
+  literal and only used as `local.key` (and reassigned only literals with
+  the same keys) is never allocated: each property becomes a local, an
+  unboxed number when it only ever holds numbers. Elsewhere, `o.k++`,
+  `o.k += n` update a cached data property in place.
 - **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
 - **JS values**: `let` / `const` / `var` holding anything, plus:
@@ -326,9 +336,9 @@ In `boundary`, the interpreted loop around the calls dominates.
 
 ## Roadmap
 
-- **Int32 representation selection**: keep integer-valued locals in machine
-  integers (loop counters, indices, bitwise code). This is the biggest
-  remaining win for `primes`, `xorshift` and array indexing.
+- **Int32 representation selection** beyond counters and steps: integer
+  arithmetic in general (`%`, bitwise code, parameters). This is the biggest
+  remaining win for `primes` and `xorshift`.
 - Shapes for class instances (inline property access), and calls to methods
   of known classes without the engine.
 - **Multi-module programs** (`import` between `.ts` files).
