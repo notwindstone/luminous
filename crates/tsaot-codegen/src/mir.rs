@@ -317,6 +317,8 @@ pub enum BinOp {
     Sshr,
     /// Signed remainder; the divisor is never 0, and `MIN % -1` is 0.
     Srem,
+    /// Signed remainder by a divisor known not to be 0 or -1.
+    SremPositive,
     Fadd,
     Fsub,
     Fmul,
@@ -500,9 +502,6 @@ pub struct Function {
     pub entry: Block,
     pub vars: Vec<Type>,
     pub slots: Vec<StackSlotData>,
-    /// Not worth vectorizing (LLVM): long and branchy, like async step
-    /// functions, whose frame spills the SLP vectorizer is slow on.
-    pub no_vectorize: bool,
 }
 
 impl Function {
@@ -553,7 +552,6 @@ impl FunctionBuilder {
                 entry: Block(0),
                 vars: Vec::new(),
                 slots: Vec::new(),
-                no_vectorize: false,
             },
             decls,
             current: None,
@@ -764,6 +762,10 @@ impl Ins<'_> {
     }
     pub fn srem(self, a: Value, b: Value) -> Value {
         self.binary(BinOp::Srem, a, b)
+    }
+    /// `srem` by a divisor known to be at least 1.
+    pub fn srem_positive(self, a: Value, b: Value) -> Value {
+        self.binary(BinOp::SremPositive, a, b)
     }
     pub fn fadd(self, a: Value, b: Value) -> Value {
         self.binary(BinOp::Fadd, a, b)

@@ -167,9 +167,6 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
     }
     writeln!(out, "\nattributes #0 = {{ nounwind }}").unwrap();
     writeln!(out, "attributes #1 = {{ nounwind }}").unwrap();
-    // No vectorization in huge functions and async step functions: the SLP
-    // vectorizer's time grows too fast with their size, for little gain.
-    writeln!(out, "attributes #2 = {{ nounwind noimplicitfloat }}").unwrap();
     // Functions of their arguments only (`errno`, which libm may set, is
     // never read): LLVM may reuse and hoist their results.
     writeln!(out, "attributes #3 = {{ nounwind readnone willreturn }}").unwrap();
@@ -240,9 +237,6 @@ const PURE: &[&str] = &[
 fn clobbers(first: u32) -> String {
     (first..32).map(|i| format!("~{{xmm{i}}}")).collect::<Vec<_>>().join(",")
 }
-
-/// Functions with more instructions than this are not vectorized.
-const HUGE_FUNCTION: usize = 20_000;
 
 fn ty(t: Type) -> &'static str {
     match t {
@@ -608,13 +602,11 @@ impl<'a> FnEmitter<'a> {
             .collect();
         let exported = linkage != Linkage::Local;
         let linkage = if exported { "dso_local " } else { "internal " };
-        let attrs = if f.no_vectorize || f.insts.len() > HUGE_FUNCTION { 2 } else { 1 };
         // Entries from C (JS entries, step functions) start on a cache line,
         // as Cranelift's do: their speed then does not depend on the code
         // before them.
         let align = if exported { " align 64" } else { "" };
-        let mut head =
-            format!("define {linkage}{} @{name}({}) #{attrs}{align} {{\n", ret_type(&f.sig), params.join(", "));
+        let mut head = format!("define {linkage}{} @{name}({}) #1{align} {{\n", ret_type(&f.sig), params.join(", "));
         head.push_str("entry:\n");
         self.out = head;
         for (i, s) in f.slots.iter().enumerate() {
@@ -1072,6 +1064,7 @@ impl<'a> FnEmitter<'a> {
                 self.line(format!("{d} = select i1 {m}, {tn} 1, {tn} {y}"));
                 format!("srem {tn} {x}, {d}")
             }
+            BinOp::SremPositive => format!("srem {tn} {x}, {y}"),
             BinOp::Fadd => format!("fadd {tn} {x}, {y}"),
             BinOp::Fsub => format!("fsub {tn} {x}, {y}"),
             BinOp::Fmul => format!("fmul {tn} {x}, {y}"),

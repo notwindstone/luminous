@@ -500,9 +500,8 @@ impl Codegen {
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &[], None, exits);
         l.stack_check();
         l.enter_async(slots, state, value, is_throw, f);
-        let mut func = l.body(&f.body).finish();
-        func.no_vectorize = true;
-        self.module.define_function(self.funcs[index], func);
+        let b = l.body(&f.body);
+        self.module.define_function(self.funcs[index], b.finish());
         Ok(())
     }
 

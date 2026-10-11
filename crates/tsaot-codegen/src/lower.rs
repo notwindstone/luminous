@@ -294,7 +294,7 @@ pub(crate) struct Lower {
     wide_of: HashMap<Value, Value>,
     /// `%` results: their integer value (the `f64` may be -0 for 0), valid
     /// when the flag (the divisor was not 0) is set; else the `f64` is NaN.
-    rem_of: HashMap<Value, (Value, Value)>,
+    rem_of: HashMap<Value, RemInt>,
     /// Int locals whose current update cannot pass 2^53: loop counters
     /// below a constant bound (see `bounded_counter`).
     bounded: Vec<ir::LocalId>,
@@ -304,6 +304,29 @@ pub(crate) struct Lower {
     i32_range: Vec<bool>,
     /// Exact integers (in `int_of`) known not to be negative.
     nonneg: std::collections::HashSet<Value>,
+    /// Lower bounds of the counters of each loop (see `loop_bounds`), and
+    /// of the loops being lowered.
+    loop_lo: HashMap<ir::LoopId, Vec<(ir::LocalId, i64)>>,
+    active_lo: Vec<(ir::LocalId, i64)>,
+    /// Exact integers (in `int_of`) known to be at least this.
+    int_lo: HashMap<Value, i64>,
+}
+
+/// Integers to compare two numbers by, and the flags under which they are
+/// valid, each with `RemInt::nan` (see `Lower::int_pair`).
+type IntPair = (Value, Value, Vec<(Value, bool)>);
+
+/// The integer form of a `%` result (see `Lower::rem_of`).
+#[derive(Clone, Copy)]
+struct RemInt {
+    /// The exact remainder, where `ok`.
+    int: Value,
+    ok: Value,
+    /// Where not `ok`, the result is NaN (`% 0`); else just a double, to
+    /// compare as one.
+    nan: bool,
+    /// Below 2^53 in magnitude, so comparable with rounded products.
+    small: bool,
 }
 
 impl Lower {
@@ -382,6 +405,9 @@ impl Lower {
             small,
             i32_range,
             nonneg: Default::default(),
+            loop_lo: loop_bounds(&f.body),
+            active_lo: Vec::new(),
+            int_lo: HashMap::new(),
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -506,6 +532,12 @@ impl Lower {
                 let d = self.int_f64(i);
                 if t == Ty::I32 || self.i32_range[l] {
                     self.i32s.insert(d);
+                }
+                if let Some(&(_, lo)) = self.active_lo.iter().rev().find(|&&(m, _)| m == l) {
+                    self.int_lo.insert(d, lo);
+                    if lo >= 0 {
+                        self.nonneg.insert(d);
+                    }
                 }
                 V::Num(d)
             }
@@ -840,6 +872,9 @@ impl Lower {
                 let exit = self.b.create_block();
                 self.loops.insert(*id, (Some(cont), exit));
                 self.b.ins().jump(header, &[]);
+                let bounds = self.loop_lo.get(id).cloned().unwrap_or_default();
+                let outer_lo = self.active_lo.len();
+                self.active_lo.extend(bounds);
 
                 self.b.switch_to_block(header);
                 match test {
@@ -885,6 +920,7 @@ impl Lower {
                         self.b.ins().jump(header, &[]);
                     }
                 }
+                self.active_lo.truncate(outer_lo);
                 self.b.switch_to_block(exit);
             }
             Stmt::Switch { id, disc, cases } => self.switch(*id, *disc, cases),
@@ -1262,13 +1298,14 @@ impl Lower {
     /// the doubles: both exact, or an int32 against a rounded product of
     /// int32s (a rounded product is past 2^53, far from any int32). `%`
     /// results may be -0 for 0, which compares the same.
-    /// Also the flags under which they are valid (else a `%` result is NaN).
-    fn int_pair(&self, a: Value, c: Value) -> Option<(Value, Value, Vec<Value>)> {
+    /// Also the flags under which they are valid (else a `%` result is NaN,
+    /// or a double: see `RemInt`).
+    fn int_pair(&self, a: Value, c: Value) -> Option<IntPair> {
         let exact = |v: &Value| match self.rem_of.get(v) {
-            Some(&(i, ok)) => Some((i, Some(ok))),
+            Some(r) => Some((r.int, Some((r.ok, r.nan)))),
             None => self.int_of.get(v).map(|&i| (i, None)),
         };
-        let small = |v: &Value| self.i32s.contains(v) || self.rem_of.contains_key(v);
+        let small = |v: &Value| self.i32s.contains(v) || self.rem_of.get(v).is_some_and(|r| r.small);
         let (x, y) = match (exact(&a), exact(&c)) {
             (Some(x), Some(y)) => (x, y),
             (None, Some(y)) if small(&c) => ((*self.wide_of.get(&a)?, None), y),
@@ -1278,9 +1315,18 @@ impl Lower {
         Some((x.0, y.0, x.1.into_iter().chain(y.1).collect()))
     }
 
-    /// `a % c` for int32s `a` (`x`) and `y`: the integer remainder,
+    /// `a % c` for int32s `a` (`x`) and `c` (`y`): the integer remainder,
     /// with the dividend's sign (`-4 % 2` is -0); NaN for `% 0`.
-    fn int_rem(&mut self, x: Value, y: Value, a: Value) -> Value {
+    fn int_rem(&mut self, x: Value, y: Value, a: Value, c: Value) -> Value {
+        // 32-bit division is much faster than 64-bit (the IR defines
+        // INT32_MIN % -1 as 0).
+        if self.lo_of(c).is_some_and(|lo| lo >= 1) {
+            // Never `% 0`.
+            let (x32, y32) = (self.b.ins().ireduce(I32, x), self.b.ins().ireduce(I32, y));
+            let r = self.b.ins().srem_positive(x32, y32);
+            let r = self.b.ins().sextend(I64, r);
+            return self.exact_rem(r, a, 32);
+        }
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
@@ -1290,8 +1336,6 @@ impl Lower {
         let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
         self.b.ins().brif(nonzero, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
-        // 32-bit division is much faster than 64-bit (the IR defines
-        // INT32_MIN % -1 as 0).
         let (x32, y32) = (self.b.ins().ireduce(I32, x), self.b.ins().ireduce(I32, y));
         let r = self.b.ins().srem(x32, y32);
         let r = self.b.ins().sextend(I64, r);
@@ -1303,8 +1347,35 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, (r_param, nonzero));
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true });
         res
+    }
+
+    /// The remainder `r` (an `i64`, exact) of dividend `a` by a divisor
+    /// below 2^`bits` in magnitude, as a number: with the dividend's sign
+    /// (`-4 % 2` is -0), or an exact integer itself when the dividend is not
+    /// negative.
+    fn exact_rem(&mut self, r: Value, a: Value, bits: u32) -> Value {
+        if self.nonneg.contains(&a) {
+            let d = self.int_f64(r);
+            self.int_bits.insert(d, bits);
+            self.nonneg.insert(d);
+            if bits <= 31 {
+                self.i32s.insert(d);
+            }
+            return d;
+        }
+        let rf = self.b.ins().fcvt_from_sint(F64, r);
+        let rf = self.b.ins().fcopysign(rf, a);
+        let ok = self.b.ins().iconst(I8, 1);
+        self.rem_of.insert(rf, RemInt { int: r, ok, nan: true, small: bits <= 53 });
+        rf
+    }
+
+    /// A lower bound of `v`, an exact integer: its value for a constant, or
+    /// a loop counter's (see `loop_bounds`).
+    fn lo_of(&self, v: Value) -> Option<i64> {
+        self.int_consts.get(&v).or(self.int_lo.get(&v)).copied()
     }
 
     /// An int local's value as an `f64` (exact: see `int_locals`).
@@ -1809,27 +1880,25 @@ impl Lower {
                             CmpOp::Ne => IntCC::NotEqual,
                         };
                         let r = self.b.ins().icmp(cc, ia, ic);
-                        // A NaN `%` result: only `!=` holds.
-                        valid.into_iter().fold(r, |r, ok| {
-                            if *op == CmpOp::Ne {
-                                let nan = self.b.ins().bxor_imm_u(ok, 1);
-                                self.b.ins().bor(r, nan)
-                            } else {
-                                self.b.ins().band(r, ok)
-                            }
-                        })
+                        if valid.iter().all(|&(_, nan)| nan) {
+                            // A NaN `%` result: only `!=` holds.
+                            valid.into_iter().fold(r, |r, (ok, _)| {
+                                if *op == CmpOp::Ne {
+                                    let nan = self.b.ins().bxor_imm_u(ok, 1);
+                                    self.b.ins().bor(r, nan)
+                                } else {
+                                    self.b.ins().band(r, ok)
+                                }
+                            })
+                        } else {
+                            // Where an integer form is not valid, the doubles
+                            // compare.
+                            let ok = valid.iter().map(|&(ok, _)| ok).reduce(|x, y| self.b.ins().band(x, y)).unwrap();
+                            let f = self.b.ins().fcmp(float_cc(*op), a, c);
+                            self.b.ins().select(ok, r, f)
+                        }
                     }
-                    (V::Num(a), V::Num(c)) => {
-                        let cc = match op {
-                            CmpOp::Lt => FloatCC::LessThan,
-                            CmpOp::Le => FloatCC::LessThanOrEqual,
-                            CmpOp::Gt => FloatCC::GreaterThan,
-                            CmpOp::Ge => FloatCC::GreaterThanOrEqual,
-                            CmpOp::Eq => FloatCC::Equal,
-                            CmpOp::Ne => FloatCC::NotEqual,
-                        };
-                        self.b.ins().fcmp(cc, a, c)
-                    }
+                    (V::Num(a), V::Num(c)) => self.b.ins().fcmp(float_cc(*op), a, c),
                     (V::Bool(a), V::Bool(c)) => {
                         let cc = if *op == CmpOp::Eq { IntCC::Equal } else { IntCC::NotEqual };
                         self.b.ins().icmp(cc, a, c)
@@ -3913,7 +3982,7 @@ impl Lower {
                 self.wide_of.insert(d, p);
                 return d;
             }
-            (BinOp::Rem, Some((x, y))) => return self.int_rem(x, y, a),
+            (BinOp::Rem, Some((x, y))) => return self.int_rem(x, y, a, c),
             _ => {}
         }
         if op == BinOp::Rem
@@ -3964,27 +4033,18 @@ impl Lower {
     /// Everything else uses C `fmod`, which matches JS exactly.
     /// `a % c` for exact integers below 2^53 in magnitude (`c` below
     /// 2^`bits`): an integer remainder, with the dividend's sign (`-4 % 2`
-    /// is -0); NaN for `% 0`. A nonzero constant divisor needs no division
-    /// (nor a test for 0), and with a dividend known not to be negative the
-    /// result is an exact integer itself.
+    /// is -0); NaN for `% 0`. A nonzero constant divisor needs no division,
+    /// and with a dividend known not to be negative the result is an exact
+    /// integer itself.
     fn int_rem64(&mut self, a: Value, c: Value, bits: u32) -> Value {
         let (x, y) = (self.int_of[&a], self.int_of[&c]);
         if self.int_consts.get(&c).is_some_and(|&k| k != 0) {
             let r = self.b.ins().srem(x, y);
-            if self.nonneg.contains(&a) {
-                let d = self.int_f64(r);
-                self.int_bits.insert(d, bits);
-                self.nonneg.insert(d);
-                if bits <= 31 {
-                    self.i32s.insert(d);
-                }
-                return d;
-            }
-            let rf = self.b.ins().fcvt_from_sint(F64, r);
-            let rf = self.b.ins().fcopysign(rf, a);
-            let ok = self.b.ins().iconst(I8, 1);
-            self.rem_of.insert(rf, (r, ok));
-            return rf;
+            return self.exact_rem(r, a, bits);
+        }
+        if self.lo_of(c).is_some_and(|lo| lo >= 1) {
+            let r = self.b.ins().srem_positive(x, y);
+            return self.exact_rem(r, a, bits);
         }
         let fast = self.b.create_block();
         let slow = self.b.create_block();
@@ -4005,7 +4065,7 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, (r_param, nonzero));
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true });
         res
     }
 
@@ -4035,26 +4095,39 @@ impl Lower {
                 (ci, self.b.ins().band(same, unsat))
             }
         };
-        let c_abs = self.b.ins().iabs(ci);
         // |c| > 1 excludes 0 (NaN result) and -1 (srem overflow on INT64_MIN).
-        let c_ok = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, c_abs, 1);
+        let positive = exact(self, c).is_some() && self.lo_of(c).is_some_and(|lo| lo >= 2);
+        let c_ok = if positive {
+            self.b.ins().iconst(I8, 1)
+        } else {
+            let c_abs = self.b.ins().iabs(ci);
+            self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, c_abs, 1)
+        };
         let ok = self.b.ins().band(a_int, c_int);
         let ok = self.b.ins().band(ok, c_ok);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, F64);
+        let r_param = self.b.append_block_param(join, I64);
+        let is_int = self.b.append_block_param(join, I8);
         self.b.ins().brif(ok, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
-        let r = self.b.ins().srem(ai, ci);
+        let r = if positive { self.b.ins().srem_positive(ai, ci) } else { self.b.ins().srem(ai, ci) };
         let rf = self.b.ins().fcvt_from_sint(F64, r);
         let rf = self.b.ins().fcopysign(rf, a);
-        self.b.ins().jump(join, &[BlockArg::Value(rf)]);
+        let yes = self.b.ins().iconst(I8, 1);
+        self.b.ins().jump(join, &[BlockArg::Value(rf), BlockArg::Value(r), BlockArg::Value(yes)]);
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
-        let r = self.call_helper("fmod", &[a, c]);
-        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        let f = self.call_helper("fmod", &[a, c]);
+        let zero = self.b.ins().iconst(I64, 0);
+        let no = self.b.ins().iconst(I8, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(f), BlockArg::Value(zero), BlockArg::Value(no)]);
         self.b.switch_to_block(join);
+        // On the fast path, the exact remainder (|r| < |c|).
+        let small = self.bits_of(c).is_some_and(|b| b <= 53);
+        self.rem_of.insert(res, RemInt { int: r_param, ok: is_int, nan: false, small });
         res
     }
 
@@ -5097,6 +5170,81 @@ enum PropStep<'e> {
     Unary(AnyUnOp),
     /// The operator, its boxed right operand and that operand's number.
     Binary(AnyBinOp, &'e Expr, &'e Expr),
+}
+
+/// The comparison of doubles for `op`.
+fn float_cc(op: CmpOp) -> FloatCC {
+    match op {
+        CmpOp::Lt => FloatCC::LessThan,
+        CmpOp::Le => FloatCC::LessThanOrEqual,
+        CmpOp::Gt => FloatCC::GreaterThan,
+        CmpOp::Ge => FloatCC::GreaterThanOrEqual,
+        CmpOp::Eq => FloatCC::Equal,
+        CmpOp::Ne => FloatCC::NotEqual,
+    }
+}
+
+/// The lower bounds of loop counters: for a loop `for (i = a; ...; i += d)`
+/// (`i++`, `i += d`, `i = i + d` with `d > 0`; `a` an integer literal, the
+/// last assignment to `i` before the loop in its statement list) whose test
+/// and body do not assign `i`, `i >= a` throughout the loop's test, body
+/// and update.
+fn loop_bounds(body: &[Stmt]) -> HashMap<ir::LoopId, Vec<(ir::LocalId, i64)>> {
+    fn walk(stmts: &[Stmt], out: &mut HashMap<ir::LoopId, Vec<(ir::LocalId, i64)>>) {
+        for (k, s) in stmts.iter().enumerate() {
+            match s {
+                Stmt::Loop { id, test, body, update, .. } => {
+                    if let Some((i, lo)) = loop_counter(&stmts[..k], test.as_ref(), body, update.as_ref()) {
+                        out.entry(*id).or_default().push((i, lo));
+                    }
+                    walk(body, out);
+                }
+                Stmt::If(_, a, b) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                Stmt::Switch { cases, .. } => cases.iter().for_each(|(_, b)| walk(b, out)),
+                Stmt::Block(b) | Stmt::IterGuard { body: b, .. } => walk(b, out),
+                Stmt::Try { body, catch, finally, .. } => {
+                    walk(body, out);
+                    catch.iter().for_each(|(_, c)| walk(c, out));
+                    finally.iter().for_each(|f| walk(f, out));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    walk(body, &mut out);
+    out
+}
+
+/// See `loop_bounds`.
+fn loop_counter(
+    before: &[Stmt],
+    test: Option<&Expr>,
+    body: &[Stmt],
+    update: Option<&Expr>,
+) -> Option<(ir::LocalId, i64)> {
+    let i = match &update?.kind {
+        ExprKind::Update { local, delta, .. } if *delta > 0.0 => *local,
+        ExprKind::SetLocal(l, x) if int_step(*l, x).is_some_and(|c| c > 0) => *l,
+        _ => return None,
+    };
+    let assigns = |s: &Stmt| {
+        let mut found = false;
+        ir::visit_stmts(std::slice::from_ref(s), &mut |e| found |= ir::assigns_local(e, i));
+        found
+    };
+    if body.iter().any(assigns) || test.is_some_and(|t| ir::assigns_local(t, i)) {
+        return None;
+    }
+    match before.iter().rev().find(|s| assigns(s))? {
+        Stmt::Expr(Expr { kind: ExprKind::SetLocal(l, v) | ExprKind::InitLocal(l, v), .. }) if *l == i => {
+            int_literal(v, INT_EXACT as f64).map(|a| (i, a))
+        }
+        _ => None,
+    }
 }
 
 /// A small expression without calls or side effects, cheap to lower twice.

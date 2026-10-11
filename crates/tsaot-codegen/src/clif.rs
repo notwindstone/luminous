@@ -292,7 +292,7 @@ impl Translator<'_, '_> {
                     BinOp::Ishl => ins.ishl(a, b),
                     BinOp::Ushr => ins.ushr(a, b),
                     BinOp::Sshr => ins.sshr(a, b),
-                    BinOp::Srem => ins.srem(a, b),
+                    BinOp::Srem | BinOp::SremPositive => ins.srem(a, b),
                     BinOp::Fadd => ins.fadd(a, b),
                     BinOp::Fsub => ins.fsub(a, b),
                     BinOp::Fmul => ins.fmul(a, b),

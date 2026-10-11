@@ -1,4 +1,4 @@
-// @native mathOfValues order remainders signs counters fieldUpdates
+// @native mathOfValues order remainders signs counters fieldUpdates loopRems
 // @interpreted bigints
 // `Math` functions on JS values convert them with ToNumber once all the
 // arguments are evaluated; integer `%` with exact operands; integer locals
@@ -134,6 +134,26 @@ function fieldUpdates(): string {
   return JSON.stringify(bs) + " " + errors.join(" | ");
 }
 
+function loopRems(n: number): string {
+  // Loop counters bounded below divide without checks; remainders compare
+  // as integers on the fast path and as doubles otherwise.
+  const out: (number | string)[] = [];
+  let hits = 0;
+  for (let d = 3; d * d <= Math.abs(n) + 50; d += 2) {
+    const r = n % d;
+    if (r === 0) hits++;
+    if (r < 1) out.push(Object.is(r, -0) ? "-0" : r);
+    if (n % d !== 2) hits += 10;
+  }
+  for (let k = 1; k < 6; k++) {
+    out.push(-k % k === 0 ? "z" : "nz", Object.is(-k % k, -0) ? "-0" : "+", k % 4 < 2 ? "lt" : "ge");
+  }
+  let m = 0;
+  for (let k = 0; k < 4; k++) m += 7 % (k + 1);
+  out.push(hits, m);
+  return out.join(",");
+}
+
 console.log(mathOfValues());
 console.log(order());
 console.log(bigints());
@@ -141,3 +161,4 @@ console.log(remainders());
 console.log(signs(7.5), signs(-8), signs(-0), signs(1e300), signs(NaN));
 console.log(counters());
 console.log(fieldUpdates());
+console.log(loopRems(-96), loopRems(97), loopRems(10.5), loopRems(-0), loopRems(NaN), loopRems(1e17));

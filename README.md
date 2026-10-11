@@ -205,10 +205,6 @@ The differential tests run every case with both.
     (the `x`, `y` differences of `bench/nbody_aot.ts` are computed as one
     vector; floating point sums keep their order, so `dot` stays scalar).
 
-  Async functions and generators are not vectorized (their step functions
-  are long and branchy, and the SLP vectorizer's time grows too fast with
-  their size).
-
   On x86-64, each libm call is followed by an empty `asm` statement that
   marks the vector registers as written: LLVM 18 does not count a call's
   clobbers, and would otherwise convert an integer to a double into a
