@@ -259,10 +259,12 @@ function using one of these stays interpreted (and functions that call it
 call it through its binding). `tsaot report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.
 
-### Forcing native compilation: `aot`
+### Forcing native compilation: `aot` (or `compiled`)
 
 Unmarked functions are compiled on a best-effort basis. A function marked
-`aot` **must** compile natively, or the build fails with the reason:
+`aot` **must** compile natively, or the build fails with the reason.
+`compiled` is another name for `aot`, everywhere it applies (`compiled
+function`, `compiled (x) => ...`, `"use compiled"`, `compiled type`):
 
 ```ts
 let count: number = 0;

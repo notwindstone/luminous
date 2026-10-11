@@ -9,7 +9,7 @@ pub mod ir;
 pub mod marker;
 pub mod structs;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use oxc::allocator::Allocator;
@@ -164,7 +164,12 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     let parsed = Parser::new(&allocator, &source, source_type).parse();
     if !parsed.diagnostics.is_empty() {
         let misplaced = marker::misplaced(original).into_iter().map(|(at, keyword)| {
-            OxcDiagnostic::error(format!("`{keyword}` can only mark a function or an arrow function"))
+            let what = if keyword == marker::INTERPRETED {
+                "a function or an arrow function"
+            } else {
+                "a function, an arrow function or a type alias"
+            };
+            OxcDiagnostic::error(format!("`{keyword}` can only mark {what}"))
                 .with_label(Span::sized(at, keyword.len() as u32))
         });
         return Err(parse_error(misplaced.chain(parsed.diagnostics), original, path));
@@ -228,7 +233,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
             out.rejected.iter().find(|r| r.1 != m.span && r.1.start <= m.span.start && m.span.end <= r.1.end);
         if let Some((name, _, reason)) = enclosing {
             errors.push(
-                OxcDiagnostic::error(format!("`aot` function inside `{name}` cannot be compiled natively"))
+                OxcDiagnostic::error(format!("`{}` function inside `{name}` cannot be compiled natively", m.keyword))
                     .with_labels([
                         LabeledSpan::new_primary_with_span(Some(reason.msg.clone()), reason.span),
                         LabeledSpan::new_with_span(Some("marked here".into()), m.span),
@@ -238,20 +243,21 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
         }
         errors.push(match out.rejected.iter().find(|r| r.1 == m.span) {
             Some((name, _, reason)) => {
-                let mut d = OxcDiagnostic::error(format!("`aot` function `{name}` cannot be compiled natively"))
-                    .with_labels([LabeledSpan::new_primary_with_span(Some(reason.msg.clone()), reason.span)]);
+                let mut d =
+                    OxcDiagnostic::error(format!("`{}` function `{name}` cannot be compiled natively", m.keyword))
+                        .with_labels([LabeledSpan::new_primary_with_span(Some(reason.msg.clone()), reason.span)]);
                 if let Some(help) = callee_chain(&reason.msg, &out.rejected) {
                     d = d.with_help(help);
                 }
                 d
             }
-            None => {
-                OxcDiagnostic::error(format!("`aot` cannot be applied to {}", m.what)).with_label(m.span).with_help(
+            None => OxcDiagnostic::error(format!("`{}` cannot be applied to {}", m.keyword, m.what))
+                .with_label(m.span)
+                .with_help(
                     "it is in code that always stays interpreted (a class constructor or field \
                      initializer); `aot` applies to module code, top-level functions and class methods, \
                      and to the functions nested in them",
-                )
-            }
+                ),
         });
     }
     if !errors.is_empty() {
@@ -384,22 +390,30 @@ fn callee_chain(msg: &str, rejected: &[(String, Span, check::Reject)]) -> Option
 struct Mark {
     span: Span,
     what: &'static str,
+    /// `aot` or `compiled`, as written.
+    keyword: &'static str,
 }
 
-/// Collects functions marked by the `aot` keyword or a `"use aot"` directive.
+/// Collects functions marked by the `aot` (or `compiled`) keyword or a
+/// `"use aot"` (`"use compiled"`) directive.
 struct MarkedFunctions<'m> {
-    marked: &'m HashSet<u32>,
+    marked: &'m HashMap<u32, &'static str>,
     found: Vec<Mark>,
 }
 
-fn has_use_aot(body: Option<&FunctionBody>) -> bool {
-    body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use aot"))
+/// The keyword of a `"use aot"` / `"use compiled"` directive, if any.
+fn use_aot(body: Option<&FunctionBody>) -> Option<&'static str> {
+    body?.directives.iter().find_map(|d| match d.directive.as_str() {
+        "use aot" => Some(marker::KEYWORD),
+        "use compiled" => Some(marker::COMPILED),
+        _ => None,
+    })
 }
 
 impl<'a> Visit<'a> for MarkedFunctions<'_> {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
-        if self.marked.contains(&it.span.start) || has_use_aot(it.body.as_deref()) {
-            self.found.push(Mark { span: it.span, what: "this function" });
+        if let Some(keyword) = self.marked.get(&it.span.start).copied().or_else(|| use_aot(it.body.as_deref())) {
+            self.found.push(Mark { span: it.span, what: "this function", keyword });
         }
         walk::walk_function(self, it, flags);
     }
@@ -409,8 +423,8 @@ impl<'a> Visit<'a> for MarkedFunctions<'_> {
             ArrowFunctionBody::FunctionBody(b) => Some(&**b),
             _ => None,
         };
-        if self.marked.contains(&it.span.start) || has_use_aot(body) {
-            self.found.push(Mark { span: it.span, what: "this arrow function" });
+        if let Some(keyword) = self.marked.get(&it.span.start).copied().or_else(|| use_aot(body)) {
+            self.found.push(Mark { span: it.span, what: "this arrow function", keyword });
         }
         walk::walk_arrow_function_expression(self, it);
     }

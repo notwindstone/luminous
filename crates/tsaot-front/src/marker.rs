@@ -1,4 +1,5 @@
-//! The `aot` and `interpreted` contextual keywords: `aot function f() {}`,
+//! The `aot` (also spelled `compiled`) and `interpreted` contextual
+//! keywords: `aot function f() {}`, `compiled function f() {}`,
 //! `aot (x) => x`, `interpreted async function g() {}`, ...
 //!
 //! `aot` also marks a type alias, `aot type P = { ... }` (see `structs`).
@@ -16,7 +17,7 @@
 //! identifier; an `aot` inside a string or comment never precedes a function
 //! node.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use oxc::allocator::Allocator;
 use oxc::ast::ast::{ArrowFunctionExpression, Function, Program, TSTypeAliasDeclaration};
@@ -26,15 +27,23 @@ use oxc::span::SourceType;
 use oxc::syntax::scope::ScopeFlags;
 
 pub const KEYWORD: &str = "aot";
+/// Another name for `aot`.
+pub const COMPILED: &str = "compiled";
 /// Keeps a function interpreted.
 pub const INTERPRETED: &str = "interpreted";
-const KEYWORDS: [&str; 2] = [KEYWORD, INTERPRETED];
+const KEYWORDS: [&str; 3] = [KEYWORD, COMPILED, INTERPRETED];
+
+/// `aot` or its other name.
+fn is_aot(keyword: &str) -> bool {
+    keyword == KEYWORD || keyword == COMPILED
+}
 
 pub struct Stripped {
     /// The source with every marker replaced by spaces.
     pub source: String,
-    /// Start offsets of the functions marked `aot` (the token after it).
-    pub marked: HashSet<u32>,
+    /// Start offsets of the functions marked `aot` or `compiled` (the token
+    /// after it), and the keyword.
+    pub marked: HashMap<u32, &'static str>,
     /// Start offsets of the functions marked `interpreted`.
     pub interpreted: HashSet<u32>,
     /// Start offsets of the type aliases marked `aot`.
@@ -137,7 +146,7 @@ pub fn strip(src: &str) -> Stripped {
                 let before = active.len();
                 active.retain(|c| {
                     let at = c.next as u32;
-                    starts.0.contains(&at) || (c.keyword == KEYWORD && starts.1.contains(&at))
+                    starts.0.contains(&at) || (is_aot(c.keyword) && starts.1.contains(&at))
                 });
                 if active.len() == before {
                     break;
@@ -166,9 +175,10 @@ pub fn strip(src: &str) -> Stripped {
             && !rest.as_bytes().get(4).is_some_and(|&b| is_ident_byte(b))
             && !rest[4..].trim_start().starts_with("=>")
     };
-    let of = |k: &str| active.iter().filter(|c| c.keyword == k && !typed(c)).map(|c| c.next as u32).collect();
-    let aot_types = active.iter().filter(|c| c.keyword == KEYWORD && typed(c)).map(|c| c.next as u32).collect();
-    Stripped { source: blank(src, &active), marked: of(KEYWORD), interpreted: of(INTERPRETED), aot_types }
+    let marked = active.iter().filter(|c| is_aot(c.keyword) && !typed(c)).map(|c| (c.next as u32, c.keyword)).collect();
+    let interpreted = active.iter().filter(|c| c.keyword == INTERPRETED).map(|c| c.next as u32).collect();
+    let aot_types = active.iter().filter(|c| is_aot(c.keyword) && typed(c)).map(|c| c.next as u32).collect();
+    Stripped { source: blank(src, &active), marked, interpreted, aot_types }
 }
 
 /// Markers directly followed by a keyword that cannot start a function
@@ -197,7 +207,7 @@ pub fn misplaced(src: &str) -> Vec<(u32, &'static str)> {
         .filter(|c| {
             let rest = &src[c.next..];
             let word: String = rest.bytes().take_while(|&b| is_ident_byte(b)).map(char::from).collect();
-            NOT_FUNCTIONS.contains(&word.as_str()) && !(c.keyword == KEYWORD && word == "type")
+            NOT_FUNCTIONS.contains(&word.as_str()) && !(is_aot(c.keyword) && word == "type")
         })
         .map(|c| (c.at as u32, c.keyword))
         .collect()

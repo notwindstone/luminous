@@ -1,2 +1,2 @@
-// @error `aot` can only mark a function or an arrow function
+// @error `aot` can only mark a function, an arrow function or a type alias
 aot class Point {}
