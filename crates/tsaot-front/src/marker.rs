@@ -1,6 +1,8 @@
 //! The `aot` and `interpreted` contextual keywords: `aot function f() {}`,
 //! `aot (x) => x`, `interpreted async function g() {}`, ...
 //!
+//! `aot` also marks a type alias, `aot type P = { ... }` (see `structs`).
+//!
 //! Like `async`, `aot` is only a keyword directly before a function: no line
 //! break may follow it, and everywhere else it is an ordinary identifier. The
 //! TypeScript parser does not know it, so markers are found here and replaced
@@ -17,7 +19,7 @@
 use std::collections::HashSet;
 
 use oxc::allocator::Allocator;
-use oxc::ast::ast::{ArrowFunctionExpression, Function, Program};
+use oxc::ast::ast::{ArrowFunctionExpression, Function, Program, TSTypeAliasDeclaration};
 use oxc::ast_visit::{Visit, walk};
 use oxc::parser::Parser;
 use oxc::span::SourceType;
@@ -35,6 +37,8 @@ pub struct Stripped {
     pub marked: HashSet<u32>,
     /// Start offsets of the functions marked `interpreted`.
     pub interpreted: HashSet<u32>,
+    /// Start offsets of the type aliases marked `aot`.
+    pub aot_types: HashSet<u32>,
 }
 
 struct Candidate {
@@ -91,8 +95,9 @@ fn blank(src: &str, cands: &[&Candidate]) -> String {
     out
 }
 
+/// Start offsets of functions, and of type aliases.
 #[derive(Default)]
-struct FunctionStarts(HashSet<u32>);
+struct FunctionStarts(HashSet<u32>, HashSet<u32>);
 
 impl<'a> Visit<'a> for FunctionStarts {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
@@ -103,10 +108,15 @@ impl<'a> Visit<'a> for FunctionStarts {
         self.0.insert(it.span.start);
         walk::walk_arrow_function_expression(self, it);
     }
+    fn visit_ts_type_alias_declaration(&mut self, it: &TSTypeAliasDeclaration<'a>) {
+        self.1.insert(it.span.start);
+        walk::walk_ts_type_alias_declaration(self, it);
+    }
 }
 
-/// Parse `src`; on success, the start offsets of all functions.
-fn function_starts(src: &str) -> Option<HashSet<u32>> {
+/// Parse `src`; on success, the start offsets of all functions and type
+/// aliases.
+fn function_starts(src: &str) -> Option<FunctionStarts> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::ts().with_module(true)).parse();
     if !ret.diagnostics.is_empty() {
@@ -115,7 +125,7 @@ fn function_starts(src: &str) -> Option<HashSet<u32>> {
     let program: &Program = &ret.program;
     let mut v = FunctionStarts::default();
     v.visit_program(program);
-    Some(v.0)
+    Some(v)
 }
 
 pub fn strip(src: &str) -> Stripped {
@@ -125,7 +135,10 @@ pub fn strip(src: &str) -> Stripped {
         match function_starts(&blank(src, &active)) {
             Some(starts) => {
                 let before = active.len();
-                active.retain(|c| starts.contains(&(c.next as u32)));
+                active.retain(|c| {
+                    let at = c.next as u32;
+                    starts.0.contains(&at) || (c.keyword == KEYWORD && starts.1.contains(&at))
+                });
                 if active.len() == before {
                     break;
                 }
@@ -146,8 +159,16 @@ pub fn strip(src: &str) -> Stripped {
             }
         }
     }
-    let of = |k: &str| active.iter().filter(|c| c.keyword == k).map(|c| c.next as u32).collect();
-    Stripped { source: blank(src, &active), marked: of(KEYWORD), interpreted: of(INTERPRETED) }
+    // `aot type Name`, not an arrow function with a parameter `type`.
+    let typed = |c: &&&Candidate| {
+        let rest = &src[c.next..];
+        rest.starts_with("type")
+            && !rest.as_bytes().get(4).is_some_and(|&b| is_ident_byte(b))
+            && !rest[4..].trim_start().starts_with("=>")
+    };
+    let of = |k: &str| active.iter().filter(|c| c.keyword == k && !typed(c)).map(|c| c.next as u32).collect();
+    let aot_types = active.iter().filter(|c| c.keyword == KEYWORD && typed(c)).map(|c| c.next as u32).collect();
+    Stripped { source: blank(src, &active), marked: of(KEYWORD), interpreted: of(INTERPRETED), aot_types }
 }
 
 /// Markers directly followed by a keyword that cannot start a function
@@ -176,7 +197,7 @@ pub fn misplaced(src: &str) -> Vec<(u32, &'static str)> {
         .filter(|c| {
             let rest = &src[c.next..];
             let word: String = rest.bytes().take_while(|&b| is_ident_byte(b)).map(char::from).collect();
-            NOT_FUNCTIONS.contains(&word.as_str())
+            NOT_FUNCTIONS.contains(&word.as_str()) && !(c.keyword == KEYWORD && word == "type")
         })
         .map(|c| (c.at as u32, c.keyword))
         .collect()

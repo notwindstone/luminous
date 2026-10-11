@@ -84,6 +84,7 @@ pub mod layout {
     pub const FDATA_FAST: i32 = 8;
     pub const FDATA_DATA: i32 = 32;
     pub const CLASS_C_FUNCTION_DATA: i64 = 15;
+    pub const OBJ_OPAQUE: i32 = 48;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -104,6 +105,7 @@ pub mod layout {
         ("FDATA_FAST", FDATA_FAST as i64),
         ("FDATA_DATA", FDATA_DATA as i64),
         ("CLASS_C_FUNCTION_DATA", CLASS_C_FUNCTION_DATA),
+        ("OBJ_OPAQUE", OBJ_OPAQUE as i64),
     ];
 }
 
@@ -221,6 +223,11 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_new_object", &[P, P, Int, P, P], &[W, W]),
         ("JS_NewObjectWithCachedShape", &[P, P, P], &[W, W]),
         ("tsaot_global_get", &[P, Int, P], &[W, W]),
+        ("tsaot_struct_new", &[P, Int, Int], &[W, W]),
+        ("tsaot_struct_put", &[P, W, W, Int, W, W], &[Int]),
+        ("tsaot_struct_validate", &[P, W, W], &[Int]),
+        ("tsaot_struct_set", &[P, W, W, Int, W, W], &[Int]),
+        ("tsaot_struct_coerce", &[P, Int, Int, W, W], &[W, W]),
         ("tsaot_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
         ("tsaot_call_setter", &[P, P, W, W, W, W], &[Int]),
         ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
@@ -261,7 +268,7 @@ struct Codegen<'m> {
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 9],
+    data: [DataId; 10],
     /// Inline caches allocated so far (`tsaot_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
@@ -273,6 +280,9 @@ struct Codegen<'m> {
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     /// Return types, by `FuncId`.
     rets: std::rc::Rc<Vec<Ty>>,
+    /// `aot type` layouts.
+    layouts: std::rc::Rc<Vec<ir::Layout>>,
+    int_wrapping: bool,
     fctx: FunctionBuilderContext,
 }
 
@@ -333,6 +343,7 @@ impl<'m> Codegen<'m> {
             "tsaot_shapes",
             "tsaot_privates",
             "tsaot_homes",
+            "tsaot_struct_class",
         ] {
             data.push(module.declare_data(name, Linkage::Import, true, false)?);
         }
@@ -342,6 +353,8 @@ impl<'m> Codegen<'m> {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
             rets: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect()),
+            layouts: std::rc::Rc::new(m.layouts.clone()),
+            int_wrapping: m.int_wrapping,
             promise_resolve: m
                 .atoms
                 .iter()
@@ -361,7 +374,7 @@ impl<'m> Codegen<'m> {
     fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
         let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
-        let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, ics] =
+        let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, struct_class, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
         let fast_sig = func.import_signature(fast_signature(self.module));
         let fast = self.fast_funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
@@ -376,6 +389,7 @@ impl<'m> Codegen<'m> {
             shapes,
             privates,
             homes,
+            struct_class,
             ics,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
@@ -384,6 +398,8 @@ impl<'m> Codegen<'m> {
             promise_resolve: self.promise_resolve,
             fast,
             rets: self.rets.clone(),
+            layouts: self.layouts.clone(),
+            int_wrapping: self.int_wrapping,
             fast_sig,
         }
     }
@@ -395,7 +411,7 @@ impl<'m> Codegen<'m> {
         let mut table = cranelift_module::DataDescription::new();
         table.define_zeroinit(n.max(1) * lower::IC_SIZE);
         table.set_align(8);
-        self.module.define_data(self.data[8], &table)?;
+        self.module.define_data(self.data[9], &table)?;
         let count = self.module.declare_data("tsaot_nics", Linkage::Export, false, false)?;
         let mut desc = cranelift_module::DataDescription::new();
         desc.define((n as i32).to_le_bytes().to_vec().into_boxed_slice());
@@ -499,9 +515,10 @@ impl<'m> Codegen<'m> {
             b.switch_to_block(ok);
         }
         let mut params = vec![V::Void; f.params.len()];
+        let struct_class = b.ins().symbol_value(ptr, env.struct_class);
         for (k, &t) in f.params.iter().enumerate() {
             if t != Ty::Any {
-                params[k] = unbox_arg(&mut b, t, argv, k, decline);
+                params[k] = unbox_arg(&mut b, t, argv, k, decline, struct_class);
             }
         }
 
@@ -563,7 +580,7 @@ impl<'m> Codegen<'m> {
             let local_ty = f.locals[k];
             let (p, tag) = match (t, params[k]) {
                 (_, V::Any(p, tag)) if f.rest && k + 1 == f.params.len() => (p, tag),
-                (Ty::Any | Ty::Arr(_), _) => {
+                (Ty::Any | Ty::Arr(_) | Ty::Struct(_), _) => {
                     let (p, tag) = load_arg(&mut b, argc, argv, k);
                     dup_value(&mut b, p, tag);
                     (p, tag)
@@ -700,9 +717,10 @@ impl<'m> Codegen<'m> {
             b.switch_to_block(ok);
         }
         let mut params = vec![V::Void; f.params.len()];
+        let struct_class = b.ins().symbol_value(ptr, env.struct_class);
         for (k, &t) in f.params.iter().enumerate() {
             if t != Ty::Any {
-                params[k] = unbox_arg(&mut b, t, argv, k, decline);
+                params[k] = unbox_arg(&mut b, t, argv, k, decline, struct_class);
             }
         }
         // A rest parameter: a new array (before any other new reference, so
@@ -713,7 +731,7 @@ impl<'m> Codegen<'m> {
         }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {
-            if matches!(t, Ty::Any | Ty::Arr(_)) && !(f.rest && k + 1 == f.params.len()) {
+            if matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_)) && !(f.rest && k + 1 == f.params.len()) {
                 let (p, tag) = load_arg(&mut b, argc, argv, k);
                 let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, tag, 0);
                 let dup = b.create_block();
@@ -762,7 +780,7 @@ impl<'m> Codegen<'m> {
                 let i = b.ins().ireduce(I32, rv[0]);
                 (b.ins().uextend(I64, i), b.ins().iconst(I64, jsvalue::TAG_INT))
             }
-            Ty::Any | Ty::Arr(_) => (rv[0], rv[1]),
+            Ty::Any | Ty::Arr(_) | Ty::Struct(_) => (rv[0], rv[1]),
             // The checker boxes these returns.
             Ty::MaybeF64 => unreachable!("MaybeF64 return type"),
         };
@@ -866,7 +884,7 @@ fn load_arg(b: &mut FunctionBuilder, argc: Value, argv: Value, k: usize) -> (Val
 
 /// Reads an unboxed argument straight from the interpreter's `JSValue`
 /// slot, branching to `decline` on a type mismatch.
-fn unbox_arg(b: &mut FunctionBuilder, t: Ty, argv: Value, k: usize, decline: Block) -> V {
+fn unbox_arg(b: &mut FunctionBuilder, t: Ty, argv: Value, k: usize, decline: Block, struct_class: Value) -> V {
     let mem = MemFlagsData::trusted();
     let at = (k * jsvalue::SIZE) as i32;
     let tag = b.ins().load(I64, mem, argv, at + jsvalue::TAG_OFFSET);
@@ -949,8 +967,43 @@ fn unbox_arg(b: &mut FunctionBuilder, t: Ty, argv: Value, k: usize, decline: Blo
             b.switch_to_block(ok);
             V::Void
         }
+        Ty::Struct(k) => {
+            // Only checked: an object of the class with this layout.
+            let is_obj = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_OBJECT);
+            let obj = b.create_block();
+            b.ins().brif(is_obj, obj, &[], decline, &[]);
+            b.switch_to_block(obj);
+            let p = b.ins().load(I64, mem, argv, at);
+            let ok = struct_check(b, p, k, struct_class);
+            let yes = b.create_block();
+            b.ins().brif(ok, yes, &[], decline, &[]);
+            b.switch_to_block(yes);
+            V::Void
+        }
         _ => unreachable!(),
     }
+}
+
+/// Whether object `p` is of `aot type` layout `k` (`struct_class`: the
+/// address of `tsaot_struct_class`). Its class first: the opaque of any
+/// other object may be anything.
+pub(crate) fn struct_check(b: &mut FunctionBuilder, p: Value, k: u32, struct_class: Value) -> Value {
+    let mem = MemFlagsData::trusted();
+    let join = b.create_block();
+    let r = b.append_block_param(join, I8);
+    let class = b.ins().uload16(I32, mem, p, layout::OBJ_CLASS_ID);
+    let want = b.ins().load(I32, mem, struct_class, 0);
+    let same_class = b.ins().icmp(IntCC::Equal, class, want);
+    let data = b.create_block();
+    let no = b.ins().iconst(I8, 0);
+    b.ins().brif(same_class, data, &[], join, &[BlockArg::Value(no)]);
+    b.switch_to_block(data);
+    let s = b.ins().load(I64, mem, p, layout::OBJ_OPAQUE);
+    let l = b.ins().load(I32, mem, s, 0);
+    let same = b.ins().icmp_imm_s(IntCC::Equal, l, k as i64);
+    b.ins().jump(join, &[BlockArg::Value(same)]);
+    b.switch_to_block(join);
+    r
 }
 
 /// `Lower::box_number` for code outside a lowered body.

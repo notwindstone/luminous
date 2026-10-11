@@ -114,14 +114,14 @@ pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
         Ty::I32 => vec![I64],
         Ty::F64 | Ty::MaybeF64 => vec![F64],
         Ty::Bool => vec![I8],
-        Ty::Any | Ty::Arr(_) => vec![I64, I64],
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) => vec![I64, I64],
         Ty::Void => vec![],
     }
 }
 
 /// Whether values of type `t` are `JSValue`s.
 pub(crate) fn is_js(t: Ty) -> bool {
-    matches!(t, Ty::Any | Ty::Arr(_))
+    matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_))
 }
 
 /// Rebuild a `V` of type `t` from Cranelift values.
@@ -130,7 +130,7 @@ pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
         Ty::I32 => V::Int(vs[0]),
         Ty::F64 | Ty::MaybeF64 => V::Num(vs[0]),
         Ty::Bool => V::Bool(vs[0]),
-        Ty::Any | Ty::Arr(_) => V::Any(vs[0], vs[1]),
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) => V::Any(vs[0], vs[1]),
         Ty::Void => V::Void,
     }
 }
@@ -186,6 +186,8 @@ pub(crate) struct Env {
     /// of classes (see `ir::Module`).
     pub privates: GlobalValue,
     pub homes: GlobalValue,
+    /// `tsaot_struct_class`: the class of `aot type` objects.
+    pub struct_class: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -199,6 +201,10 @@ pub(crate) struct Env {
     pub fast: Vec<FuncRef>,
     /// Return types, by `FuncId`.
     pub rets: std::rc::Rc<Vec<Ty>>,
+    /// `aot type` layouts.
+    pub layouts: std::rc::Rc<Vec<ir::Layout>>,
+    /// Stores into `int` fields wrap.
+    pub int_wrapping: bool,
     /// The signature of `JSCFunctionFast` entries.
     pub fast_sig: SigRef,
 }
@@ -311,7 +317,7 @@ impl<'a> Lower<'a> {
                     // into their frame).
                     owned: f.is_async || f.is_generator || !f.captures.contains(&i),
                 },
-                Ty::Any | Ty::Arr(_) => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
+                Ty::Any | Ty::Arr(_) | Ty::Struct(_) => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
             .collect();
@@ -424,7 +430,7 @@ impl<'a> Lower<'a> {
             Ty::F64 | Ty::MaybeF64 => V::Num(self.b.ins().f64const(0.0)),
             Ty::I32 => V::Int(self.b.ins().iconst(I64, 0)),
             Ty::Bool => V::Bool(self.b.ins().iconst(I8, 0)),
-            Ty::Any | Ty::Arr(_) => self.konst(0, TAG_UNDEFINED),
+            Ty::Any | Ty::Arr(_) | Ty::Struct(_) => self.konst(0, TAG_UNDEFINED),
             Ty::Void => V::Void,
         }
     }
@@ -1486,6 +1492,133 @@ impl<'a> Lower<'a> {
                 V::Num(self.binary(*op, a, c))
             }
             ExprKind::Inline { body, locals } => self.inline_body(body, locals, e.ty),
+            ExprKind::StructNew { layout, mask, fields } => {
+                // The values first (in order), then the object, which takes them.
+                let held: Vec<V> = fields
+                    .iter()
+                    .map(|(_, x)| {
+                        let v = self.expr(x);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                let ctx = self.ctx;
+                let k = self.b.ins().iconst(I32, *layout as i64);
+                let m = self.b.ins().iconst(I32, *mask as i64);
+                let r = self.helper("tsaot_struct_new", &[ctx, k, m]);
+                self.check_value(r[1]);
+                let obj = V::Any(r[0], r[1]);
+                self.hold(obj);
+                for (&(fi, _), &v) in fields.iter().zip(&held) {
+                    self.release(v);
+                    self.struct_store(*layout, fi, (r[0], r[1]), v, true);
+                }
+                // Which member it matches may depend on the values.
+                let l = &self.env.layouts[*layout as usize];
+                let check = l.members.len() > 1 && fields.iter().any(|&(fi, _)| !l.fields[fi as usize].simple);
+                if check {
+                    let ok = self.helper("tsaot_struct_validate", &[ctx, r[0], r[1]]);
+                    self.check_int(ok[0]);
+                }
+                self.release(obj);
+                obj
+            }
+            ExprKind::StructCoerce(k, fi, x) => {
+                let v = self.expr(x);
+                let want = e.ty;
+                let storage = self.env.layouts[*k as usize].fields[*fi as usize].storage;
+                let join = self.b.create_block();
+                let params: Vec<Value> =
+                    clif_types(want).into_iter().map(|t| self.b.append_block_param(join, t)).collect();
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                match (storage, v) {
+                    (ir::Storage::Int32, V::Num(d)) if self.int_of.contains_key(&d) && self.env.int_wrapping => {
+                        // An exact integer: it wraps, as `| 0`.
+                        let i = self.int_of[&d];
+                        let i = self.b.ins().ireduce(I32, i);
+                        let i = self.b.ins().sextend(I64, i);
+                        self.b.ins().jump(join, &[BlockArg::Value(i)]);
+                    }
+                    (ir::Storage::Int32, V::Num(d)) => {
+                        let i = self.b.ins().fcvt_to_sint_sat(I32, d);
+                        let back = self.b.ins().fcvt_from_sint(F64, i);
+                        let same = self.b.ins().fcmp(FloatCC::Equal, back, d);
+                        let bits = self.b.ins().bitcast(I64, MemFlagsData::new(), d);
+                        let negzero = self.b.ins().icmp_imm_s(IntCC::Equal, bits, i64::MIN);
+                        let ok = self.b.ins().band_not(same, negzero);
+                        let i = self.b.ins().sextend(I64, i);
+                        self.b.ins().brif(ok, join, &[BlockArg::Value(i)], slow, &[]);
+                    }
+                    (ir::Storage::Int32, V::Any(p, t)) => {
+                        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
+                        let i = self.b.ins().ireduce(I32, p);
+                        let i = self.b.ins().sextend(I64, i);
+                        self.b.ins().brif(is_int, join, &[BlockArg::Value(i)], slow, &[]);
+                    }
+                    (ir::Storage::F64, V::Any(p, t)) => {
+                        let num = self.is_number(t);
+                        let ok = self.b.create_block();
+                        self.b.ins().brif(num, ok, &[], slow, &[]);
+                        self.b.switch_to_block(ok);
+                        let d = self.number_of((p, t));
+                        self.b.ins().jump(join, &[BlockArg::Value(d)]);
+                    }
+                    (ir::Storage::Bool, V::Any(p, t)) => {
+                        let is_bool = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL);
+                        let x = self.b.ins().ireduce(I32, p);
+                        let x = self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0);
+                        self.b.ins().brif(is_bool, join, &[BlockArg::Value(x)], slow, &[]);
+                    }
+                    _ => {
+                        self.b.ins().jump(slow, &[]);
+                    }
+                }
+                // The runtime converts it, or throws.
+                self.b.switch_to_block(slow);
+                let (bp, bt) = self.boxed(v);
+                let ctx = self.ctx;
+                let kv = self.b.ins().iconst(I32, *k as i64);
+                let fv = self.b.ins().iconst(I32, *fi as i64);
+                let r = self.helper("tsaot_struct_coerce", &[ctx, kv, fv, bp, bt]);
+                self.check_value(r[1]);
+                let args: Vec<BlockArg> = match storage {
+                    ir::Storage::Int32 => {
+                        let i = self.b.ins().ireduce(I32, r[0]);
+                        vec![BlockArg::Value(self.b.ins().sextend(I64, i))]
+                    }
+                    ir::Storage::F64 => vec![BlockArg::Value(self.number_of((r[0], r[1])))],
+                    ir::Storage::Bool => {
+                        let x = self.b.ins().ireduce(I32, r[0]);
+                        vec![BlockArg::Value(self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0))]
+                    }
+                    ir::Storage::Value => vec![BlockArg::Value(r[0]), BlockArg::Value(r[1])],
+                };
+                self.b.ins().jump(join, &args);
+                self.b.switch_to_block(join);
+                self.unabi(want, &params)
+            }
+            ExprKind::StructGet(k, o, fi) => {
+                let (obj, owned) = self.operand(o, &[]);
+                let (p, _) = obj.any();
+                let v = self.struct_load(*k, *fi, p);
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::StructSet(k, o, fi, x) => {
+                let (obj, owned) = self.operand(o, &[x]);
+                let v = self.expr(x);
+                // One reference for the field (the store takes it), one for
+                // the expression.
+                if let V::Any(p, t) = v {
+                    self.dup((p, t));
+                }
+                self.hold(v);
+                self.struct_store(*k, *fi, obj.any(), v, false);
+                self.release(v);
+                self.drop_operand(obj, owned);
+                v
+            }
             ExprKind::Predicted { expr, func, body, locals } => {
                 // Taken first thing by the call, getter or setter `expr`
                 // lowers to (not by an update in place).
@@ -2580,6 +2713,146 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The address of field `fi` of layout `k` in object `p` (of that
+    /// layout): past its `TsaotStruct` header (layout, mask).
+    fn struct_field_addr(&mut self, k: u32, fi: u32, p: Value) -> Value {
+        let s = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_OPAQUE);
+        let off = 8 + self.env.layouts[k as usize].fields[fi as usize].offset;
+        self.b.ins().iadd_imm_s(s, off as i64)
+    }
+
+    /// The value of a field `fi` it is present in object `p` (its type's
+    /// storage; boxed when JS values are what `ty` says).
+    fn struct_field_value(&mut self, k: u32, fi: u32, p: Value, boxed: bool) -> V {
+        let f = self.env.layouts[k as usize].fields[fi as usize].clone();
+        let at = self.struct_field_addr(k, fi, p);
+        let v = match f.storage {
+            ir::Storage::Int32 => {
+                let i = self.b.ins().sload32(Self::mem(), at, 0);
+                let d = self.int_f64(i);
+                self.i32s.insert(d);
+                V::Num(d)
+            }
+            ir::Storage::F64 => V::Num(self.b.ins().load(F64, Self::mem(), at, 0)),
+            ir::Storage::Bool => {
+                let x = self.b.ins().uload8(I32, Self::mem(), at, 0);
+                V::Bool(self.b.ins().ireduce(I8, x))
+            }
+            ir::Storage::Value => {
+                let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+                let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.dup((vp, vt));
+                V::Any(vp, vt)
+            }
+        };
+        if boxed && !matches!(v, V::Any(..)) {
+            let (bp, bt) = self.boxed(v);
+            V::Any(bp, bt)
+        } else {
+            v
+        }
+    }
+
+    /// `obj.field` of an object of layout `k` (borrowed): typed if the field
+    /// is in every member, else a JS value (`undefined` if absent).
+    fn struct_load(&mut self, k: u32, fi: u32, p: Value) -> V {
+        if self.env.layouts[k as usize].fields[fi as usize].universal {
+            return self.struct_field_value(k, fi, p, false);
+        }
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let s = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_OPAQUE);
+        let mask = self.b.ins().load(I32, Self::mem(), s, 4);
+        let bit = self.b.ins().band_imm_u(mask, 1i64 << fi);
+        let present = self.b.create_block();
+        let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().brif(bit, present, &[], join, &[BlockArg::Value(zero), BlockArg::Value(undef)]);
+        self.b.switch_to_block(present);
+        let (vp, vt) = self.struct_field_value(k, fi, p, true).any();
+        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.b.switch_to_block(join);
+        V::Any(rp, rt)
+    }
+
+    /// Store `v` (taken) in field `fi` of `obj` (layout `k`): of a new
+    /// object (`fresh`, from a literal) or a write. Numbers and booleans of
+    /// the field's type go inline into fields that hold them unboxed when
+    /// no member can change; everything else is checked by the runtime.
+    fn struct_store(&mut self, k: u32, fi: u32, (p, t): (Value, Value), v: V, fresh: bool) {
+        let f = self.env.layouts[k as usize].fields[fi as usize].clone();
+        let join = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let inline = fresh || f.simple;
+        let at = self.struct_field_addr(k, fi, p);
+        match (f.storage, v) {
+            (ir::Storage::Int32, V::Num(d)) if inline => {
+                if self.i32s.contains(&d) || (self.env.int_wrapping && self.int_of.contains_key(&d)) {
+                    // An int32, or an exact integer that wraps.
+                    let i = self.int_of_num(d);
+                    let i = self.b.ins().ireduce(I32, i);
+                    self.b.ins().store(Self::mem(), i, at, 0);
+                    self.b.ins().jump(join, &[]);
+                } else {
+                    // An int32 exactly (not -0): else the runtime wraps it
+                    // or throws.
+                    let i = self.b.ins().fcvt_to_sint_sat(I32, d);
+                    let back = self.b.ins().fcvt_from_sint(F64, i);
+                    let same = self.b.ins().fcmp(FloatCC::Equal, back, d);
+                    let bits = self.b.ins().bitcast(I64, MemFlagsData::new(), d);
+                    let negzero = self.b.ins().icmp_imm_s(IntCC::Equal, bits, i64::MIN);
+                    let ok = self.b.ins().band_not(same, negzero);
+                    let st = self.b.create_block();
+                    self.b.ins().brif(ok, st, &[], slow, &[]);
+                    self.b.switch_to_block(st);
+                    self.b.ins().store(Self::mem(), i, at, 0);
+                    self.b.ins().jump(join, &[]);
+                }
+            }
+            (ir::Storage::Int32, V::Any(vp, vt)) if inline => {
+                let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_INT);
+                let st = self.b.create_block();
+                self.b.ins().brif(is_int, st, &[], slow, &[]);
+                self.b.switch_to_block(st);
+                let i = self.b.ins().ireduce(I32, vp);
+                self.b.ins().store(Self::mem(), i, at, 0);
+                self.b.ins().jump(join, &[]);
+            }
+            (ir::Storage::F64, V::Num(d)) if inline => {
+                self.b.ins().store(Self::mem(), d, at, 0);
+                self.b.ins().jump(join, &[]);
+            }
+            (ir::Storage::F64, V::Any(vp, vt)) if inline => {
+                let num = self.is_number(vt);
+                let st = self.b.create_block();
+                self.b.ins().brif(num, st, &[], slow, &[]);
+                self.b.switch_to_block(st);
+                let d = self.number_of((vp, vt));
+                self.b.ins().store(Self::mem(), d, at, 0);
+                self.b.ins().jump(join, &[]);
+            }
+            (ir::Storage::Bool, V::Bool(x)) if inline => {
+                let x = self.b.ins().uextend(I32, x);
+                self.b.ins().istore8(Self::mem(), x, at, 0);
+                self.b.ins().jump(join, &[]);
+            }
+            _ => {
+                self.b.ins().jump(slow, &[]);
+            }
+        }
+        self.b.switch_to_block(slow);
+        let (bp, bt) = self.boxed(v);
+        let ctx = self.ctx;
+        let fv = self.b.ins().iconst(I32, fi as i64);
+        let name = if fresh { "tsaot_struct_put" } else { "tsaot_struct_set" };
+        let r = self.helper(name, &[ctx, p, t, fv, bp, bt]);
+        self.check_int(r[0]);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+    }
+
     /// An inlined body (see `ExprKind::Inline`) of type `ty` over `locals`.
     fn inline_body(&mut self, body: &[Stmt], locals: &[ir::LocalId], ty: Ty) -> V {
         let join = self.b.create_block();
@@ -2641,7 +2914,7 @@ impl<'a> Lower<'a> {
         let mut checks = Vec::new();
         for (i, &pt) in params.iter().enumerate() {
             match pt {
-                Ty::Any | Ty::Arr(_) => {}
+                Ty::Any | Ty::Arr(_) | Ty::Struct(_) => {}
                 Ty::F64 | Ty::MaybeF64 => checks.push((args.get(i)?.1, true)),
                 Ty::Bool => checks.push((args.get(i)?.1, false)),
                 _ => return None,
@@ -3942,6 +4215,18 @@ impl<'a> Lower<'a> {
         // On the prototype: its value; or a call of a getter (own or on the
         // prototype).
         self.b.switch_to_block(proto);
+        if receiver.is_none() {
+            // A field of an `aot type` object.
+            let low = self.b.ins().band_imm_u(kind, 0xff);
+            let is_struct = self.b.ins().icmp_imm_s(IntCC::Equal, low, IC_STRUCT);
+            let st = self.b.create_block();
+            let rest = self.b.create_block();
+            self.b.ins().brif(is_struct, st, &[], rest, &[]);
+            self.b.switch_to_block(st);
+            let (vp, vt) = self.struct_ic_read(p, kind, ic, slow);
+            self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+            self.b.switch_to_block(rest);
+        }
         let data = self.b.create_block();
         let getter = self.b.create_block();
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
@@ -3974,6 +4259,74 @@ impl<'a> Lower<'a> {
         };
         self.check_value(r[1]);
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(join);
+        (rp, rt)
+    }
+
+    /// A field of an `aot type` object (`p`) cached in `ic`
+    /// (`TSAOT_IC_STRUCT`), as a new JS value: if `p` is of the cached layout
+    /// and has the field, else go to `slow`.
+    fn struct_ic_read(&mut self, p: Value, kind: Value, ic: Value, slow: Block) -> (Value, Value) {
+        let class = self.b.ins().uload16(I32, Self::mem(), p, layout::OBJ_CLASS_ID);
+        let sc = self.b.ins().symbol_value(self.ptr, self.env.struct_class);
+        let want = self.b.ins().load(I32, Self::mem(), sc, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, class, want);
+        let ours = self.b.create_block();
+        self.b.ins().brif(same, ours, &[], slow, &[]);
+        self.b.switch_to_block(ours);
+        let s = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_OPAQUE);
+        let l = self.b.ins().load(I32, Self::mem(), s, 0);
+        let slot = self.b.ins().load(I32, Self::mem(), ic, 8);
+        let cached = self.b.ins().band_imm_u(slot, 0xffff);
+        let same = self.b.ins().icmp(IntCC::Equal, l, cached);
+        let laid = self.b.create_block();
+        self.b.ins().brif(same, laid, &[], slow, &[]);
+        self.b.switch_to_block(laid);
+        // Present (the mask's bit of the field).
+        let mask = self.b.ins().load(I32, Self::mem(), s, 4);
+        let fi = self.b.ins().ushr_imm_u(kind, 8);
+        let fi = self.b.ins().band_imm_u(fi, 0xff);
+        let bit = self.b.ins().ushr(mask, fi);
+        let bit = self.b.ins().band_imm_u(bit, 1);
+        let present = self.b.create_block();
+        self.b.ins().brif(bit, present, &[], slow, &[]);
+        self.b.switch_to_block(present);
+        let off = self.b.ins().ushr_imm_u(slot, 16);
+        let off = self.b.ins().uextend(I64, off);
+        let base = self.b.ins().iadd_imm_s(s, 8);
+        let at = self.b.ins().iadd(base, off);
+        let storage = self.b.ins().ushr_imm_u(kind, 16);
+        let storage = self.b.ins().band_imm_u(storage, 3);
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let blocks: Vec<Block> = (0..4).map(|_| self.b.create_block()).collect();
+        let mut table = cranelift_frontend::Switch::new();
+        for (i, &b) in blocks.iter().enumerate() {
+            table.set_entry(i as u128, b);
+        }
+        table.emit(&mut self.b, storage, blocks[3]);
+        // int32
+        self.b.switch_to_block(blocks[0]);
+        let i = self.b.ins().uload32(Self::mem(), at, 0);
+        let tag = self.b.ins().iconst(I64, TAG_INT);
+        self.b.ins().jump(join, &[BlockArg::Value(i), BlockArg::Value(tag)]);
+        // f64
+        self.b.switch_to_block(blocks[1]);
+        let d = self.b.ins().load(F64, Self::mem(), at, 0);
+        let (bp, bt) = self.box_number(d);
+        self.b.ins().jump(join, &[BlockArg::Value(bp), BlockArg::Value(bt)]);
+        // boolean
+        self.b.switch_to_block(blocks[2]);
+        let x = self.b.ins().uload8(I64, Self::mem(), at, 0);
+        let tag = self.b.ins().iconst(I64, TAG_BOOL);
+        self.b.ins().jump(join, &[BlockArg::Value(x), BlockArg::Value(tag)]);
+        // a JS value
+        self.b.switch_to_block(blocks[3]);
+        let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+        let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+        self.dup((vp, vt));
+        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
         self.b.switch_to_block(join);
         (rp, rt)
     }
@@ -4361,6 +4714,8 @@ impl V {
 
 /// Size of a `TsaotIC` (an inline cache entry).
 pub(crate) const IC_SIZE: usize = 32;
+/// `TSAOT_IC_STRUCT`: a cached field of an `aot type` object.
+const IC_STRUCT: i64 = 7;
 
 /// Frame layout of an async function: per local, its first slot (boxed
 /// locals use two: the box object and the address of its value), then the

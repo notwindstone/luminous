@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue, layout};
 use tsaot_front::ClassDecl;
-use tsaot_front::erase::{BIND_FN, CELLS_OBJ, CLASS_FN, INIT_FN, METHOD_FN, NATIVE_MODULE};
+use tsaot_front::erase::{BIND_FN, CELLS_OBJ, CLASS_FN, INIT_FN, METHOD_FN, NATIVE_MODULE, STRUCT_FN};
 use tsaot_front::ir;
 
 /// C init function name passed to `qjsc -M tsaot:native,<CNAME>`.
@@ -31,7 +31,7 @@ fn c_str(s: &str) -> String {
     out
 }
 
-pub fn generate(m: &ir::Module, mutable: &[usize], classes: &[ClassDecl]) -> String {
+pub fn generate(m: &ir::Module, mutable: &[usize], classes: &[ClassDecl], int_wrapping: bool) -> String {
     let mut c = String::new();
     write!(
         c,
@@ -92,6 +92,7 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     }
     c.push_str("    { NULL, NULL, 0, 0 },\n};\n\n");
     writeln!(c, "TsaotFnCache tsaot_fn_caches[{}];\nconst int32_t tsaot_nfn_caches = {nall};\n", nall + 1).unwrap();
+    layouts(&mut c, m, int_wrapping);
 
     // Step functions of async functions and generators.
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
@@ -313,6 +314,8 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
         return -1;
     if (JS_SetModuleExport(ctx, m, "{CLASS_FN}", JS_NewCFunction(ctx, tsaot_class, "{CLASS_FN}", 3)) < 0)
         return -1;
+    if (JS_SetModuleExport(ctx, m, "{STRUCT_FN}", JS_NewCFunction(ctx, tsaot_struct_from, "{STRUCT_FN}", 2)) < 0)
+        return -1;
     return 0;
 }}
 
@@ -332,10 +335,77 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     JS_AddModuleExport(ctx, m, "{CELLS_OBJ}");
     JS_AddModuleExport(ctx, m, "{METHOD_FN}");
     JS_AddModuleExport(ctx, m, "{CLASS_FN}");
+    JS_AddModuleExport(ctx, m, "{STRUCT_FN}");
     return m;
 }}
 "#
     )
     .unwrap();
     c
+}
+
+/// The `aot type` layouts (`TsaotLayoutDesc`), and the literal strings
+/// their fields may hold.
+fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
+    let mut lits: Vec<String> = Vec::new();
+    for (k, l) in m.layouts.iter().enumerate() {
+        writeln!(c, "static const TsaotFieldDesc tsaot_fields_{k}[] = {{").unwrap();
+        for f in &l.fields {
+            let storage = match f.storage {
+                ir::Storage::Int32 => 0,
+                ir::Storage::F64 => 1,
+                ir::Storage::Bool => 2,
+                ir::Storage::Value => 3,
+            };
+            writeln!(c, "    {{ {}, {storage}, {}, {} }},", c_str(&f.name), f.simple as u8, f.offset).unwrap();
+        }
+        c.push_str("    { NULL, 0, 0, 0 },\n};\n");
+        for (j, mem) in l.members.iter().enumerate() {
+            writeln!(c, "static const TsaotTypeDesc tsaot_types_{k}_{j}[] = {{").unwrap();
+            for t in &mem.types {
+                let (kind, nlits, layout, base) = match t {
+                    ir::FieldType::Absent => (0, 0, 0, 0),
+                    ir::FieldType::Int => (1, 0, 0, 0),
+                    ir::FieldType::Number => (2, 0, 0, 0),
+                    ir::FieldType::Bool => (3, 0, 0, 0),
+                    ir::FieldType::String => (4, 0, 0, 0),
+                    ir::FieldType::Literals(ls) => {
+                        let base = lits.len();
+                        lits.extend(ls.iter().cloned());
+                        (5, ls.len(), 0, base)
+                    }
+                    ir::FieldType::Struct(s) => (6, 0, *s, 0),
+                };
+                writeln!(c, "    {{ {kind}, {nlits}, {layout}, {base} }},").unwrap();
+            }
+            c.push_str("    { 0, 0, 0, 0 },\n};\n");
+        }
+        writeln!(c, "static const TsaotMemberDesc tsaot_members_{k}[] = {{").unwrap();
+        for (j, mem) in l.members.iter().enumerate() {
+            writeln!(c, "    {{ {}u, tsaot_types_{k}_{j} }},", mem.mask).unwrap();
+        }
+        c.push_str("    { 0, NULL },\n};\n");
+    }
+    c.push_str("const TsaotLayoutDesc tsaot_layouts[] = {\n");
+    for (k, l) in m.layouts.iter().enumerate() {
+        writeln!(
+            c,
+            "    {{ {}, {}, {}, {}, {}, tsaot_fields_{k}, tsaot_members_{k} }},",
+            c_str(&l.name),
+            l.fields.len(),
+            l.size,
+            l.members.len(),
+            (l.members.len() > 1) as u8
+        )
+        .unwrap();
+    }
+    c.push_str("    { NULL, 0, 0, 0, 0, NULL, NULL },\n};\n");
+    writeln!(c, "const int32_t tsaot_nlayouts = {};", m.layouts.len()).unwrap();
+    c.push_str("const char *const tsaot_struct_lits[] = {\n");
+    for s in &lits {
+        writeln!(c, "    {},", c_str(s)).unwrap();
+    }
+    c.push_str("    NULL,\n};\n");
+    writeln!(c, "const int32_t tsaot_nstruct_lits = {};", lits.len()).unwrap();
+    writeln!(c, "int tsaot_int_wrapping = {};\n", int_wrapping as u8).unwrap();
 }

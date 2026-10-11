@@ -33,6 +33,9 @@ pub enum Ty {
     /// are expected; represented as a sign-extended `i64` in locals, block
     /// parameters, arguments and returns.
     I32,
+    /// A `JSValue` known to be an object of `aot type` layout `k` (see
+    /// `Layout`; represented like `Any`).
+    Struct(u32),
 }
 
 impl Ty {
@@ -112,6 +115,7 @@ impl fmt::Display for Ty {
             Ty::Arr(k) => k.name(),
             Ty::MaybeF64 => "number | undefined",
             Ty::I32 => "int",
+            Ty::Struct(_) => "aot type",
         })
     }
 }
@@ -148,6 +152,69 @@ pub struct Module {
     pub homes: usize,
     /// Top-level classes (by home slot `k`).
     pub classes: Vec<ClassTable>,
+    /// `aot type` layouts (`Ty::Struct`).
+    pub layouts: Vec<Layout>,
+    /// Stores into `int`s wrap to int32 (no `--no-int-wrapping`).
+    pub int_wrapping: bool,
+}
+
+/// How an `aot type` field is stored: unboxed when all members agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Storage {
+    Int32,
+    F64,
+    Bool,
+    Value,
+}
+
+/// The type of a field in one member of an `aot type`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldType {
+    Absent,
+    Int,
+    Number,
+    Bool,
+    String,
+    /// One of these strings.
+    Literals(Vec<String>),
+    /// An object of this layout.
+    Struct(u32),
+}
+
+#[derive(Clone, Debug)]
+pub struct LayoutField {
+    pub name: String,
+    pub storage: Storage,
+    /// Byte offset in the object's data.
+    pub offset: u32,
+    /// Present in every member (so in every object).
+    pub universal: bool,
+    /// The type a read gives, when it is present.
+    pub ty: Ty,
+    /// Of the same type in every member: a write cannot change which member
+    /// the object matches.
+    pub simple: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LayoutMember {
+    /// The member's fields (bit `i`: field `i`).
+    pub mask: u32,
+    /// Per field (`Absent` outside `mask`).
+    pub types: Vec<FieldType>,
+}
+
+/// An `aot type`: one layout holding the fields of all its union members,
+/// with a mask of those present. An object is valid when its fields
+/// include all of some member's, with that member's types, and every
+/// other field it has belongs to some member and has a type it allows.
+#[derive(Clone, Debug)]
+pub struct Layout {
+    pub name: String,
+    pub fields: Vec<LayoutField>,
+    pub members: Vec<LayoutMember>,
+    /// Bytes of field data.
+    pub size: u32,
 }
 
 /// A top-level class: its superclass (if a top-level class) and its native
@@ -447,6 +514,24 @@ pub enum ExprKind {
         body: Vec<Stmt>,
         locals: Vec<LocalId>,
     },
+    /// An object of `aot type` `layout` from a literal with the fields in
+    /// `mask`: (field, value) in source order. `Ty::Struct(layout)`.
+    StructNew {
+        layout: u32,
+        mask: u32,
+        fields: Vec<(u32, Expr)>,
+    },
+    /// Field `field` of an object of layout `layout` (`Ty::Struct`): the
+    /// field's type if it is in every member, else `Any` (`undefined` when
+    /// absent).
+    StructGet(u32, Box<Expr>, u32),
+    /// Store a field (the value is checked, as a write from JS would be);
+    /// evaluates to the value.
+    StructSet(u32, Box<Expr>, u32, Box<Expr>),
+    /// A value converted for field `field` of layout `layout` as a store
+    /// would convert it (an `int` wraps; TypeError if not of its type): of
+    /// the field's type (see `scalar_replace_structs`).
+    StructCoerce(u32, u32, Box<Expr>),
 }
 
 /// What a `Stmt::Yield` does.
@@ -719,6 +804,16 @@ macro_rules! visitor {
                 Predicted { expr, body, .. } => {
                     $name(expr, f);
                     $stmts(body, f);
+                }
+                StructNew { fields, .. } => {
+                    for (_, x) in fields {
+                        $name(x, f);
+                    }
+                }
+                StructGet(_, a, _) | StructCoerce(_, _, a) => $name(a, f),
+                StructSet(_, a, _, b) => {
+                    $name(a, f);
+                    $name(b, f);
                 }
                 SetLocal(_, a)
                 | InitLocal(_, a)
@@ -1932,5 +2027,147 @@ pub fn predict_calls(m: &mut Module) {
             f.local_names.extend(added.iter().map(|_| None));
             f.locals.extend(added);
         }
+    }
+}
+
+/// Scalar replacement of `aot type` objects (as `scalar_replace` does for
+/// object literals): a local of a single-member `aot type` initialized
+/// once by a literal and only used for its fields (reads, and writes as
+/// statements) becomes a local per field. Stores keep their conversion
+/// (`StructCoerce`).
+pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
+    let n = f.locals.len();
+    let mut ok: Vec<bool> = (0..n)
+        .map(|l| {
+            l >= f.params.len()
+                && !f.boxed[l]
+                && f.ret_slot != Some(l)
+                && matches!(f.locals[l], Ty::Struct(k) if layouts[k as usize].members.len() == 1)
+        })
+        .collect();
+    let mut inits = vec![0; n];
+    let mut fields_used = vec![0; n];
+    let mut sets = vec![0; n];
+    let mut top_sets = vec![0; n];
+    let mut total = vec![0; n];
+    stmt_locals(&f.body, &mut |l| ok[l] = false);
+    top_exprs(&f.body, &mut |e| {
+        if let ExprKind::StructSet(_, o, _, _) = &e.kind
+            && let ExprKind::Local(l) = o.kind
+        {
+            top_sets[l] += 1;
+        }
+    });
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, x) if matches!(x.kind, ExprKind::StructNew { .. }) => inits[*l] += 1,
+        ExprKind::StructGet(_, o, _) => {
+            if let ExprKind::Local(l) = o.kind {
+                fields_used[l] += 1;
+            }
+        }
+        ExprKind::StructSet(_, o, _, _) => {
+            if let ExprKind::Local(l) = o.kind {
+                fields_used[l] += 1;
+                sets[l] += 1;
+            }
+        }
+        ExprKind::Local(l) => total[*l] += 1,
+        _ => {
+            for (l, ok) in ok.iter_mut().enumerate() {
+                if *ok && local_refs(e, l) != (0, 0) {
+                    *ok = false;
+                }
+            }
+        }
+    });
+    // Per replaced local: the locals of its fields.
+    let mut fields: Vec<Option<Vec<LocalId>>> = vec![None; n];
+    for l in 0..n {
+        if ok[l] && inits[l] == 1 && total[l] == fields_used[l] && sets[l] == top_sets[l] {
+            let Ty::Struct(k) = f.locals[l] else { unreachable!() };
+            let mut map = Vec::new();
+            for fd in &layouts[k as usize].fields {
+                map.push(f.locals.len());
+                f.locals.push(field_local_ty(fd));
+                f.boxed.push(false);
+                f.local_names.push(None);
+            }
+            fields[l] = Some(map);
+        }
+    }
+    if fields.iter().all(Option::is_none) {
+        return;
+    }
+    let coerce = |k: u32, fi: u32, v: Expr| -> Expr {
+        let fd = &layouts[k as usize].fields[fi as usize];
+        let want = field_local_ty(fd);
+        let fits = match (fd.storage, v.ty) {
+            // A JS value is checked unless of the `aot type` it must be.
+            (Storage::Value, t) => t == want && matches!(t, Ty::Struct(_)),
+            (_, t) if t == want => true,
+            (Storage::F64, Ty::I32) => true,
+            _ => false,
+        };
+        if fits {
+            return v;
+        }
+        if fd.storage == Storage::Int32
+            && let ExprKind::Num(c) = v.kind
+            && c.fract() == 0.0
+            && c.abs() <= i32::MAX as f64
+            && !(c == 0.0 && c.is_sign_negative())
+        {
+            return Expr::new(Ty::I32, ExprKind::Num(c));
+        }
+        Expr::new(want, ExprKind::StructCoerce(k, fi, Box::new(v)))
+    };
+    let field_of = |l: LocalId| fields.get(l).and_then(Option::as_ref);
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let new = match &mut e.kind {
+            ExprKind::InitLocal(l, x) if field_of(*l).is_some() => {
+                let ExprKind::StructNew { layout, fields: values, .. } =
+                    std::mem::replace(&mut x.kind, ExprKind::Undefined)
+                else {
+                    unreachable!()
+                };
+                let map = field_of(*l).unwrap();
+                let mut seq: Vec<Expr> = values
+                    .into_iter()
+                    .map(|(fi, v)| {
+                        let fl = map[fi as usize];
+                        let v = coerce(layout, fi, v);
+                        Expr::new(v.ty, ExprKind::InitLocal(fl, Box::new(v)))
+                    })
+                    .collect();
+                seq.push(Expr::new(Ty::Any, ExprKind::Undefined));
+                ExprKind::Seq(seq)
+            }
+            ExprKind::StructGet(_, o, fi) => match o.kind {
+                ExprKind::Local(l) if field_of(l).is_some() => ExprKind::Local(field_of(l).unwrap()[*fi as usize]),
+                _ => return,
+            },
+            ExprKind::StructSet(k, o, fi, v) => match o.kind {
+                ExprKind::Local(l) if field_of(l).is_some() => {
+                    let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
+                    let v = coerce(*k, *fi, v);
+                    let ty = v.ty;
+                    e.ty = ty;
+                    ExprKind::SetLocal(field_of(l).unwrap()[*fi as usize], Box::new(v))
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        e.kind = new;
+    });
+}
+
+/// The type of the local holding a field after `scalar_replace_structs`.
+fn field_local_ty(f: &LayoutField) -> Ty {
+    match f.storage {
+        Storage::Int32 => Ty::I32,
+        Storage::F64 => Ty::F64,
+        Storage::Bool => Ty::Bool,
+        Storage::Value => f.ty,
     }
 }

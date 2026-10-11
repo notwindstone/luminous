@@ -199,6 +199,7 @@ pub fn check<'a>(
     scoping: &'a Scoping,
     int_syms: &HashSet<SymbolId>,
     interpreted: &HashSet<u32>,
+    structs: &crate::structs::Structs,
 ) -> Outcome<'a> {
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
@@ -263,6 +264,8 @@ pub fn check<'a>(
             privates: Vec::new(),
             private_ids: HashMap::new(),
             homes_used: Vec::new(),
+            layouts: &structs.layouts,
+            struct_sites: &structs.sites,
         };
         for i in 0..candidates.len() {
             cx.ensure(i);
@@ -275,7 +278,7 @@ pub fn check<'a>(
             let funcs = std::mem::take(&mut cx.state)
                 .into_iter()
                 .map(|s| match s {
-                    State::Done(f) => f,
+                    State::Done(f) => *f,
                     _ => unreachable!(),
                 })
                 .collect();
@@ -290,6 +293,8 @@ pub fn check<'a>(
                 privates: cx.privates.len(),
                 homes: 2 * classes.len(),
                 classes: class_tables(&classes, &candidates),
+                layouts: structs.layouts.clone(),
+                int_wrapping: true,
             };
             ir::capture_values(&mut module);
             ir::inline_calls(&mut module);
@@ -664,7 +669,10 @@ fn ts_type(t: &TSType) -> Option<Ty> {
                 // checked to hold int32 values.
                 "int" => Some(Ty::I32),
                 "double" => Some(Ty::F64),
-                name => ArrKind::from_name(name).map(Ty::Arr),
+                name => match crate::structs::struct_named(name) {
+                    Some(k) if r.type_arguments.is_none() => Some(Ty::Struct(k)),
+                    _ => ArrKind::from_name(name).map(Ty::Arr),
+                },
             },
             _ => None,
         },
@@ -693,7 +701,7 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     for p in &params.items {
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_)))
+            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_) | Ty::Struct(_)))
                 if p.initializer.is_none()
                     && !p.optional
                     && matches!(p.pattern, BindingPattern::BindingIdentifier(_)) =>
@@ -715,7 +723,7 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
 enum State {
     Todo,
     InProgress,
-    Done(ir::Func),
+    Done(Box<ir::Func>),
     Failed(Reject),
 }
 
@@ -748,6 +756,10 @@ struct ModuleCx<'m, 'a> {
     private_ids: HashMap<(usize, String), usize>,
     /// Classes whose home object native code uses.
     homes_used: Vec<usize>,
+    /// `aot type` layouts, and the object literals that make their objects
+    /// (span start: span end, layout).
+    layouts: &'m [ir::Layout],
+    struct_sites: &'m HashMap<u32, (u32, u32)>,
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
@@ -792,7 +804,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                     self.ret_override.insert(c.node.span().start, f.ret);
                     self.ret_changed = true;
                 }
-                State::Done(f)
+                State::Done(Box::new(f))
             }
             Err(r) => State::Failed(r),
         };
@@ -1076,7 +1088,7 @@ fn any(e: Expr) -> Expr {
         Ty::Any => e,
         Ty::F64 | Ty::I32 | Ty::Bool | Ty::MaybeF64 => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
         // Already a JSValue.
-        Ty::Arr(_) => Expr { ty: Ty::Any, ..e },
+        Ty::Arr(_) | Ty::Struct(_) => Expr { ty: Ty::Any, ..e },
         Ty::Void => Expr::new(Ty::Any, ExprKind::Void(Box::new(e))),
     }
 }
@@ -1331,6 +1343,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             body: prologue,
         };
         ir::scalar_replace(&mut func);
+        ir::scalar_replace_structs(&mut func, self.m.layouts);
         ir::number_locals(&mut func);
         Ok(func)
     }
@@ -2288,12 +2301,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 self.bind_pattern(&p.left, v, kind, out)
             }
             BindingPattern::ObjectPattern(o) => {
-                let src = self.temp(Ty::Any);
-                out.push(Stmt::Expr(set(src, Expr::new(Ty::Any, ExprKind::ToObject(Box::new(any(v)))))));
+                // An object of an `aot type` keeps its type.
+                let (src, init) = match v.ty {
+                    Ty::Struct(_) => (self.temp(v.ty), v),
+                    _ => (self.temp(Ty::Any), Expr::new(Ty::Any, ExprKind::ToObject(Box::new(any(v))))),
+                };
+                out.push(Stmt::Expr(set(src, init)));
                 let mut excluded = Vec::new();
                 for p in &o.properties {
                     let key = self.pattern_key(&p.key, p.computed, out)?;
-                    let value = get_elem(self.local(src), key.0.clone());
+                    let value = match &key.0 {
+                        Key::Atom(a) => self.get_prop(self.local(src), *a),
+                        k => get_elem(self.local(src), k.clone()),
+                    };
                     excluded.push(key.1);
                     self.bind_pattern(&p.value, value, kind, out)?;
                 }
@@ -2789,12 +2809,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     if m.optional {
                         return reject(span, "optional chaining is not supported yet");
                     }
-                    let obj = any(self.expr(&m.object)?);
+                    let obj = self.expr(&m.object)?;
                     let atom = self.m.atom(m.property.name.as_str());
-                    if m.property.name == "length" {
-                        Expr::new(Ty::Any, ExprKind::Length(Box::new(obj), atom))
+                    if self.struct_field(obj.ty, atom).is_some() {
+                        self.get_prop(obj, atom)
+                    } else if m.property.name == "length" {
+                        Expr::new(Ty::Any, ExprKind::Length(Box::new(any(obj)), atom))
                     } else {
-                        Expr::new(Ty::Any, ExprKind::GetProp(Box::new(obj), atom))
+                        Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), atom))
                     }
                 }
             },
@@ -3111,7 +3133,73 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             .fold(first, |a, part| Expr::new(Ty::Any, ExprKind::AnyBinary(AnyBinOp::Add, Box::new(a), Box::new(part)))))
     }
 
+    /// An object literal that makes an object of `aot type` `k` (see
+    /// `structs`, which checked its fields).
+    fn struct_literal(&mut self, o: &'a ObjectExpression<'a>, k: u32) -> R<Expr> {
+        let mut fields: Vec<u32> = Vec::new();
+        let mut values: Vec<Expr> = Vec::new();
+        let mut mask = 0u32;
+        for p in &o.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = p else { unreachable!("checked by `structs`") };
+            let name = match &p.key {
+                PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                PropertyKey::StringLiteral(s) => s.value.to_string(),
+                _ => unreachable!("checked by `structs`"),
+            };
+            let i = self.m.layouts[k as usize].fields.iter().position(|f| f.name == name).unwrap() as u32;
+            let mark = self.pre.len();
+            let v = self.expr(&p.value)?;
+            let v = self.struct_value(k, i, v);
+            self.order(&mut values, mark);
+            values.push(v);
+            fields.push(i);
+            mask |= 1 << i;
+        }
+        let fields = fields.into_iter().zip(values).collect();
+        Ok(Expr::new(Ty::Struct(k), ExprKind::StructNew { layout: k, mask, fields }))
+    }
+
+    /// `v` as a value for field `i` of layout `k`: numbers and booleans as
+    /// they are for unboxed fields, else a JS value.
+    fn struct_value(&self, k: u32, i: u32, v: Expr) -> Expr {
+        match self.m.layouts[k as usize].fields[i as usize].storage {
+            ir::Storage::Int32 | ir::Storage::F64 if num(v.ty) || v.ty == Ty::Any => to_f64(v),
+            ir::Storage::Bool if matches!(v.ty, Ty::Bool | Ty::Any) => v,
+            _ => any(v),
+        }
+    }
+
+    /// Field `atom` of an object of type `ty`, if an `aot type` with it.
+    fn struct_field(&self, ty: Ty, atom: ir::AtomId) -> Option<(u32, u32)> {
+        let Ty::Struct(k) = ty else { return None };
+        let name = &self.m.atoms[atom];
+        let i = self.m.layouts[k as usize].fields.iter().position(|f| f.name == *name)?;
+        Some((k, i as u32))
+    }
+
+    /// `obj.atom`: a field of an `aot type`, else a property.
+    fn get_prop(&self, obj: Expr, atom: ir::AtomId) -> Expr {
+        if let Some((k, i)) = self.struct_field(obj.ty, atom) {
+            let f = &self.m.layouts[k as usize].fields[i as usize];
+            let ty = if f.universal { f.ty } else { Ty::Any };
+            return Expr::new(ty, ExprKind::StructGet(k, Box::new(obj), i));
+        }
+        Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), atom))
+    }
+
+    /// `obj.atom = v` (evaluates to the value stored).
+    fn set_prop(&self, obj: Expr, atom: ir::AtomId, v: Expr) -> Expr {
+        if let Some((k, i)) = self.struct_field(obj.ty, atom) {
+            let v = self.struct_value(k, i, v);
+            return Expr::new(v.ty, ExprKind::StructSet(k, Box::new(obj), i, Box::new(v)));
+        }
+        Expr::new(Ty::Any, ExprKind::SetProp(Box::new(any(obj)), atom, Box::new(any(v))))
+    }
+
     fn object(&mut self, o: &'a ObjectExpression<'a>) -> R<Expr> {
+        if let Some(&(_, k)) = self.m.struct_sites.get(&o.span.start) {
+            return self.struct_literal(o, k);
+        }
         // Parts: a field (its atom), a computed key, a spread; `values` are
         // all the operands, in evaluation order.
         enum Part {
@@ -3386,8 +3474,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     // reassign it.
                     return Ok((vec![], Place::Prop(l, atom), None));
                 }
-                let obj = any(self.expr(&m.object)?);
-                let t = self.temp(Ty::Any);
+                let obj = self.expr(&m.object)?;
+                let obj = if matches!(obj.ty, Ty::Struct(_)) { obj } else { any(obj) };
+                let t = self.temp(obj.ty);
                 (vec![set(t, obj)], Place::Prop(t, atom), None)
             }
             SimpleAssignmentTarget::ComputedMemberExpression(m) => {
@@ -3428,7 +3517,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn plain_local(&self, e: &'a Expression<'a>) -> Option<ir::LocalId> {
         let Expression::Identifier(id) = e.without_parentheses() else { return None };
         let &l = self.sym_local.get(&self.resolve(id)?)?;
-        (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_))).then_some(l)
+        (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_) | Ty::Struct(_))).then_some(l)
     }
 
     /// An identifier as an assignment target.
@@ -3470,8 +3559,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                         return self.place_ident(id);
                     }
                     Expression::StaticMemberExpression(m) => {
-                        let obj = any(self.expr(&m.object)?);
-                        let t = self.temp(Ty::Any);
+                        let obj = self.expr(&m.object)?;
+                        let obj = if matches!(obj.ty, Ty::Struct(_)) { obj } else { any(obj) };
+                        let t = self.temp(obj.ty);
                         let atom = self.m.atom(m.property.name.as_str());
                         (vec![set(t, obj)], Place::Prop(t, atom), None)
                     }
@@ -3513,7 +3603,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Place::Local(l) => self.local(l),
             Place::Cell(c) => Expr::new(Ty::Any, ExprKind::Cell(c)),
             Place::Global(a) => Expr::new(Ty::Any, ExprKind::Global(a)),
-            Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(self.local(o))), a)),
+            Place::Prop(o, a) => self.get_prop(self.local(o), a),
             Place::Elem(o, k) => get_elem(self.local(o), Key::Value(Box::new(self.local(k)))),
             Place::Private(o, ref name) => {
                 let name = name.clone();
@@ -3529,9 +3619,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Place::Local(l) => return self.set_local(sym, l, v, span),
             Place::Cell(c) => Expr::new(Ty::Any, ExprKind::SetCell(c, Box::new(any(v)))),
             Place::Global(a) => Expr::new(Ty::Any, ExprKind::SetGlobal(a, Box::new(any(v)))),
-            Place::Prop(o, a) => {
-                Expr::new(Ty::Any, ExprKind::SetProp(Box::new(any(self.local(o))), a, Box::new(any(v))))
-            }
+            Place::Prop(o, a) => self.set_prop(self.local(o), a, v),
             Place::Elem(o, k) => set_elem(self.local(o), self.local(k), v),
             Place::Private(o, ref name) => {
                 let name = name.clone();

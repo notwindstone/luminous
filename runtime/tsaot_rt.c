@@ -1,4 +1,5 @@
 #include <math.h>
+#include <string.h>
 
 #include "tsaot_rt.h"
 
@@ -331,6 +332,8 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 /* ---- module state: cells, string constants, atoms ---- */
 
 static JSClassID tsaot_state_class;
+static int tsaot_structs_init(JSContext *ctx);
+static void tsaot_structs_free(JSRuntime *rt);
 /* `Symbol.iterator` and `next`, made with the pins. */
 static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL;
 
@@ -344,6 +347,7 @@ static int tsaot_fn_cache_count(void)
 static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
+    tsaot_structs_free(rt);
     for (i = 0; i < tsaot_fn_cache_count(); i++) {
         if (tsaot_fn_caches[i].shape)
             JS_FreeCachedShape(rt, tsaot_fn_caches[i].shape);
@@ -495,6 +499,8 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
         if (JS_NewClass(rt, tsaot_frame_class, &frame_def) < 0)
             return -1;
     }
+    if (tsaot_structs_init(ctx) < 0)
+        return -1;
     JS_NewClassID(rt, &tsaot_state_class);
     if (JS_NewClass(rt, tsaot_state_class, &def) < 0)
         return -1;
@@ -585,6 +591,10 @@ int tsaot_lock_builtins(JSContext *ctx)
 }
 
 /* ---- inline caches ---- */
+static TsaotStruct *tsaot_struct_of(JSValueConst v);
+static JSValue tsaot_struct_get_atom(JSContext *ctx, TsaotStruct *s, JSAtom prop);
+static int tsaot_field_index(int layout, JSAtom prop);
+static JSValue tsaot_field_get(JSContext *ctx, TsaotStruct *s, const TsaotFieldDesc *f);
 
 static int tsaot_ic_count(void)
 {
@@ -1288,6 +1298,18 @@ static void tsaot_ic_count_miss(TsaotIC *ic)
 JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
     JSValue v;
+    TsaotStruct *s = tsaot_struct_of(obj);
+    if (s) {
+        /* An object of an `aot type`: its field, read directly, and
+           cached (TSAOT_IC_STRUCT) when it is one. */
+        int fi = tsaot_field_index(s->layout, prop);
+        if (fi < 0 || !(s->mask & (1u << fi)))
+            return JS_GetProperty(ctx, obj, prop);
+        const TsaotFieldDesc *f = &tsaot_layouts[s->layout].fields[fi];
+        tsaot_ic_store(ctx, ic, JS_DupObjectShape(obj), NULL, NULL, s->layout | f->offset << 16,
+                       TSAOT_IC_STRUCT | fi << 8 | f->storage << 16);
+        return tsaot_field_get(ctx, s, f);
+    }
     if (tsaot_ic_gave_up(ic)) {
         /* `kind` holds the index of the property last found */
         v = JS_GetOwnDataHint(ctx, obj, prop, &ic->kind);
@@ -1424,4 +1446,486 @@ int tsaot_is_promise_resolve(JSValue promise, JSValue resolve)
 JSValue tsaot_global_get(JSContext *ctx, JSAtom prop, TsaotIC *ic)
 {
     return JS_GetGlobalVariableHint(ctx, prop, &ic->slot);
+}
+
+/* ---- `aot type` objects ----
+ *
+ * An object of an `aot type` is an object of class tsaot_struct_class with
+ * its fields in a TsaotStruct (its opaque), laid out as tsaot_layouts says.
+ * Native code reads and writes the fields there directly. To JS it looks
+ * like a plain object whose fields are its own enumerable, writable data
+ * properties, but it keeps to its type: fields cannot be added, deleted or
+ * redefined, and a field only takes values of its type (else TypeError).
+ * An `int` field wraps other integers to int32, as `int` variables do. */
+
+uint32_t tsaot_struct_class;
+/* Per layout field (flat, layout by layout): its name as an atom. */
+static JSAtom *tsaot_struct_atoms;
+static uint32_t *tsaot_struct_atom_base;
+/* tsaot_struct_lits as JS strings. */
+static JSValue *tsaot_struct_lit_values;
+
+static int tsaot_layout_count(void)
+{
+    return &tsaot_nlayouts ? tsaot_nlayouts : 0;
+}
+
+static inline void *tsaot_field_at(TsaotStruct *s, const TsaotFieldDesc *f)
+{
+    return (uint8_t *)s->data + f->offset;
+}
+
+static size_t tsaot_field_size(const TsaotFieldDesc *f)
+{
+    static const size_t sizes[] = { 4, 8, 1, 16 };
+    return sizes[f->storage];
+}
+
+static TsaotStruct *tsaot_struct_of(JSValueConst v)
+{
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT || JS_GetClassID(v) != tsaot_struct_class)
+        return NULL;
+    return JS_GetOpaque(v, tsaot_struct_class);
+}
+
+/* The index of field `prop` of a layout, or -1. */
+static int tsaot_field_index(int layout, JSAtom prop)
+{
+    const TsaotLayoutDesc *l = &tsaot_layouts[layout];
+    uint32_t i;
+    for (i = 0; i < l->nfields; i++) {
+        if (tsaot_struct_atoms[tsaot_struct_atom_base[layout] + i] == prop)
+            return i;
+    }
+    return -1;
+}
+
+static JSValue tsaot_field_get(JSContext *ctx, TsaotStruct *s, const TsaotFieldDesc *f)
+{
+    void *at = tsaot_field_at(s, f);
+    switch (f->storage) {
+    case TSAOT_ST_INT32:
+        return JS_NewInt32(ctx, *(int32_t *)at);
+    case TSAOT_ST_F64:
+        return JS_NewNumber(ctx, *(double *)at);
+    case TSAOT_ST_BOOL:
+        return JS_NewBool(ctx, *(uint8_t *)at);
+    default:
+        return JS_DupValue(ctx, *(JSValue *)at);
+    }
+}
+
+static bool tsaot_value_fits(JSContext *ctx, const TsaotTypeDesc *t, JSValueConst v)
+{
+    int tag = JS_VALUE_GET_TAG(v);
+    TsaotStruct *s;
+    uint32_t i;
+    switch (t->kind) {
+    case TSAOT_FT_INT:
+        if (tag == JS_TAG_INT)
+            return true;
+        if (tag == JS_TAG_FLOAT64) {
+            double d = JS_VALUE_GET_FLOAT64(v);
+            return d == (double)(int32_t)d && !(d == 0 && signbit(d)) && d >= INT32_MIN && d <= INT32_MAX;
+        }
+        return false;
+    case TSAOT_FT_NUMBER:
+        return tag == JS_TAG_INT || tag == JS_TAG_FLOAT64;
+    case TSAOT_FT_BOOL:
+        return tag == JS_TAG_BOOL;
+    case TSAOT_FT_STRING:
+        return tag == JS_TAG_STRING;
+    case TSAOT_FT_LITERALS:
+        if (tag != JS_TAG_STRING)
+            return false;
+        for (i = 0; i < t->nlits; i++) {
+            if (JS_IsStrictEqual(ctx, v, tsaot_struct_lit_values[t->lit_base + i]))
+                return true;
+        }
+        return false;
+    case TSAOT_FT_STRUCT:
+        s = tsaot_struct_of(v);
+        return s && s->layout == t->layout;
+    default:
+        return false;
+    }
+}
+
+/* Whether field `fi` of layout `l` may hold `v` (in some member). */
+static bool tsaot_union_fits(JSContext *ctx, const TsaotLayoutDesc *l, int fi, JSValueConst v)
+{
+    uint32_t m;
+    for (m = 0; m < l->nmembers; m++) {
+        const TsaotTypeDesc *t = &l->members[m].types[fi];
+        if (t->kind != TSAOT_FT_ABSENT && tsaot_value_fits(ctx, t, v))
+            return true;
+    }
+    return false;
+}
+
+static void tsaot_field_error(JSContext *ctx, const TsaotLayoutDesc *l, int fi)
+{
+    JS_ThrowTypeError(ctx, "`%s` of aot type `%s` cannot hold this value", l->fields[fi].name, l->name);
+}
+
+/* Store v (taken) in field fi of s, checked against the field's type; the
+ * old value of a JS-valued field goes to *old (owned). */
+static int tsaot_put_raw(JSContext *ctx, TsaotStruct *s, int fi, JSValue v, JSValue *old)
+{
+    const TsaotLayoutDesc *l = &tsaot_layouts[s->layout];
+    const TsaotFieldDesc *f = &l->fields[fi];
+    void *at = tsaot_field_at(s, f);
+    *old = JS_UNDEFINED;
+    if (f->storage == TSAOT_ST_INT32) {
+        /* Integers wrap to int32 (unless `--no-int-wrapping`). */
+        int tag = JS_VALUE_GET_TAG(v);
+        double d = tag == JS_TAG_INT ? JS_VALUE_GET_INT(v) : tag == JS_TAG_FLOAT64 ? JS_VALUE_GET_FLOAT64(v) : NAN;
+        int32_t i;
+        if (!(d == trunc(d)) || isinf(d)) {
+            JS_FreeValue(ctx, v);
+            return tsaot_field_error(ctx, l, fi), -1;
+        }
+        if (JS_ToInt32(ctx, &i, v) < 0)
+            return -1;
+        if (i != d && &tsaot_int_wrapping && !tsaot_int_wrapping) {
+            JS_FreeValue(ctx, v);
+            return tsaot_field_error(ctx, l, fi), -1;
+        }
+        *(int32_t *)at = i;
+        JS_FreeValue(ctx, v);
+        return 0;
+    }
+    if (!tsaot_union_fits(ctx, l, fi, v)) {
+        JS_FreeValue(ctx, v);
+        return tsaot_field_error(ctx, l, fi), -1;
+    }
+    switch (f->storage) {
+    case TSAOT_ST_F64:
+        *(double *)at = JS_VALUE_GET_TAG(v) == JS_TAG_INT ? JS_VALUE_GET_INT(v) : JS_VALUE_GET_FLOAT64(v);
+        break;
+    case TSAOT_ST_BOOL:
+        *(uint8_t *)at = JS_VALUE_GET_BOOL(v);
+        break;
+    default:
+        *old = *(JSValue *)at;
+        *(JSValue *)at = v;
+        return 0;
+    }
+    JS_FreeValue(ctx, v);
+    return 0;
+}
+
+/* Whether s matches a member: has its fields, with its types. */
+static bool tsaot_struct_matches(JSContext *ctx, TsaotStruct *s)
+{
+    const TsaotLayoutDesc *l = &tsaot_layouts[s->layout];
+    uint32_t m, fi;
+    for (m = 0; m < l->nmembers; m++) {
+        const TsaotMemberDesc *mem = &l->members[m];
+        bool ok = (mem->mask & ~s->mask) == 0;
+        for (fi = 0; ok && fi < l->nfields; fi++) {
+            if (!(mem->mask & (1u << fi)))
+                continue;
+            JSValue v = tsaot_field_get(ctx, s, &l->fields[fi]);
+            ok = tsaot_value_fits(ctx, &mem->types[fi], v);
+            JS_FreeValue(ctx, v);
+        }
+        if (ok)
+            return true;
+    }
+    return false;
+}
+
+JSValue tsaot_struct_new(JSContext *ctx, int layout, uint32_t mask)
+{
+    const TsaotLayoutDesc *l = &tsaot_layouts[layout];
+    void *data;
+    JSValue obj = JS_NewObjectClassData(ctx, tsaot_struct_class, sizeof(TsaotStruct) + l->size, &data);
+    TsaotStruct *s = data;
+    uint32_t i;
+    if (JS_IsException(obj))
+        return obj;
+    s->layout = layout;
+    s->mask = mask;
+    for (i = 0; i < l->nfields; i++) {
+        if (l->fields[i].storage == TSAOT_ST_VALUE)
+            *(JSValue *)tsaot_field_at(s, &l->fields[i]) = JS_UNDEFINED;
+    }
+    return obj;
+}
+
+/* A field of a new object (from native code), checked against its type. */
+int tsaot_struct_put(JSContext *ctx, JSValue obj, int field, JSValue v)
+{
+    JSValue old;
+    int r = tsaot_put_raw(ctx, JS_GetOpaque(obj, tsaot_struct_class), field, v, &old);
+    JS_FreeValue(ctx, old);
+    return r;
+}
+
+/* A new object (from native code) must match a member of its type. */
+int tsaot_struct_validate(JSContext *ctx, JSValue obj)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    if (tsaot_struct_matches(ctx, s))
+        return 0;
+    JS_ThrowTypeError(ctx, "not an object of aot type `%s`", tsaot_layouts[s->layout].name);
+    return -1;
+}
+
+/* A write of field `field` (v taken): it must be present, and the object
+ * must still match a member afterwards (else it is left as it was). */
+int tsaot_struct_set(JSContext *ctx, JSValue obj, int field, JSValue v)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    const TsaotLayoutDesc *l = &tsaot_layouts[s->layout];
+    const TsaotFieldDesc *f = &l->fields[field];
+    uint64_t saved[2];
+    JSValue old;
+    if (!(s->mask & (1u << field))) {
+        JS_FreeValue(ctx, v);
+        JS_ThrowTypeError(ctx, "cannot add `%s` to an object of aot type `%s`", f->name, l->name);
+        return -1;
+    }
+    memcpy(saved, tsaot_field_at(s, f), tsaot_field_size(f));
+    if (tsaot_put_raw(ctx, s, field, v, &old) < 0)
+        return -1;
+    if (l->validate && !f->simple && !tsaot_struct_matches(ctx, s)) {
+        if (f->storage == TSAOT_ST_VALUE)
+            JS_FreeValue(ctx, *(JSValue *)tsaot_field_at(s, f));
+        memcpy(tsaot_field_at(s, f), saved, tsaot_field_size(f));
+        JS_ThrowTypeError(ctx, "the object would not be of aot type `%s`", l->name);
+        return -1;
+    }
+    JS_FreeValue(ctx, old);
+    return 0;
+}
+
+/* A field read of an object of an `aot type` from a generic access: its
+ * value, or JS_UNINITIALIZED if not an own field. */
+static JSValue tsaot_struct_get_atom(JSContext *ctx, TsaotStruct *s, JSAtom prop)
+{
+    int fi = tsaot_field_index(s->layout, prop);
+    if (fi < 0 || !(s->mask & (1u << fi)))
+        return JS_UNINITIALIZED;
+    return tsaot_field_get(ctx, s, &tsaot_layouts[s->layout].fields[fi]);
+}
+
+static int tsaot_struct_get_own(JSContext *ctx, JSPropertyDescriptor *desc, JSValueConst obj, JSAtom prop)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    JSValue v = tsaot_struct_get_atom(ctx, s, prop);
+    if (JS_IsUninitialized(v))
+        return 0;
+    if (desc) {
+        desc->flags = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+        desc->value = v;
+        desc->getter = JS_UNDEFINED;
+        desc->setter = JS_UNDEFINED;
+    } else {
+        JS_FreeValue(ctx, v);
+    }
+    return 1;
+}
+
+static int tsaot_struct_own_names(JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    const TsaotLayoutDesc *l = &tsaot_layouts[s->layout];
+    uint32_t i, n = 0;
+    JSPropertyEnum *tab = js_malloc(ctx, sizeof(JSPropertyEnum) * (l->nfields ? l->nfields : 1));
+    if (!tab)
+        return -1;
+    for (i = 0; i < l->nfields; i++) {
+        if (s->mask & (1u << i)) {
+            tab[n].atom = JS_DupAtom(ctx, tsaot_struct_atoms[tsaot_struct_atom_base[s->layout] + i]);
+            tab[n].is_enumerable = true;
+            n++;
+        }
+    }
+    *ptab = tab;
+    *plen = n;
+    return 0;
+}
+
+static int tsaot_struct_delete(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    int fi = tsaot_field_index(s->layout, prop);
+    return !(fi >= 0 && (s->mask & (1u << fi)));
+}
+
+static int tsaot_struct_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst val,
+                               JSValueConst getter, JSValueConst setter, int flags)
+{
+    TsaotStruct *s = JS_GetOpaque(obj, tsaot_struct_class);
+    const TsaotLayoutDesc *l = &tsaot_layouts[s->layout];
+    int fi = tsaot_field_index(s->layout, prop);
+    if (fi < 0 || !(s->mask & (1u << fi))) {
+        JS_ThrowTypeError(ctx, "cannot add a property to an object of aot type `%s`", l->name);
+        return -1;
+    }
+    if ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+        ((flags & JS_PROP_HAS_CONFIGURABLE) && (flags & JS_PROP_CONFIGURABLE)) ||
+        ((flags & JS_PROP_HAS_ENUMERABLE) && !(flags & JS_PROP_ENUMERABLE)) ||
+        ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE))) {
+        JS_ThrowTypeError(ctx, "cannot redefine `%s` of an object of aot type `%s`", l->fields[fi].name, l->name);
+        return -1;
+    }
+    if (!(flags & JS_PROP_HAS_VALUE))
+        return true;
+    if (tsaot_struct_set(ctx, obj, fi, JS_DupValue(ctx, val)) < 0)
+        return -1;
+    return true;
+}
+
+static void tsaot_struct_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    TsaotStruct *s = JS_GetOpaque(val, tsaot_struct_class);
+    const TsaotLayoutDesc *l;
+    uint32_t i;
+    if (!s)
+        return;
+    l = &tsaot_layouts[s->layout];
+    for (i = 0; i < l->nfields; i++) {
+        if (l->fields[i].storage == TSAOT_ST_VALUE)
+            JS_FreeValueRT(rt, *(JSValue *)tsaot_field_at(s, &l->fields[i]));
+    }
+    /* The data is part of the object's allocation. */
+}
+
+static void tsaot_struct_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    TsaotStruct *s = JS_GetOpaque(val, tsaot_struct_class);
+    const TsaotLayoutDesc *l;
+    uint32_t i;
+    if (!s)
+        return;
+    l = &tsaot_layouts[s->layout];
+    for (i = 0; i < l->nfields; i++) {
+        if (l->fields[i].storage == TSAOT_ST_VALUE)
+            JS_MarkValue(rt, *(JSValue *)tsaot_field_at(s, &l->fields[i]), mark_func);
+    }
+}
+
+static const JSClassExoticMethods tsaot_struct_exotic = {
+    .get_own_property = tsaot_struct_get_own,
+    .get_own_property_names = tsaot_struct_own_names,
+    .delete_property = tsaot_struct_delete,
+    .define_own_property = tsaot_struct_define,
+};
+
+/* __tsaot_struct(k, obj): an object of layout k with the own enumerable
+ * properties of obj (a fresh object literal), checked. */
+JSValue tsaot_struct_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    int32_t k;
+    JSPropertyEnum *tab;
+    uint32_t len, i, mask = 0;
+    JSValue obj;
+    if (argc < 2 || JS_ToInt32(ctx, &k, argv[0]) < 0 || k < 0 || k >= tsaot_layout_count())
+        return JS_ThrowTypeError(ctx, "__tsaot_struct: bad layout");
+    if (JS_GetOwnPropertyNames(ctx, &tab, &len, argv[1], JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
+        return JS_EXCEPTION;
+    for (i = 0; i < len; i++) {
+        int fi = tsaot_field_index(k, tab[i].atom);
+        if (fi < 0) {
+            JS_FreePropertyEnum(ctx, tab, len);
+            return JS_ThrowTypeError(ctx, "not an object of aot type `%s`", tsaot_layouts[k].name);
+        }
+        mask |= 1u << fi;
+    }
+    obj = tsaot_struct_new(ctx, k, mask);
+    for (i = 0; i < len && !JS_IsException(obj); i++) {
+        JSValue v = JS_GetProperty(ctx, argv[1], tab[i].atom);
+        if (JS_IsException(v) ||
+            tsaot_struct_put(ctx, obj, tsaot_field_index(k, tab[i].atom), v) < 0) {
+            JS_FreeValue(ctx, obj);
+            obj = JS_EXCEPTION;
+        }
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+    if (!JS_IsException(obj) && tsaot_struct_validate(ctx, obj) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
+}
+
+/* The class, field atoms and literal strings (when the runtime starts). */
+static int tsaot_structs_init(JSContext *ctx)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSClassDef def = { "Object", .finalizer = tsaot_struct_finalizer, .gc_mark = tsaot_struct_mark,
+                       .exotic = (JSClassExoticMethods *)&tsaot_struct_exotic };
+    int n = tsaot_layout_count(), i, total = 0;
+    uint32_t f;
+    JSValue proto;
+    if (n == 0)
+        return 0;
+    JS_NewClassID(rt, &tsaot_struct_class);
+    if (JS_NewClass(rt, tsaot_struct_class, &def) < 0)
+        return -1;
+    proto = JS_NewObject(ctx);
+    if (JS_IsException(proto))
+        return -1;
+    JS_SetClassProto(ctx, tsaot_struct_class, JS_GetPrototype(ctx, proto));
+    JS_FreeValue(ctx, proto);
+    tsaot_struct_atom_base = js_mallocz(ctx, sizeof(uint32_t) * n);
+    for (i = 0; i < n; i++) {
+        tsaot_struct_atom_base[i] = total;
+        total += tsaot_layouts[i].nfields;
+    }
+    tsaot_struct_atoms = js_mallocz(ctx, sizeof(JSAtom) * (total ? total : 1));
+    for (i = 0; i < n; i++) {
+        for (f = 0; f < tsaot_layouts[i].nfields; f++)
+            tsaot_struct_atoms[tsaot_struct_atom_base[i] + f] = JS_NewAtom(ctx, tsaot_layouts[i].fields[f].name);
+    }
+    tsaot_struct_lit_values = js_mallocz(ctx, sizeof(JSValue) * (tsaot_nstruct_lits ? tsaot_nstruct_lits : 1));
+    for (i = 0; i < tsaot_nstruct_lits; i++)
+        tsaot_struct_lit_values[i] = JS_NewString(ctx, tsaot_struct_lits[i]);
+    return 0;
+}
+
+static void tsaot_structs_free(JSRuntime *rt)
+{
+    int n = tsaot_layout_count(), i, total = 0;
+    if (!tsaot_struct_atoms)
+        return;
+    for (i = 0; i < n; i++)
+        total += tsaot_layouts[i].nfields;
+    for (i = 0; i < total; i++)
+        JS_FreeAtomRT(rt, tsaot_struct_atoms[i]);
+    for (i = 0; i < tsaot_nstruct_lits; i++)
+        JS_FreeValueRT(rt, tsaot_struct_lit_values[i]);
+    js_free_rt(rt, tsaot_struct_atoms);
+    js_free_rt(rt, tsaot_struct_atom_base);
+    js_free_rt(rt, tsaot_struct_lit_values);
+    tsaot_struct_atoms = NULL;
+}
+
+/* `v` (taken) as field `field` of layout `layout` would store it (see
+ * StructCoerce): an int32 for an `int`, else v if of the field's type;
+ * TypeError if not. */
+JSValue tsaot_struct_coerce(JSContext *ctx, int layout, int field, JSValue v)
+{
+    const TsaotLayoutDesc *l = &tsaot_layouts[layout];
+    if (l->fields[field].storage == TSAOT_ST_INT32) {
+        int tag = JS_VALUE_GET_TAG(v);
+        double d = tag == JS_TAG_INT ? JS_VALUE_GET_INT(v) : tag == JS_TAG_FLOAT64 ? JS_VALUE_GET_FLOAT64(v) : NAN;
+        int32_t i;
+        if (!(d == trunc(d)) || isinf(d) || JS_ToInt32(ctx, &i, v) < 0 ||
+            (i != d && &tsaot_int_wrapping && !tsaot_int_wrapping)) {
+            JS_FreeValue(ctx, v);
+            tsaot_field_error(ctx, l, field);
+            return JS_EXCEPTION;
+        }
+        return JS_NewInt32(ctx, i);
+    }
+    if (!tsaot_union_fits(ctx, l, field, v)) {
+        JS_FreeValue(ctx, v);
+        tsaot_field_error(ctx, l, field);
+        return JS_EXCEPTION;
+    }
+    return v;
 }

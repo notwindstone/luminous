@@ -98,6 +98,10 @@ typedef struct TsaotIC {
 #define TSAOT_IC_PROTO_SETTER 3
 #define TSAOT_IC_OWN_GETTER 4
 #define TSAOT_IC_OWN_SETTER 5
+/* A field of an `aot type` object: `slot` holds the layout (low 16 bits)
+ * and the field's offset (high 16 bits), `kind` bits 8-15 the field and
+ * bits 16-17 its storage. */
+#define TSAOT_IC_STRUCT 7
 extern TsaotIC tsaot_ics[] __attribute__((weak));
 extern const int32_t tsaot_nics __attribute__((weak));
 /* Per native function: the shape of its closures (referenced) and its name
@@ -154,3 +158,70 @@ int tsaot_lock_builtins(JSContext *ctx);
 int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *cells_obj);
 
 #endif
+
+/* ---- `aot type` objects (see tsaot-front's `structs`) ---- */
+
+/* Field storage, as ir::Storage. */
+#define TSAOT_ST_INT32 0
+#define TSAOT_ST_F64 1
+#define TSAOT_ST_BOOL 2
+#define TSAOT_ST_VALUE 3
+/* Field types in a member, as ir::FieldType. */
+#define TSAOT_FT_ABSENT 0
+#define TSAOT_FT_INT 1
+#define TSAOT_FT_NUMBER 2
+#define TSAOT_FT_BOOL 3
+#define TSAOT_FT_STRING 4
+#define TSAOT_FT_LITERALS 5
+#define TSAOT_FT_STRUCT 6
+
+typedef struct TsaotFieldDesc {
+    const char *name;
+    uint8_t storage;
+    uint8_t simple; /* same type in every member, present in all */
+    uint16_t offset;
+} TsaotFieldDesc;
+
+typedef struct TsaotTypeDesc {
+    uint8_t kind;
+    uint8_t nlits;
+    uint16_t layout;   /* TSAOT_FT_STRUCT */
+    uint32_t lit_base; /* TSAOT_FT_LITERALS: first in tsaot_struct_lits */
+} TsaotTypeDesc;
+
+typedef struct TsaotMemberDesc {
+    uint32_t mask;
+    const TsaotTypeDesc *types; /* per field */
+} TsaotMemberDesc;
+
+typedef struct TsaotLayoutDesc {
+    const char *name;
+    uint32_t nfields;
+    uint32_t size;
+    uint32_t nmembers;
+    uint32_t validate; /* writes or literals may change the member matched */
+    const TsaotFieldDesc *fields;
+    const TsaotMemberDesc *members;
+} TsaotLayoutDesc;
+
+/* An object's data (its opaque): the layout, the fields present, then the
+ * fields at their offsets. */
+typedef struct TsaotStruct {
+    uint32_t layout;
+    uint32_t mask;
+    uint64_t data[];
+} TsaotStruct;
+
+extern const TsaotLayoutDesc tsaot_layouts[] __attribute__((weak));
+extern const int32_t tsaot_nlayouts __attribute__((weak));
+extern const char *const tsaot_struct_lits[] __attribute__((weak));
+extern const int32_t tsaot_nstruct_lits __attribute__((weak));
+extern uint32_t tsaot_struct_class;
+
+JSValue tsaot_struct_new(JSContext *ctx, int layout, uint32_t mask);
+int tsaot_struct_put(JSContext *ctx, JSValue obj, int field, JSValue v);
+int tsaot_struct_validate(JSContext *ctx, JSValue obj);
+int tsaot_struct_set(JSContext *ctx, JSValue obj, int field, JSValue v);
+JSValue tsaot_struct_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+extern int tsaot_int_wrapping __attribute__((weak));
+JSValue tsaot_struct_coerce(JSContext *ctx, int layout, int field, JSValue v);

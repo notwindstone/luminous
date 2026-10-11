@@ -134,7 +134,10 @@ fn analyze(input: &Path, fopts: &tsaot_front::Options) -> Result<(String, Analys
 
 fn disable_native(a: &mut Analysis) {
     a.natives.clear();
+    // `aot type` objects are made by the runtime either way.
+    let layouts = std::mem::take(&mut a.module.layouts);
     a.module = Default::default();
+    a.module.layouts = layouts;
     a.cells.clear();
     a.cell_refs.clear();
     a.classes.clear();
@@ -239,7 +242,7 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Opt
 
         std::fs::write(
             tmp.join("glue.c"),
-            glue::generate(&analysis.module, &mutable_cells(&analysis), &analysis.classes),
+            glue::generate(&analysis.module, &mutable_cells(&analysis), &analysis.classes, fopts.int_wrapping),
         )?;
         std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
         std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;

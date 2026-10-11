@@ -157,6 +157,9 @@ fast paths that keep the engine's semantics:
   queued without allocating reaction records; `await` of a primitive
   queues its continuation without making a promise
   (`JS_EnqueueAwaitJob`: native frames resume from a job of their own);
+- `JS_NewObjectClassData`: an object of a class with its data in the same
+  allocation and no property storage (`aot type` objects), and
+  `JS_DupObjectShape` for caching their shape;
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first.
@@ -412,6 +415,60 @@ function isPrime(n: int): boolean {
 - `type double = number` is accepted as a plain alias of `number`. An `int`
   captured by a closure or declared at module level is checked and wrapped
   like any other; native code keeps it as a JS value.
+
+## `aot type`
+
+`aot type` declares an object type with a fixed layout:
+
+```ts
+aot type Point = {
+  x: int; y: int; z: int;
+  kind: "colored";
+  color: string;
+} | {
+  x: int; y: int; z: int;
+  kind: "uncolored";
+};
+
+aot type AB = { a: number } | { b: string };   // { a }, { b } and { a, b }
+aot type XY = { x: int } & { y: number };        // one member: { x, y }
+
+const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
+```
+
+- **Members and fields.** An `aot type` is object types combined with `|`
+  and `&` (and other `aot type`s), at the top level of the module. Fields
+  are `int`, `number` / `double`, `boolean`, `string`, string literals or
+  another `aot type`; no optional fields, methods, index signatures or
+  type parameters.
+- **One layout.** All the members' fields share one layout, with a mask of
+  the fields an object has. An object is valid when it has every field of
+  some member, with that member's types, and its other fields belong to
+  some member (so `{ a } | { b }` holds `{ a }`, `{ b }` and `{ a, b }`).
+  Fields that every member stores the same way are unboxed: an `int` is an
+  int32, a `number` a double, a `boolean` a byte.
+- **Made by literals.** An object literal where an `aot type` is expected
+  makes one: the initializer of a binding declared with it, a value
+  assigned to one or to such a field, a returned value, an argument for
+  such a parameter, an element of an array declared `T[]` (in an array
+  literal, `a[i] = ...` or `a.push(...)`). Its fields are checked at
+  compile time: unknown, missing or ill-typed fields are errors. The same
+  literals in interpreted code make the same objects.
+- **Kept to its type.** To JS, an object of an `aot type` is a plain-looking
+  object (`JSON.stringify`, `Object.keys`, spread, `in` all work) that is
+  not extensible: fields cannot be added, deleted or redefined, and a field
+  only takes values of its type, else a TypeError, from native or
+  interpreted code alike. An `int` field wraps other integers to int32 (as
+  `| 0`; with `--no-int-wrapping`, a TypeError); a write that would leave
+  the object matching no member is a TypeError. `Object.freeze` throws.
+- **Native code** reads and writes fields at fixed offsets: on a value of a
+  declared `aot type` (a literal, a parameter, a field), `p.x` is one load
+  of an int32 and arithmetic on it stays in integers. Elsewhere (an element
+  of a plain array), property caches recognize the object's layout. An
+  object that does not escape is not allocated at all: its fields become
+  locals, with the same checks on stores. A native function whose `aot
+  type` parameter gets another value declines the call (the interpreted
+  version runs).
 
 ## Getting started
 

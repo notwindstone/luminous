@@ -7,6 +7,7 @@ pub mod erase;
 pub mod ints;
 pub mod ir;
 pub mod marker;
+pub mod structs;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -144,6 +145,8 @@ pub struct Analysis {
     pub rejected: Vec<Rejected>,
     pub classes: Vec<ClassDecl>,
     pub int_wraps: Vec<IntWrap>,
+    /// Object literals that make objects of an `aot type`: span and layout.
+    pub struct_sites: Vec<((u32, u32), u32)>,
 }
 
 fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
@@ -172,10 +175,18 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     let scoping = sem.semantic.into_scoping();
 
     let mut errors = builtins::check(program, &scoping);
+    // `aot type`s: their layouts and the literals that make their objects.
+    let (structs, mut struct_errors) = structs::analyze(program, &scoping, &stripped.aot_types);
+    if !struct_errors.is_empty() {
+        // Checking assumes well-formed `aot type`s and literals.
+        errors.append(&mut struct_errors);
+        return Err(erase::render(errors, original, path));
+    }
     // The `int` type, over the whole module.
     let mut ints = ints::check(program, &scoping, opts.int_wrapping);
     errors.append(&mut ints.errors);
-    let out = check::check(program, &scoping, &ints.vars, &stripped.interpreted);
+    let mut out = check::check(program, &scoping, &ints.vars, &stripped.interpreted, &structs);
+    out.module.int_wrapping = opts.int_wrapping;
 
     let line = |pos: u32| source[..pos as usize].matches('\n').count() as u32 + 1;
     let natives: Vec<NativeDecl> = out
@@ -285,7 +296,19 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
         .map(|u| ClassDecl { index: u.class, body_start: out.classes[u.class].body_start, vars: u.vars.clone() })
         .collect();
     let int_wraps = ints.wraps;
-    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected, classes, int_wraps })
+    let mut struct_sites: Vec<((u32, u32), u32)> = structs.sites.iter().map(|(&s, &(e, k))| ((s, e), k)).collect();
+    struct_sites.sort();
+    Ok(Analysis {
+        source: source.clone(),
+        module: out.module,
+        natives,
+        cells,
+        cell_refs,
+        rejected,
+        classes,
+        int_wraps,
+        struct_sites,
+    })
 }
 
 /// Collects interpreted references to bindings that live in mutable cells.
