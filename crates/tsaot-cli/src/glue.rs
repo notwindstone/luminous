@@ -91,6 +91,7 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
         writeln!(c, "    {{ tsaot_fast_{i}, {}, {}, {kind} }},", c_str(&f.name), f.js_length).unwrap();
     }
     c.push_str("    { NULL, NULL, 0, 0 },\n};\n\n");
+    writeln!(c, "TsaotFnCache tsaot_fn_caches[{}];\nconst int32_t tsaot_nfn_caches = {nall};\n", nall + 1).unwrap();
 
     // Step functions of async functions and generators.
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
@@ -197,9 +198,9 @@ static JSValue tsaot_closure_slow(JSContext *ctx, JSValueConst this_val, int arg
 /* A closure of native function `fn` over `data` (borrowed). */
 JSValue tsaot_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
 {{
-    return tsaot_function_kind(ctx, JS_NewCFunctionDataFast(ctx, tsaot_table[fn].fast, tsaot_closure_slow,
-                                                            tsaot_table[fn].name, tsaot_table[fn].length,
-                                                            fn, n, data),
+    return tsaot_function_kind(ctx, tsaot_new_closure(ctx, &tsaot_fn_caches[fn], tsaot_table[fn].fast,
+                                                      tsaot_closure_slow, tsaot_table[fn].name,
+                                                      tsaot_table[fn].length, fn, n, data),
                                JS_UNDEFINED, tsaot_table[fn].kind);
 }}
 

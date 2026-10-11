@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I8, I32, I64, I64X2};
 use cranelift_codegen::ir::{
-    Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind, Type, Value,
+    Block, BlockArg, FuncRef, GlobalValue, InstBuilder, MemFlagsData, SigRef, StackSlotData, StackSlotKind, Type, Value,
 };
 use cranelift_frontend::{FunctionBuilder, Variable};
 use tsaot_front::ir::{
@@ -191,6 +191,10 @@ pub(crate) struct Env {
     pub closure_base: usize,
     /// Parameter types, by `FuncId`.
     pub params: std::rc::Rc<Vec<Vec<Ty>>>,
+    /// `value_captures`, by `ClosureId`.
+    pub value_captures: std::rc::Rc<Vec<Vec<bool>>>,
+    /// The signature of `JSCFunctionFast` entries.
+    pub fast_sig: SigRef,
 }
 
 /// An exception edge: its block, the temporaries to free there, the handler.
@@ -370,13 +374,18 @@ impl<'a> Lower<'a> {
         }
         // A closure's data slots hold, per captured variable, its box object
         // and the address of the box's value (as a non-reference value).
+        // A value capture holds the value itself, which its slot points at.
         if let Some(data) = closure_data {
             for (k, &cl) in f.captures.iter().enumerate() {
                 let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[cl] else { unreachable!() };
                 let at = (2 * k * SIZE) as i32;
                 let p = l.b.ins().load(I64, Self::mem(), data, at);
                 let t = l.b.ins().load(I64, Self::mem(), data, at + TAG_OFFSET);
-                let s = l.b.ins().load(I64, Self::mem(), data, at + SIZE as i32);
+                let s = if f.value_captures[k] {
+                    l.b.ins().iadd_imm_s(data, at as i64)
+                } else {
+                    l.b.ins().load(I64, Self::mem(), data, at + SIZE as i32)
+                };
                 l.b.def_var(op, p);
                 l.b.def_var(ot, t);
                 l.b.def_var(slot, s);
@@ -1365,12 +1374,25 @@ impl<'a> Lower<'a> {
             ExprKind::Closure(cid, boxes) => {
                 // Data slots: per captured variable, its box object and the
                 // address of its value (borrowed: the function dups them).
+                // A value capture: the value itself (the closure points
+                // the second slot at it).
+                let by_value = self.env.value_captures[*cid].clone();
                 let mut vals = Vec::new();
-                for &bl in boxes {
+                for (&bl, &value) in boxes.iter().zip(&by_value) {
+                    let tag = self.b.ins().iconst(I64, TAG_FLOAT64);
+                    if value {
+                        let v = match self.vars[bl] {
+                            LVar::Boxed { .. } => self.load_box(bl),
+                            _ => self.use_local(bl).any(),
+                        };
+                        let zero = self.b.ins().iconst(I64, 0);
+                        vals.push(v);
+                        vals.push((zero, tag));
+                        continue;
+                    }
                     let LVar::Boxed { obj: (op, ot), .. } = self.vars[bl] else { unreachable!() };
                     let obj = (self.b.use_var(op), self.b.use_var(ot));
                     let slot = self.box_slot(bl);
-                    let tag = self.b.ins().iconst(I64, TAG_FLOAT64);
                     vals.push(obj);
                     vals.push((slot, tag));
                 }
@@ -1432,6 +1454,19 @@ impl<'a> Lower<'a> {
                 let a = self.expr(x).num();
                 let c = self.expr(y).num();
                 V::Num(self.binary(*op, a, c))
+            }
+            ExprKind::NumArith(op, x, y) => {
+                let a = self.expr(x);
+                self.hold(a);
+                let c = self.expr(y);
+                self.hold(c);
+                let an = self.number_value(a);
+                let cn = self.number_value(c);
+                self.release(c);
+                self.release(a);
+                self.free_v(c);
+                self.free_v(a);
+                V::Num(self.binary(*op, an, cn))
             }
             ExprKind::Compare(op, x, y) => {
                 let a = self.expr(x);
@@ -1749,19 +1784,32 @@ impl<'a> Lower<'a> {
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
                 // An own writable data property of a cached shape, or a setter
-                // of the prototype.
+                // (own or of the prototype).
                 let (shape, kind) = self.ic_shape_hit(p, t, ic, slow);
                 let own = self.b.create_block();
                 let proto = self.b.create_block();
                 let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
                 self.b.ins().brif(is_own, own, &[], proto, &[]);
                 self.b.switch_to_block(proto);
-                let pat = self.ic_proto_slot(shape, ic, slow);
+                let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
                 let setter = self.b.ins().load(I64, Self::mem(), pat, 8);
+                self.nonnull(setter, slow);
                 let ctx = self.ctx;
-                // The setter takes the property's reference.
-                let r = self.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
-                self.check_int(r[0]);
+                // The property's reference is dropped after the call.
+                let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+                let argv = self.values_slot(&[(vp, vt)]);
+                let (sp, st) = self.call_linked((setter, tag), (p, t), 1, argv, true, |l| {
+                    l.dup((vp, vt));
+                    let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
+                    let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+                    let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
+                    let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
+                    let zero = l.b.ins().iconst(I64, 0);
+                    (zero, l.b.ins().select(failed, exc, undef))
+                });
+                self.free((vp, vt));
+                self.free((sp, st));
+                self.check_value(st);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(own);
                 let at = self.ic_slot_addr(p, ic);
@@ -2092,21 +2140,56 @@ impl<'a> Lower<'a> {
                 V::Any(r[0], r[1])
             }
             ExprKind::Object(props) => {
-                let ctx = self.ctx;
-                let o = self.helper("JS_NewObject", &[ctx]);
-                self.check_value(o[1]);
-                let obj = V::Any(o[0], o[1]);
-                self.hold(obj);
-                let slot = self.values_slot(&[(o[0], o[1])]);
-                for (a, x) in props {
-                    let (p, t) = self.expr(x).any();
-                    let atom = self.atom(*a);
-                    // Takes ownership of the value.
-                    let r = self.helper("tsaot_define_field", &[ctx, slot, atom, p, t]);
-                    self.check_int(r[0]);
+                // The values first (the object is unobservable until made),
+                // then the object: an allocation site caches the literal's
+                // final shape, and later objects are made with it directly,
+                // as JSC's allocation profiles do.
+                let held: Vec<V> = props
+                    .iter()
+                    .map(|(_, x)| {
+                        let (p, t) = self.expr(x).any();
+                        let v = V::Any(p, t);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                // Both paths take the values.
+                for &v in held.iter().rev() {
+                    self.release(v);
                 }
-                self.release(obj);
-                obj
+                let values = self.values_slot(&vals);
+                let ic = self.new_ic();
+                let ctx = self.ctx;
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let fast = self.b.create_block();
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                let shape = self.b.ins().load(I64, Self::mem(), ic, 0);
+                self.b.ins().brif(shape, fast, &[], slow, &[]);
+                self.b.switch_to_block(fast);
+                let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(slow);
+                let n = props.len();
+                let atoms = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (n.max(1) * 4) as u32,
+                    2,
+                ));
+                for (i, (a, _)) in props.iter().enumerate() {
+                    let atom = self.atom(*a);
+                    self.b.ins().stack_store(self.ptr, atom, atoms, (i * 4) as i32);
+                }
+                let atoms = self.b.ins().stack_addr(self.ptr, atoms, 0);
+                let count = self.b.ins().iconst(I32, n as i64);
+                let r = self.helper("tsaot_new_object", &[ctx, ic, count, atoms, values]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                self.check_value(rt);
+                V::Any(rp, rt)
             }
             ExprKind::Array(elems) => {
                 let held: Vec<V> = elems
@@ -2463,15 +2546,79 @@ impl<'a> Lower<'a> {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, args.len() as i64);
         let ctx = self.ctx;
-        let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
-        self.check_value(r[1]);
+        let (rp, rt) = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        self.check_value(rt);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.release(f);
         self.free_v(f);
-        V::Any(r[0], r[1])
+        V::Any(rp, rt)
+    }
+
+    /// Call `f` with `this` and `argc` arguments at `argv` (all borrowed;
+    /// `f` held by the caller unless `borrowed`, then held here during the
+    /// call). A native function (C function data with a fast entry) is
+    /// entered directly through its entry, as linked calls in JSC; other
+    /// callees, or a declining entry, take `generic`. A new reference.
+    fn call_linked(
+        &mut self,
+        (fp, ft): (Value, Value),
+        (thp, tht): (Value, Value),
+        argc: usize,
+        argv: Value,
+        borrowed: bool,
+        generic: impl FnOnce(&mut Self) -> (Value, Value),
+    ) -> (Value, Value) {
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let class = self.b.ins().uload16(I32, Self::mem(), fp, layout::OBJ_CLASS_ID);
+        let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
+        let data = self.b.create_block();
+        self.b.ins().brif(is_data, data, &[], slow, &[]);
+        self.b.switch_to_block(data);
+        let rec = self.b.ins().load(I64, Self::mem(), fp, layout::OBJ_FUNC_DATA);
+        let entry = self.b.ins().load(I64, Self::mem(), rec, layout::FDATA_FAST);
+        let has = self.b.create_block();
+        self.b.ins().brif(entry, has, &[], slow, &[]);
+        self.b.switch_to_block(has);
+        // Entries skip the stack check of the engine's call path: so here.
+        let limit_addr = self.b.ins().symbol_value(self.ptr, self.env.stack_limit);
+        let limit = self.b.ins().load(self.ptr, Self::mem(), limit_addr, 0);
+        let sp = self.b.ins().get_stack_pointer(self.ptr);
+        let deep = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, limit);
+        let call = self.b.create_block();
+        self.b.ins().brif(deep, slow, &[], call, &[]);
+        self.b.switch_to_block(call);
+        if borrowed {
+            self.dup((fp, ft));
+        }
+        let fdata = self.b.ins().iadd_imm_s(rec, layout::FDATA_DATA as i64);
+        let ctx = self.ctx;
+        let n = self.b.ins().iconst(I32, argc as i64);
+        let sig: SigRef = self.env.fast_sig;
+        let inst = self.b.ins().call_indirect(sig, entry, &[ctx, thp, tht, n, argv, fdata]);
+        let r = self.b.inst_results(inst).to_vec();
+        if borrowed {
+            self.free((fp, ft));
+        }
+        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_UNINITIALIZED);
+        self.b.ins().brif(declined, slow, &[], join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(slow);
+        let (gp, gt) = generic(self);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        (rp, rt)
     }
 
     /// Spill JS values into a fresh stack slot; returns its address.
@@ -2560,6 +2707,32 @@ impl<'a> Lower<'a> {
     }
 
     // ---- dynamic values ----
+
+    /// ToNumber of an operand (borrowed): inline for numbers, else
+    /// `JS_ToFloat64`, which may throw.
+    fn number_value(&mut self, v: V) -> Value {
+        let V::Any(p, t) = v else { return v.num() };
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, F64);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let num = self.is_number(t);
+        self.b.ins().brif(num, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let d = self.number_of((p, t));
+        self.b.ins().jump(join, &[BlockArg::Value(d)]);
+        self.b.switch_to_block(slow);
+        let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let addr = self.b.ins().stack_addr(self.ptr, out, 0);
+        let ctx = self.ctx;
+        let s = self.helper("JS_ToFloat64", &[ctx, addr, p, t]);
+        self.check_int(s[0]);
+        let d = self.b.ins().stack_load(self.ptr, F64, out, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(d)]);
+        self.b.switch_to_block(join);
+        r
+    }
 
     fn is_number(&mut self, t: Value) -> Value {
         let i = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
@@ -3566,25 +3739,33 @@ impl<'a> Lower<'a> {
         let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
         self.dup((vp, vt));
         self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
-        // On the prototype: its value, or a call of its getter.
+        // On the prototype: its value; or a call of a getter (own or on the
+        // prototype).
         self.b.switch_to_block(proto);
-        let pat = self.ic_proto_slot(shape, ic, slow);
         let data = self.b.create_block();
         let getter = self.b.create_block();
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
         self.b.ins().brif(is_data, data, &[], getter, &[]);
         self.b.switch_to_block(data);
+        let pat = self.ic_proto_slot(shape, ic, slow);
         let vp = self.b.ins().load(I64, Self::mem(), pat, 0);
         let vt = self.b.ins().load(I64, Self::mem(), pat, TAG_OFFSET);
         self.dup((vp, vt));
         self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
         self.b.switch_to_block(getter);
+        let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
         let g = self.b.ins().load(I64, Self::mem(), pat, 0);
+        self.nonnull(g, slow);
         let ctx = self.ctx;
         let (thp, tht) = receiver.unwrap_or((p, t));
-        let r = self.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
-        self.check_value(r[1]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+        let none = self.b.ins().iconst(I64, 0);
+        let (gp, gt) = self.call_linked((g, tag), (thp, tht), 0, none, true, |l| {
+            let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
+            (r[0], r[1])
+        });
+        self.check_value(gt);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let r = match receiver {
@@ -3649,6 +3830,33 @@ impl<'a> Lower<'a> {
         self.b.ins().brif(same, hit, &[], slow, &[]);
         self.b.switch_to_block(hit);
         self.ic_slot_addr(proto, ic)
+    }
+
+    /// For a cache of a getter or setter: the address of the property
+    /// holding it, own (kinds 4 and 5) or on a prototype (`ic_proto_slot`).
+    fn ic_accessor_slot(&mut self, p: Value, shape: Value, kind: Value, ic: Value, slow: Block) -> Value {
+        let holder = self.b.create_block();
+        let at = self.b.append_block_param(holder, I64);
+        let own = self.b.create_block();
+        let proto = self.b.create_block();
+        let is_own = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, kind, 4);
+        self.b.ins().brif(is_own, own, &[], proto, &[]);
+        self.b.switch_to_block(own);
+        let own_at = self.ic_slot_addr(p, ic);
+        self.b.ins().jump(holder, &[BlockArg::Value(own_at)]);
+        self.b.switch_to_block(proto);
+        let proto_at = self.ic_proto_slot(shape, ic, slow);
+        self.b.ins().jump(holder, &[BlockArg::Value(proto_at)]);
+        self.b.switch_to_block(holder);
+        at
+    }
+
+    /// Continue if `v` (a cached getter or setter) is not NULL, else go to
+    /// `slow`: an accessor half can be removed without a shape change.
+    fn nonnull(&mut self, v: Value, slow: Block) {
+        let ok = self.b.create_block();
+        self.b.ins().brif(v, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
     }
 
     /// The address of a new inline cache (a `TsaotIC`).

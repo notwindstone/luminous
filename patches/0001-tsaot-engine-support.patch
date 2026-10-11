@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,108 @@
+@@ -1052,6 +1059,121 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -41,14 +41,23 @@
 +JS_EXTERN int JS_AwaitValue(JSContext *ctx, JSValueConst value,
 +                            JSValueConst on_fulfilled, JSValueConst on_rejected);
 +/* Inline caches of own data properties. If `obj` has a shared shape and an
-+   own data property `prop` (writable, for a write), returns the property's
++   own data property `prop` (writable, for a write: mode 1; mode 0 reads),
++   or own accessor with a getter (mode 2) or setter (mode 3), returns the property's
 +   index in the object's property array and a new reference to the shape in
 +   `*pshape`, else -1. While referenced, a shape is never modified in place:
 +   every object with this shape has the same property at the same index. */
 +JS_EXTERN int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
-+                                  bool for_write, void **pshape);
++                                  int mode, void **pshape);
 +JS_EXTERN int JS_CacheProtoProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int kind,
 +                                    void **pshape, void **pproto_shape, void **pmid_shape);
++JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
++/* Object literal allocation sites. If `obj` is a plain extensible object
++   whose shared shape holds exactly `count` enumerable, writable,
++   configurable data properties, returns 0 and a new reference to the shape
++   in `*pshape`, else -1. JS_NewObjectWithCachedShape makes an object of
++   such a shape, taking its property values (in shape order). */
++JS_EXTERN int JS_CachePlainShape(JSContext *ctx, JSValueConst obj, int count, void **pshape);
++JS_EXTERN JSValue JS_NewObjectWithCachedShape(JSContext *ctx, void *shape, JSValue *values);
 +JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
 +JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
 +/* For natively compiled code: the interpreter's own iteration (for-of,
@@ -120,10 +129,14 @@
 +#define JS_LAYOUT_ABUF_IMMUTABLE    9    /* uint8_t */
 +#define JS_LAYOUT_CLASS_ARRAY       2
 +#define JS_LAYOUT_CLASS_TYPED_ARRAY 22   /* + JSTypedArrayEnum */
++#define JS_LAYOUT_OBJ_FUNC_DATA     48   /* JSCFunctionDataRecord *, for C function data */
++#define JS_LAYOUT_FDATA_FAST        8    /* JSCFunctionFast *, or NULL */
++#define JS_LAYOUT_FDATA_DATA        32   /* JSValue[]: the function data */
++#define JS_LAYOUT_CLASS_C_FUNCTION_DATA 15
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1342,6 +1451,15 @@
+@@ -1342,6 +1464,22 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -133,6 +146,13 @@
 +                                          JSCFunctionData *func, const char *name,
 +                                          int length, int magic, int data_len,
 +                                          JSValueConst *data);
++/* JS_NewCFunctionDataFast with the name as an atom, for many functions of one
++   kind: `*pshape` caches (with a reference) the shape of the first one, and
++   later ones are made with it directly. */
++JS_EXTERN JSValue JS_NewCFunctionDataShaped(JSContext *ctx, JSCFunctionFast *fast,
++                                            JSCFunctionData *func, JSAtom name,
++                                            int length, int magic, int data_len,
++                                            JSValueConst *data, void **pshape);
 +/* The function object of a C function data object, from the data that its
 +   JSCFunctionFast entry receives (borrowed). */
 +JS_EXTERN JSValueConst JS_GetFunctionOfData(JSValueConst *func_data);
@@ -179,7 +199,7 @@
  typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
-@@ -6560,6 +6584,8 @@
+@@ -6560,12 +6584,19 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
@@ -188,7 +208,18 @@
      uint8_t length;
      uint8_t data_len;
      uint16_t magic;
-@@ -6608,6 +6634,11 @@
+     JSValue data[];
+ } JSCFunctionDataRecord;
+ 
++static_assert(offsetof(JSObject, u.c_function_data_record) == JS_LAYOUT_OBJ_FUNC_DATA, "");
++static_assert(offsetof(JSCFunctionDataRecord, fast) == JS_LAYOUT_FDATA_FAST, "");
++static_assert(offsetof(JSCFunctionDataRecord, data) == JS_LAYOUT_FDATA_DATA, "");
++static_assert(JS_CLASS_C_FUNCTION_DATA == JS_LAYOUT_CLASS_C_FUNCTION_DATA, "");
++
+ static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
+ {
+     JSCFunctionDataRecord *s = JS_GetOpaque(val, JS_CLASS_C_FUNCTION_DATA);
+@@ -6608,6 +6639,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -200,7 +231,7 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6684,8 @@
+@@ -6653,6 +6689,8 @@
          return JS_EXCEPTION;
      }
      s->func = func;
@@ -209,7 +240,7 @@
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6705,25 @@
+@@ -6672,6 +6710,73 @@
      return func_obj;
  }
  
@@ -225,6 +256,54 @@
 +    return func_obj;
 +}
 +
++JSValue JS_NewCFunctionDataShaped(JSContext *ctx, JSCFunctionFast *fast,
++                                  JSCFunctionData *func, JSAtom name,
++                                  int length, int magic, int data_len,
++                                  JSValueConst *data, void **pshape)
++{
++    JSCFunctionDataRecord *s;
++    JSShape *sh = *pshape;
++    JSValue func_obj;
++    int i;
++
++    if (sh) {
++        /* `length` then `name`, as js_function_set_properties defines them */
++        JSProperty props[2];
++        props[0].u.value = js_int32(length);
++        props[1].u.value = JS_AtomToString(ctx, name);
++        if (JS_IsException(props[1].u.value))
++            return JS_EXCEPTION;
++        func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh),
++                                         JS_CLASS_C_FUNCTION_DATA, props);
++    } else {
++        func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
++                                          JS_CLASS_C_FUNCTION_DATA);
++    }
++    if (JS_IsException(func_obj))
++        return func_obj;
++    s = js_malloc(ctx, sizeof(*s) + data_len * sizeof(JSValue));
++    if (!s) {
++        JS_FreeValue(ctx, func_obj);
++        return JS_EXCEPTION;
++    }
++    s->func = func;
++    s->fast = fast;
++    s->self = JS_VALUE_GET_OBJ(func_obj);
++    s->length = length;
++    s->data_len = data_len;
++    s->magic = magic;
++    for(i = 0; i < data_len; i++)
++        s->data[i] = js_dup(data[i]);
++    JS_SetOpaqueInternal(func_obj, s);
++    if (!sh) {
++        js_function_set_properties(ctx, func_obj, name, length);
++        sh = JS_VALUE_GET_OBJ(func_obj)->shape;
++        if (sh->is_hashed && sh->prop_count == 2)
++            *pshape = js_dup_shape(sh);
++    }
++    return func_obj;
++}
++
 +JSValueConst JS_GetFunctionOfData(JSValueConst *func_data)
 +{
 +    JSCFunctionDataRecord *s = (JSCFunctionDataRecord *)((uint8_t *)func_data -
@@ -235,7 +314,7 @@
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -7036,6 +7088,8 @@
+@@ -7036,6 +7141,8 @@
      JSObject *p = JS_VALUE_GET_OBJ(val);
      JSForInIterator *it = p->u.for_in_iterator;
      JS_FreeValueRT(rt, it->obj);
@@ -244,7 +323,7 @@
      js_free_rt(rt, it);
  }
  
-@@ -7045,6 +7099,8 @@
+@@ -7045,6 +7152,8 @@
      JSObject *p = JS_VALUE_GET_OBJ(val);
      JSForInIterator *it = p->u.for_in_iterator;
      JS_MarkValue(rt, it->obj, mark_func);
@@ -253,7 +332,7 @@
  }
  
  static void free_object(JSRuntime *rt, JSObject *p)
-@@ -10827,6 +10883,20 @@
+@@ -10827,6 +10936,20 @@
  }
  
  /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -274,7 +353,7 @@
  int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                          JSValue prop, JSValue val, int flags)
  {
-@@ -16550,6 +16620,119 @@
+@@ -16550,6 +16673,119 @@
      return atom;
  }
  
@@ -394,7 +473,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -16757,6 +16940,13 @@
+@@ -16757,6 +16993,13 @@
      return JS_EXCEPTION;
  }
  
@@ -408,7 +487,7 @@
  static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
  {
      JSObject *p;
-@@ -16785,6 +16975,8 @@
+@@ -16785,6 +17028,8 @@
      it->is_array = false;
      it->obj = obj;
      it->idx = 0;
@@ -417,7 +496,7 @@
      p = JS_VALUE_GET_OBJ(enum_obj);
      p->u.for_in_iterator = it;
  
-@@ -16906,7 +17098,20 @@
+@@ -16906,7 +17151,20 @@
      it = p->u.for_in_iterator;
  
      for(;;) {
@@ -439,7 +518,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18252,46 @@
+@@ -18047,6 +18305,46 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -486,7 +565,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18793,12 @@
+@@ -18548,9 +18846,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -499,7 +578,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +18833,12 @@
+@@ -18585,9 +18886,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -512,7 +591,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +18849,21 @@
+@@ -18598,6 +18902,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -534,7 +613,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -21274,13 +21540,21 @@
+@@ -21274,13 +21593,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -557,7 +636,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21581,10 @@
+@@ -21307,7 +21634,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -569,7 +648,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21592,56 @@
+@@ -21315,6 +21645,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -626,7 +705,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21653,8 @@
+@@ -21326,6 +21706,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -635,7 +714,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +21769,61 @@
+@@ -21440,6 +21822,61 @@
      return JS_EXCEPTION;
  }
  
@@ -697,7 +776,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22056,12 @@
+@@ -21672,6 +22109,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -710,7 +789,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22078,11 @@
+@@ -21688,8 +22131,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -724,7 +803,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22111,11 @@
+@@ -21718,8 +22164,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -738,7 +817,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22228,12 @@
+@@ -21832,7 +22281,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -752,7 +831,7 @@
      }
  }
  
-@@ -21874,6 +22275,55 @@
+@@ -21874,6 +22328,55 @@
      return res;
  }
  
@@ -808,7 +887,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +22360,12 @@
+@@ -21910,6 +22413,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -821,7 +900,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +22378,20 @@
+@@ -21922,10 +22431,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -843,7 +922,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +22465,12 @@
+@@ -21999,6 +22518,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -856,7 +935,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +22567,37 @@
+@@ -22095,6 +22620,37 @@
      return JS_EXCEPTION;
  }
  
@@ -894,7 +973,7 @@
  /* JS parser */
  
  enum {
-@@ -44978,6 +45481,15 @@
+@@ -44978,6 +45534,15 @@
      return JS_EXCEPTION;
  }
  
@@ -910,7 +989,86 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56106,6 +56618,306 @@
+@@ -56073,6 +56638,48 @@
+     return result_promise;
+ }
+ 
++/* A new promise of %Promise.prototype%, settled with value. */
++static JSValue js_promise_new_settled(JSContext *ctx, JSValueConst value, bool is_reject)
++{
++    JSValue obj;
++    JSPromiseData *s;
++
++    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_PROMISE);
++    if (JS_IsException(obj))
++        return JS_EXCEPTION;
++    s = js_mallocz(ctx, sizeof(*s));
++    if (!s) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
++    s->promise_state = JS_PROMISE_PENDING;
++    s->is_handled = false;
++    init_list_head(&s->promise_reactions[0]);
++    init_list_head(&s->promise_reactions[1]);
++    s->promise_result = JS_UNDEFINED;
++    JS_SetOpaqueInternal(obj, s);
++    fulfill_or_reject_promise(ctx, obj, value, is_reject);
++    return obj;
++}
++
++/* Whether `promise.constructor` is %Promise% with nothing observable
++   happening: no own properties, %Promise.prototype% as the prototype, and
++   its `constructor` a data property holding %Promise%. */
++static bool js_promise_ctor_is_intrinsic(JSContext *ctx, JSObject *p)
++{
++    JSObject *proto = p->shape->proto;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++
++    if (p->shape->prop_count != 0 ||
++        proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_PROMISE]))
++        return false;
++    prs = find_own_property(&pr, proto, JS_ATOM_constructor);
++    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++           JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT &&
++           JS_VALUE_GET_PTR(pr->u.value) == JS_VALUE_GET_PTR(ctx->promise_ctor);
++}
++
+ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int magic)
+ {
+@@ -56081,14 +56688,24 @@
+ 
+     if (!JS_IsObject(this_val))
+         return JS_ThrowTypeErrorNotAnObject(ctx);
++    if (JS_VALUE_GET_PTR(this_val) == JS_VALUE_GET_PTR(ctx->promise_ctor) &&
++        !JS_IsObject(argv[0]) && !ctx->rt->promise_hook) {
++        /* Of %Promise% and a non-object: nothing observable happens but
++           the settlement, so no resolving functions are made. */
++        return js_promise_new_settled(ctx, argv[0], is_reject);
++    }
+     if (!is_reject && JS_GetOpaque(argv[0], JS_CLASS_PROMISE)) {
+         JSValue ctor;
+         bool is_same;
+-        ctor = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
+-        if (JS_IsException(ctor))
+-            return ctor;
+-        is_same = js_same_value(ctx, ctor, this_val);
+-        JS_FreeValue(ctx, ctor);
++        if (js_promise_ctor_is_intrinsic(ctx, JS_VALUE_GET_OBJ(argv[0]))) {
++            is_same = JS_VALUE_GET_PTR(this_val) == JS_VALUE_GET_PTR(ctx->promise_ctor);
++        } else {
++            ctor = JS_GetProperty(ctx, argv[0], JS_ATOM_constructor);
++            if (JS_IsException(ctor))
++                return ctor;
++            is_same = js_same_value(ctx, ctor, this_val);
++            JS_FreeValue(ctx, ctor);
++        }
+         if (is_same)
+             return js_dup(argv[0]);
+     }
+@@ -56106,6 +56723,358 @@
      return result_promise;
  }
  
@@ -979,7 +1137,7 @@
 +}
 +
 +int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
-+                        bool for_write, void **pshape)
++                        int mode, void **pshape)
 +{
 +    JSObject *p;
 +    JSShapeProperty *prs;
@@ -998,12 +1156,64 @@
 +    if (!prs)
 +        return -1;
 +    flags = prs->flags;
++    /* mode 2, 3: a getter, a setter */
++    if (mode >= 2) {
++        if ((flags & JS_PROP_TMASK) != JS_PROP_GETSET ||
++            !(mode == 2 ? pr->u.getset.getter : pr->u.getset.setter))
++            return -1;
++        *pshape = js_dup_shape(p->shape);
++        return pr - p->prop;
++    }
 +    if ((flags & JS_PROP_TMASK) != JS_PROP_NORMAL || (flags & JS_PROP_LENGTH))
 +        return -1;
-+    if (for_write && !(flags & JS_PROP_WRITABLE))
++    if (mode && !(flags & JS_PROP_WRITABLE))
 +        return -1;
 +    *pshape = js_dup_shape(p->shape);
 +    return pr - p->prop;
++}
++
++/* Whether `obj` has an own data property `prop` holding `value` (the same
++   object or primitive bits), with nothing observable happening. */
++bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value)
++{
++    JSShapeProperty *prs;
++    JSProperty *pr;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return false;
++    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(obj), prop);
++    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++           JS_VALUE_GET_TAG(pr->u.value) == JS_VALUE_GET_TAG(value) &&
++           JS_VALUE_GET_PTR(pr->u.value) == JS_VALUE_GET_PTR(value);
++}
++
++/* Object literal allocation sites: see quickjs.h. */
++int JS_CachePlainShape(JSContext *ctx, JSValueConst obj, int count, void **pshape)
++{
++    JSObject *p;
++    JSShape *sh;
++    JSShapeProperty *prs;
++    int i;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    sh = p->shape;
++    if (p->class_id != JS_CLASS_OBJECT || !p->extensible || p->is_exotic || !sh->is_hashed ||
++        sh->prop_count != count || sh->deleted_prop_count != 0)
++        return -1;
++    for (i = 0, prs = get_shape_prop(sh); i < count; i++, prs++) {
++        if (prs->flags != JS_PROP_C_W_E)
++            return -1;
++    }
++    *pshape = js_dup_shape(sh);
++    return 0;
++}
++
++JSValue JS_NewObjectWithCachedShape(JSContext *ctx, void *shape, JSValue *values)
++{
++    static_assert(sizeof(JSProperty) == sizeof(JSValue), "");
++    return JS_NewObjectFromShape(ctx, js_dup_shape(shape), JS_CLASS_OBJECT, (JSProperty *)values);
 +}
 +
 +void JS_FreeCachedShape(JSRuntime *rt, void *shape)
@@ -1217,3 +1427,55 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
+@@ -56479,6 +57448,25 @@
+     JSPromiseReactionData *rd_array[2], *rd;
+     int i, j;
+ 
++    if (s->promise_state != JS_PROMISE_PENDING) {
++        /* Settled: the reaction job directly, without reaction records. */
++        JSValueConst args[5];
++        JSValueConst handler;
++        call_promise_rejection_tracker(ctx, promise, true);
++        i = s->promise_state - JS_PROMISE_FULFILLED;
++        handler = resolve_reject[i];
++        if (!JS_IsFunction(ctx, handler))
++            handler = JS_UNDEFINED;
++        args[0] = cap_resolving_funcs[0];
++        args[1] = cap_resolving_funcs[1];
++        args[2] = handler;
++        args[3] = js_bool(i);
++        args[4] = s->promise_result;
++        if (JS_EnqueueJob(ctx, promise_reaction_job, 5, args))
++            return -1;
++        s->is_handled = true;
++        return 0;
++    }
+     rd_array[0] = NULL;
+     rd_array[1] = NULL;
+     for(i = 0; i < 2; i++) {
+@@ -56498,23 +57486,8 @@
+         rd_array[i] = rd;
+     }
+ 
+-    if (s->promise_state == JS_PROMISE_PENDING) {
+-        for(i = 0; i < 2; i++)
+-            list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
+-    } else {
+-        JSValueConst args[5];
+-        call_promise_rejection_tracker(ctx, promise, true);
+-        i = s->promise_state - JS_PROMISE_FULFILLED;
+-        rd = rd_array[i];
+-        args[0] = rd->resolving_funcs[0];
+-        args[1] = rd->resolving_funcs[1];
+-        args[2] = rd->handler;
+-        args[3] = js_bool(i);
+-        args[4] = s->promise_result;
+-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+-        for(i = 0; i < 2; i++)
+-            promise_reaction_data_free(ctx->rt, rd_array[i]);
+-    }
++    for(i = 0; i < 2; i++)
++        list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
+     s->is_handled = true;
+     return 0;
+ }

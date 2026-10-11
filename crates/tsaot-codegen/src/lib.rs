@@ -80,6 +80,10 @@ pub mod layout {
     pub const ABUF_IMMUTABLE: i32 = 9;
     pub const CLASS_ARRAY: i64 = 2;
     pub const CLASS_TYPED_ARRAY: i64 = 22;
+    pub const OBJ_FUNC_DATA: i32 = 48;
+    pub const FDATA_FAST: i32 = 8;
+    pub const FDATA_DATA: i32 = 32;
+    pub const CLASS_C_FUNCTION_DATA: i64 = 15;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -96,6 +100,10 @@ pub mod layout {
         ("ABUF_IMMUTABLE", ABUF_IMMUTABLE as i64),
         ("CLASS_ARRAY", CLASS_ARRAY),
         ("CLASS_TYPED_ARRAY", CLASS_TYPED_ARRAY),
+        ("OBJ_FUNC_DATA", OBJ_FUNC_DATA as i64),
+        ("FDATA_FAST", FDATA_FAST as i64),
+        ("FDATA_DATA", FDATA_DATA as i64),
+        ("CLASS_C_FUNCTION_DATA", CLASS_C_FUNCTION_DATA),
     ];
 }
 
@@ -148,6 +156,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_BinaryOperator", &[P, Int, W, W, W, W], &[W, W]),
         ("JS_UnaryOperator", &[P, Int, W, W], &[W, W]),
         ("JS_ToBool", &[P, W, W], &[Int]),
+        ("JS_ToFloat64", &[P, P, W, W], &[Int]),
         ("JS_ToString", &[P, W, W], &[W, W]),
         ("JS_GetProperty", &[P, W, W, Int], &[W, W]),
         ("JS_SetProperty", &[P, W, W, Int, W, W], &[Int]),
@@ -206,6 +215,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_ic_set_proto", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_call_getter", &[P, P, W, W], &[W, W]),
         ("tsaot_define_accessor", &[P, P, Int, W, W, Int], &[Int]),
+        ("tsaot_new_object", &[P, P, Int, P, P], &[W, W]),
+        ("JS_NewObjectWithCachedShape", &[P, P, P], &[W, W]),
         ("tsaot_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
         ("tsaot_call_setter", &[P, P, W, W, W, W], &[Int]),
         ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
@@ -251,6 +262,8 @@ struct Codegen<'m> {
     closure_base: usize,
     /// Parameter types, by `FuncId`.
     params: std::rc::Rc<Vec<Vec<Ty>>>,
+    /// `value_captures`, by `ClosureId`.
+    value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     fctx: FunctionBuilderContext,
 }
 
@@ -318,6 +331,7 @@ impl<'m> Codegen<'m> {
         data.push(module.declare_data("tsaot_ics", Linkage::Export, true, false)?);
         Ok(Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
+            value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
             module,
             funcs,
             fast_funcs,
@@ -334,6 +348,7 @@ impl<'m> Codegen<'m> {
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
         let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
+        let fast_sig = func.import_signature(fast_signature(self.module));
         Env {
             helpers,
             funcs,
@@ -349,6 +364,8 @@ impl<'m> Codegen<'m> {
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
             params: self.params.clone(),
+            value_captures: self.value_captures.clone(),
+            fast_sig,
         }
     }
 

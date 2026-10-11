@@ -316,12 +316,27 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 /* ---- module state: cells, string constants, atoms ---- */
 
 static JSClassID tsaot_state_class;
+/* `Symbol.iterator` and `next`, made with the pins. */
+static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL;
 
 static int tsaot_ic_count(void);
+
+static int tsaot_fn_cache_count(void)
+{
+    return &tsaot_nfn_caches ? tsaot_nfn_caches : 0;
+}
 
 static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
+    for (i = 0; i < tsaot_fn_cache_count(); i++) {
+        if (tsaot_fn_caches[i].shape)
+            JS_FreeCachedShape(rt, tsaot_fn_caches[i].shape);
+        tsaot_fn_caches[i].shape = NULL;
+        if (tsaot_fn_caches[i].name != JS_ATOM_NULL)
+            JS_FreeAtomRT(rt, tsaot_fn_caches[i].name);
+        tsaot_fn_caches[i].name = JS_ATOM_NULL;
+    }
     for (i = 0; i < tsaot_ncells; i++) {
         JS_FreeValueRT(rt, tsaot_cells[i]);
         tsaot_cells[i] = JS_UNINITIALIZED;
@@ -340,6 +355,9 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     }
     for (i = 0; i < tsaot_natoms; i++)
         JS_FreeAtomRT(rt, tsaot_atoms[i]);
+    JS_FreeAtomRT(rt, tsaot_atom_iterator);
+    JS_FreeAtomRT(rt, tsaot_atom_next);
+    tsaot_atom_iterator = tsaot_atom_next = JS_ATOM_NULL;
     for (i = 0; i < TSAOT_PINS; i++) {
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
@@ -364,6 +382,10 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
 static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     int i;
+    for (i = 0; i < tsaot_fn_cache_count(); i++) {
+        if (tsaot_fn_caches[i].shape)
+            JS_MarkCachedShape(rt, tsaot_fn_caches[i].shape, mark_func);
+    }
     for (i = 0; i < tsaot_ncells; i++)
         JS_MarkValue(rt, tsaot_cells[i], mark_func);
     for (i = 0; i < tsaot_nprivates; i++)
@@ -540,6 +562,8 @@ int tsaot_lock_builtins(JSContext *ctx)
         if (i <= TSAOT_SHAPE_ARRAY)
             tsaot_shapes[i] = *(void **)((char *)JS_VALUE_GET_PTR(tsaot_pins[i]) + JS_LAYOUT_OBJ_SHAPE);
     }
+    tsaot_atom_iterator = JS_ValueToAtom(ctx, tsaot_pins[TSAOT_PIN_SYMBOL_ITERATOR]);
+    tsaot_atom_next = JS_NewAtom(ctx, "next");
     JS_FreeValue(ctx, r);
     return 0;
 }
@@ -569,14 +593,15 @@ static void tsaot_ic_store(JSContext *ctx, TsaotIC *ic, void *shape, void *proto
     ic->kind = kind;
 }
 
-/* Cache an own data property; returns whether it could. */
-static bool tsaot_ic_fill(JSContext *ctx, JSValue obj, JSAtom prop, bool for_write, TsaotIC *ic)
+/* Cache an own data property (mode 0: read, 1: write) or accessor (2: its
+   getter, 3: its setter); returns whether it could. */
+static bool tsaot_ic_fill(JSContext *ctx, JSValue obj, JSAtom prop, int mode, TsaotIC *ic)
 {
     void *shape;
-    int slot = JS_CacheOwnProperty(ctx, obj, prop, for_write, &shape);
+    int slot = JS_CacheOwnProperty(ctx, obj, prop, mode, &shape);
     if (slot < 0)
         return false;
-    tsaot_ic_store(ctx, ic, shape, NULL, NULL, slot, TSAOT_IC_OWN);
+    tsaot_ic_store(ctx, ic, shape, NULL, NULL, slot, mode < 2 ? TSAOT_IC_OWN : TSAOT_IC_OWN_GETTER + mode - 2);
     return true;
 }
 
@@ -597,7 +622,7 @@ JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
     JSValue v = JS_GetProperty(ctx, obj, prop);
     if (!JS_IsException(v))
-        tsaot_ic_fill(ctx, obj, prop, false, ic);
+        tsaot_ic_fill(ctx, obj, prop, 0, ic);
     return v;
 }
 
@@ -612,7 +637,7 @@ int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC 
         before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
     r = JS_SetProperty(ctx, obj, prop, val);
     if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
-        tsaot_ic_fill(ctx, obj, prop, true, ic);
+        tsaot_ic_fill(ctx, obj, prop, 1, ic);
     return r;
 }
 
@@ -805,24 +830,6 @@ int tsaot_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_thro
 
 /* Whether own property `prop` of `obj` is still the data property `value`
  * (checked without calling any getter). */
-static bool tsaot_own_data_is(JSContext *ctx, JSValue obj, JSAtom prop, JSValue value)
-{
-    JSPropertyDescriptor desc;
-    bool same;
-    int r = JS_GetOwnProperty(ctx, &desc, obj, prop);
-    if (r < 0) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return false;
-    }
-    if (r == 0)
-        return false;
-    same = !(desc.flags & JS_PROP_GETSET) && JS_VALUE_GET_TAG(desc.value) == JS_VALUE_GET_TAG(value) &&
-           JS_VALUE_GET_PTR(desc.value) == JS_VALUE_GET_PTR(value);
-    JS_FreeValue(ctx, desc.value);
-    JS_FreeValue(ctx, desc.getter);
-    JS_FreeValue(ctx, desc.setter);
-    return same;
-}
 
 /* Whether iterating an array with the shape of a fresh one is still the
  * original array iteration: Array.prototype[Symbol.iterator] and the
@@ -830,16 +837,10 @@ static bool tsaot_own_data_is(JSContext *ctx, JSValue obj, JSAtom prop, JSValue 
  * iteration starts). */
 int tsaot_array_iter_ok(JSContext *ctx)
 {
-    JSAtom it = JS_ValueToAtom(ctx, tsaot_pins[TSAOT_PIN_SYMBOL_ITERATOR]), next;
-    bool ok = tsaot_own_data_is(ctx, tsaot_pins[TSAOT_PIN_ARRAY_PROTO], it, tsaot_pins[TSAOT_PIN_ARRAY_VALUES]);
-    JS_FreeAtom(ctx, it);
-    if (!ok)
-        return 0;
-    next = JS_NewAtom(ctx, "next");
-    ok = tsaot_own_data_is(ctx, tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_PROTO], next,
-                           tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_NEXT]);
-    JS_FreeAtom(ctx, next);
-    return ok;
+    return JS_OwnDataIs(ctx, tsaot_pins[TSAOT_PIN_ARRAY_PROTO], tsaot_atom_iterator,
+                        tsaot_pins[TSAOT_PIN_ARRAY_VALUES]) &&
+           JS_OwnDataIs(ctx, tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_PROTO], tsaot_atom_next,
+                        tsaot_pins[TSAOT_PIN_ARRAY_ITERATOR_NEXT]);
 }
 
 /* ---- generators ---- */
@@ -1220,7 +1221,7 @@ JSValue tsaot_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, TsaotIC 
     if (!JS_IsException(v) && JS_IsObject(obj)) {
         JSAtom a = JS_ValueToAtom(ctx, name);
         if (a != JS_ATOM_NULL) {
-            tsaot_ic_fill(ctx, obj, a, false, ic);
+            tsaot_ic_fill(ctx, obj, a, 0, ic);
             JS_FreeAtom(ctx, a);
         }
     }
@@ -1235,7 +1236,7 @@ int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic)
     if (r >= 0 && JS_IsObject(v[0])) {
         JSAtom a = JS_ValueToAtom(ctx, v[1]);
         if (a != JS_ATOM_NULL) {
-            tsaot_ic_fill(ctx, v[0], a, true, ic);
+            tsaot_ic_fill(ctx, v[0], a, 1, ic);
             JS_FreeAtom(ctx, a);
         }
     }
@@ -1249,14 +1250,32 @@ _Static_assert(sizeof(TsaotIC) == 32 && offsetof(TsaotIC, slot) == 8 && offsetof
                    offsetof(TsaotIC, proto_shape) == 16 && offsetof(TsaotIC, mid_shape) == 24,
                "TsaotIC layout");
 
+/* Sites that never cache (as for objects with unshared shapes) stop trying
+ * after this many misses, as megamorphic sites in JSC. An empty entry
+ * counts them in `slot`. */
+#define TSAOT_IC_GIVE_UP 64
+
+static bool tsaot_ic_gave_up(TsaotIC *ic)
+{
+    return !ic->shape && ic->slot >= TSAOT_IC_GIVE_UP;
+}
+
+static void tsaot_ic_count_miss(TsaotIC *ic)
+{
+    if (!ic->shape)
+        ic->slot++;
+}
+
 /* A cache miss reading obj.prop (obj borrowed) at a site that also caches
  * the direct prototype's data properties (methods) and getters. */
 JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
     JSValue v = JS_GetProperty(ctx, obj, prop);
-    if (!JS_IsException(v) && !tsaot_ic_fill(ctx, obj, prop, false, ic) &&
-        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_DATA, ic))
-        tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_GETTER, ic);
+    if (!JS_IsException(v) && !tsaot_ic_gave_up(ic) && !tsaot_ic_fill(ctx, obj, prop, 0, ic) &&
+        !tsaot_ic_fill(ctx, obj, prop, 2, ic) &&
+        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_DATA, ic) &&
+        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_GETTER, ic))
+        tsaot_ic_count_miss(ic);
     return v;
 }
 
@@ -1269,9 +1288,12 @@ int tsaot_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, Ts
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
         before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
     r = JS_SetProperty(ctx, obj, prop, val);
-    if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
-        !tsaot_ic_fill(ctx, obj, prop, true, ic))
-        tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_SETTER, ic);
+    if (r >= 0 && before && !tsaot_ic_gave_up(ic) &&
+        before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
+        !tsaot_ic_fill(ctx, obj, prop, 1, ic) &&
+        !tsaot_ic_fill(ctx, obj, prop, 3, ic) &&
+        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_SETTER, ic))
+        tsaot_ic_count_miss(ic);
     return r;
 }
 
@@ -1323,4 +1345,42 @@ int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn,
                               is_setter ? fn : JS_UNDEFINED, flags);
     JS_FreeValue(ctx, fn);
     return r;
+}
+
+/* An object literal { atoms[i]: values[i] } (values taken) at an allocation
+ * site that caches the literal's final shape in `ic`: later objects are
+ * made with it directly (JS_NewObjectWithCachedShape). */
+JSValue tsaot_new_object(JSContext *ctx, TsaotIC *ic, int n, JSAtom *atoms, JSValue *values)
+{
+    JSValue obj = JS_NewObject(ctx);
+    void *shape;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (JS_IsException(obj) ||
+            JS_DefinePropertyValue(ctx, obj, atoms[i], values[i], JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            if (JS_IsException(obj))
+                JS_FreeValue(ctx, values[i]);
+            while (++i < n)
+                JS_FreeValue(ctx, values[i]);
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+    }
+    if (JS_CachePlainShape(ctx, obj, n, &shape) == 0)
+        tsaot_ic_store(ctx, ic, shape, NULL, NULL, 0, TSAOT_IC_OWN);
+    return obj;
+}
+
+/* A closure of a native function (data borrowed): made with the shape of
+ * the function's first closure, as JSC allocates functions with a known
+ * structure. */
+JSValue tsaot_new_closure(JSContext *ctx, TsaotFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
+                          const char *name, int length, int magic, int n, JSValue *data)
+{
+    if (c->name == JS_ATOM_NULL) {
+        c->name = JS_NewAtom(ctx, name);
+        if (c->name == JS_ATOM_NULL)
+            return JS_EXCEPTION;
+    }
+    return JS_NewCFunctionDataShaped(ctx, fast, slow, c->name, length, magic, n, (JSValueConst *)data, &c->shape);
 }

@@ -281,7 +281,7 @@ pub fn check<'a>(
                 .collect();
             let cells = cx.cell_infos();
             let class_uses = cx.class_uses();
-            let module = ir::Module {
+            let mut module = ir::Module {
                 funcs,
                 closures: std::mem::take(&mut cx.closures),
                 strings: cx.strings,
@@ -290,6 +290,7 @@ pub fn check<'a>(
                 privates: cx.privates.len(),
                 homes: 2 * classes.len(),
             };
+            ir::capture_values(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
@@ -1308,6 +1309,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             locals: std::mem::take(&mut self.locals),
             boxed: std::mem::take(&mut self.boxed),
             local_names: std::mem::take(&mut self.local_names),
+            value_captures: vec![false; self.captures.len()],
             captures: std::mem::take(&mut self.captures),
             is_closure: self.is_closure,
             has_this: self.has_this,
@@ -4096,6 +4098,21 @@ fn arith(op: AnyBinOp, x: Expr, y: Expr) -> Expr {
             _ => Ty::F64,
         };
         return Expr::new(ty, ExprKind::Binary(op, Box::new(x), Box::new(y)));
+    }
+    // With a number operand, the result is a number (a BigInt one throws).
+    let numeric = match op {
+        AnyBinOp::Sub => Some(BinOp::Sub),
+        AnyBinOp::Mul => Some(BinOp::Mul),
+        AnyBinOp::Div => Some(BinOp::Div),
+        AnyBinOp::Rem => Some(BinOp::Rem),
+        AnyBinOp::Pow => Some(BinOp::Pow),
+        _ => None,
+    };
+    if let Some(op) = numeric
+        && (num(x.ty) || num(y.ty))
+    {
+        let side = |e: Expr| if num(e.ty) { to_f64(e) } else { any(e) };
+        return Expr::new(Ty::F64, ExprKind::NumArith(op, Box::new(side(x)), Box::new(side(y))));
     }
     let int32 = matches!(op, AnyBinOp::Shl | AnyBinOp::Sar | AnyBinOp::BitAnd | AnyBinOp::BitOr | AnyBinOp::BitXor)
         && (num(x.ty) || num(y.ty));

@@ -168,6 +168,9 @@ pub struct Func {
     /// Closures only: the boxed locals bound to the closure's captured
     /// boxes, in the order of its data slots.
     pub captures: Vec<LocalId>,
+    /// Per capture: whether its data slot holds the captured value itself
+    /// (never assigned; see `capture_values`) rather than its box.
+    pub value_captures: Vec<bool>,
     pub is_closure: bool,
     /// Methods: `this` is passed in (borrowed).
     pub has_this: bool,
@@ -408,6 +411,10 @@ pub enum ExprKind {
     /// A JS value that is an int32 (a bitwise operator applied to a number
     /// and anything else), as an `I32`.
     IntOf(Box<Expr>),
+    /// `-`, `*`, `/`, `%`, `**` with a number and a JS value (`Any`): both
+    /// are evaluated, then the JS value is converted with ToNumber (a BigInt
+    /// throws, as mixing it with a number does). An `F64`.
+    NumArith(BinOp, Box<Expr>, Box<Expr>),
 }
 
 /// What a `Stmt::Yield` does.
@@ -754,6 +761,7 @@ macro_rules! visitor {
                     $name(c, f);
                 }
                 Binary(_, a, b)
+                | NumArith(_, a, b)
                 | Compare(_, a, b)
                 | Logical(_, a, b)
                 | AnyBinary(_, a, b)
@@ -1321,4 +1329,204 @@ fn alias_destructuring(f: &mut Func) {
         }
         _ => {}
     });
+}
+
+/// How `e` itself (not its subexpressions) refers to local `l`: reads
+/// (`Local`, closure captures), and other references (writes).
+fn local_refs(e: &Expr, l: LocalId) -> (usize, usize) {
+    match &e.kind {
+        ExprKind::Local(m) => ((*m == l) as usize, 0),
+        ExprKind::Closure(_, caps) => (caps.iter().filter(|&&m| m == l).count(), 0),
+        ExprKind::SetLocal(m, _)
+        | ExprKind::InitLocal(m, _)
+        | ExprKind::Update { local: m, .. }
+        | ExprKind::ForInGet(m, _, _)
+        | ExprKind::ArrayPush(m, _)
+        | ExprKind::AsyncIterResult(_, m)
+        | ExprKind::IterCloseQuiet(m) => (0, (*m == l) as usize),
+        ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) => (0, (*m == l || *n == l) as usize),
+        ExprKind::IterStep(m, n) => (0, (*m == l || *n == Some(l)) as usize),
+        _ => (0, 0),
+    }
+}
+
+/// `local_refs` over statements, counting the locals that statements name
+/// themselves (except in `NewBoxes`) as other references.
+fn stmts_refs(stmts: &[Stmt], l: LocalId) -> (usize, usize) {
+    let (mut reads, mut others) = (0, 0);
+    visit_stmts(stmts, &mut |e| {
+        let (r, o) = local_refs(e, l);
+        reads += r;
+        others += o;
+    });
+    stmt_locals(stmts, &mut |m| others += (m == l) as usize);
+    others -= new_boxes(stmts, l);
+    (reads, others)
+}
+
+/// How many `NewBoxes` in `stmts` name `l`.
+fn new_boxes(stmts: &[Stmt], l: LocalId) -> usize {
+    let mut n = 0;
+    stmt_lists(stmts, &mut |list| {
+        for s in list {
+            if let Stmt::NewBoxes(ls) = s {
+                n += ls.iter().filter(|&&m| m == l).count();
+            }
+        }
+    });
+    n
+}
+
+/// Calls `f` on `stmts` and on every statement list nested in them.
+fn stmt_lists<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(&'a [Stmt])) {
+    f(stmts);
+    for s in stmts {
+        match s {
+            Stmt::If(_, a, b) => {
+                stmt_lists(a, f);
+                stmt_lists(b, f);
+            }
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => stmt_lists(body, f),
+            Stmt::Switch { cases, .. } => cases.iter().for_each(|(_, b)| stmt_lists(b, f)),
+            Stmt::Try { body, catch, finally, .. } => {
+                stmt_lists(body, f);
+                catch.iter().for_each(|(_, c)| stmt_lists(c, f));
+                finally.iter().for_each(|c| stmt_lists(c, f));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `stmt_lists` for rewriting.
+fn stmt_lists_mut(stmts: &mut Vec<Stmt>, f: &mut impl FnMut(&mut Vec<Stmt>)) {
+    f(stmts);
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::If(_, a, b) => {
+                stmt_lists_mut(a, f);
+                stmt_lists_mut(b, f);
+            }
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => stmt_lists_mut(body, f),
+            Stmt::Switch { cases, .. } => cases.iter_mut().for_each(|(_, b)| stmt_lists_mut(b, f)),
+            Stmt::Try { body, catch, finally, .. } => {
+                stmt_lists_mut(body, f);
+                catch.iter_mut().for_each(|(_, c)| stmt_lists_mut(c, f));
+                finally.iter_mut().for_each(|c| stmt_lists_mut(c, f));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The closures created in `stmts` that capture `l`: (closure, data index).
+fn capturing(stmts: &[Stmt], l: LocalId) -> Vec<(ClosureId, usize)> {
+    let mut out = Vec::new();
+    visit_stmts(stmts, &mut |e| {
+        if let ExprKind::Closure(k, caps) = &e.kind {
+            out.extend(caps.iter().enumerate().filter(|&(_, &m)| m == l).map(|(j, _)| (*k, j)));
+        }
+    });
+    out
+}
+
+/// The statement `InitLocal(l, x)` in `stmts`: `x`, and the statements that
+/// run after it (in its list and, through blocks, the lists around it).
+fn find_decl<'a>(stmts: &'a [Stmt], l: LocalId, outer: &[&'a Stmt]) -> Option<(&'a Expr, Vec<&'a Stmt>)> {
+    for (p, s) in stmts.iter().enumerate() {
+        let rest = || stmts[p + 1..].iter().chain(outer.iter().copied()).collect::<Vec<_>>();
+        match s {
+            Stmt::Expr(Expr { kind: ExprKind::InitLocal(m, x), .. }) if *m == l => return Some((x, rest())),
+            Stmt::Block(body) => {
+                if let Some(r) = find_decl(body, l, &rest()) {
+                    return Some(r);
+                }
+            }
+            _ => {
+                let mut found = None;
+                stmt_lists(std::slice::from_ref(s), &mut |list| {
+                    if found.is_none() && !std::ptr::eq(list, std::slice::from_ref(s)) {
+                        found = find_decl(list, l, &[]);
+                    }
+                });
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether capture `j` of closure `k` can hold the captured value itself:
+/// the closure never assigns it and does not suspend (its frame would
+/// outlive the function data), and neither do the closures it passes it to.
+fn value_capture_ok(m: &Module, k: ClosureId, j: usize) -> bool {
+    let f = &m.closures[k];
+    let c = f.captures[j];
+    !f.is_async
+        && !f.is_generator
+        && stmts_refs(&f.body, c).1 == 0
+        && capturing(&f.body, c).into_iter().all(|(k2, j2)| value_capture_ok(m, k2, j2))
+}
+
+fn mark_value_capture(m: &mut Module, k: ClosureId, j: usize) {
+    m.closures[k].value_captures[j] = true;
+    let c = m.closures[k].captures[j];
+    for (k2, j2) in capturing(&m.closures[k].body, c) {
+        mark_value_capture(m, k2, j2);
+    }
+}
+
+/// Captures by value, as engines capture variables that never change: a
+/// boxed local assigned only by its declaration, used only in the
+/// statements after it (in the same list), and captured only by closures
+/// that never assign it, is no longer boxed, and its closures hold its value
+/// in their data slots instead of the box.
+pub fn capture_values(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    for g in 0..nfuncs + m.closures.len() {
+        let f = if g < nfuncs { &m.funcs[g] } else { &m.closures[g - nfuncs] };
+        let mut found = Vec::new();
+        for l in 0..f.locals.len() {
+            if !f.boxed[l] || f.captures.contains(&l) {
+                continue;
+            }
+            // The declaration: `InitLocal(l, x)` as a statement.
+            let Some((x, after)) = find_decl(&f.body, l, &[]) else { continue };
+            let mut in_init = (0, 0);
+            visit(x, &mut |e| {
+                let (r, o) = local_refs(e, l);
+                in_init.0 += r;
+                in_init.1 += o;
+            });
+            let (reads, others) = stmts_refs(&f.body, l);
+            let after = after.iter().fold((0, 0), |(r, o), s| {
+                let (r2, o2) = stmts_refs(std::slice::from_ref(*s), l);
+                (r + r2, o + o2)
+            });
+            if in_init != (0, 0) || others != 1 || after != (reads, 0) {
+                continue;
+            }
+            let caps = capturing(&f.body, l);
+            if !caps.is_empty() && caps.iter().all(|&(k, j)| value_capture_ok(m, k, j)) {
+                found.push((l, caps));
+            }
+        }
+        for (l, caps) in found {
+            let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+            f.boxed[l] = false;
+            stmt_lists_mut(&mut f.body, &mut |list| {
+                for s in list.iter_mut() {
+                    if let Stmt::NewBoxes(ls) = s {
+                        ls.retain(|&m| m != l);
+                    }
+                }
+                list.retain(|s| !matches!(s, Stmt::NewBoxes(ls) if ls.is_empty()));
+            });
+            for (k, j) in caps {
+                mark_value_capture(m, k, j);
+            }
+        }
+    }
 }

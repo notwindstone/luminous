@@ -120,7 +120,8 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/0001-tsaot-engine-support.patch`, which only *adds* API:
+`patches/0001-tsaot-engine-support.patch`, which adds API and a few
+fast paths that keep the engine's semantics:
 
 - `JSCFunctionFast` and `JS_NewCFunctionDataFast`, the call hook above;
 - `JS_BinaryOperator` / `JS_UnaryOperator`: every JS operator, with exactly
@@ -146,6 +147,14 @@ regular call path's generated code alone.
 - `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
   counts, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
+- `JS_CachePlainShape` / `JS_NewObjectWithCachedShape` and
+  `JS_NewCFunctionDataShaped`: objects and native closures made directly
+  with a cached shape;
+- promises, as in JSC: `Promise.resolve` / `Promise.reject` of a primitive
+  makes a settled promise without resolving functions; resolving a native
+  promise whose `constructor` is the intrinsic one (read without running
+  code) skips the property lookup; reactions to a settled promise are
+  queued without allocating reaction records.
 
 ## What compiles natively
 
@@ -170,12 +179,21 @@ regular call path's generated code alone.
   - string, template, object and array literals;
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
-    check, then a load or store. A cache also covers methods, getters and
-    setters found on the first or second prototype (checking the shapes on
-    the way), and private fields and `super.name`;
+    check, then a load or store. A cache also covers the object's own
+    getters and setters, methods, getters and setters found on the first
+    or second prototype (checking the shapes on the way), and private
+    fields and `super.name`. Sites that never cache stop trying;
+  - object literals: each site caches the literal's final shape, and
+    later objects are made with it directly (as JSC's allocation profiles
+    do);
   - `typeof`, `in`, `instanceof`, `new`;
-  - calls to any function: native functions directly, interpreted ones
-    through the engine;
+  - calls to any function: native functions directly; a callee only known
+    at run time (a method, a getter, a callback) is checked for being a
+    native function and then entered through its native entry, skipping
+    the engine's call path; interpreted ones through the engine;
+  - `-`, `*`, `/`, `%` and `**` between a number and a JS value: the JS
+    value is converted inline, and the result is a number (a BigInt
+    throws, as mixing it with a number does);
   - globals.
 
   Unboxed values are boxed where they meet JS values.
@@ -185,7 +203,9 @@ regular call path's generated code alone.
   `undefined`, encoded as a reserved NaN inside native code.
 - **Closures**: nested functions and arrows, including ones that outlive
   their creator and capture loop variables (one binding per iteration, as in
-  JS). Side effects on module-level bindings (`count++`) are shared with
+  JS). A captured variable never assigned after its declaration is
+  captured by value: no box is allocated for it. Closures of one function
+  share a shape. Side effects on module-level bindings (`count++`) are shared with
   interpreted code.
 - **Class methods, getters and setters** (`this` included; static ones
   too), with the class's
