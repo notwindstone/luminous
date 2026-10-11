@@ -230,6 +230,17 @@ const PURE: &[&str] = &[
     "tsaot_toint32_slow",
 ];
 
+/// The constraints of an empty `asm` statement that writes the vector
+/// registers from `xmm<first>` on (x86-64). LLVM 18 does not know what
+/// writes them before a function's entry or in a call: an instruction that
+/// writes part of a register (`vcvtsi2sd`) may then merge into one of them,
+/// and wait for the caller's or callee's last use of it (which serializes
+/// independent libm calls in a loop). Seeing them written, LLVM breaks the
+/// dependency (`vxorps`). The statement itself is empty.
+fn clobbers(first: u32) -> String {
+    (first..32).map(|i| format!("~{{xmm{i}}}")).collect::<Vec<_>>().join(",")
+}
+
 /// Functions with more instructions than this are not vectorized.
 const HUGE_FUNCTION: usize = 20_000;
 
@@ -595,9 +606,15 @@ impl<'a> FnEmitter<'a> {
                 }
             })
             .collect();
-        let linkage = if linkage == Linkage::Local { "internal " } else { "dso_local " };
+        let exported = linkage != Linkage::Local;
+        let linkage = if exported { "dso_local " } else { "internal " };
         let attrs = if f.no_vectorize || f.insts.len() > HUGE_FUNCTION { 2 } else { 1 };
-        let mut head = format!("define {linkage}{} @{name}({}) #{attrs} {{\n", ret_type(&f.sig), params.join(", "));
+        // Entries from C (JS entries, step functions) start on a cache line,
+        // as Cranelift's do: their speed then does not depend on the code
+        // before them.
+        let align = if exported { " align 64" } else { "" };
+        let mut head =
+            format!("define {linkage}{} @{name}({}) #{attrs}{align} {{\n", ret_type(&f.sig), params.join(", "));
         head.push_str("entry:\n");
         self.out = head;
         for (i, s) in f.slots.iter().enumerate() {
@@ -607,6 +624,13 @@ impl<'a> FnEmitter<'a> {
             let zero = if t.is_float() { "0.0" } else { "0" };
             self.line(format!("%var{i} = alloca {}", ty(t)));
             self.line(format!("store {} {zero}, ptr %var{i}", ty(t)));
+        }
+        if self.x86 && exported && f.sig.params.iter().all(|p| !p.ty.is_float()) {
+            // The caller's vector registers, as written (see `clobbers`):
+            // converting an argument to a double must not wait for the
+            // interpreter's last use of the register it writes. Entries
+            // are only called through pointers, never inlined.
+            self.line(format!("call void asm sideeffect \"\", \"{}\"()", clobbers(0)));
         }
         for (p, &v) in f.sig.params.iter().zip(&entry.params) {
             if p.ptr {
@@ -908,14 +932,9 @@ impl<'a> FnEmitter<'a> {
                 let args = self.call_args(&decl.sig, args);
                 self.call(&decl.sig, &format!("@{}", decl.name), &args, results);
                 if self.x86 && PURE.contains(&decl.name.as_str()) {
-                    // The vector registers the callee wrote, as LLVM 18
-                    // does not count a call's clobbers: an instruction
-                    // writing part of a register (`vcvtsi2sd`) may otherwise
-                    // pick one, and wait for the callee's last use of it,
-                    // which serializes independent libm calls in a loop.
-                    // Seeing them written, LLVM breaks the dependency.
-                    let clobbers: Vec<String> = (1..32).map(|i| format!("~{{xmm{i}}}")).collect();
-                    self.line(format!("call void asm sideeffect \"\", \"{}\"()", clobbers.join(",")));
+                    // The vector registers the callee wrote (but the
+                    // result's), as written: see `clobbers`.
+                    self.line(format!("call void asm sideeffect \"\", \"{}\"()", clobbers(1)));
                 }
             }
             InstData::CallIndirect { sig, callee, args } => {

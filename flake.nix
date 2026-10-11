@@ -1,5 +1,5 @@
 {
-  description = "typescript-aot: strict TypeScript subset AOT-compiled with Cranelift, QuickJS-NG fallback";
+  description = "typescript-aot: strict TypeScript subset AOT-compiled with Cranelift or LLVM, QuickJS-NG fallback";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -10,7 +10,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        # clang as the C compiler/linker driver for QuickJS and the generated glue
+        # clang as the C compiler/linker driver for QuickJS and the generated glue,
+        # and as the LLVM backend (`tsaot build --backend llvm`)
         mkShell = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; };
       in
       {
