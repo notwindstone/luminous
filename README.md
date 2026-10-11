@@ -466,7 +466,9 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   of an int32 and arithmetic on it stays in integers. Elsewhere (an element
   of a plain array), property caches recognize the object's layout. An
   object that does not escape is not allocated at all: its fields become
-  locals, with the same checks on stores. A native function whose `aot
+  locals, with the same checks on stores. In a loop that runs no other code
+  (no calls, getters or conversions), the fields it uses live in registers
+  and are stored back after the loop. A native function whose `aot
   type` parameter gets another value declines the call (the interpreted
   version runs).
 

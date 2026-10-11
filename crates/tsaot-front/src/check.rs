@@ -1344,6 +1344,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         };
         ir::scalar_replace(&mut func);
         ir::scalar_replace_structs(&mut func, self.m.layouts);
+        ir::promote_struct_fields(&mut func, self.m.layouts);
         ir::number_locals(&mut func);
         Ok(func)
     }

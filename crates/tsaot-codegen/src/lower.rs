@@ -271,6 +271,11 @@ pub(crate) struct Lower<'a> {
     int_of: HashMap<Value, Value>,
     /// Of those, the ones in the int32 range.
     i32s: std::collections::HashSet<Value>,
+    /// Exact integers known to be below 2^bits in magnitude (int32s are
+    /// at most 2^31), and integral constants' values: sums and products
+    /// that stay below 2^53 are then exact in integers too.
+    int_bits: HashMap<Value, u32>,
+    int_consts: HashMap<Value, i64>,
     /// Products of two int32s: their exact `i64` value (the `f64` may be
     /// rounded, which cannot change how it compares to an int32).
     wide_of: HashMap<Value, Value>,
@@ -353,6 +358,8 @@ impl<'a> Lower<'a> {
             int_of: HashMap::new(),
             i32s: Default::default(),
             wide_of: HashMap::new(),
+            int_bits: HashMap::new(),
+            int_consts: HashMap::new(),
             rem_of: HashMap::new(),
             bounded: Vec::new(),
             small,
@@ -1363,6 +1370,8 @@ impl<'a> Lower<'a> {
                 if let Some(c) = int_literal(e, INT_EXACT as f64) {
                     let i = self.b.ins().iconst(I64, c);
                     self.int_of.insert(d, i);
+                    self.int_consts.insert(d, c);
+                    self.int_bits.insert(d, 64 - c.unsigned_abs().leading_zeros());
                     if i32::try_from(c).is_ok() {
                         self.i32s.insert(d);
                     }
@@ -3622,7 +3631,39 @@ impl<'a> Lower<'a> {
         self.helper(name, args)[0]
     }
 
+    /// The bound on an exact integer's magnitude (`int_bits`), if known.
+    fn bits_of(&self, v: Value) -> Option<u32> {
+        if !self.int_of.contains_key(&v) {
+            return None;
+        }
+        self.int_bits.get(&v).copied().or(self.i32s.contains(&v).then_some(32))
+    }
+
     fn binary(&mut self, op: BinOp, a: Value, c: Value) -> Value {
+        // Exact in integers below 2^53 (where the `f64` operation is exact
+        // too); a product with a positive constant is never -0.
+        if let (Some(ba), Some(bc)) = (self.bits_of(a), self.bits_of(c)) {
+            let (x, y) = (self.int_of[&a], self.int_of[&c]);
+            let positive = |v: Value| self.int_consts.get(&v).is_some_and(|&k| k > 0);
+            let exact = match op {
+                BinOp::Add | BinOp::Sub => Some(ba.max(bc) + 1),
+                BinOp::Mul if positive(a) || positive(c) => Some(ba + bc),
+                _ => None,
+            };
+            if let Some(bits) = exact.filter(|&b| b <= 53) {
+                let r = match op {
+                    BinOp::Add => self.b.ins().iadd(x, y),
+                    BinOp::Sub => self.b.ins().isub(x, y),
+                    _ => self.b.ins().imul(x, y),
+                };
+                let d = self.int_f64(r);
+                self.int_bits.insert(d, bits);
+                if bits <= 31 {
+                    self.i32s.insert(d);
+                }
+                return d;
+            }
+        }
         let ints = (self.i32s.contains(&a) && self.i32s.contains(&c)).then(|| (self.int_of[&a], self.int_of[&c]));
         match (op, ints) {
             // Exact: |a + b| <= 2^32.

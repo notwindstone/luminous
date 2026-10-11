@@ -2171,3 +2171,222 @@ fn field_local_ty(f: &LayoutField) -> Ty {
         Storage::Value => f.ty,
     }
 }
+
+/// Whether `e` (this node, not its subexpressions) can run no other code
+/// and throw nothing: numbers, booleans, locals, typed array elements, and
+/// fields of `aot type` objects (`promote_struct_fields`; plain stores of
+/// values of the field's type).
+fn pure_node(e: &Expr, layouts: &[Layout]) -> bool {
+    match &e.kind {
+        ExprKind::Num(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Local(_)
+        | ExprKind::SetLocal(..)
+        | ExprKind::InitLocal(..)
+        | ExprKind::Update { .. }
+        | ExprKind::Unary(..)
+        | ExprKind::Binary(..)
+        | ExprKind::Compare(..)
+        | ExprKind::Logical(..)
+        | ExprKind::Cond(..)
+        | ExprKind::Truthy(_)
+        | ExprKind::Math(..)
+        | ExprKind::Seq(_)
+        | ExprKind::Undefined
+        | ExprKind::Null
+        | ExprKind::Str(_)
+        | ExprKind::Box(_)
+        | ExprKind::TypedGet(..)
+        | ExprKind::TypedSet(..)
+        | ExprKind::IntOf(_) => true,
+        ExprKind::StructGet(k, o, fi) => {
+            matches!(o.ty, Ty::Struct(_)) && layouts[*k as usize].fields[*fi as usize].universal
+        }
+        ExprKind::StructSet(k, o, fi, v) => {
+            let f = &layouts[*k as usize].fields[*fi as usize];
+            matches!(o.ty, Ty::Struct(_))
+                && f.simple
+                && match f.storage {
+                    Storage::Int32 => v.ty == Ty::I32,
+                    Storage::F64 => v.ty.is_number(),
+                    Storage::Bool => v.ty == Ty::Bool,
+                    Storage::Value => false,
+                }
+        }
+        ExprKind::Inline { body, .. } => pure_stmts(body, layouts, None),
+        _ => false,
+    }
+}
+
+/// `pure_node` over statements; `loop_id`: the loop they are in (breaks
+/// and continues may only target it or loops within), `None` in an
+/// inlined body (whose `return`s end it).
+fn pure_stmts(stmts: &[Stmt], layouts: &[Layout], loop_id: Option<LoopId>) -> bool {
+    let mut inner = Vec::new();
+    stmt_lists(stmts, &mut |list| {
+        for s in list {
+            if let Stmt::Loop { id, .. } = s {
+                inner.push(*id);
+            }
+        }
+    });
+    let mut ok = true;
+    stmt_lists(stmts, &mut |list| {
+        for s in list {
+            ok &= match s {
+                Stmt::Expr(_) | Stmt::If(..) | Stmt::Block(_) | Stmt::Loop { .. } => true,
+                Stmt::Break(id) | Stmt::Continue(id) => Some(*id) == loop_id || inner.contains(id),
+                Stmt::Return(_) => loop_id.is_none(),
+                _ => false,
+            };
+        }
+    });
+    if ok {
+        visit_stmts(stmts, &mut |e| ok &= pure_node(e, layouts));
+    }
+    ok
+}
+
+/// Fields of `aot type` objects in registers: in a loop that runs no other
+/// code and throws nothing (`pure_stmts`), nothing else can see the object
+/// of a struct local, so the fields it uses live in locals for the loop,
+/// loaded before it and stored back after it. Locals of the same layout
+/// could be the same object: then nothing is done for that layout.
+pub fn promote_struct_fields(f: &mut Func, layouts: &[Layout]) {
+    let mut body = std::mem::take(&mut f.body);
+    promote_in(&mut body, f, layouts);
+    f.body = body;
+}
+
+fn promote_in(stmts: &mut [Stmt], f: &mut Func, layouts: &[Layout]) {
+    let mut i = 0;
+    while i < stmts.len() {
+        if let Stmt::Loop { .. } = &stmts[i]
+            && let Some(block) = promote_loop(&mut stmts[i], f, layouts)
+        {
+            stmts[i] = block;
+            i += 1;
+            continue;
+        }
+        match &mut stmts[i] {
+            Stmt::If(_, a, b) => {
+                promote_in(a, f, layouts);
+                promote_in(b, f, layouts);
+            }
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => promote_in(body, f, layouts),
+            Stmt::Switch { cases, .. } => cases.iter_mut().for_each(|(_, b)| promote_in(b, f, layouts)),
+            Stmt::Try { body, catch, finally, .. } => {
+                promote_in(body, f, layouts);
+                catch.iter_mut().for_each(|(_, c)| promote_in(c, f, layouts));
+                finally.iter_mut().for_each(|c| promote_in(c, f, layouts));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// `promote_struct_fields` for one loop: the block replacing it, if any.
+fn promote_loop(s: &mut Stmt, f: &mut Func, layouts: &[Layout]) -> Option<Stmt> {
+    let Stmt::Loop { id, test, body, update, .. } = s else { return None };
+    let parts: Vec<Stmt> = test.iter().chain(update.iter()).map(|e| Stmt::Expr(e.clone())).collect();
+    if !pure_stmts(body, layouts, Some(*id)) || !pure_stmts(&parts, layouts, Some(*id)) {
+        return None;
+    }
+    // Struct locals used for fields: their layout, fields read and written.
+    let mut fields: HashMap<LocalId, (u32, Vec<u32>, Vec<u32>)> = HashMap::new();
+    let mut count = |e: &Expr| {
+        if let ExprKind::StructGet(k, o, fi) | ExprKind::StructSet(k, o, fi, _) = &e.kind
+            && let ExprKind::Local(l) = o.kind
+        {
+            let entry = fields.entry(l).or_insert((*k, Vec::new(), Vec::new()));
+            let list = if matches!(e.kind, ExprKind::StructSet(..)) { &mut entry.2 } else { &mut entry.1 };
+            if !list.contains(fi) {
+                list.push(*fi);
+            }
+        }
+    };
+    visit_stmts(body, &mut count);
+    test.iter().chain(update.iter()).for_each(|e| visit(e, &mut count));
+    // A local as the object of a field access is also a `Local` node: the
+    // ones used otherwise have more `Local` nodes than accesses.
+    let mut uses: HashMap<LocalId, usize> = HashMap::new();
+    let mut accesses: HashMap<LocalId, usize> = HashMap::new();
+    let mut tally = |e: &Expr| match &e.kind {
+        ExprKind::Local(l) => *uses.entry(*l).or_default() += 1,
+        ExprKind::StructGet(_, o, _) | ExprKind::StructSet(_, o, _, _) => {
+            if let ExprKind::Local(l) = o.kind {
+                *accesses.entry(l).or_default() += 1;
+            }
+        }
+        ExprKind::SetLocal(l, _) | ExprKind::InitLocal(l, _) | ExprKind::Update { local: l, .. } => {
+            *uses.entry(*l).or_default() += 1000;
+        }
+        _ => {}
+    };
+    visit_stmts(body, &mut tally);
+    test.iter().chain(update.iter()).for_each(|e| visit(e, &mut tally));
+    let mut candidates: Vec<(LocalId, u32, Vec<u32>, Vec<u32>)> = fields
+        .into_iter()
+        .filter(|(l, _)| !f.boxed[*l] && uses.get(l) == accesses.get(l))
+        .map(|(l, (k, r, w))| (l, k, r, w))
+        .collect();
+    // One local per layout (two could hold the same object).
+    let mut per_layout: HashMap<u32, usize> = HashMap::new();
+    for c in &candidates {
+        *per_layout.entry(c.1).or_default() += 1;
+    }
+    candidates.retain(|c| per_layout[&c.1] == 1);
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by_key(|c| c.0);
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut map: HashMap<(LocalId, u32), LocalId> = HashMap::new();
+    for (l, k, reads, writes) in &candidates {
+        let lt = f.locals[*l];
+        let mut all: Vec<u32> = reads.iter().chain(writes).copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        for fi in all {
+            let fd = &layouts[*k as usize].fields[fi as usize];
+            let t = field_local_ty(fd);
+            let tmp = f.locals.len();
+            f.locals.push(t);
+            f.boxed.push(false);
+            f.local_names.push(None);
+            map.insert((*l, fi), tmp);
+            let get = Expr::new(fd.ty, ExprKind::StructGet(*k, Box::new(Expr::new(lt, ExprKind::Local(*l))), fi));
+            before.push(Stmt::Expr(Expr::new(t, ExprKind::InitLocal(tmp, Box::new(get)))));
+            if writes.contains(&fi) {
+                let v = Expr::new(t, ExprKind::Local(tmp));
+                let obj = Box::new(Expr::new(lt, ExprKind::Local(*l)));
+                after.push(Stmt::Expr(Expr::new(t, ExprKind::StructSet(*k, obj, fi, Box::new(v)))));
+            }
+        }
+    }
+    let mut rewrite = |e: &mut Expr| {
+        let new = match &mut e.kind {
+            ExprKind::StructGet(_, o, fi) => match o.kind {
+                ExprKind::Local(l) if map.contains_key(&(l, *fi)) => ExprKind::Local(map[&(l, *fi)]),
+                _ => return,
+            },
+            ExprKind::StructSet(_, o, fi, v) => match o.kind {
+                ExprKind::Local(l) if map.contains_key(&(l, *fi)) => {
+                    let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
+                    ExprKind::SetLocal(map[&(l, *fi)], Box::new(v))
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        e.kind = new;
+    };
+    visit_stmts_mut(body, &mut rewrite);
+    test.iter_mut().chain(update.iter_mut()).for_each(|e| visit_mut(e, &mut rewrite));
+    let lp = std::mem::replace(s, Stmt::Block(Vec::new()));
+    before.push(lp);
+    before.extend(after);
+    Some(Stmt::Block(before))
+}
