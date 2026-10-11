@@ -107,6 +107,9 @@ pub struct Candidate<'a> {
     rest: bool,
     /// Annotated return type, if any (only a hint for callers).
     ret: Option<Ty>,
+    /// Methods: their class (index in `Outcome::classes`), and whether
+    /// they are static.
+    class: Option<(usize, bool)>,
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +175,9 @@ pub struct Outcome<'a> {
     pub closure_spans: Vec<Span>,
     /// Rejected candidates with the reason they stay interpreted.
     pub rejected: Vec<(String, Span, Reject)>,
+    /// Top-level classes, and those that native code needs data from.
+    pub classes: Vec<ClassInfo>,
+    pub class_uses: Vec<ClassUse>,
 }
 
 pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> {
@@ -179,7 +185,8 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
     let mut rejected = Vec::new();
     let mut consts = HashMap::new();
     let mut bindings = HashMap::new();
-    collect_toplevel(program, scoping, &mut candidates, &mut rejected, &mut consts, &mut bindings);
+    let mut classes = Vec::new();
+    collect_toplevel(program, scoping, &mut classes, &mut candidates, &mut rejected, &mut consts, &mut bindings);
 
     if scoping.root_unresolved_references().contains_key("eval") {
         // Direct eval can read and rebind module-level bindings, so nothing
@@ -217,6 +224,10 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
             cell_ids: HashMap::new(),
             closures: Vec::new(),
             closure_spans: Vec::new(),
+            classes: &classes,
+            privates: Vec::new(),
+            private_ids: HashMap::new(),
+            homes_used: Vec::new(),
         };
         for i in 0..candidates.len() {
             cx.ensure(i);
@@ -234,15 +245,18 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
                 })
                 .collect();
             let cells = cx.cell_infos();
+            let class_uses = cx.class_uses();
             let module = ir::Module {
                 funcs,
                 closures: std::mem::take(&mut cx.closures),
                 strings: cx.strings,
                 atoms: cx.atoms,
                 cells: cells.iter().map(|c| c.name.clone()).collect(),
+                privates: cx.privates.len(),
+                homes: 2 * classes.len(),
             };
             let closure_spans = std::mem::take(&mut cx.closure_spans);
-            return Outcome { native: candidates, module, cells, closure_spans, rejected };
+            return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
         let mut reasons: HashMap<usize, Reject> = HashMap::new();
         for &i in &failed {
@@ -270,6 +284,7 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping) -> Outcome<'a> 
 fn collect_toplevel<'a>(
     program: &'a Program<'a>,
     scoping: &'a Scoping,
+    classes: &mut Vec<ClassInfo>,
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
     consts: &mut HashMap<SymbolId, ConstVal>,
@@ -328,6 +343,7 @@ fn collect_toplevel<'a>(
                 params,
                 rest,
                 ret,
+                class: None,
             }),
             Err(r) => rejected.push((name, node.span(), r)),
         }
@@ -416,8 +432,9 @@ fn collect_toplevel<'a>(
                 if let Some(id) = &c.id {
                     bind(id, BindingKind::Class, None, end, exported);
                     if c.decorators.is_empty() && !c.declare {
-                        class_methods(c, &id.name, end, &mut methods, &mut method_rejects);
+                        class_methods(c, &id.name, classes.len(), end, &mut methods, &mut method_rejects);
                     }
+                    classes.push(class_info(c, &id.name));
                 }
                 pure_prefix = false;
             }
@@ -430,10 +447,68 @@ fn collect_toplevel<'a>(
     rejected.extend(method_rejects);
 }
 
+/// What a private name of a class is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateKind {
+    Field,
+    Method,
+    Getter,
+    Setter,
+    /// A getter and a setter.
+    Accessor,
+}
+
+/// A top-level class, for the native code of its methods.
+#[derive(Clone, Debug)]
+pub struct ClassInfo {
+    pub name: String,
+    /// Just inside the `{` of the class body.
+    pub body_start: u32,
+    /// Private names (with their `#`).
+    pub privates: Vec<(String, PrivateKind)>,
+}
+
+/// A class whose private names or home object native code uses: it gets
+/// a static block that hands them over (see `erase`).
+#[derive(Clone, Debug)]
+pub struct ClassUse {
+    /// Index in `Outcome::classes`, which is also its home slots' (`2k`).
+    pub class: usize,
+    /// The private name variables (`#x`, or `#x<set>` for a setter) it
+    /// hands over, and their slots.
+    pub vars: Vec<(String, usize)>,
+}
+
+fn class_info(c: &Class, name: &str) -> ClassInfo {
+    let mut privates: Vec<(String, PrivateKind)> = Vec::new();
+    for el in &c.body.body {
+        let (key, kind) = match el {
+            ClassElement::PropertyDefinition(p) => (&p.key, PrivateKind::Field),
+            ClassElement::MethodDefinition(m) => (
+                &m.key,
+                match m.kind {
+                    MethodDefinitionKind::Get => PrivateKind::Getter,
+                    MethodDefinitionKind::Set => PrivateKind::Setter,
+                    _ => PrivateKind::Method,
+                },
+            ),
+            _ => continue,
+        };
+        let PropertyKey::PrivateIdentifier(id) = key else { continue };
+        let name = format!("#{}", id.name);
+        match privates.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, k)) => *k = PrivateKind::Accessor,
+            None => privates.push((name, kind)),
+        }
+    }
+    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates }
+}
+
 /// Ordinary methods (static or not) of a top-level class.
 fn class_methods<'a>(
     c: &'a Class<'a>,
     class: &str,
+    index: usize,
     stmt_end: u32,
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
@@ -466,6 +541,7 @@ fn class_methods<'a>(
                 params,
                 rest,
                 ret,
+                class: Some((index, m.r#static)),
             }),
             Err(r) => rejected.push((format!("{class}.{key}"), node.span(), r)),
         }
@@ -569,6 +645,12 @@ struct ModuleCx<'m, 'a> {
     cell_ids: HashMap<SymbolId, ir::CellId>,
     closures: Vec<ir::Func>,
     closure_spans: Vec<Span>,
+    classes: &'m [ClassInfo],
+    /// Private name slots: (class, variable).
+    privates: Vec<(usize, String)>,
+    private_ids: HashMap<(usize, String), usize>,
+    /// Classes whose home object native code uses.
+    homes_used: Vec<usize>,
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
@@ -581,11 +663,13 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         let (sym, node, name, has_this) = (c.node.span().start, c.node, c.name.clone(), c.has_this);
         let params: Vec<ParamSpec<'a>> = c.params.iter().map(|p| (p.pattern, p.ty, p.default)).collect();
         let rest = c.rest;
+        let class = c.class;
         let caps = Rc::new(capture_info(node, self.scoping));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
             let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
             fx.rest = rest;
+            fx.class = class;
             fx.has_this = has_this;
             let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
@@ -672,6 +756,38 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         Ok(self.cells.len() - 1)
     }
 
+    /// The slot of private name variable `var` of class `class`.
+    fn private(&mut self, class: usize, var: &str) -> usize {
+        let key = (class, var.to_string());
+        if let Some(&id) = self.private_ids.get(&key) {
+            return id;
+        }
+        self.privates.push(key.clone());
+        self.private_ids.insert(key, self.privates.len() - 1);
+        self.privates.len() - 1
+    }
+
+    fn class_uses(&self) -> Vec<ClassUse> {
+        fn index(uses: &mut Vec<ClassUse>, class: usize) -> usize {
+            match uses.iter().position(|u| u.class == class) {
+                Some(i) => i,
+                None => {
+                    uses.push(ClassUse { class, vars: Vec::new() });
+                    uses.len() - 1
+                }
+            }
+        }
+        let mut uses: Vec<ClassUse> = Vec::new();
+        for &c in &self.homes_used {
+            index(&mut uses, c);
+        }
+        for (slot, (c, var)) in self.privates.iter().enumerate() {
+            let i = index(&mut uses, *c);
+            uses[i].vars.push((var.clone(), slot));
+        }
+        uses
+    }
+
     fn cell_infos(&self) -> Vec<CellInfo> {
         self.cells
             .iter()
@@ -718,6 +834,9 @@ struct FnCx<'x, 'm, 'a> {
     has_this: bool,
     is_async: bool,
     is_generator: bool,
+    /// Methods (and the closures in them): their class, and whether the
+    /// method is static.
+    class: Option<(usize, bool)>,
     /// The last parameter is a rest parameter.
     rest: bool,
     /// Functions that suspend: where a return value waits for `finally`s.
@@ -881,6 +1000,10 @@ enum Place {
     /// used in place, which `assign` copies when the value may reassign it.
     Prop(ir::LocalId, ir::AtomId),
     Elem(ir::LocalId, ir::LocalId),
+    /// `obj.#name` (with the `#`).
+    Private(ir::LocalId, String),
+    /// `super[key]`: the home slot, and the key in a local.
+    Super(usize, ir::LocalId),
 }
 
 impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
@@ -901,6 +1024,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_generator: false,
             ret_slot: None,
             rest: false,
+            class: None,
             locals: Vec::new(),
             mutable: Vec::new(),
             boxed: Vec::new(),
@@ -1700,6 +1824,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let widened = self.widened.clone();
         let mut inner = FnCx::new(&mut *self.m, caps, key, true, widened);
         inner.rest = rest;
+        inner.class = self.class;
         let r = inner.function(node, name, params);
         let request = inner.widen_request;
         let f = match r {
@@ -1722,6 +1847,112 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.m.closure_spans.push(node.span());
         Ok(Expr::new(Ty::Any, ExprKind::Closure(self.m.closures.len() - 1, boxes)))
     }
+    // ---- classes: private names and `super` ----
+
+    /// The class and kind of private name `name` (with its `#`).
+    fn private_kind(&self, name: &str, span: Span) -> R<(usize, PrivateKind)> {
+        let Some((class, _)) = self.class else {
+            return reject(span, "private names outside class methods are not supported");
+        };
+        match self.m.classes[class].privates.iter().find(|(n, _)| n == name) {
+            Some(&(_, kind)) => Ok((class, kind)),
+            None => reject(span, format!("`{name}` is not a private name of this class")),
+        }
+    }
+
+    fn private_read(&mut self, obj: Expr, name: &str, span: Span) -> R<Expr> {
+        let (class, kind) = self.private_kind(name, span)?;
+        let obj = Box::new(any(obj));
+        let slot = self.m.private(class, name);
+        Ok(Expr::new(
+            Ty::Any,
+            match kind {
+                PrivateKind::Field => ExprKind::PrivateField(obj, slot),
+                PrivateKind::Method => ExprKind::PrivateMethod(obj, slot),
+                PrivateKind::Getter | PrivateKind::Accessor => ExprKind::PrivateGetter(obj, slot),
+                PrivateKind::Setter => return reject(span, format!("`{name}` has no getter")),
+            },
+        ))
+    }
+
+    fn private_write(&mut self, obj: Expr, name: &str, v: Expr, span: Span) -> R<Expr> {
+        let (class, kind) = self.private_kind(name, span)?;
+        let (obj, v) = (Box::new(any(obj)), Box::new(any(v)));
+        Ok(Expr::new(
+            Ty::Any,
+            match kind {
+                PrivateKind::Field => ExprKind::PrivateSetField(obj, self.m.private(class, name), v),
+                PrivateKind::Setter | PrivateKind::Accessor => {
+                    ExprKind::PrivateSetter(obj, self.m.private(class, &format!("{name}<set>")), v)
+                }
+                PrivateKind::Method | PrivateKind::Getter => {
+                    return reject(span, format!("`{name}` cannot be assigned"));
+                }
+            },
+        ))
+    }
+
+    /// The home object slot of the enclosing method, for `super`.
+    fn home(&mut self, span: Span) -> R<usize> {
+        match self.class {
+            Some((class, is_static)) if self.has_this => {
+                if !self.m.homes_used.contains(&class) {
+                    self.m.homes_used.push(class);
+                }
+                Ok(2 * class + is_static as usize)
+            }
+            _ => reject(span, "`super` is only supported in class methods"),
+        }
+    }
+
+    /// The key of `super.name` / `super[e]` (`None`: not `super`).
+    fn super_key(&mut self, e: &'a MemberExpression<'a>) -> R<Option<(usize, Expr)>> {
+        let (object, key) = match e {
+            MemberExpression::StaticMemberExpression(s) => {
+                let id = self.m.string(s.property.name.as_str());
+                (&s.object, Expr::new(Ty::Any, ExprKind::Str(id)))
+            }
+            MemberExpression::ComputedMemberExpression(c) if matches!(c.object, Expression::Super(_)) => {
+                (&c.object, any(self.expr(&c.expression)?))
+            }
+            _ => return Ok(None),
+        };
+        if !matches!(object, Expression::Super(_)) {
+            return Ok(None);
+        }
+        Ok(Some((self.home(e.span())?, key)))
+    }
+
+    /// `f.call(this, ...args)`: `this`, then `f` (from `this`, in a local),
+    /// are evaluated before the arguments (into temporaries before any
+    /// `await` in them).
+    fn call_this(
+        &mut self,
+        this: Expr,
+        f: impl FnOnce(&mut Self, Expr) -> R<Expr>,
+        args: &'a [Argument<'a>],
+    ) -> R<Expr> {
+        let mark = self.pre.len();
+        let (ft, tt) = (self.temp(Ty::Any), self.temp(Ty::Any));
+        let f = f(self, self.local(tt))?;
+        let call = if has_spread(args) {
+            let arr = self.arg_array(args, &mut [])?;
+            ExprKind::CallSpread(Box::new(self.local(ft)), Box::new(self.local(tt)), Box::new(arr))
+        } else {
+            let args = self.args(args)?;
+            ExprKind::CallThis(Box::new(self.local(ft)), Box::new(self.local(tt)), args)
+        };
+        let setup = vec![set(tt, any(this)), set(ft, any(f))];
+        let call = Expr::new(Ty::Any, call);
+        if self.pre.len() == mark {
+            let mut xs = setup;
+            xs.push(call);
+            return Ok(seq(xs));
+        }
+        self.pre.splice(mark..mark, setup.into_iter().map(Stmt::Expr));
+        Ok(call)
+    }
+
     // ---- destructuring ----
 
     /// Evaluate `e` for a statement appended to `out`: the statements
@@ -2116,6 +2347,28 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::TemplateLiteral(t) => self.template(t)?,
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             Expression::Identifier(id) => self.ident(id)?,
+            Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)
+                if let Some((home, key)) = self.super_key(e.as_member_expression().unwrap())? =>
+            {
+                Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(key)))
+            }
+            Expression::PrivateFieldExpression(p) => {
+                if p.optional {
+                    return reject(span, "optional chaining is not supported yet");
+                }
+                let obj = self.expr(&p.object)?;
+                self.private_read(obj, &format!("#{}", p.field.name), span)?
+            }
+            Expression::PrivateInExpression(p) => {
+                let name = format!("#{}", p.left.name);
+                let (class, kind) = self.private_kind(&name, span)?;
+                if kind == PrivateKind::Setter {
+                    return reject(span, format!("`{name} in` of a setter is not supported"));
+                }
+                let obj = any(self.expr(&p.right)?);
+                let slot = self.m.private(class, &name);
+                Expr::new(Ty::Bool, ExprKind::PrivateIn(Box::new(obj), slot))
+            }
             Expression::StaticMemberExpression(m) => match builtin_const(m, self.m.scoping) {
                 Some(v) => Expr::num(v),
                 None => {
@@ -2665,6 +2918,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn place(&mut self, t: &'a SimpleAssignmentTarget<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         Ok(match t {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => return self.ident_place(id),
+            SimpleAssignmentTarget::StaticMemberExpression(_) | SimpleAssignmentTarget::ComputedMemberExpression(_)
+                if let Some((home, key)) = self.super_key(t.as_member_expression().unwrap())? =>
+            {
+                // The key is evaluated into a local first.
+                let k = self.temp(Ty::Any);
+                (vec![set(k, key)], Place::Super(home, k), None)
+            }
+            SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                let name = format!("#{}", p.field.name);
+                if let Some(l) = self.plain_local(&p.object) {
+                    return Ok((vec![], Place::Private(l, name), None));
+                }
+                let obj = any(self.expr(&p.object)?);
+                let t = self.temp(Ty::Any);
+                (vec![set(t, obj)], Place::Private(t, name), None)
+            }
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 let atom = self.m.atom(m.property.name.as_str());
                 if let Some(l) = self.plain_local(&m.object) {
@@ -2706,7 +2975,6 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             SimpleAssignmentTarget::TSNonNullExpression(a) => return self.place_expr(&a.expression),
             SimpleAssignmentTarget::TSSatisfiesExpression(a) => return self.place_expr(&a.expression),
             SimpleAssignmentTarget::TSTypeAssertion(a) => return self.place_expr(&a.expression),
-            other => return reject(other.span(), "unsupported assignment target"),
         })
     }
 
@@ -2795,14 +3063,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     /// The current value at `place`.
-    fn read(&self, p: &Place) -> Expr {
-        match *p {
+    fn read(&mut self, p: &Place, span: Span) -> R<Expr> {
+        Ok(match *p {
             Place::Local(l) => self.local(l),
             Place::Cell(c) => Expr::new(Ty::Any, ExprKind::Cell(c)),
             Place::Global(a) => Expr::new(Ty::Any, ExprKind::Global(a)),
             Place::Prop(o, a) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(self.local(o))), a)),
             Place::Elem(o, k) => get_elem(self.local(o), Key::Value(Box::new(self.local(k)))),
-        }
+            Place::Private(o, ref name) => {
+                let name = name.clone();
+                return self.private_read(self.local(o), &name, span);
+            }
+            Place::Super(home, k) => Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(self.local(k)))),
+        })
     }
 
     /// Store `v` at `place`; evaluates to the stored value.
@@ -2815,6 +3088,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Expr::new(Ty::Any, ExprKind::SetProp(Box::new(any(self.local(o))), a, Box::new(any(v))))
             }
             Place::Elem(o, k) => set_elem(self.local(o), self.local(k), v),
+            Place::Private(o, ref name) => {
+                let name = name.clone();
+                return self.private_write(self.local(o), &name, v, span);
+            }
+            Place::Super(home, k) => {
+                Expr::new(Ty::Any, ExprKind::SuperSet(home, Box::new(self.local(k)), Box::new(any(v))))
+            }
         })
     }
 
@@ -2852,7 +3132,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 AssignmentOperator::BitwiseAnd => AnyBinOp::BitAnd,
                 _ => return reject(a.span, format!("`{}` is not supported yet", a.operator.as_str())),
             };
-            let mut cur = [self.read(&place)];
+            let mut cur = [self.read(&place, a.span)?];
             let rhs = self.expr(&a.right)?;
             if self.pre.len() > mark {
                 // The target is resolved and read before the awaits.
@@ -2866,7 +3146,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // may reassign the local (or awaits run in between): then the object
         // is copied first, as JS evaluates it before the value.
         let mut place = place;
-        if let Place::Prop(o, _) | Place::Elem(o, _) = place
+        if let Place::Prop(o, _) | Place::Elem(o, _) | Place::Private(o, _) = place
             && self.local_names[o].is_some()
             && (ir::assigns_local(&value, o) || self.pre.len() > mark)
         {
@@ -2876,6 +3156,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             place = match place {
                 Place::Prop(_, a) => Place::Prop(t, a),
                 Place::Elem(_, k) => Place::Elem(t, k),
+                Place::Private(_, n) => Place::Private(t, n),
                 other => other,
             };
         }
@@ -2900,7 +3181,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.widen_request = sym;
             return Err(Reject { span: u.span, msg: "retry".into(), retry: true, callee: false });
         }
-        let cur = self.read(&place);
+        let cur = self.read(&place, u.span)?;
         if num(cur.ty) {
             // A typed array element: number arithmetic.
             let old = self.temp(Ty::F64);
@@ -3046,6 +3327,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             return reject(c.span, "optional calls are not supported yet");
         }
         match c.callee.without_parentheses() {
+            callee @ (Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_))
+                if let Some((home, key)) = self.super_key(callee.as_member_expression().unwrap())? =>
+            {
+                let this = Expr::new(Ty::Any, ExprKind::This);
+                let get = |_: &mut Self, _| Ok(Expr::new(Ty::Any, ExprKind::SuperGet(home, Box::new(key))));
+                self.call_this(this, get, &c.arguments)
+            }
+            Expression::PrivateFieldExpression(p) => {
+                let obj = self.expr(&p.object)?;
+                let name = format!("#{}", p.field.name);
+                let span = p.span;
+                self.call_this(obj, |cx, o| cx.private_read(o, &name, span), &c.arguments)
+            }
             Expression::Identifier(id) => {
                 let sym = self.resolve(id);
                 if let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == Some(s)))
@@ -3101,8 +3395,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let [obj] = obj;
                 self.call_method(obj, key, &c.arguments)
             }
-            Expression::PrivateFieldExpression(_) => reject(c.span, "private fields are not supported yet"),
-            Expression::Super(_) => reject(c.span, "`super` is not supported yet"),
+            Expression::Super(_) => reject(c.span, "`super()` calls (in constructors) are not supported"),
             other => {
                 let callee = any(self.expr(other)?);
                 self.call_value(callee, &c.arguments)

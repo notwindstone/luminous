@@ -178,6 +178,12 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_object_spread", &[P, W, W, W, W], &[Int]),
         ("tsaot_array_iter_close", &[P, W, W, Int, Int], &[Int]),
         ("tsaot_array_iter_ok", &[P], &[Int]),
+        ("JS_PrivateGet", &[P, W, W, W, W], &[W, W]),
+        ("tsaot_private_set", &[P, P, W, W], &[Int]),
+        ("JS_PrivateCheckBrand", &[P, W, W, W, W], &[Int]),
+        ("JS_PrivateIn", &[P, W, W, W, W], &[Int]),
+        ("tsaot_super_get", &[P, P], &[W, W]),
+        ("tsaot_super_set", &[P, P, W, W], &[Int]),
         ("tsaot_gen_start", &[P, Int, Int, P], &[W, W]),
         ("tsaot_gen_new", &[P, W, W, P], &[W, W]),
         ("tsaot_yield_star", &[P, P, Int, P], &[W, W]),
@@ -218,7 +224,7 @@ struct Codegen<'m> {
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 7],
+    data: [DataId; 9],
     /// Inline caches allocated so far (`tsaot_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
@@ -246,6 +252,16 @@ impl<'m> Codegen<'m> {
             Arg::D => F64,
         };
         for &(name, params, rets) in HELPERS {
+            // A JSValue (two words) that does not fit in the remaining
+            // argument registers is passed on the stack whole (SysV), which
+            // separate words cannot express.
+            let mut pair = false;
+            for (words, a) in params.iter().enumerate() {
+                if matches!(a, Arg::W) {
+                    pair = !pair;
+                    assert!(!(pair && words == 5), "helper {name}: a JSValue would straddle the registers");
+                }
+            }
             let mut sig = module.make_signature();
             sig.params.extend(params.iter().map(|a| AbiParam::new(ty(a))));
             sig.returns.extend(rets.iter().map(|a| AbiParam::new(ty(a))));
@@ -263,9 +279,16 @@ impl<'m> Codegen<'m> {
             }
         }
         let mut data = Vec::new();
-        for name in
-            ["tsaot_stack_limit", "tsaot_unwinding", "tsaot_cells", "tsaot_strings", "tsaot_atoms", "tsaot_shapes"]
-        {
+        for name in [
+            "tsaot_stack_limit",
+            "tsaot_unwinding",
+            "tsaot_cells",
+            "tsaot_strings",
+            "tsaot_atoms",
+            "tsaot_shapes",
+            "tsaot_privates",
+            "tsaot_homes",
+        ] {
             data.push(module.declare_data(name, Linkage::Import, true, false)?);
         }
         // Defined here, once all sites are known (`define_ics`).
@@ -285,7 +308,7 @@ impl<'m> Codegen<'m> {
     fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
         let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
         let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
-        let [stack_limit, unwinding, cells, strings, atoms, shapes, ics] =
+        let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, ics] =
             self.data.map(|d| self.module.declare_data_in_func(d, func));
         Env {
             helpers,
@@ -296,6 +319,8 @@ impl<'m> Codegen<'m> {
             strings,
             atoms,
             shapes,
+            privates,
+            homes,
             ics,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
@@ -309,7 +334,7 @@ impl<'m> Codegen<'m> {
         let mut table = cranelift_module::DataDescription::new();
         table.define_zeroinit(n.max(1) * 16);
         table.set_align(8);
-        self.module.define_data(self.data[6], &table)?;
+        self.module.define_data(self.data[8], &table)?;
         let count = self.module.declare_data("tsaot_nics", Linkage::Export, false, false)?;
         let mut desc = cranelift_module::DataDescription::new();
         desc.define((n as i32).to_le_bytes().to_vec().into_boxed_slice());

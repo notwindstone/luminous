@@ -174,6 +174,10 @@ pub(crate) struct Env {
     pub shapes: GlobalValue,
     /// `tsaot_ics`: inline caches, and the next free one.
     pub ics: GlobalValue,
+    /// `tsaot_privates` / `tsaot_homes`: private name values and home objects
+    /// of classes (see `ir::Module`).
+    pub privates: GlobalValue,
+    pub homes: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -1836,6 +1840,116 @@ impl<'a> Lower<'a> {
             }
             ExprKind::ForInIterator(x) => self.convert(x, "JS_ForInIteratorObject"),
             ExprKind::ToObject(x) => self.convert(x, "JS_ToObject"),
+            ExprKind::PrivateField(o, slot) => {
+                let (obj, owned) = self.operand(o, &[]);
+                let (op_, ot) = obj.any();
+                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let r = self.helper("JS_PrivateGet", &[ctx, op_, ot, np, nt]);
+                self.check_value(r[1]);
+                self.drop_operand(obj, owned);
+                V::Any(r[0], r[1])
+            }
+            ExprKind::PrivateSetField(o, slot, x) => {
+                let (obj, owned) = self.operand(o, &[x]);
+                let v = self.expr(x);
+                self.hold(v);
+                let (vp, vt) = v.any();
+                // One reference for the field (taken), one for the expression.
+                self.dup((vp, vt));
+                let (op_, ot) = obj.any();
+                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let slot = self.values_slot(&[(op_, ot), (np, nt)]);
+                let r = self.helper("tsaot_private_set", &[ctx, slot, vp, vt]);
+                self.check_int(r[0]);
+                self.release(v);
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::PrivateMethod(o, slot) | ExprKind::PrivateGetter(o, slot) => {
+                let (obj, owned) = self.operand(o, &[]);
+                let (op_, ot) = obj.any();
+                let (fp, ft) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let r = self.helper("JS_PrivateCheckBrand", &[ctx, op_, ot, fp, ft]);
+                self.check_int(r[0]);
+                let v = if let ExprKind::PrivateGetter(..) = e.kind {
+                    let slot = self.values_slot(&[(fp, ft), (op_, ot)]);
+                    let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+                    let argc = self.b.ins().iconst(I32, 0);
+                    let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                    self.check_value(r[1]);
+                    V::Any(r[0], r[1])
+                } else {
+                    self.dup((fp, ft));
+                    V::Any(fp, ft)
+                };
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::PrivateSetter(o, slot, x) => {
+                let (obj, owned) = self.operand(o, &[x]);
+                let v = self.expr(x);
+                self.hold(v);
+                let (vp, vt) = v.any();
+                let (op_, ot) = obj.any();
+                let (fp, ft) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let r = self.helper("JS_PrivateCheckBrand", &[ctx, op_, ot, fp, ft]);
+                self.check_int(r[0]);
+                let slot = self.values_slot(&[(fp, ft), (op_, ot), (vp, vt)]);
+                let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+                let argc = self.b.ins().iconst(I32, 1);
+                let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                self.check_value(r[1]);
+                self.free((r[0], r[1]));
+                self.release(v);
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::PrivateIn(o, slot) => {
+                let (obj, owned) = self.operand(o, &[]);
+                let (op_, ot) = obj.any();
+                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let r = self.helper("JS_PrivateIn", &[ctx, op_, ot, np, nt]);
+                self.check_int(r[0]);
+                self.drop_operand(obj, owned);
+                V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, r[0], 0))
+            }
+            ExprKind::SuperGet(home, k) => {
+                let key = self.expr(k);
+                self.hold(key);
+                let h = self.table_value(self.env.homes, *home);
+                let this = self.this.expect("`super` in a method");
+                let slot = self.values_slot(&[h, this, key.any()]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_super_get", &[ctx, slot]);
+                self.check_value(r[1]);
+                self.release(key);
+                self.free_v(key);
+                V::Any(r[0], r[1])
+            }
+            ExprKind::SuperSet(home, k, x) => {
+                let key = self.expr(k);
+                self.hold(key);
+                let v = self.expr(x);
+                self.hold(v);
+                let (vp, vt) = v.any();
+                // One reference for the property (taken), one for the expression.
+                self.dup((vp, vt));
+                let h = self.table_value(self.env.homes, *home);
+                let this = self.this.expect("`super` in a method");
+                let slot = self.values_slot(&[h, this, key.any()]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_super_set", &[ctx, slot, vp, vt]);
+                self.check_int(r[0]);
+                self.release(v);
+                self.release(key);
+                self.free_v(key);
+                v
+            }
             ExprKind::ToPropKey(x) => self.convert(x, "JS_ToPropertyKey"),
             ExprKind::ArrayPush(arr, x) => {
                 // Takes ownership of the value.
@@ -2801,6 +2915,15 @@ impl<'a> Lower<'a> {
         self.b.ins().brif(is_array, array, &[], slow, &[]);
         self.b.switch_to_block(array);
         self.b.ins().uload32(Self::mem(), p, layout::OBJ_ARRAY_COUNT)
+    }
+
+    /// Entry `slot` of a table of JS values (borrowed).
+    fn table_value(&mut self, table: GlobalValue, slot: usize) -> (Value, Value) {
+        let base = self.b.ins().symbol_value(self.ptr, table);
+        let at = (slot * SIZE) as i32;
+        let p = self.b.ins().load(I64, Self::mem(), base, at);
+        let t = self.b.ins().load(I64, Self::mem(), base, at + TAG_OFFSET);
+        (p, t)
     }
 
     /// Address of fast array element `idx`.

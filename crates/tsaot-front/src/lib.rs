@@ -38,6 +38,19 @@ pub struct NativeDecl {
     pub line: u32,
 }
 
+/// A class that hands data to native code when it is defined: a static
+/// block calls `__tsaot_class(index, this, (o) => { ... })`, where the arrow
+/// references private names so that their values can be read from it.
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    /// Its home slots are `2 * index` (prototype) and `2 * index + 1`.
+    pub index: usize,
+    /// Where the static block goes (just inside the class body).
+    pub body_start: u32,
+    /// Private name variables (`#x`, `#x<set>`) and their slots.
+    pub vars: Vec<(String, usize)>,
+}
+
 /// A module-level binding that native code accesses through a cell.
 #[derive(Debug, Clone)]
 pub struct CellDecl {
@@ -86,6 +99,7 @@ pub struct Analysis {
     pub cells: Vec<CellDecl>,
     pub cell_refs: Vec<CellRef>,
     pub rejected: Vec<Rejected>,
+    pub classes: Vec<ClassDecl>,
 }
 
 fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
@@ -214,7 +228,12 @@ pub fn analyze(original: &str, path: &Path) -> Result<Analysis, String> {
         refs.visit_program(program);
     }
     let cell_refs = refs.out;
-    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected })
+    let classes = out
+        .class_uses
+        .iter()
+        .map(|u| ClassDecl { index: u.class, body_start: out.classes[u.class].body_start, vars: u.vars.clone() })
+        .collect();
+    Ok(Analysis { source: source.clone(), module: out.module, natives, cells, cell_refs, rejected, classes })
 }
 
 /// Collects interpreted references to bindings that live in mutable cells.

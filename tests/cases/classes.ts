@@ -1,5 +1,5 @@
-// @native norm add scale describe origin swap twice
-// @interpreted secret mapped
+// @native norm add scale describe origin swap twice secret
+// @interpreted mapped
 class Vec2 {
   #hidden = 7;
   constructor(public x: number, public y: number) {}
@@ -25,7 +25,7 @@ class Vec2 {
     this.x = this.y;
     this.y = t;
   }
-  // Private fields are not supported natively yet: stays interpreted.
+  // Private fields are compiled natively too.
   secret(): number {
     return this.#hidden;
   }

@@ -131,6 +131,7 @@ fn disable_native(a: &mut Analysis) {
     a.module = Default::default();
     a.cells.clear();
     a.cell_refs.clear();
+    a.classes.clear();
 }
 
 fn mutable_cells(a: &Analysis) -> Vec<usize> {
@@ -230,7 +231,10 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts) -> Result<()> {
         qjsc.arg("-M").arg(format!("{NATIVE_MODULE},{}", glue::MODULE_CNAME));
         run(qjsc.arg(&js_path))?;
 
-        std::fs::write(tmp.join("glue.c"), glue::generate(&analysis.module, &mutable_cells(&analysis)))?;
+        std::fs::write(
+            tmp.join("glue.c"),
+            glue::generate(&analysis.module, &mutable_cells(&analysis), &analysis.classes),
+        )?;
         std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
         std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());

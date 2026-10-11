@@ -54,6 +54,7 @@ pub fn fallback_name(name: &str) -> String {
 pub const INIT_FN: &str = "__tsaot_init";
 pub const CELLS_OBJ: &str = "__tsaot_m";
 pub const METHOD_FN: &str = "__tsaot_method";
+pub const CLASS_FN: &str = "__tsaot_class";
 
 /// A JS string literal for `s`.
 fn js_string(s: &str) -> String {
@@ -130,6 +131,19 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
         let text = if r.shorthand { format!("{name}: {CELLS_OBJ}.{name}") } else { format!("{CELLS_OBJ}.{name}") };
         edits.push((r.span.0 as usize, r.span.1 as usize, text));
     }
+    for cl in &a.classes {
+        // Hands the class and its private names to native code, first
+        // thing when the class is defined.
+        let mut refs = String::new();
+        for (var, _) in &cl.vars {
+            match var.strip_suffix("<set>") {
+                Some(name) => refs.push_str(&format!(" o.{name} = 0;")),
+                None => refs.push_str(&format!(" o.{var};")),
+            }
+        }
+        let block = format!("static {{ {CLASS_FN}({}, this, (o) => {{{refs} }}); }}", cl.index);
+        prefixes.entry(cl.body_start as usize).or_default().push(block);
+    }
     for (pos, v) in prefixes {
         // Innermost wrapper was pushed first; the outermost goes first in text.
         edits.push((pos, pos, v.into_iter().rev().collect()));
@@ -148,7 +162,7 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // the builtins) even when nothing else is needed: named imports that end
     // up unused are elided by type stripping.
     let mut head = format!(
-        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN} }} from \"{NATIVE_MODULE}\";"
+        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN}, {CLASS_FN} }} from \"{NATIVE_MODULE}\";"
     );
     for h in header {
         head.push(' ');

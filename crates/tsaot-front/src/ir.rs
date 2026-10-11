@@ -127,6 +127,11 @@ pub struct Module {
     /// Names of the module-level bindings native code reads or writes. Each
     /// cell holds the binding's current value, or is uninitialized (TDZ).
     pub cells: Vec<String>,
+    /// Private name slots (see `ExprKind::PrivateField`).
+    pub privates: usize,
+    /// Home object slots: for class `k`, its prototype (`2k`) and itself
+    /// (`2k + 1`, for static methods).
+    pub homes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -341,6 +346,20 @@ pub enum ExprKind {
     ToObject(Box<Expr>),
     /// ToPropertyKey.
     ToPropKey(Box<Expr>),
+    /// Private names of classes (`Module::privates` slots, filled when the
+    /// class is defined): a field's value (`obj.#x`), its assignment (to
+    /// the value), a method after the brand check, a getter's result, a
+    /// setter call (to the value), `#x in obj` (`Bool`).
+    PrivateField(Box<Expr>, usize),
+    PrivateSetField(Box<Expr>, usize, Box<Expr>),
+    PrivateMethod(Box<Expr>, usize),
+    PrivateGetter(Box<Expr>, usize),
+    PrivateSetter(Box<Expr>, usize, Box<Expr>),
+    PrivateIn(Box<Expr>, usize),
+    /// `super[key]` in a method (home object: `Module::homes` slot), and
+    /// its assignment (to the value).
+    SuperGet(usize, Box<Expr>),
+    SuperSet(usize, Box<Expr>, Box<Expr>),
     /// Append a value to the array in a local (array rest; `undefined`).
     ArrayPush(LocalId, Box<Expr>),
     /// A new object with the own enumerable properties of the source but
@@ -630,6 +649,11 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
         | ForInIterator(a)
         | ToObject(a)
         | ToPropKey(a)
+        | PrivateField(a, _)
+        | PrivateMethod(a, _)
+        | PrivateGetter(a, _)
+        | PrivateIn(a, _)
+        | SuperGet(_, a)
         | ArrayPush(_, a)
         | Void(a) => visit(a, f),
         ArrayParts(parts) => {
@@ -653,6 +677,10 @@ pub fn visit(x: &Expr, f: &mut impl FnMut(&Expr)) {
         ObjectRest(a, xs) => {
             visit(a, f);
             xs.iter().for_each(|x| visit(x, f));
+        }
+        PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) => {
+            visit(a, f);
+            visit(b, f);
         }
         NewSpread(a, b) => {
             visit(a, f);

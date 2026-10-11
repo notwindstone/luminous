@@ -313,6 +313,14 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, tsaot_strings[i]);
         tsaot_strings[i] = JS_UNDEFINED;
     }
+    for (i = 0; i < tsaot_nprivates; i++) {
+        JS_FreeValueRT(rt, tsaot_privates[i]);
+        tsaot_privates[i] = JS_UNDEFINED;
+    }
+    for (i = 0; i < tsaot_nhomes; i++) {
+        JS_FreeValueRT(rt, tsaot_homes[i]);
+        tsaot_homes[i] = JS_UNDEFINED;
+    }
     for (i = 0; i < tsaot_natoms; i++)
         JS_FreeAtomRT(rt, tsaot_atoms[i]);
     for (i = 0; i < TSAOT_PINS; i++) {
@@ -335,6 +343,10 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     int i;
     for (i = 0; i < tsaot_ncells; i++)
         JS_MarkValue(rt, tsaot_cells[i], mark_func);
+    for (i = 0; i < tsaot_nprivates; i++)
+        JS_MarkValue(rt, tsaot_privates[i], mark_func);
+    for (i = 0; i < tsaot_nhomes; i++)
+        JS_MarkValue(rt, tsaot_homes[i], mark_func);
     for (i = 0; i < TSAOT_PINS; i++)
         JS_MarkValue(rt, tsaot_pins[i], mark_func);
     for (i = 0; i < tsaot_ic_count(); i++)
@@ -931,4 +943,53 @@ JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback,
  fail:
     JS_FreeValue(ctx, func);
     return JS_EXCEPTION;
+}
+
+/* ---- super ---- */
+
+/* super[key] with v = { home object, this, key } (borrowed). */
+JSValue tsaot_super_get(JSContext *ctx, JSValue *v)
+{
+    JSValue base = JS_GetPrototype(ctx, v[0]), r;
+    JSAtom atom;
+    if (JS_IsException(base))
+        return base;
+    atom = JS_ValueToAtom(ctx, v[2]);
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, base);
+        return JS_EXCEPTION;
+    }
+    r = JS_GetPropertyReceiver(ctx, base, atom, v[1]);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, base);
+    return r;
+}
+
+/* super[key] = val, v as for tsaot_super_get; val taken. */
+int tsaot_super_set(JSContext *ctx, JSValue *v, JSValue val)
+{
+    JSValue base = JS_GetPrototype(ctx, v[0]);
+    JSAtom atom;
+    int r;
+    if (JS_IsException(base)) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    atom = JS_ValueToAtom(ctx, v[2]);
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, base);
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
+    r = JS_SetPropertyReceiver(ctx, base, atom, val, v[1], JS_PROP_THROW);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, base);
+    return r;
+}
+
+/* obj.#name = val with v = { obj, name } (borrowed); val taken. (A third
+ * JSValue argument would not fit in argument registers.) */
+int tsaot_private_set(JSContext *ctx, JSValue *v, JSValue val)
+{
+    return JS_PrivateSet(ctx, v[0], v[1], val);
 }

@@ -10,7 +10,8 @@
 use std::fmt::Write;
 
 use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue, layout};
-use tsaot_front::erase::{BIND_FN, CELLS_OBJ, INIT_FN, METHOD_FN, NATIVE_MODULE};
+use tsaot_front::ClassDecl;
+use tsaot_front::erase::{BIND_FN, CELLS_OBJ, CLASS_FN, INIT_FN, METHOD_FN, NATIVE_MODULE};
 use tsaot_front::ir;
 
 /// C init function name passed to `qjsc -M tsaot:native,<CNAME>`.
@@ -30,7 +31,7 @@ fn c_str(s: &str) -> String {
     out
 }
 
-pub fn generate(m: &ir::Module, mutable: &[usize]) -> String {
+pub fn generate(m: &ir::Module, mutable: &[usize], classes: &[ClassDecl]) -> String {
     let mut c = String::new();
     write!(
         c,
@@ -73,6 +74,7 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     }
 
     let n = m.funcs.len();
+    let nclasses = m.homes / 2;
     let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
     // kind: 0 plain, 1 async, 2 generator (see tsaot_function_kind).
@@ -135,6 +137,25 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     .unwrap();
     write!(c, "const int tsaot_mutable_cells[] = {{\n{}}};\n\n", list(mutable.iter().map(|k| k.to_string()).collect()))
         .unwrap();
+
+    // Classes: private name values and home objects, and what each class
+    // hands over.
+    writeln!(c, "JSValue tsaot_privates[{}];", m.privates + 1).unwrap();
+    writeln!(c, "JSValue tsaot_homes[{}];", m.homes + 1).unwrap();
+    writeln!(c, "const int tsaot_nprivates = {}, tsaot_nhomes = {};", m.privates, m.homes).unwrap();
+    c.push_str("struct tsaot_class_var { const char *name; int slot; };\n");
+    for cl in classes {
+        writeln!(c, "static const struct tsaot_class_var tsaot_class_vars_{}[] = {{", cl.index).unwrap();
+        for (name, slot) in &cl.vars {
+            writeln!(c, "    {{ {}, {slot} }},", c_str(name)).unwrap();
+        }
+        c.push_str("    { NULL, 0 },\n};\n");
+    }
+    writeln!(c, "static const struct tsaot_class_var *const tsaot_class_vars[{}] = {{", m.homes / 2 + 1).unwrap();
+    for cl in classes {
+        writeln!(c, "    [{0}] = tsaot_class_vars_{0},", cl.index).unwrap();
+    }
+    c.push_str("};\n\n");
 
     write!(
         c,
@@ -216,6 +237,36 @@ static JSValue tsaot_method(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
 }}
 
+/* {CLASS_FN}(k, Class, fn) in a static block of class k: its home objects,
+ * and the values of the private names that `fn` references. */
+static JSValue tsaot_class(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{{
+    int32_t k;
+    const struct tsaot_class_var *v;
+    JSValue proto;
+    if (argc < 3 || JS_ToInt32(ctx, &k, argv[0]) || k < 0 || k >= {nclasses} || !tsaot_class_vars[k])
+        return JS_ThrowTypeError(ctx, "{CLASS_FN}: bad arguments");
+    proto = JS_GetPropertyStr(ctx, argv[1], "prototype");
+    if (JS_IsException(proto))
+        return proto;
+    JS_FreeValue(ctx, tsaot_homes[2 * k]);
+    JS_FreeValue(ctx, tsaot_homes[2 * k + 1]);
+    tsaot_homes[2 * k] = proto;
+    tsaot_homes[2 * k + 1] = JS_DupValue(ctx, argv[1]);
+    for (v = tsaot_class_vars[k]; v->name; v++) {{
+        JSAtom name = JS_NewAtom(ctx, v->name);
+        JSValue val;
+        if (name == JS_ATOM_NULL)
+            return JS_EXCEPTION;
+        if (JS_GetClosureVariable(ctx, argv[2], name, &val)) {{
+            JS_FreeValue(ctx, tsaot_privates[v->slot]);
+            tsaot_privates[v->slot] = val;
+        }}
+        JS_FreeAtom(ctx, name);
+    }}
+    return JS_UNDEFINED;
+}}
+
 static JSValue tsaot_exports[4];
 
 static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
@@ -229,6 +280,8 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
         JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0 ||
         JS_SetModuleExport(ctx, m, "{METHOD_FN}",
                            JS_NewCFunction(ctx, tsaot_method, "{METHOD_FN}", 4)) < 0)
+        return -1;
+    if (JS_SetModuleExport(ctx, m, "{CLASS_FN}", JS_NewCFunction(ctx, tsaot_class, "{CLASS_FN}", 3)) < 0)
         return -1;
     return 0;
 }}
@@ -248,6 +301,7 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     JS_AddModuleExport(ctx, m, "{INIT_FN}");
     JS_AddModuleExport(ctx, m, "{CELLS_OBJ}");
     JS_AddModuleExport(ctx, m, "{METHOD_FN}");
+    JS_AddModuleExport(ctx, m, "{CLASS_FN}");
     return m;
 }}
 "#

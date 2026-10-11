@@ -27,6 +27,11 @@ extern const char *const tsaot_string_data[];
 extern const size_t tsaot_string_lens[];
 extern const int tsaot_mutable_cells[];
 extern const int tsaot_ncells, tsaot_nstrings, tsaot_natoms, tsaot_nmutable;
+/* Private name values and home objects of classes (filled by the classes
+ * as they are defined). */
+extern JSValue tsaot_privates[];
+extern JSValue tsaot_homes[];
+extern const int tsaot_nprivates, tsaot_nhomes;
 
 /* Called from native code. */
 double tsaot_pow(double a, double b);
@@ -91,6 +96,9 @@ JSValue tsaot_object_rest(JSContext *ctx, JSValue *v, int nkeys);
 int tsaot_define_computed(JSContext *ctx, JSValue *v, JSValue val);
 int tsaot_object_spread(JSContext *ctx, JSValue obj, JSValue source);
 int tsaot_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_throw);
+JSValue tsaot_super_get(JSContext *ctx, JSValue *v);
+int tsaot_private_set(JSContext *ctx, JSValue *v, JSValue val);
+int tsaot_super_set(JSContext *ctx, JSValue *v, JSValue val);
 JSValue tsaot_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots);
 JSValue tsaot_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data);
 JSValue tsaot_yield_star(JSContext *ctx, JSValue *v, int mode, int *kind);
