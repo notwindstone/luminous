@@ -2,7 +2,9 @@
 
 An ahead-of-time compiler for strict TypeScript, built on
 [QuickJS-NG](https://github.com/quickjs-ng/quickjs). Functions are compiled to
-machine code with [Cranelift](https://cranelift.dev):
+machine code with [Cranelift](https://cranelift.dev), or with
+[LLVM](https://llvm.org) for code that should run as fast as possible
+(`--backend llvm`, see [Backends](#backends)):
 - numbers, booleans and typed arrays use unboxed machine representations;
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
@@ -25,7 +27,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 ```
              ┌──────────── oxc parser + semantic analysis
  foo.ts ─────┤
-             ├─ checker ── typed IR ── Cranelift ── native.o ───────────────────┐
+             ├─ checker ── typed IR ── SSA IR ── Cranelift or LLVM ── native.o ─┐
              │   (per function; rejects anything it cannot prove)               │
              │                                                                  ├─ cc ─> foo
              └─ rewrite + type erasure ── foo.js ── qjsc ── bytecode + main.c ──┤
@@ -59,9 +61,11 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 
    Everything else is a `JSValue`, and operations on it go through inline fast
    paths and then the engine's own implementation.
-3. **Native code.** `crates/tsaot-codegen` lowers the IR with Cranelift. Calls
-   between native functions are direct machine calls. Exceptions propagate
-   through native frames, freeing their temporaries.
+3. **Native code.** `crates/tsaot-codegen` lowers the IR to a small
+   backend-neutral SSA IR, which Cranelift or LLVM compiles (see
+   [Backends](#backends)). Calls between native functions are direct machine
+   calls. Exceptions propagate through native frames, freeing their
+   temporaries.
 4. **Interpreted code.** The whole module is type-erased (oxc transformer) and
    compiled by `qjsc` to bytecode. Each native function's binding is
    re-pointed at a function object whose entry is native code. The original
@@ -163,6 +167,54 @@ fast paths that keep the engine's semantics:
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first.
+
+## Backends
+
+`--backend cranelift` (the default) or `--backend llvm` (or `TSAOT_BACKEND`)
+picks the code generator of `tsaot build` / `tsaot run`. Both translate the
+same backend-neutral IR (`mir.rs`), which the lowering builds, with the same
+semantics: wrapping integer arithmetic, shift amounts modulo the width,
+saturating float-to-integer conversions, NaN-propagating `fmin` / `fmax`.
+The differential tests run every case with both.
+
+- **Cranelift** compiles in process, in milliseconds. It optimizes little
+  beyond what the lowering does itself.
+- **LLVM** emits LLVM IR (text) and compiles it with `clang -O3
+  -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `TSAOT_CLANG`;
+  `--march` picks another CPU, e.g. `x86-64-v3` for portable executables).
+  Compiling takes seconds, and the code is optimized much further:
+  - the functions that only native code calls are internal to the LLVM
+    module, so LLVM inlines them anywhere in the program (recursive `fib` is
+    partly inlined into itself), drops the unused ones and picks their
+    calling convention;
+  - every load and store carries its alias region as type-based alias
+    analysis metadata: reference counts, `JSValue` slots (properties,
+    elements, cells, frames), the engine's object headers, typed array
+    elements, `aot type` storage, inline caches, constant tables. Values
+    then stay in registers across stores to other regions (a field is not
+    read again after a reference count update), and dead stores go;
+  - addresses derived from globals, stack slots and loaded pointers stay
+    pointers (`getelementptr`), and the tables filled before any native code
+    runs (atoms, strings, shapes) are invariant loads, hoisted out of loops
+    and across calls;
+  - slow and exception paths become branch weights (laid out of line);
+  - libm and the runtime's numeric helpers are declared pure, so their
+    results are reused and hoisted;
+  - and the usual pipeline applies: GVN, LICM, induction variable
+    simplification, unrolling, vectorization where JS semantics allow it
+    (the `x`, `y` differences of `bench/nbody_aot.ts` are computed as one
+    vector; floating point sums keep their order, so `dot` stays scalar).
+
+  Async functions and generators are not vectorized (their step functions
+  are long and branchy, and the SLP vectorizer's time grows too fast with
+  their size).
+
+  On x86-64, each libm call is followed by an empty `asm` statement that
+  marks the vector registers as written: LLVM 18 does not count a call's
+  clobbers, and would otherwise convert an integer to a double into a
+  register the callee wrote last, a false dependency that serializes
+  independent libm calls in a loop (`fill` in `bench/arrays.ts` ran almost
+  twice as long).
 
 ## What compiles natively
 
@@ -489,6 +541,8 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
 ## Getting started
 
 Requires Nix with flakes (or rustc ≥ 1.88, clang, cmake and ninja on `PATH`).
+The LLVM backend runs clang (≥ 15) at compile time; the Cranelift backend
+needs only a C compiler, for linking.
 
 ```sh
 git clone --recursive https://github.com/notwindstone/typescript-aot
@@ -499,11 +553,12 @@ cargo build --release
 
 ./target/release/tsaot run bench/fib.ts
 ./target/release/tsaot build bench/mandelbrot.ts -o mandelbrot
+./target/release/tsaot build --backend llvm bench/nbody_aot.ts -o nbody
 ./target/release/tsaot report tests/cases/rejected.ts
 ./target/release/tsaot emit-js bench/fib.ts       # what the interpreter runs
 ./target/release/tsaot ir bench/fib.ts            # typed IR of native functions
-cargo test                                        # differential tests (leak-checking engine)
-bench/run.sh                                      # hyperfine: native vs interpreted
+cargo test                                        # differential tests (leak-checking engine), both backends
+bench/run.sh                                      # hyperfine: interpreted vs Cranelift vs LLVM
 ```
 
 `scripts/build-quickjs.sh` also builds `build/quickjs-check`, an engine with
@@ -541,8 +596,8 @@ In `boundary`, the interpreted loop around the calls dominates.
 
 ```
 crates/tsaot-front    oxc front end, checker, typed IR, type erasure, `aot` marker
-crates/tsaot-codegen  Cranelift backend (IR -> object file)
-crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + cc driver; differential tests
+crates/tsaot-codegen  lowering to a backend-neutral SSA IR (mir.rs); Cranelift (clif.rs) and LLVM (llvm.rs) backends
+crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + clang + cc driver; differential tests
 runtime/              C runtime linked into every program (helpers, boxes, async frames, cells)
 vendor/quickjs        QuickJS-NG (git submodule, kept pristine)
 patches/              engine patch applied by scripts/build-quickjs.sh

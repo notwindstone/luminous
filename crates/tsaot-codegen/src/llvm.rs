@@ -149,11 +149,13 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
     for f in &m.funcs {
         match &f.body {
             None => {
-                writeln!(out, "declare dso_local {} @{}({}) #0", ret_type(&f.sig), f.name, param_types(&f.sig))
+                let attrs = if PURE.contains(&f.name.as_str()) { 3 } else { 0 };
+                writeln!(out, "declare dso_local {} @{}({}) #{attrs}", ret_type(&f.sig), f.name, param_types(&f.sig))
                     .unwrap();
             }
             Some(body) => {
                 let mut e = FnEmitter::new(m, body, &mut intrinsics);
+                e.x86 = triple.starts_with("x86_64");
                 let text = e.function(&f.name, f.linkage);
                 out.push_str(&text);
             }
@@ -168,6 +170,9 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
     // No vectorization in huge functions and async step functions: the SLP
     // vectorizer's time grows too fast with their size, for little gain.
     writeln!(out, "attributes #2 = {{ nounwind noimplicitfloat }}").unwrap();
+    // Functions of their arguments only (`errno`, which libm may set, is
+    // never read): LLVM may reuse and hoist their results.
+    writeln!(out, "attributes #3 = {{ nounwind readnone willreturn }}").unwrap();
     writeln!(out, "\n!0 = !{{!\"{sp_register}\"}}").unwrap();
     writeln!(out, "!1 = !{{!\"branch_weights\", i32 1, i32 2000}}").unwrap();
     writeln!(out, "!2 = !{{!\"branch_weights\", i32 2000, i32 1}}").unwrap();
@@ -194,6 +199,36 @@ fn mem_metadata(region: Region, load: bool) -> String {
         format!(", !tbaa !{tag}")
     }
 }
+
+/// Imported functions that only compute a result from their arguments:
+/// libm, and the runtime's numeric helpers.
+const PURE: &[&str] = &[
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    "exp",
+    "expm1",
+    "log",
+    "log1p",
+    "log2",
+    "log10",
+    "cbrt",
+    "hypot",
+    "fmod",
+    "tsaot_pow",
+    "tsaot_round",
+    "tsaot_toint32_slow",
+];
 
 /// Functions with more instructions than this are not vectorized.
 const HUGE_FUNCTION: usize = 20_000;
@@ -310,6 +345,8 @@ struct FnEmitter<'a> {
     out: String,
     tmps: usize,
     intrinsics: &'a mut BTreeSet<String>,
+    /// The target is x86-64.
+    x86: bool,
     /// Literals of constants.
     consts: HashMap<Value, String>,
     /// `i1` twins of booleans.
@@ -332,6 +369,7 @@ impl<'a> FnEmitter<'a> {
             out: String::new(),
             tmps: 0,
             intrinsics,
+            x86: false,
             consts: HashMap::new(),
             bools: HashMap::new(),
             ptr_like: vec![false; n],
@@ -869,6 +907,16 @@ impl<'a> FnEmitter<'a> {
                 let decl = &self.m.funcs[func.index()];
                 let args = self.call_args(&decl.sig, args);
                 self.call(&decl.sig, &format!("@{}", decl.name), &args, results);
+                if self.x86 && PURE.contains(&decl.name.as_str()) {
+                    // The vector registers the callee wrote, as LLVM 18
+                    // does not count a call's clobbers: an instruction
+                    // writing part of a register (`vcvtsi2sd`) may otherwise
+                    // pick one, and wait for the callee's last use of it,
+                    // which serializes independent libm calls in a loop.
+                    // Seeing them written, LLVM breaks the dependency.
+                    let clobbers: Vec<String> = (1..32).map(|i| format!("~{{xmm{i}}}")).collect();
+                    self.line(format!("call void asm sideeffect \"\", \"{}\"()", clobbers.join(",")));
+                }
             }
             InstData::CallIndirect { sig, callee, args } => {
                 let sig = &self.m.sigs[sig.index()];

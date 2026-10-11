@@ -1,6 +1,6 @@
-//! Lowering of function bodies to Cranelift IR.
+//! Lowering of function bodies to the backend-neutral IR (`mir.rs`).
 //!
-//! Values: `F64` / `Bool` are plain Cranelift values. `Any` is a QuickJS
+//! Values: `F64` / `Bool` are plain IR values. `Any` is a QuickJS
 //! `JSValue` as a `(payload, tag)` pair of `I64`s, and is *owned*: every
 //! `Any` expression evaluates to a new reference that the consumer must
 //! either store, pass on to a callee that takes ownership, or free.
@@ -109,7 +109,7 @@ impl V {
             other => panic!("expected a JS value, got {other:?}"),
         }
     }
-    /// As Cranelift values (block arguments, returns).
+    /// As IR values (block arguments, returns).
     pub(crate) fn values(self) -> Vec<Value> {
         match self {
             V::Num(v) | V::Bool(v) | V::Int(v) => vec![v],
@@ -119,7 +119,7 @@ impl V {
     }
 }
 
-/// Cranelift types of a value of type `t`.
+/// IR types of a value of type `t`.
 pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
     match t {
         Ty::I32 => vec![I64],
@@ -135,7 +135,7 @@ pub(crate) fn is_js(t: Ty) -> bool {
     matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_))
 }
 
-/// Rebuild a `V` of type `t` from Cranelift values.
+/// Rebuild a `V` of type `t` from IR values.
 pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
     match t {
         Ty::I32 => V::Int(vs[0]),
@@ -165,7 +165,7 @@ enum LVar {
 /// Where lowered code goes when it leaves the body.
 #[derive(Clone, Copy)]
 pub(crate) enum Exit {
-    /// Return from the Cranelift function (on exception: set
+    /// Return from the IR function (on exception: set
     /// `tsaot_unwinding` and return placeholder values).
     Return,
     /// Jump to a block: for `ret`, with the return value as its parameters;
@@ -179,7 +179,7 @@ pub(crate) struct Exits {
     pub unwind: Exit,
 }
 
-/// Function-level references declared in the Cranelift function.
+/// References to the module's functions and data.
 pub(crate) struct Env {
     pub helpers: HashMap<&'static str, FuncRef>,
     pub funcs: Vec<FuncRef>,
@@ -302,6 +302,8 @@ pub(crate) struct Lower {
     small: Vec<bool>,
     /// Int locals always in the int32 range (see `i32_locals`).
     i32_range: Vec<bool>,
+    /// Exact integers (in `int_of`) known not to be negative.
+    nonneg: std::collections::HashSet<Value>,
 }
 
 impl Lower {
@@ -379,6 +381,7 @@ impl Lower {
             bounded: Vec::new(),
             small,
             i32_range,
+            nonneg: Default::default(),
         };
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
@@ -1287,7 +1290,7 @@ impl Lower {
         let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
         self.b.ins().brif(nonzero, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
-        // 32-bit division is much faster than 64-bit (Cranelift defines
+        // 32-bit division is much faster than 64-bit (the IR defines
         // INT32_MIN % -1 as 0).
         let (x32, y32) = (self.b.ins().ireduce(I32, x), self.b.ins().ireduce(I32, y));
         let r = self.b.ins().srem(x32, y32);
@@ -1318,11 +1321,10 @@ impl Lower {
         if c == 0 {
             return r;
         }
-        let over = if c > 0 {
-            self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, r, INT_EXACT)
-        } else {
-            self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r, -INT_EXACT)
-        };
+        // |r| > 2^53, either way: `x` may already be past 2^53 in the
+        // other direction (`x += 4; x -= 1`).
+        let shifted = self.b.ins().iadd_imm_s(r, INT_EXACT);
+        let over = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThan, shifted, 2 * INT_EXACT);
         let round = self.b.create_block();
         self.b.set_cold_block(round);
         let join = self.b.create_block();
@@ -1392,6 +1394,9 @@ impl Lower {
                     self.int_bits.insert(d, 64 - c.unsigned_abs().leading_zeros());
                     if i32::try_from(c).is_ok() {
                         self.i32s.insert(d);
+                    }
+                    if c >= 0 {
+                        self.nonneg.insert(d);
                     }
                 }
                 V::Num(d)
@@ -1948,7 +1953,20 @@ impl Lower {
                 V::Any(rp, rt)
             }
             ExprKind::Math(f, args) => {
-                let vals: Vec<Value> = args.iter().map(|a| self.expr(a).num()).collect();
+                // JS values are converted once all arguments are evaluated.
+                let held: Vec<V> = args
+                    .iter()
+                    .map(|a| {
+                        let v = self.expr(a);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                let vals: Vec<Value> = held.iter().map(|&v| self.number_value(v)).collect();
+                for &v in held.iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
                 V::Num(self.math(*f, &vals)).retype(f.ret(), self)
             }
             ExprKind::Seq(xs) => {
@@ -3898,6 +3916,13 @@ impl Lower {
             (BinOp::Rem, Some((x, y))) => return self.int_rem(x, y, a),
             _ => {}
         }
+        if op == BinOp::Rem
+            && let (Some(ba), Some(bc)) = (self.bits_of(a), self.bits_of(c))
+            && ba <= 53
+            && bc <= 53
+        {
+            return self.int_rem64(a, c, bc);
+        }
         match op {
             BinOp::Add => self.b.ins().fadd(a, c),
             BinOp::Sub => self.b.ins().fsub(a, c),
@@ -3908,7 +3933,7 @@ impl Lower {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Sar | BinOp::Shr => {
                 let x = self.toint32(a);
                 let y = self.toint32(c);
-                // Cranelift shifts take the amount modulo 32, as JS does.
+                // IR shifts take the amount modulo 32, as JS does.
                 let r = match op {
                     BinOp::BitAnd => self.b.ins().band(x, y),
                     BinOp::BitOr => self.b.ins().bor(x, y),
@@ -3918,7 +3943,10 @@ impl Lower {
                     BinOp::Shr => {
                         let r = self.b.ins().ushr(x, y);
                         let r = self.b.ins().uextend(I64, r);
-                        return self.int_f64(r);
+                        let d = self.int_f64(r);
+                        self.int_bits.insert(d, 32);
+                        self.nonneg.insert(d);
+                        return d;
                     }
                     _ => unreachable!(),
                 };
@@ -3934,24 +3962,84 @@ impl Lower {
     /// or -1) an integer remainder is exact; `copysign` restores JS's rule
     /// that the result has the dividend's sign, including `-4 % 2 === -0`.
     /// Everything else uses C `fmod`, which matches JS exactly.
+    /// `a % c` for exact integers below 2^53 in magnitude (`c` below
+    /// 2^`bits`): an integer remainder, with the dividend's sign (`-4 % 2`
+    /// is -0); NaN for `% 0`. A nonzero constant divisor needs no division
+    /// (nor a test for 0), and with a dividend known not to be negative the
+    /// result is an exact integer itself.
+    fn int_rem64(&mut self, a: Value, c: Value, bits: u32) -> Value {
+        let (x, y) = (self.int_of[&a], self.int_of[&c]);
+        if self.int_consts.get(&c).is_some_and(|&k| k != 0) {
+            let r = self.b.ins().srem(x, y);
+            if self.nonneg.contains(&a) {
+                let d = self.int_f64(r);
+                self.int_bits.insert(d, bits);
+                self.nonneg.insert(d);
+                if bits <= 31 {
+                    self.i32s.insert(d);
+                }
+                return d;
+            }
+            let rf = self.b.ins().fcvt_from_sint(F64, r);
+            let rf = self.b.ins().fcopysign(rf, a);
+            let ok = self.b.ins().iconst(I8, 1);
+            self.rem_of.insert(rf, (r, ok));
+            return rf;
+        }
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, F64);
+        let r_param = self.b.append_block_param(join, I64);
+        let nonzero = self.b.ins().icmp_imm_s(IntCC::NotEqual, y, 0);
+        self.b.ins().brif(nonzero, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        // No overflow: |x| < 2^53.
+        let r = self.b.ins().srem(x, y);
+        let rf = self.b.ins().fcvt_from_sint(F64, r);
+        let rf = self.b.ins().fcopysign(rf, a);
+        self.b.ins().jump(join, &[BlockArg::Value(rf), BlockArg::Value(r)]);
+        self.b.switch_to_block(slow);
+        let nan = self.b.ins().f64const(f64::NAN);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
+        self.b.switch_to_block(join);
+        self.rem_of.insert(res, (r_param, nonzero));
+        res
+    }
+
     fn rem(&mut self, a: Value, c: Value) -> Value {
-        let ai = self.b.ins().fcvt_to_sint_sat(I64, a);
-        let ci = self.b.ins().fcvt_to_sint_sat(I64, c);
-        let af = self.b.ins().fcvt_from_sint(F64, ai);
-        let cf = self.b.ins().fcvt_from_sint(F64, ci);
-        let a_int = self.b.ins().fcmp(FloatCC::Equal, af, a);
-        let c_int = self.b.ins().fcmp(FloatCC::Equal, cf, c);
+        // An operand that is an exact integer needs no test (`int_of` values
+        // stay far from the `i64` limits).
+        let exact = |l: &Self, v: Value| l.int_of.get(&v).copied();
+        let (ai, a_int) = match exact(self, a) {
+            Some(i) => (i, self.b.ins().iconst(I8, 1)),
+            None => {
+                let ai = self.b.ins().fcvt_to_sint_sat(I64, a);
+                let af = self.b.ins().fcvt_from_sint(F64, ai);
+                // Values >= 2^63 saturate to i64::MAX, which converts back
+                // to 2^63 and would pass the round-trip check.
+                let unsat = self.b.ins().icmp_imm_s(IntCC::NotEqual, ai, i64::MAX);
+                let same = self.b.ins().fcmp(FloatCC::Equal, af, a);
+                (ai, self.b.ins().band(same, unsat))
+            }
+        };
+        let (ci, c_int) = match exact(self, c) {
+            Some(i) => (i, self.b.ins().iconst(I8, 1)),
+            None => {
+                let ci = self.b.ins().fcvt_to_sint_sat(I64, c);
+                let cf = self.b.ins().fcvt_from_sint(F64, ci);
+                let unsat = self.b.ins().icmp_imm_s(IntCC::NotEqual, ci, i64::MAX);
+                let same = self.b.ins().fcmp(FloatCC::Equal, cf, c);
+                (ci, self.b.ins().band(same, unsat))
+            }
+        };
         let c_abs = self.b.ins().iabs(ci);
         // |c| > 1 excludes 0 (NaN result) and -1 (srem overflow on INT64_MIN).
         let c_ok = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, c_abs, 1);
-        // Values >= 2^63 saturate to i64::MAX, which converts back to 2^63
-        // and would pass the round-trip check.
-        let a_unsat = self.b.ins().icmp_imm_s(IntCC::NotEqual, ai, i64::MAX);
-        let c_unsat = self.b.ins().icmp_imm_s(IntCC::NotEqual, ci, i64::MAX);
         let ok = self.b.ins().band(a_int, c_int);
         let ok = self.b.ins().band(ok, c_ok);
-        let unsat = self.b.ins().band(a_unsat, c_unsat);
-        let ok = self.b.ins().band(ok, unsat);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
@@ -4933,7 +5021,7 @@ impl Lower {
                 let s = ins(self).fdemote(F32, a[0]);
                 ins(self).fpromote(F64, s)
             }
-            // Cranelift fmin/fmax propagate NaN and order -0 < +0, like JS.
+            // IR fmin/fmax propagate NaN and order -0 < +0, like JS.
             MathFn::Min => ins(self).fmin(a[0], a[1]),
             MathFn::Max => ins(self).fmax(a[0], a[1]),
             MathFn::Imul => {

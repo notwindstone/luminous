@@ -723,16 +723,13 @@ impl Ins<'_> {
         self.b.push1(InstData::Conv { op, ty, arg }, ty)
     }
 
+    /// An immediate operand of `like`'s type. Immediates are truncated to
+    /// the type's width, so the `_imm_s` (sign-extending) and `_imm_u`
+    /// (zero-extending) forms of Cranelift's builder agree.
     fn imm(&mut self, like: Value, imm: i64) -> Value {
         let ty = self.ty(like);
         let imm = ty.canonical(imm);
         self.b.push1(InstData::Iconst { ty, imm }, ty)
-    }
-
-    /// An immediate zero-extended from... nothing: immediates are 64-bit and
-    /// truncated to the operand's type either way.
-    fn imm_u(&mut self, like: Value, imm: i64) -> Value {
-        self.imm(like, imm)
     }
 
     pub fn iadd(self, a: Value, b: Value) -> Value {
@@ -799,19 +796,19 @@ impl Ins<'_> {
         self.binary(BinOp::Imul, a, c)
     }
     pub fn band_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
-        let c = self.imm_u(a, imm.into());
+        let c = self.imm(a, imm.into());
         self.binary(BinOp::Band, a, c)
     }
     pub fn bxor_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
-        let c = self.imm_u(a, imm.into());
+        let c = self.imm(a, imm.into());
         self.binary(BinOp::Bxor, a, c)
     }
     pub fn ishl_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
-        let c = self.imm_u(a, imm.into());
+        let c = self.imm(a, imm.into());
         self.binary(BinOp::Ishl, a, c)
     }
     pub fn ushr_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
-        let c = self.imm_u(a, imm.into());
+        let c = self.imm(a, imm.into());
         self.binary(BinOp::Ushr, a, c)
     }
 
@@ -858,7 +855,7 @@ impl Ins<'_> {
         self.icmp(cc, a, c)
     }
     pub fn icmp_imm_u(mut self, cc: IntCC, a: Value, imm: impl Into<i64>) -> Value {
-        let c = self.imm_u(a, imm.into());
+        let c = self.imm(a, imm.into());
         self.icmp(cc, a, c)
     }
     pub fn fcmp(self, cc: FloatCC, a: Value, b: Value) -> Value {

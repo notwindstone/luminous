@@ -3985,6 +3985,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                         if args.iter().all(|a| num(a.ty)) {
                             return math_call(f, args.into_iter().map(to_f64).collect(), c.span);
                         }
+                        // `Math` functions convert their arguments with
+                        // ToNumber once all are evaluated, as the lowering
+                        // does (`Number.is*` do not; n-ary `min` / `max`
+                        // would interleave the two as a chain).
+                        let coerces =
+                            !matches!(f, MathFn::IsNaN | MathFn::IsFinite | MathFn::IsInteger | MathFn::IsSafeInteger);
+                        let arity = match f {
+                            MathFn::Min | MathFn::Max => (1..=2).contains(&args.len()),
+                            _ => args.len() == f.arity(),
+                        };
+                        if coerces && arity && args.iter().all(|a| num(a.ty) || a.ty == Ty::Any) {
+                            return math_call(f, args.into_iter().map(to_f64).collect(), c.span);
+                        }
                         // Generic call with the already-checked arguments.
                         let obj = Expr::new(
                             Ty::Any,

@@ -2,7 +2,7 @@
 //! `tsaot:native` C module exporting `__tsaot_bind(i, fallback)`, which
 //! creates the JS function object for native function `i`.
 //!
-//! The JS entry itself (`tsaot_fast_<i>`) is Cranelift code: the engine's
+//! The JS entry itself (`tsaot_fast_<i>`) is native code: the engine's
 //! `JSCFunctionFast` hook calls it straight from the interpreter's call
 //! opcodes. When it declines (ill-typed arguments), the engine calls the
 //! regular C function, a shared trampoline into the interpreted fallback.
@@ -39,7 +39,7 @@ pub fn generate(m: &ir::Module, mutable: &[usize], classes: &[ClassDecl], int_wr
 #include <stddef.h>
 #include "tsaot_rt.h"
 
-/* The Cranelift entries read and write JSValues directly. */
+/* The native entries read and write JSValues directly. */
 _Static_assert(sizeof(JSValue) == {size}, "tsaot needs the 64-bit struct JSValue layout");
 _Static_assert(offsetof(JSValue, tag) == {tag_off}, "unexpected JSValue layout");
 _Static_assert(JS_TAG_INT == {int} && JS_TAG_BOOL == {bool} && JS_TAG_UNDEFINED == {undef} &&

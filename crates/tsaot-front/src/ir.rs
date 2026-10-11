@@ -372,6 +372,9 @@ pub enum ExprKind {
     Truthy(Box<Expr>),
     /// Direct call of a native function; argument types match its params.
     Call(FuncId, Vec<Expr>),
+    /// A `Math` function or `Number` predicate. The arguments are numbers,
+    /// or for `Math` functions also JS values, converted with ToNumber in
+    /// order once all are evaluated.
     Math(MathFn, Vec<Expr>),
     /// Comma operator: all evaluated, value of the last.
     Seq(Vec<Expr>),
@@ -2236,7 +2239,6 @@ fn pure_node(e: &Expr, layouts: &[Layout]) -> bool {
         | ExprKind::Logical(..)
         | ExprKind::Cond(..)
         | ExprKind::Truthy(_)
-        | ExprKind::Math(..)
         | ExprKind::Seq(_)
         | ExprKind::Undefined
         | ExprKind::Null
@@ -2245,6 +2247,8 @@ fn pure_node(e: &Expr, layouts: &[Layout]) -> bool {
         | ExprKind::TypedGet(..)
         | ExprKind::TypedSet(..)
         | ExprKind::IntOf(_) => true,
+        // Converting a JS value may run code.
+        ExprKind::Math(_, args) => args.iter().all(|a| a.ty != Ty::Any),
         ExprKind::StructGet(k, o, fi) => {
             matches!(o.ty, Ty::Struct(_)) && layouts[*k as usize].fields[*fi as usize].universal
         }
