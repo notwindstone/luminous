@@ -193,6 +193,8 @@ pub(crate) struct Env {
     pub params: std::rc::Rc<Vec<Vec<Ty>>>,
     /// `value_captures`, by `ClosureId`.
     pub value_captures: std::rc::Rc<Vec<Vec<bool>>>,
+    /// The atoms `Promise` and `resolve`, if used.
+    pub promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     /// The signature of `JSCFunctionFast` entries.
     pub fast_sig: SigRef,
 }
@@ -1737,7 +1739,8 @@ impl<'a> Lower<'a> {
             ExprKind::Global(a) => {
                 let atom = self.atom(*a);
                 let ctx = self.ctx;
-                let r = self.helper("JS_GetGlobalVariable", &[ctx, atom]);
+                let ic = self.new_ic();
+                let r = self.helper("tsaot_global_get", &[ctx, atom, ic]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -4503,7 +4506,7 @@ impl Lower<'_> {
             cx.resumes.push(resume);
             cx.resumes.len() - 1
         };
-        let (p, t) = self.expr(value).any();
+        let (p, t) = self.awaited_operand(value);
         let slots = self.async_cx.as_ref().unwrap().slots;
         let st = self.b.ins().iconst(I32, state as i64);
         let ctx = self.ctx;
@@ -4537,6 +4540,58 @@ impl Lower<'_> {
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);
         (vp, vt)
+    }
+
+    /// The value to await (a new reference). `await Promise.resolve(x)`
+    /// awaits `x` itself when `Promise` and its `resolve` are the intrinsic
+    /// ones: PromiseResolve of `x` happens either way, and no promise is
+    /// made for nothing. `Promise` and `resolve` are read first, as in JS.
+    fn awaited_operand(&mut self, value: &Expr) -> (Value, Value) {
+        let ExprKind::CallMethod(o, Key::Atom(a), args) = &value.kind else {
+            return self.expr(value).any();
+        };
+        let ExprKind::Global(g) = o.kind else {
+            return self.expr(value).any();
+        };
+        if self.env.promise_resolve != Some((g, *a)) || args.len() != 1 {
+            return self.expr(value).any();
+        }
+        let ctx = self.ctx;
+        let atom = self.atom(g);
+        let ic = self.new_ic();
+        let pr = self.helper("tsaot_global_get", &[ctx, atom, ic]);
+        self.check_value(pr[1]);
+        let promise = V::Any(pr[0], pr[1]);
+        self.hold(promise);
+        let (mp, mt) = self.prop_get(pr[0], pr[1], *a);
+        let method = V::Any(mp, mt);
+        self.hold(method);
+        let x = self.expr(&args[0]);
+        self.hold(x);
+        let (xp, xt) = x.any();
+        let same = self.helper("tsaot_is_promise_resolve", &[pr[0], pr[1], mp, mt]);
+        // Both paths consume `x`.
+        self.release(x);
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let call = self.b.create_block();
+        self.b.set_cold_block(call);
+        self.b.ins().brif(same[0], join, &[BlockArg::Value(xp), BlockArg::Value(xt)], call, &[]);
+        self.b.switch_to_block(call);
+        let slot = self.values_slot(&[(mp, mt), (pr[0], pr[1]), (xp, xt)]);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+        self.free((xp, xt));
+        self.check_value(r[1]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(join);
+        self.release(method);
+        self.release(promise);
+        self.free((mp, mt));
+        self.free((pr[0], pr[1]));
+        (rp, rt)
     }
 
     /// Deliver an awaited value (a new reference) to `target`.

@@ -69,7 +69,10 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define TSAOT_PIN_GENERATOR_FUNCTION_PROTO 19
 #define TSAOT_PIN_GENERATOR_NEXT 20
 #define TSAOT_PIN_ASYNC_GENERATOR_FUNCTION_PROTO 21
-#define TSAOT_PINS 22
+#define TSAOT_PIN_PROMISE 22
+#define TSAOT_PIN_PROMISE_RESOLVE 23
+#define TSAOT_PINS 24
+int tsaot_is_promise_resolve(JSValue promise, JSValue resolve);
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
 int tsaot_array_iter_ok(JSContext *ctx);
@@ -118,6 +121,7 @@ JSValue tsaot_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAto
 int tsaot_call_setter(JSContext *ctx, void *setter, JSValue this_obj, JSValue val);
 int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn, int is_setter);
 JSValue tsaot_new_object(JSContext *ctx, TsaotIC *ic, int n, JSAtom *atoms, JSValue *values);
+JSValue tsaot_global_get(JSContext *ctx, JSAtom prop, TsaotIC *ic);
 
 /* Spread, rest and iteration. */
 int tsaot_array_push(JSContext *ctx, JSValue arr, JSValue v);

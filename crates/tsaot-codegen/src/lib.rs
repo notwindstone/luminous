@@ -217,6 +217,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_define_accessor", &[P, P, Int, W, W, Int], &[Int]),
         ("tsaot_new_object", &[P, P, Int, P, P], &[W, W]),
         ("JS_NewObjectWithCachedShape", &[P, P, P], &[W, W]),
+        ("tsaot_global_get", &[P, Int, P], &[W, W]),
         ("tsaot_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
         ("tsaot_call_setter", &[P, P, W, W, W, W], &[Int]),
         ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
@@ -233,6 +234,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_async_start", &[P, Int, Int, P, P], &[W, W]),
         ("tsaot_async_step", &[P, P, Int, P, Int], &[]),
         ("tsaot_await", &[P, P, W, W, Int], &[Int]),
+        ("tsaot_is_promise_resolve", &[W, W, W, W], &[Int]),
         ("tsaot_pow", &[D, D], &[D]),
         ("tsaot_toint32_slow", &[D], &[Int]),
         ("fmod", &[D, D], &[D]),
@@ -264,6 +266,8 @@ struct Codegen<'m> {
     params: std::rc::Rc<Vec<Vec<Ty>>>,
     /// `value_captures`, by `ClosureId`.
     value_captures: std::rc::Rc<Vec<Vec<bool>>>,
+    /// The atoms `Promise` and `resolve`, if used.
+    promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     fctx: FunctionBuilderContext,
 }
 
@@ -332,6 +336,11 @@ impl<'m> Codegen<'m> {
         Ok(Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
+            promise_resolve: m
+                .atoms
+                .iter()
+                .position(|a| a == "Promise")
+                .zip(m.atoms.iter().position(|a| a == "resolve")),
             module,
             funcs,
             fast_funcs,
@@ -365,6 +374,7 @@ impl<'m> Codegen<'m> {
             closure_base: self.closure_base,
             params: self.params.clone(),
             value_captures: self.value_captures.clone(),
+            promise_resolve: self.promise_resolve,
             fast_sig,
         }
     }

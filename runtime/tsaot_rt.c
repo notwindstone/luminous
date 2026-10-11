@@ -288,6 +288,16 @@ static JSValue tsaot_async_resume(JSContext *ctx, JSValueConst this_val, int arg
     return JS_UNDEFINED;
 }
 
+/* The job that resumes a frame (argv[0]) awaiting a primitive (argv[1]),
+ * queued where the promise reaction would be. */
+static JSValue tsaot_await_job(JSContext *ctx, int argc, JSValueConst *argv)
+{
+    TsaotFrame *f = JS_GetOpaque(argv[0], tsaot_frame_class);
+    JSValue value = argv[1];
+    tsaot_async_step(ctx, f->slots, f->state, &value, 0);
+    return JS_UNDEFINED;
+}
+
 /* `await value` at resume point `state`: continue the frame when the value
    settles. Takes ownership of `value`. Returns -1 on exception. */
 int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
@@ -296,6 +306,11 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
     JSValue self;
     int i, ret = -1;
     f->state = state;
+    /* A primitive: the frame resumes from a job of its own. */
+    ret = JS_EnqueueAwaitJob(ctx, value, tsaot_await_job, JS_MKPTR(JS_TAG_OBJECT, f->self));
+    if (ret <= 0)
+        goto done;
+    ret = -1;
     /* The reactions never reach user code, so one pair serves every await. */
     for (i = 0; i < 2; i++) {
         if (!JS_IsUndefined(f->on_settled[i]))
@@ -548,7 +563,8 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             Object.getPrototypeOf(async function () {}),\n"
         "             Object.getPrototypeOf(function* () {}),\n"
         "             Object.getPrototypeOf(function* () {}).prototype.next,\n"
-        "             Object.getPrototypeOf(async function* () {}));\n"
+        "             Object.getPrototypeOf(async function* () {}),\n"
+        "             g.Promise, g.Promise.resolve);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
@@ -1252,7 +1268,8 @@ _Static_assert(sizeof(TsaotIC) == 32 && offsetof(TsaotIC, slot) == 8 && offsetof
 
 /* Sites that never cache (as for objects with unshared shapes) stop trying
  * after this many misses, as megamorphic sites in JSC. An empty entry
- * counts them in `slot`. */
+ * counts them in `slot`. Reads at such a site look for an own data property at the
+ * index where they last found it (in `kind`). */
 #define TSAOT_IC_GIVE_UP 64
 
 static bool tsaot_ic_gave_up(TsaotIC *ic)
@@ -1270,8 +1287,16 @@ static void tsaot_ic_count_miss(TsaotIC *ic)
  * the direct prototype's data properties (methods) and getters. */
 JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
-    JSValue v = JS_GetProperty(ctx, obj, prop);
-    if (!JS_IsException(v) && !tsaot_ic_gave_up(ic) && !tsaot_ic_fill(ctx, obj, prop, 0, ic) &&
+    JSValue v;
+    if (tsaot_ic_gave_up(ic)) {
+        /* `kind` holds the index of the property last found */
+        v = JS_GetOwnDataHint(ctx, obj, prop, &ic->kind);
+        if (!JS_IsUninitialized(v))
+            return v;
+        return JS_GetProperty(ctx, obj, prop);
+    }
+    v = JS_GetProperty(ctx, obj, prop);
+    if (!JS_IsException(v) && !tsaot_ic_fill(ctx, obj, prop, 0, ic) &&
         !tsaot_ic_fill(ctx, obj, prop, 2, ic) &&
         !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_DATA, ic) &&
         !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_GETTER, ic))
@@ -1383,4 +1408,20 @@ JSValue tsaot_new_closure(JSContext *ctx, TsaotFnCache *c, JSCFunctionFast *fast
             return JS_EXCEPTION;
     }
     return JS_NewCFunctionDataShaped(ctx, fast, slow, c->name, length, magic, n, (JSValueConst *)data, &c->shape);
+}
+
+/* Whether `promise.resolve` was the intrinsic Promise.resolve (both
+ * borrowed): then `await Promise.resolve(x)` is `await x`. */
+int tsaot_is_promise_resolve(JSValue promise, JSValue resolve)
+{
+    return JS_VALUE_GET_TAG(promise) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(resolve) == JS_TAG_OBJECT &&
+           JS_VALUE_GET_PTR(promise) == JS_VALUE_GET_PTR(tsaot_pins[TSAOT_PIN_PROMISE]) &&
+           JS_VALUE_GET_PTR(resolve) == JS_VALUE_GET_PTR(tsaot_pins[TSAOT_PIN_PROMISE_RESOLVE]);
+}
+
+/* A global variable read: the global object's property is looked for at
+ * the index where this site last found it (in `slot`). */
+JSValue tsaot_global_get(JSContext *ctx, JSAtom prop, TsaotIC *ic)
+{
+    return JS_GetGlobalVariableHint(ctx, prop, &ic->slot);
 }

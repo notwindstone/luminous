@@ -154,7 +154,12 @@ fast paths that keep the engine's semantics:
   makes a settled promise without resolving functions; resolving a native
   promise whose `constructor` is the intrinsic one (read without running
   code) skips the property lookup; reactions to a settled promise are
-  queued without allocating reaction records.
+  queued without allocating reaction records; `await` of a primitive
+  queues its continuation without making a promise
+  (`JS_EnqueueAwaitJob`: native frames resume from a job of their own);
+- `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
+  that inline caches skip (the global object, built-in constructors) look
+  at the index where the property was last found first.
 
 ## What compiles natively
 
@@ -214,7 +219,8 @@ fast paths that keep the engine's semantics:
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering
-  matches the interpreter exactly.
+  matches the interpreter exactly. `await Promise.resolve(x)` awaits `x`
+  itself while `Promise.resolve` is the intrinsic one (the same ticks).
 - **Generators** (`function*`, generator methods and closures), with
   `yield`, `yield*` and the exact `next` / `return` / `throw` behavior:
   native generator objects are the engine's own.

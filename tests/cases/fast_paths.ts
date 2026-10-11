@@ -1,5 +1,5 @@
-// @native ownAccessors linkedCalls deep literals numArith closureShapes valueCaptures captureTdz switchCapture arrayIter giveUp promises
-// @interpreted slowAdd
+// @native ownAccessors linkedCalls deep literals numArith closureShapes valueCaptures captureTdz switchCapture arrayIter giveUp promises nativeA nativeB patched
+// @interpreted slowAdd interpC
 // Fast paths: own accessor caches, linked calls, object literal and
 // closure shapes, value captures, numeric arithmetic on JS values.
 
@@ -339,3 +339,48 @@ async function promises(): Promise<string> {
   return log.join(",");
 }
 promises().then((s) => console.log(s));
+
+// Microtask order with awaits of primitives and promises, native and
+// interpreted, against `.then` chains; a replaced Promise.resolve is called.
+const order: string[] = [];
+async function nativeA(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    order.push("A" + i);
+    await i;
+  }
+}
+async function nativeB(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    order.push("B" + i);
+    await Promise.resolve(i);
+  }
+}
+interpreted async function interpC(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    order.push("C" + i);
+    await i;
+  }
+}
+async function patched(): Promise<string> {
+  const original = Promise.resolve;
+  let calls = 0;
+  Promise.resolve = ((v: unknown) => {
+    calls++;
+    return original.call(Promise, v);
+  }) as typeof Promise.resolve;
+  const v = await Promise.resolve(7);
+  Promise.resolve = original;
+  const w = await Promise.resolve(8);
+  return [v, w, calls].join(",");
+}
+Promise.resolve()
+  .then(() => {
+    const all = Promise.all([nativeA(), nativeB(), interpC()]);
+    Promise.resolve()
+      .then(() => order.push("t1"))
+      .then(() => order.push("t2"))
+      .then(() => order.push("t3"));
+    return all;
+  })
+  .then(() => patched())
+  .then((s) => console.log(order.join(" ") + " | " + s));
