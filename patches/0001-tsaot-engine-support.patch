@@ -14,7 +14,7 @@
  typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
  
  typedef struct JSMallocFunctions {
-@@ -1052,6 +1059,132 @@
+@@ -1052,6 +1059,141 @@
                                const char *input, size_t input_len,
                                JSEvalOptions *options);
  JS_EXTERN JSValue JS_GetGlobalObject(JSContext *ctx);
@@ -60,14 +60,23 @@
 +   such a shape, taking its property values (in shape order). */
 +JS_EXTERN int JS_CachePlainShape(JSContext *ctx, JSValueConst obj, int count, void **pshape);
 +JS_EXTERN JSValue JS_NewObjectWithCachedShape(JSContext *ctx, void *shape, JSValue *values);
-+/* An object of class `class_id` (and its class prototype) that is not
-+   extensible and has no properties, with `size` zeroed bytes of data as its
-+   opaque (`*pdata`) in the same allocation: for classes whose exotic
++/* An object of class `class_id` (and its class prototype) without
++   properties (extensible or not), with `size` bytes of data (uninitialized)
++   as its opaque (`*pdata`) in the same allocation: for classes whose exotic
 +   methods present the data as properties. Their finalizer must not free
 +   the opaque. */
 +/* A new reference to the shape of object `obj` (see JS_FreeCachedShape). */
 +JS_EXTERN void *JS_DupObjectShape(JSValueConst obj);
-+JS_EXTERN JSValue JS_NewObjectClassData(JSContext *ctx, JSClassID class_id, size_t size, void **pdata);
++/* Objects of this class (with exotic methods) are arrays to Array.isArray,
++   JSON and the like. */
++JS_EXTERN void JS_SetArrayClass(JSClassID class_id);
++/* For a fast array (an Array whose elements are all stored, from 0): its
++   values (borrowed) and their count; past it, holes up to the length. */
++JS_EXTERN bool JS_GetFastArrayValues(JSContext *ctx, JSValueConst obj, JSValue **pvalues, uint32_t *pcount);
++/* Whether `atom` is an array index, and which. */
++JS_EXTERN bool JS_AtomToArrayIndex(JSContext *ctx, uint32_t *pidx, JSAtom atom);
++JS_EXTERN JSValue JS_NewObjectClassData(JSContext *ctx, JSClassID class_id, size_t size, bool extensible,
++                                        void **pdata);
 +JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
 +JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
 +/* For natively compiled code: the interpreter's own iteration (for-of,
@@ -147,7 +156,7 @@
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
  JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
                                  JSAtom prop, JSValueConst val,
-@@ -1251,6 +1384,8 @@
+@@ -1251,6 +1393,8 @@
  typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
  JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
                              int argc, JSValueConst *argv);
@@ -156,7 +165,7 @@
  
  JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
  JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
-@@ -1342,6 +1477,22 @@
+@@ -1342,6 +1486,22 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
@@ -374,7 +383,47 @@
  int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                          JSValue prop, JSValue val, int flags)
  {
-@@ -16550,6 +16674,165 @@
+@@ -15015,11 +15139,29 @@
+     }
+ }
+ 
++/* Another class whose objects are arrays (JS_SetArrayClass), or 0. */
++static JSClassID js_array_class2;
++
++void JS_SetArrayClass(JSClassID class_id)
++{
++    js_array_class2 = class_id;
++}
++
++bool JS_GetFastArrayValues(JSContext *ctx, JSValueConst obj, JSValue **pvalues, uint32_t *pcount)
++{
++    return js_get_fast_array(ctx, unsafe_unconst(obj), pvalues, pcount);
++}
++
++bool JS_AtomToArrayIndex(JSContext *ctx, uint32_t *pidx, JSAtom atom)
++{
++    return JS_AtomIsArrayIndex(ctx, pidx, atom);
++}
++
+ bool JS_IsArray(JSValueConst val)
+ {
+     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+         JSObject *p = JS_VALUE_GET_OBJ(val);
+-        return p->class_id == JS_CLASS_ARRAY;
++        return p->class_id == JS_CLASS_ARRAY || (js_array_class2 && p->class_id == js_array_class2);
+     }
+     return false;
+ }
+@@ -15033,7 +15175,7 @@
+         if (unlikely(p->class_id == JS_CLASS_PROXY))
+             return js_proxy_isArray(ctx, val);
+         else
+-            return p->class_id == JS_CLASS_ARRAY;
++            return p->class_id == JS_CLASS_ARRAY || (js_array_class2 && p->class_id == js_array_class2);
+     } else {
+         return false;
+     }
+@@ -16550,6 +16692,165 @@
      return atom;
  }
  
@@ -540,7 +589,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -16757,6 +17040,13 @@
+@@ -16757,6 +17058,13 @@
      return JS_EXCEPTION;
  }
  
@@ -554,7 +603,7 @@
  static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
  {
      JSObject *p;
-@@ -16785,6 +17075,8 @@
+@@ -16785,6 +17093,8 @@
      it->is_array = false;
      it->obj = obj;
      it->idx = 0;
@@ -563,7 +612,7 @@
      p = JS_VALUE_GET_OBJ(enum_obj);
      p->u.for_in_iterator = it;
  
-@@ -16906,7 +17198,20 @@
+@@ -16906,7 +17216,20 @@
      it = p->u.for_in_iterator;
  
      for(;;) {
@@ -585,7 +634,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18352,46 @@
+@@ -18047,6 +18370,46 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -632,7 +681,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18893,12 @@
+@@ -18548,9 +18911,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -645,7 +694,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +18933,12 @@
+@@ -18585,9 +18951,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -658,7 +707,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +18949,21 @@
+@@ -18598,6 +18967,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -680,7 +729,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -21274,13 +21640,21 @@
+@@ -21274,13 +21658,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -703,7 +752,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21681,10 @@
+@@ -21307,7 +21699,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -715,7 +764,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21692,56 @@
+@@ -21315,6 +21710,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -772,7 +821,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21753,8 @@
+@@ -21326,6 +21771,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -781,7 +830,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +21869,61 @@
+@@ -21440,6 +21887,61 @@
      return JS_EXCEPTION;
  }
  
@@ -843,7 +892,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22156,12 @@
+@@ -21672,6 +22174,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -856,7 +905,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22178,11 @@
+@@ -21688,8 +22196,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -870,7 +919,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22211,11 @@
+@@ -21718,8 +22229,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -884,7 +933,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22328,12 @@
+@@ -21832,7 +22346,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -898,7 +947,7 @@
      }
  }
  
-@@ -21874,6 +22375,55 @@
+@@ -21874,6 +22393,55 @@
      return res;
  }
  
@@ -954,7 +1003,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +22460,12 @@
+@@ -21910,6 +22478,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -967,7 +1016,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +22478,20 @@
+@@ -21922,10 +22496,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -989,7 +1038,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +22565,12 @@
+@@ -21999,6 +22583,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -1002,7 +1051,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +22667,37 @@
+@@ -22095,6 +22685,37 @@
      return JS_EXCEPTION;
  }
  
@@ -1040,7 +1089,7 @@
  /* JS parser */
  
  enum {
-@@ -44978,6 +45581,15 @@
+@@ -44978,6 +45599,15 @@
      return JS_EXCEPTION;
  }
  
@@ -1056,7 +1105,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56073,6 +56685,48 @@
+@@ -56073,6 +56703,48 @@
      return result_promise;
  }
  
@@ -1105,7 +1154,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +56735,24 @@
+@@ -56081,14 +56753,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -1135,7 +1184,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +56770,418 @@
+@@ -56106,6 +56788,421 @@
      return result_promise;
  }
  
@@ -1307,7 +1356,8 @@
 +    return js_dup_shape(JS_VALUE_GET_OBJ(obj)->shape);
 +}
 +
-+JSValue JS_NewObjectClassData(JSContext *ctx, JSClassID class_id, size_t size, void **pdata)
++JSValue JS_NewObjectClassData(JSContext *ctx, JSClassID class_id, size_t size, bool extensible,
++                              void **pdata)
 +{
 +    JSObject *p, *proto = object_or_null(ctx->class_proto[class_id]);
 +    JSShape *sh = find_hashed_shape_proto(ctx->rt, proto);
@@ -1320,13 +1370,15 @@
 +            return JS_EXCEPTION;
 +    }
 +    js_trigger_gc(ctx->rt, sizeof(JSObject) + size);
-+    p = js_mallocz(ctx, sizeof(JSObject) + size);
++    p = js_malloc(ctx, sizeof(JSObject) + size);
 +    if (!p) {
 +        js_free_shape(ctx->rt, sh);
 +        return JS_EXCEPTION;
 +    }
++    /* The data is the caller's to initialize. */
++    memset(p, 0, sizeof(JSObject));
 +    p->class_id = class_id;
-+    p->extensible = false;
++    p->extensible = extensible;
 +    p->is_exotic = ctx->rt->class_array[class_id].exotic != NULL;
 +    p->shape = sh;
 +    p->prop = NULL;
@@ -1554,7 +1606,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +57555,25 @@
+@@ -56479,6 +57576,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -1580,7 +1632,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +57593,8 @@
+@@ -56498,23 +57614,8 @@
          rd_array[i] = rd;
      }
  

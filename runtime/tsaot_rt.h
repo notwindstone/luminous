@@ -225,3 +225,18 @@ int tsaot_struct_set(JSContext *ctx, JSValue obj, int field, JSValue v);
 JSValue tsaot_struct_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 extern int tsaot_int_wrapping __attribute__((weak));
 JSValue tsaot_struct_coerce(JSContext *ctx, int layout, int field, JSValue v);
+
+/* An array of objects of one `aot type` layout (its opaque): elements are
+ * objects of that layout or `undefined` (holes). */
+typedef struct TsaotStructArray {
+    uint32_t layout;
+    uint32_t len;
+    uint32_t cap;
+    uint32_t pad;
+    JSValue *items;
+} TsaotStructArray;
+extern uint32_t tsaot_sarr_class;
+JSValue tsaot_sarr_from(JSContext *ctx, int layout, JSValue src);
+int tsaot_sarr_set(JSContext *ctx, JSValue obj, int64_t idx, JSValue v);
+int64_t tsaot_sarr_push(JSContext *ctx, JSValue obj, JSValue v);
+JSValue tsaot_sarr_js(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);

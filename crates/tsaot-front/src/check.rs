@@ -266,6 +266,8 @@ pub fn check<'a>(
             homes_used: Vec::new(),
             layouts: &structs.layouts,
             struct_sites: &structs.sites,
+            array_sites: &structs.array_sites,
+            sure_arrays: &structs.sure_arrays,
         };
         for i in 0..candidates.len() {
             cx.ensure(i);
@@ -661,6 +663,20 @@ fn ts_type(t: &TSType) -> Option<Ty> {
         TSType::TSBooleanKeyword(_) => Some(Ty::Bool),
         TSType::TSVoidKeyword(_) => Some(Ty::Void),
         TSType::TSParenthesizedType(p) => ts_type(&p.type_annotation),
+        // An array of an `aot type`, as `structs::array_sites` makes them.
+        TSType::TSArrayType(a) => match ts_type(&a.element_type)? {
+            Ty::Struct(k) => Some(Ty::StructArr(k)),
+            _ => None,
+        },
+        TSType::TSTypeReference(r)
+            if matches!(&r.type_name, TSTypeName::IdentifierReference(id) if id.name == "Array")
+                && r.type_arguments.as_ref().is_some_and(|a| a.params.len() == 1) =>
+        {
+            match ts_type(&r.type_arguments.as_ref().unwrap().params[0])? {
+                Ty::Struct(k) => Some(Ty::StructArr(k)),
+                _ => None,
+            }
+        }
         // Typed arrays (or a user type of the same name: either way, the
         // entry checks the class).
         TSType::TSTypeReference(r) => match &r.type_name {
@@ -701,7 +717,7 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     for p in &params.items {
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_) | Ty::Struct(_)))
+            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_)))
                 if p.initializer.is_none()
                     && !p.optional
                     && matches!(p.pattern, BindingPattern::BindingIdentifier(_)) =>
@@ -760,6 +776,8 @@ struct ModuleCx<'m, 'a> {
     /// (span start: span end, layout).
     layouts: &'m [ir::Layout],
     struct_sites: &'m HashMap<u32, (u32, u32)>,
+    array_sites: &'m HashMap<u32, (u32, u32)>,
+    sure_arrays: &'m HashMap<SymbolId, u32>,
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
@@ -1088,7 +1106,7 @@ fn any(e: Expr) -> Expr {
         Ty::Any => e,
         Ty::F64 | Ty::I32 | Ty::Bool | Ty::MaybeF64 => Expr::new(Ty::Any, ExprKind::Box(Box::new(e))),
         // Already a JSValue.
-        Ty::Arr(_) | Ty::Struct(_) => Expr { ty: Ty::Any, ..e },
+        Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => Expr { ty: Ty::Any, ..e },
         Ty::Void => Expr::new(Ty::Any, ExprKind::Void(Box::new(e))),
     }
 }
@@ -2305,6 +2323,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 // An object of an `aot type` keeps its type.
                 let (src, init) = match v.ty {
                     Ty::Struct(_) => (self.temp(v.ty), v),
+                    Ty::StructOrUndef(k) => {
+                        let t = Ty::Struct(k);
+                        (self.temp(t), Expr::new(t, ExprKind::NonNull(None, Box::new(v))))
+                    }
                     _ => (self.temp(Ty::Any), Expr::new(Ty::Any, ExprKind::ToObject(Box::new(any(v))))),
                 };
                 out.push(Stmt::Expr(set(src, init)));
@@ -2748,6 +2770,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     fn expr(&mut self, e: &'a Expression<'a>) -> R<Expr> {
         let span = e.span();
+        // An array of objects of an `aot type`.
+        if matches!(e, Expression::ArrayExpression(_) | Expression::NewExpression(_) | Expression::CallExpression(_))
+            && let Some(&(end, k)) = self.m.array_sites.get(&span.start)
+            && end == span.end
+        {
+            let arr = any(self.expr_plain(e)?);
+            return Ok(Expr::new(Ty::StructArr(k), ExprKind::StructArrFrom(k, Box::new(arr))));
+        }
+        self.expr_plain(e)
+    }
+
+    fn expr_plain(&mut self, e: &'a Expression<'a>) -> R<Expr> {
+        let span = e.span();
         // Only the expression right after a binding is named by it.
         let name_hint = self.name_hint.take();
         Ok(match e {
@@ -2812,8 +2847,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     }
                     let obj = self.expr(&m.object)?;
                     let atom = self.m.atom(m.property.name.as_str());
-                    if self.struct_field(obj.ty, atom).is_some() {
+                    if self.struct_field(obj.ty, atom).is_some() || matches!(obj.ty, Ty::StructOrUndef(_)) {
                         self.get_prop(obj, atom)
+                    } else if m.property.name == "length" && matches!(obj.ty, Ty::StructArr(_)) {
+                        Expr::new(Ty::F64, ExprKind::StructArrLen(Box::new(obj)))
                     } else if m.property.name == "length" {
                         Expr::new(Ty::Any, ExprKind::Length(Box::new(any(obj)), atom))
                     } else {
@@ -3180,6 +3217,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     /// `obj.atom`: a field of an `aot type`, else a property.
     fn get_prop(&self, obj: Expr, atom: ir::AtomId) -> Expr {
+        // An element of an array of an `aot type`: an object, else what JS
+        // throws reading a property of `undefined`.
+        if let Ty::StructOrUndef(k) = obj.ty
+            && self.struct_field(Ty::Struct(k), atom).is_some()
+        {
+            let obj = Expr::new(Ty::Struct(k), ExprKind::NonNull(Some(atom), Box::new(obj)));
+            return self.get_prop(obj, atom);
+        }
         if let Some((k, i)) = self.struct_field(obj.ty, atom) {
             let f = &self.m.layouts[k as usize].fields[i as usize];
             let ty = if f.universal { f.ty } else { Ty::Any };
@@ -3428,7 +3473,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 if self.is_module_symbol(sym) {
                     let cell = self.m.cell(sym, id.span)?;
-                    return Ok(Expr::new(Ty::Any, ExprKind::Cell(cell)));
+                    // Only ever an array of an `aot type` (or in its TDZ).
+                    let ty = self.m.sure_arrays.get(&sym).map_or(Ty::Any, |&k| Ty::StructArr(k));
+                    return Ok(Expr::new(ty, ExprKind::Cell(cell)));
                 }
                 reject(id.span, format!("`{}` is not a local variable, module binding or global", id.name))
             }
@@ -3484,7 +3531,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 // Typed arrays keep their type.
                 let direct = self.plain_local(&m.object);
                 let obj = self.expr(&m.object)?;
-                let obj = if matches!(obj.ty, Ty::Arr(_)) { obj } else { any(obj) };
+                let obj = if matches!(obj.ty, Ty::Arr(_) | Ty::StructArr(_)) { obj } else { any(obj) };
                 let mark = self.pre.len();
                 let key = self.elem_key(&m.expression)?;
                 let mut setup = Vec::new();
@@ -3518,7 +3565,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn plain_local(&self, e: &'a Expression<'a>) -> Option<ir::LocalId> {
         let Expression::Identifier(id) = e.without_parentheses() else { return None };
         let &l = self.sym_local.get(&self.resolve(id)?)?;
-        (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_) | Ty::Struct(_))).then_some(l)
+        (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_)))
+            .then_some(l)
     }
 
     /// An identifier as an assignment target.
@@ -3901,7 +3949,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let sym = self.resolve(id);
                 if let Some(i) = sym.and_then(|s| self.m.cands.iter().position(|c| c.symbol == Some(s)))
                     && !self.sym_local.contains_key(&sym.unwrap())
-                    && let Some(e) = self.direct_call(i, &c.arguments, c.span)?
+                    && let Some(e) = self.direct_call(i, &c.arguments, c.span, Some(id))?
                 {
                     return Ok(e);
                 }
@@ -3937,7 +3985,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 if m.optional {
                     return reject(c.span, "optional chaining is not supported yet");
                 }
-                let obj = any(self.expr(&m.object)?);
+                let obj = self.expr(&m.object)?;
+                if let Ty::StructArr(k) = obj.ty
+                    && m.property.name == "push"
+                    && let [a] = &c.arguments[..]
+                    && let Some(a) = a.as_expression()
+                {
+                    let mut operands = [obj];
+                    let mark = self.pre.len();
+                    let v = self.expr(a)?;
+                    self.order(&mut operands, mark);
+                    let [obj] = operands;
+                    let v = if v.ty == Ty::Struct(k) { v } else { any(v) };
+                    return Ok(Expr::new(Ty::F64, ExprKind::StructArrPush(k, Box::new(obj), Box::new(v))));
+                }
+                let obj = any(obj);
                 let atom = self.m.atom(m.property.name.as_str());
                 self.call_method(obj, Key::Atom(atom), &c.arguments)
             }
@@ -4015,7 +4077,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A direct machine call to native function `i`, if the arguments fit
     /// its parameters exactly (otherwise the call goes through its JS entry,
     /// which guards the types and may fall back to the interpreter).
-    fn direct_call(&mut self, i: usize, args: &'a [Argument<'a>], span: Span) -> R<Option<Expr>> {
+    fn direct_call(
+        &mut self,
+        i: usize,
+        args: &'a [Argument<'a>],
+        span: Span,
+        callee: Option<&'a IdentifierReference<'a>>,
+    ) -> R<Option<Expr>> {
         // Async functions and generators are called through their JS entry
         // (which returns a promise or a generator object).
         let node = self.m.cands[i].node;
@@ -4030,6 +4098,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         }
         let start = self.pre.len();
         let mut out = Vec::with_capacity(params.len());
+        let mut checks = Vec::new();
         if rest {
             // The extra arguments, in an array.
             let mut extra = Vec::new();
@@ -4080,6 +4149,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             out.push(match (p, x.ty) {
                 (Ty::Any, _) => any(x),
                 (p, _) if let Some(y) = fit(p, &x) => y,
+                // A JS value for an `aot type` parameter: checked at the call.
+                (Ty::Struct(l), Ty::Any | Ty::StructOrUndef(_)) if callee.is_some() => {
+                    checks.push((k, l));
+                    any(x)
+                }
                 // An unproven argument for an unboxed parameter: the caller
                 // checks the arguments again.
                 _ => {
@@ -4087,6 +4161,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     return Ok(None);
                 }
             });
+        }
+        if !checks.is_empty() {
+            let callee = any(self.ident(callee.unwrap())?);
+            let call = ExprKind::CallChecked { func: i, callee: Box::new(callee), args: out, checks };
+            return Ok(Some(Expr::new(Ty::Any, call)));
         }
         Ok(Some(Expr::new(ret, ExprKind::Call(i, out))))
     }
@@ -4155,6 +4234,9 @@ fn get_elem(obj: Expr, key: Key) -> Expr {
         (Ty::Arr(kind), Key::Value(k)) if k.ty.is_number() => {
             Expr::new(Ty::MaybeF64, ExprKind::TypedGet(kind, Box::new(obj), k))
         }
+        (Ty::StructArr(l), Key::Value(k)) if k.ty.is_number() => {
+            Expr::new(Ty::StructOrUndef(l), ExprKind::StructArrGet(l, Box::new(obj), k))
+        }
         (_, Key::Atom(a)) => Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), a)),
         (_, Key::Value(k)) => Expr::new(Ty::Any, ExprKind::GetElem(Box::new(any(obj)), k)),
     }
@@ -4165,6 +4247,10 @@ fn set_elem(obj: Expr, key: Expr, v: Expr) -> Expr {
     match obj.ty {
         Ty::Arr(kind) if key.ty.is_number() && num(v.ty) => {
             Expr::new(v.ty, ExprKind::TypedSet(kind, Box::new(obj), Box::new(key), Box::new(v)))
+        }
+        Ty::StructArr(l) if key.ty.is_number() => {
+            let v = if v.ty == Ty::Struct(l) { v } else { any(v) };
+            Expr::new(v.ty, ExprKind::StructArrSet(l, Box::new(obj), Box::new(key), Box::new(v)))
         }
         _ => Expr::new(Ty::Any, ExprKind::SetElem(Box::new(any(obj)), Box::new(key), Box::new(any(v)))),
     }

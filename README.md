@@ -461,6 +461,16 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   interpreted code alike. An `int` field wraps other integers to int32 (as
   `| 0`; with `--no-int-wrapping`, a TypeError); a write that would leave
   the object matching no member is a TypeError. `Object.freeze` throws.
+- **Arrays of them.** An array literal or `new Array(n)` (or `Array(n)`)
+  where `T[]` / `Array<T>` is expected makes an array that only holds
+  objects of `T` (or holes): storing anything else in it is a TypeError,
+  while to JS it is still an array (`Array.isArray`, JSON, spread and the
+  `Array.prototype` methods work; `push`, `unshift`, `splice` and `fill`
+  arguments that are literals make objects of `T`). Native code reads an
+  element as an object of `T` or `undefined` (reading a field of
+  `undefined` throws as in JS), and so field reads through it are typed.
+  A `let` / `const` declared `T[]` that is only ever assigned such arrays
+  is typed everywhere, module bindings included.
 - **Native code** reads and writes fields at fixed offsets: on a value of a
   declared `aot type` (a literal, a parameter, a field), `p.x` is one load
   of an int32 and arithmetic on it stays in integers. Elsewhere (an element
@@ -470,7 +480,9 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   (no calls, getters or conversions), the fields it uses live in registers
   and are stored back after the loop. A native function whose `aot
   type` parameter gets another value declines the call (the interpreted
-  version runs).
+  version runs). A call whose argument of an `aot type` is not known
+  to be one (an element of an untyped array) checks it at the call and
+  calls the native function directly.
 
 ## Getting started
 

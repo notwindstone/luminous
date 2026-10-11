@@ -114,14 +114,14 @@ pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
         Ty::I32 => vec![I64],
         Ty::F64 | Ty::MaybeF64 => vec![F64],
         Ty::Bool => vec![I8],
-        Ty::Any | Ty::Arr(_) | Ty::Struct(_) => vec![I64, I64],
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => vec![I64, I64],
         Ty::Void => vec![],
     }
 }
 
 /// Whether values of type `t` are `JSValue`s.
 pub(crate) fn is_js(t: Ty) -> bool {
-    matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_))
+    matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_))
 }
 
 /// Rebuild a `V` of type `t` from Cranelift values.
@@ -130,7 +130,7 @@ pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
         Ty::I32 => V::Int(vs[0]),
         Ty::F64 | Ty::MaybeF64 => V::Num(vs[0]),
         Ty::Bool => V::Bool(vs[0]),
-        Ty::Any | Ty::Arr(_) | Ty::Struct(_) => V::Any(vs[0], vs[1]),
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => V::Any(vs[0], vs[1]),
         Ty::Void => V::Void,
     }
 }
@@ -188,6 +188,8 @@ pub(crate) struct Env {
     pub homes: GlobalValue,
     /// `tsaot_struct_class`: the class of `aot type` objects.
     pub struct_class: GlobalValue,
+    /// `tsaot_sarr_class`: the class of arrays of `aot type` objects.
+    pub sarr_class: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -322,7 +324,9 @@ impl<'a> Lower<'a> {
                     // into their frame).
                     owned: f.is_async || f.is_generator || !f.captures.contains(&i),
                 },
-                Ty::Any | Ty::Arr(_) | Ty::Struct(_) => LVar::Two(b.declare_var(I64), b.declare_var(I64)),
+                Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {
+                    LVar::Two(b.declare_var(I64), b.declare_var(I64))
+                }
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
             .collect();
@@ -437,7 +441,9 @@ impl<'a> Lower<'a> {
             Ty::F64 | Ty::MaybeF64 => V::Num(self.b.ins().f64const(0.0)),
             Ty::I32 => V::Int(self.b.ins().iconst(I64, 0)),
             Ty::Bool => V::Bool(self.b.ins().iconst(I8, 0)),
-            Ty::Any | Ty::Arr(_) | Ty::Struct(_) => self.konst(0, TAG_UNDEFINED),
+            Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {
+                self.konst(0, TAG_UNDEFINED)
+            }
             Ty::Void => V::Void,
         }
     }
@@ -1532,6 +1538,143 @@ impl<'a> Lower<'a> {
                 self.release(obj);
                 obj
             }
+            ExprKind::StructArrFrom(k, x) => {
+                let (p, t) = self.expr(x).any();
+                let ctx = self.ctx;
+                let kv = self.b.ins().iconst(I32, *k as i64);
+                let r = self.helper("tsaot_sarr_from", &[ctx, kv, p, t]);
+                self.check_value(r[1]);
+                V::Any(r[0], r[1])
+            }
+            ExprKind::StructArrLen(a) => {
+                let (obj, owned) = self.operand(a, &[]);
+                let (p, _) = obj.any();
+                let s = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_OPAQUE);
+                let len = self.b.ins().uload32(Self::mem(), s, 4);
+                let d = self.int_f64(len);
+                self.int_bits.insert(d, 32);
+                self.drop_operand(obj, owned);
+                V::Num(d)
+            }
+            ExprKind::StructArrGet(_, a, i) => {
+                let (obj, owned) = self.operand(a, &[i]);
+                let (p, _) = obj.any();
+                let key = self.expr(i);
+                let (ok, idx) = self.elem_index(key);
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let s = self.b.ins().load(I64, Self::mem(), p, layout::OBJ_OPAQUE);
+                let len = self.b.ins().uload32(Self::mem(), s, 4);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                let inb = self.b.ins().band(inb, ok);
+                let hit = self.b.create_block();
+                let zero = self.b.ins().iconst(I64, 0);
+                let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
+                self.b.ins().brif(inb, hit, &[], join, &[BlockArg::Value(zero), BlockArg::Value(undef)]);
+                self.b.switch_to_block(hit);
+                let items = self.b.ins().load(I64, Self::mem(), s, 16);
+                let off = self.b.ins().imul_imm_s(idx, SIZE as i64);
+                let at = self.b.ins().iadd(items, off);
+                let vp = self.b.ins().load(I64, Self::mem(), at, 0);
+                let vt = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                self.dup((vp, vt));
+                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                self.b.switch_to_block(join);
+                self.drop_operand(obj, owned);
+                V::Any(rp, rt)
+            }
+            ExprKind::StructArrSet(k, a, i, x) => {
+                let (obj, owned) = self.operand(a, &[i, x]);
+                let (op_, ot) = obj.any();
+                let key = self.expr(i);
+                self.hold(key);
+                let v = self.expr(x);
+                let (vp, vt) = self.boxed(v);
+                let v = V::Any(vp, vt);
+                // One reference for the array, one for the expression.
+                self.dup((vp, vt));
+                self.hold(v);
+                let join = self.b.create_block();
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                if x.ty == Ty::Struct(*k) {
+                    // An object of the layout over an element: in place.
+                    let (ok, idx) = self.elem_index(key);
+                    let s = self.b.ins().load(I64, Self::mem(), op_, layout::OBJ_OPAQUE);
+                    let len = self.b.ins().uload32(Self::mem(), s, 4);
+                    let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+                    let inb = self.b.ins().band(inb, ok);
+                    let hit = self.b.create_block();
+                    self.b.ins().brif(inb, hit, &[], slow, &[]);
+                    self.b.switch_to_block(hit);
+                    let items = self.b.ins().load(I64, Self::mem(), s, 16);
+                    let off = self.b.ins().imul_imm_s(idx, SIZE as i64);
+                    let at = self.b.ins().iadd(items, off);
+                    let old_p = self.b.ins().load(I64, Self::mem(), at, 0);
+                    let old_t = self.b.ins().load(I64, Self::mem(), at, TAG_OFFSET);
+                    self.b.ins().store(Self::mem(), vp, at, 0);
+                    self.b.ins().store(Self::mem(), vt, at, TAG_OFFSET);
+                    self.free((old_p, old_t));
+                    self.b.ins().jump(join, &[]);
+                } else {
+                    self.b.ins().jump(slow, &[]);
+                }
+                // Anything else: as JS stores it (the array checks it).
+                self.b.switch_to_block(slow);
+                let kv = self.boxed(key);
+                let slot = self.values_slot(&[(op_, ot), kv, (vp, vt)]);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_set_elem", &[ctx, slot]);
+                self.check_int(r[0]);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
+                self.release(v);
+                self.release(key);
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::StructArrPush(_, a, x) => {
+                let (obj, owned) = self.operand(a, &[x]);
+                let (p, t) = obj.any();
+                let v = self.expr(x);
+                let (vp, vt) = self.boxed(v);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_sarr_push", &[ctx, p, t, vp, vt]);
+                let failed = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+                self.branch_throw(failed);
+                let d = self.int_f64(r[0]);
+                self.int_bits.insert(d, 32);
+                self.drop_operand(obj, owned);
+                V::Num(d)
+            }
+            ExprKind::NonNull(atom, x) => {
+                let v = self.expr(x);
+                let (p, t) = v.any();
+                self.hold(v);
+                let ok = self.b.create_block();
+                let bad = self.b.create_block();
+                self.b.set_cold_block(bad);
+                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+                self.b.ins().brif(is_obj, ok, &[], bad, &[]);
+                // What JS throws for `undefined.x` / converting `undefined`.
+                self.b.switch_to_block(bad);
+                let ctx = self.ctx;
+                let r = match atom {
+                    Some(a) => {
+                        let atom = self.atom(*a);
+                        self.helper("JS_GetProperty", &[ctx, p, t, atom])
+                    }
+                    None => self.helper("JS_ToObject", &[ctx, p, t]),
+                };
+                self.check_value(r[1]);
+                self.free((r[0], r[1]));
+                let edge = self.throw_edge();
+                self.b.ins().jump(edge, &[]);
+                self.b.switch_to_block(ok);
+                self.release(v);
+                v
+            }
             ExprKind::StructCoerce(k, fi, x) => {
                 let v = self.expr(x);
                 let want = e.ty;
@@ -1738,6 +1881,79 @@ impl<'a> Lower<'a> {
                 let results = self.b.inst_results(call).to_vec();
                 self.check_flag();
                 self.unabi(e.ty, &results)
+            }
+            ExprKind::CallChecked { func, callee, args, checks } => {
+                let tys = self.env.params.clone();
+                let held: Vec<V> = args
+                    .iter()
+                    .map(|a| {
+                        let v = self.expr(a);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                // The arguments of `aot type`s must be objects of them.
+                let sc = self.b.ins().symbol_value(self.ptr, self.env.struct_class);
+                for &(i, k) in checks {
+                    let (p, t) = held[i].any();
+                    let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+                    let obj = self.b.create_block();
+                    self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+                    self.b.switch_to_block(obj);
+                    let ok = crate::struct_check(&mut self.b, p, k, sc);
+                    let next = self.b.create_block();
+                    self.b.ins().brif(ok, next, &[], slow, &[]);
+                    self.b.switch_to_block(next);
+                }
+                // Direct: the callee takes the arguments.
+                let mut vals = Vec::new();
+                for (v, &t) in held.iter().zip(&tys[*func]) {
+                    vals.extend(self.abi(t, *v));
+                }
+                for &v in held.iter().rev() {
+                    self.release(v);
+                }
+                let mut call_args = vec![self.ctx];
+                call_args.extend(vals);
+                let call = self.b.ins().call(self.env.funcs[*func], &call_args);
+                let results = self.b.inst_results(call).to_vec();
+                self.check_flag();
+                let ret = self.env.rets[*func];
+                let r = self.unabi(ret, &results);
+                let (p, t) = self.boxed(r);
+                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+                // Else through the function object (whose entry declines).
+                self.b.switch_to_block(slow);
+                for &v in &held {
+                    self.hold(v);
+                }
+                let fv = self.expr(callee);
+                self.hold(fv);
+                let mut vals = vec![fv.any(), (self.b.ins().iconst(I64, 0), self.b.ins().iconst(I64, TAG_UNDEFINED))];
+                for &v in &held {
+                    let b = self.boxed(v);
+                    vals.push(b);
+                }
+                let slot = self.values_slot(&vals);
+                let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+                let argc = self.b.ins().iconst(I32, held.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                self.check_value(r[1]);
+                self.release(fv);
+                self.free_v(fv);
+                for &v in held.iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                V::Any(rp, rt)
             }
             ExprKind::Math(f, args) => {
                 let vals: Vec<Value> = args.iter().map(|a| self.expr(a).num()).collect();
@@ -2923,7 +3139,7 @@ impl<'a> Lower<'a> {
         let mut checks = Vec::new();
         for (i, &pt) in params.iter().enumerate() {
             match pt {
-                Ty::Any | Ty::Arr(_) | Ty::Struct(_) => {}
+                Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {}
                 Ty::F64 | Ty::MaybeF64 => checks.push((args.get(i)?.1, true)),
                 Ty::Bool => checks.push((args.get(i)?.1, false)),
                 _ => return None,

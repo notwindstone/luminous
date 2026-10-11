@@ -147,6 +147,8 @@ pub struct Analysis {
     pub int_wraps: Vec<IntWrap>,
     /// Object literals that make objects of an `aot type`: span and layout.
     pub struct_sites: Vec<((u32, u32), u32)>,
+    /// Arrays of objects of an `aot type`: span and layout.
+    pub array_sites: Vec<((u32, u32), u32)>,
 }
 
 fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
@@ -298,6 +300,8 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     let int_wraps = ints.wraps;
     let mut struct_sites: Vec<((u32, u32), u32)> = structs.sites.iter().map(|(&s, &(e, k))| ((s, e), k)).collect();
     struct_sites.sort();
+    let mut array_sites: Vec<((u32, u32), u32)> = structs.array_sites.iter().map(|(&s, &(e, k))| ((s, e), k)).collect();
+    array_sites.sort();
     Ok(Analysis {
         source: source.clone(),
         module: out.module,
@@ -308,6 +312,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
         classes,
         int_wraps,
         struct_sites,
+        array_sites,
     })
 }
 

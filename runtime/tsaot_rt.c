@@ -334,8 +334,11 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 static JSClassID tsaot_state_class;
 static int tsaot_structs_init(JSContext *ctx);
 static void tsaot_structs_free(JSRuntime *rt);
+static int tsaot_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
 static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL;
+/* `length`, for arrays of `aot type` objects. */
+static JSAtom tsaot_atom_length = JS_ATOM_NULL;
 
 static int tsaot_ic_count(void);
 
@@ -1640,7 +1643,7 @@ JSValue tsaot_struct_new(JSContext *ctx, int layout, uint32_t mask)
 {
     const TsaotLayoutDesc *l = &tsaot_layouts[layout];
     void *data;
-    JSValue obj = JS_NewObjectClassData(ctx, tsaot_struct_class, sizeof(TsaotStruct) + l->size, &data);
+    JSValue obj = JS_NewObjectClassData(ctx, tsaot_struct_class, sizeof(TsaotStruct) + l->size, false, &data);
     TsaotStruct *s = data;
     uint32_t i;
     if (JS_IsException(obj))
@@ -1881,6 +1884,8 @@ static int tsaot_structs_init(JSContext *ctx)
         for (f = 0; f < tsaot_layouts[i].nfields; f++)
             tsaot_struct_atoms[tsaot_struct_atom_base[i] + f] = JS_NewAtom(ctx, tsaot_layouts[i].fields[f].name);
     }
+    if (tsaot_sarr_init(ctx) < 0)
+        return -1;
     tsaot_struct_lit_values = js_mallocz(ctx, sizeof(JSValue) * (tsaot_nstruct_lits ? tsaot_nstruct_lits : 1));
     for (i = 0; i < tsaot_nstruct_lits; i++)
         tsaot_struct_lit_values[i] = JS_NewString(ctx, tsaot_struct_lits[i]);
@@ -1901,6 +1906,8 @@ static void tsaot_structs_free(JSRuntime *rt)
     js_free_rt(rt, tsaot_struct_atoms);
     js_free_rt(rt, tsaot_struct_atom_base);
     js_free_rt(rt, tsaot_struct_lit_values);
+    JS_FreeAtomRT(rt, tsaot_atom_length);
+    tsaot_atom_length = JS_ATOM_NULL;
     tsaot_struct_atoms = NULL;
 }
 
@@ -1928,4 +1935,302 @@ JSValue tsaot_struct_coerce(JSContext *ctx, int layout, int field, JSValue v)
         return JS_EXCEPTION;
     }
     return v;
+}
+
+/* ---- arrays of `aot type` objects ----
+ *
+ * An array declared `T[]` (T an `aot type`) made by an array literal or
+ * `new Array(n)` is an object of class tsaot_sarr_class: its elements are
+ * objects of T's layout or `undefined` (holes), which native code relies
+ * on. To JS it is an array (Array.isArray, JSON, Array.prototype
+ * methods); storing anything else in it is a TypeError. */
+
+uint32_t tsaot_sarr_class;
+
+static TsaotStructArray *tsaot_sarr_of(JSValueConst v)
+{
+    return JS_GetOpaque(v, tsaot_sarr_class);
+}
+
+static int tsaot_sarr_reserve(JSContext *ctx, TsaotStructArray *a, uint64_t n)
+{
+    uint32_t cap, i;
+    JSValue *items;
+    if (n <= a->cap)
+        return 0;
+    if (n > UINT32_MAX) {
+        JS_ThrowRangeError(ctx, "invalid array length");
+        return -1;
+    }
+    cap = a->cap * 2 > n ? a->cap * 2 : (uint32_t)n;
+    if (cap < 4)
+        cap = 4;
+    items = js_realloc(ctx, a->items, sizeof(JSValue) * cap);
+    if (!items)
+        return -1;
+    for (i = a->cap; i < cap; i++)
+        items[i] = JS_UNDEFINED;
+    a->items = items;
+    a->cap = cap;
+    return 0;
+}
+
+/* The new length (from JS): elements past it are dropped. */
+static int tsaot_sarr_set_length(JSContext *ctx, TsaotStructArray *a, uint32_t len)
+{
+    uint32_t i;
+    if (len > a->len && tsaot_sarr_reserve(ctx, a, len) < 0)
+        return -1;
+    for (i = len; i < a->len; i++) {
+        JS_FreeValue(ctx, a->items[i]);
+        a->items[i] = JS_UNDEFINED;
+    }
+    a->len = len;
+    return 0;
+}
+
+static JSValue tsaot_sarr_new(JSContext *ctx, int layout, uint32_t len)
+{
+    void *data;
+    JSValue obj = JS_NewObjectClassData(ctx, tsaot_sarr_class, sizeof(TsaotStructArray), true, &data);
+    TsaotStructArray *a = data;
+    if (JS_IsException(obj))
+        return obj;
+    a->layout = layout;
+    a->len = a->cap = a->pad = 0;
+    a->items = NULL;
+    if (tsaot_sarr_set_length(ctx, a, len) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
+}
+
+/* Store v (taken) at idx: an object of the layout, or undefined. */
+int tsaot_sarr_set(JSContext *ctx, JSValue obj, int64_t idx, JSValue v)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    TsaotStruct *s = tsaot_struct_of(v);
+    if (!(JS_IsUndefined(v) || (s && s->layout == a->layout))) {
+        JS_FreeValue(ctx, v);
+        JS_ThrowTypeError(ctx, "an array of aot type `%s` cannot hold this value", tsaot_layouts[a->layout].name);
+        return -1;
+    }
+    if (idx < 0 || idx >= UINT32_MAX) {
+        JS_FreeValue(ctx, v);
+        JS_ThrowRangeError(ctx, "invalid array index");
+        return -1;
+    }
+    if (idx >= a->len) {
+        if (tsaot_sarr_reserve(ctx, a, idx + 1) < 0) {
+            JS_FreeValue(ctx, v);
+            return -1;
+        }
+        a->len = idx + 1;
+    }
+    JS_FreeValue(ctx, a->items[idx]);
+    a->items[idx] = v;
+    return 0;
+}
+
+/* `a.push(v)` (v taken): the new length, or -1. */
+int64_t tsaot_sarr_push(JSContext *ctx, JSValue obj, JSValue v)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    if (tsaot_sarr_set(ctx, obj, a->len, v) < 0)
+        return -1;
+    return a->len;
+}
+
+/* An array of layout `layout` with the elements of src (taken; an array
+ * literal or `new Array(n)`, as both halves make them). */
+JSValue tsaot_sarr_from(JSContext *ctx, int layout, JSValue src)
+{
+    int64_t len, i;
+    JSValue obj;
+    TsaotStructArray *a = tsaot_sarr_of(src);
+    if (a && a->layout == (uint32_t)layout)
+        return src;
+    if (JS_GetLength(ctx, src, &len) < 0) {
+        JS_FreeValue(ctx, src);
+        return JS_EXCEPTION;
+    }
+    obj = tsaot_sarr_new(ctx, layout, len > UINT32_MAX ? UINT32_MAX : (uint32_t)len);
+    {
+        /* A fast array (what literals and `new Array(n)` make): its stored
+           elements, then holes. */
+        JSValue *values;
+        uint32_t count;
+        if (!JS_IsException(obj) && JS_GetFastArrayValues(ctx, src, &values, &count) && count <= len) {
+            for (i = 0; i < count && !JS_IsException(obj); i++) {
+                if (tsaot_sarr_set(ctx, obj, i, JS_DupValue(ctx, values[i])) < 0) {
+                    JS_FreeValue(ctx, obj);
+                    obj = JS_EXCEPTION;
+                }
+            }
+            JS_FreeValue(ctx, src);
+            return obj;
+        }
+    }
+    for (i = 0; i < len && !JS_IsException(obj); i++) {
+        JSValue v = JS_GetPropertyInt64(ctx, src, i);
+        if (JS_IsException(v) || tsaot_sarr_set(ctx, obj, i, v) < 0) {
+            JS_FreeValue(ctx, obj);
+            obj = JS_EXCEPTION;
+        }
+    }
+    JS_FreeValue(ctx, src);
+    return obj;
+}
+
+/* __tsaot_sarr(k, array) */
+JSValue tsaot_sarr_js(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    int32_t k;
+    if (argc < 2 || JS_ToInt32(ctx, &k, argv[0]) < 0 || k < 0 || k >= tsaot_layout_count())
+        return JS_ThrowTypeError(ctx, "__tsaot_sarr: bad layout");
+    return tsaot_sarr_from(ctx, k, JS_DupValue(ctx, argv[1]));
+}
+
+static int tsaot_sarr_get_own(JSContext *ctx, JSPropertyDescriptor *desc, JSValueConst obj, JSAtom prop)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    uint32_t idx;
+    if (prop == tsaot_atom_length) {
+        if (desc) {
+            desc->flags = JS_PROP_WRITABLE;
+            desc->value = JS_NewUint32(ctx, a->len);
+            desc->getter = desc->setter = JS_UNDEFINED;
+        }
+        return 1;
+    }
+    if (!JS_AtomToArrayIndex(ctx, &idx, prop) || idx >= a->len || JS_IsUndefined(a->items[idx]))
+        return 0;
+    if (desc) {
+        desc->flags = JS_PROP_C_W_E;
+        desc->value = JS_DupValue(ctx, a->items[idx]);
+        desc->getter = desc->setter = JS_UNDEFINED;
+    }
+    return 1;
+}
+
+static int tsaot_sarr_own_names(JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    uint32_t i, n = 0;
+    JSPropertyEnum *tab = js_malloc(ctx, sizeof(JSPropertyEnum) * ((size_t)a->len + 1));
+    if (!tab)
+        return -1;
+    for (i = 0; i < a->len; i++) {
+        if (!JS_IsUndefined(a->items[i])) {
+            tab[n].atom = JS_NewAtomUInt32(ctx, i);
+            tab[n].is_enumerable = true;
+            n++;
+        }
+    }
+    tab[n].atom = JS_DupAtom(ctx, tsaot_atom_length);
+    tab[n].is_enumerable = false;
+    *ptab = tab;
+    *plen = n + 1;
+    return 0;
+}
+
+static int tsaot_sarr_delete(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    uint32_t idx;
+    if (prop == tsaot_atom_length)
+        return false;
+    if (JS_AtomToArrayIndex(ctx, &idx, prop) && idx < a->len) {
+        JS_FreeValue(ctx, a->items[idx]);
+        a->items[idx] = JS_UNDEFINED;
+    }
+    return true;
+}
+
+static int tsaot_sarr_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst val,
+                             JSValueConst getter, JSValueConst setter, int flags)
+{
+    TsaotStructArray *a = tsaot_sarr_of(obj);
+    const char *name = tsaot_layouts[a->layout].name;
+    uint32_t idx;
+    if (prop == tsaot_atom_length) {
+        double d;
+        if ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+            ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE))) {
+            JS_ThrowTypeError(ctx, "cannot redefine the length of an array of aot type `%s`", name);
+            return -1;
+        }
+        if (!(flags & JS_PROP_HAS_VALUE))
+            return true;
+        if (JS_ToFloat64(ctx, &d, val) < 0)
+            return -1;
+        if (!(d >= 0 && d <= UINT32_MAX && d == trunc(d))) {
+            JS_ThrowRangeError(ctx, "invalid array length");
+            return -1;
+        }
+        return tsaot_sarr_set_length(ctx, a, (uint32_t)d) < 0 ? -1 : true;
+    }
+    if (!JS_AtomToArrayIndex(ctx, &idx, prop)) {
+        JS_ThrowTypeError(ctx, "cannot add a property to an array of aot type `%s`", name);
+        return -1;
+    }
+    if ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
+        ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE)) ||
+        ((flags & JS_PROP_HAS_ENUMERABLE) && !(flags & JS_PROP_ENUMERABLE)) ||
+        ((flags & JS_PROP_HAS_CONFIGURABLE) && !(flags & JS_PROP_CONFIGURABLE))) {
+        JS_ThrowTypeError(ctx, "cannot redefine an element of an array of aot type `%s`", name);
+        return -1;
+    }
+    if (!(flags & JS_PROP_HAS_VALUE))
+        return true;
+    return tsaot_sarr_set(ctx, obj, idx, JS_DupValue(ctx, val)) < 0 ? -1 : true;
+}
+
+static void tsaot_sarr_finalizer(JSRuntime *rt, JSValueConst val)
+{
+    TsaotStructArray *a = tsaot_sarr_of(val);
+    uint32_t i;
+    if (!a)
+        return;
+    for (i = 0; i < a->len; i++)
+        JS_FreeValueRT(rt, a->items[i]);
+    js_free_rt(rt, a->items);
+}
+
+static void tsaot_sarr_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
+{
+    TsaotStructArray *a = tsaot_sarr_of(val);
+    uint32_t i;
+    if (!a)
+        return;
+    for (i = 0; i < a->len; i++)
+        JS_MarkValue(rt, a->items[i], mark_func);
+}
+
+static const JSClassExoticMethods tsaot_sarr_exotic = {
+    .get_own_property = tsaot_sarr_get_own,
+    .get_own_property_names = tsaot_sarr_own_names,
+    .delete_property = tsaot_sarr_delete,
+    .define_own_property = tsaot_sarr_define,
+};
+
+static int tsaot_sarr_init(JSContext *ctx)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSClassDef def = { "Array", .finalizer = tsaot_sarr_finalizer, .gc_mark = tsaot_sarr_mark,
+                       .exotic = (JSClassExoticMethods *)&tsaot_sarr_exotic };
+    JSValue arr, proto;
+    JS_NewClassID(rt, &tsaot_sarr_class);
+    if (JS_NewClass(rt, tsaot_sarr_class, &def) < 0)
+        return -1;
+    arr = JS_NewArray(ctx);
+    if (JS_IsException(arr))
+        return -1;
+    proto = JS_GetPrototype(ctx, arr);
+    JS_FreeValue(ctx, arr);
+    JS_SetClassProto(ctx, tsaot_sarr_class, proto);
+    JS_SetArrayClass(tsaot_sarr_class);
+    tsaot_atom_length = JS_NewAtom(ctx, "length");
+    return 0;
 }

@@ -56,6 +56,7 @@ pub const CELLS_OBJ: &str = "__tsaot_m";
 pub const METHOD_FN: &str = "__tsaot_method";
 pub const CLASS_FN: &str = "__tsaot_class";
 pub const STRUCT_FN: &str = "__tsaot_struct";
+pub const SARR_FN: &str = "__tsaot_sarr";
 
 /// A JS string literal for `s`.
 fn js_string(s: &str) -> String {
@@ -125,6 +126,10 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // object, checked (native code makes the same objects directly).
     for &((s, e), k) in &a.struct_sites {
         prefixes.entry(s as usize).or_default().push(format!("{STRUCT_FN}({k}, "));
+        suffixes.entry(e as usize).or_default().insert(0, ")".into());
+    }
+    for &((s, e), k) in &a.array_sites {
+        prefixes.entry(s as usize).or_default().push(format!("{SARR_FN}({k}, "));
         suffixes.entry(e as usize).or_default().insert(0, ")".into());
     }
     // Native module code: its statements become one call (a native
@@ -216,7 +221,7 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // the builtins) even when nothing else is needed: named imports that end
     // up unused are elided by type stripping.
     let mut head = format!(
-        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN}, {CLASS_FN}, {STRUCT_FN} }} from \"{NATIVE_MODULE}\";"
+        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN}, {CLASS_FN}, {STRUCT_FN}, {SARR_FN} }} from \"{NATIVE_MODULE}\";"
     );
     for h in header {
         head.push(' ');

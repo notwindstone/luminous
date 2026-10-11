@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use tsaot_codegen::{NATIVE_STACK_BUDGET, jsvalue, layout};
 use tsaot_front::ClassDecl;
-use tsaot_front::erase::{BIND_FN, CELLS_OBJ, CLASS_FN, INIT_FN, METHOD_FN, NATIVE_MODULE, STRUCT_FN};
+use tsaot_front::erase::{BIND_FN, CELLS_OBJ, CLASS_FN, INIT_FN, METHOD_FN, NATIVE_MODULE, SARR_FN, STRUCT_FN};
 use tsaot_front::ir;
 
 /// C init function name passed to `qjsc -M tsaot:native,<CNAME>`.
@@ -316,6 +316,8 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
         return -1;
     if (JS_SetModuleExport(ctx, m, "{STRUCT_FN}", JS_NewCFunction(ctx, tsaot_struct_from, "{STRUCT_FN}", 2)) < 0)
         return -1;
+    if (JS_SetModuleExport(ctx, m, "{SARR_FN}", JS_NewCFunction(ctx, tsaot_sarr_js, "{SARR_FN}", 2)) < 0)
+        return -1;
     return 0;
 }}
 
@@ -336,6 +338,7 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     JS_AddModuleExport(ctx, m, "{METHOD_FN}");
     JS_AddModuleExport(ctx, m, "{CLASS_FN}");
     JS_AddModuleExport(ctx, m, "{STRUCT_FN}");
+    JS_AddModuleExport(ctx, m, "{SARR_FN}");
     return m;
 }}
 "#

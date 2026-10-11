@@ -36,6 +36,10 @@ pub enum Ty {
     /// A `JSValue` known to be an object of `aot type` layout `k` (see
     /// `Layout`; represented like `Any`).
     Struct(u32),
+    /// An array of objects of layout `k` (`TsaotStructArray`; like `Any`).
+    StructArr(u32),
+    /// An element of such an array: an object of layout `k` or `undefined`.
+    StructOrUndef(u32),
 }
 
 impl Ty {
@@ -116,6 +120,8 @@ impl fmt::Display for Ty {
             Ty::MaybeF64 => "number | undefined",
             Ty::I32 => "int",
             Ty::Struct(_) => "aot type",
+            Ty::StructArr(_) => "aot type array",
+            Ty::StructOrUndef(_) => "aot type | undefined",
         })
     }
 }
@@ -528,6 +534,29 @@ pub enum ExprKind {
     /// Store a field (the value is checked, as a write from JS would be);
     /// evaluates to the value.
     StructSet(u32, Box<Expr>, u32, Box<Expr>),
+    /// A direct call of native function `func` whose arguments at `checks`
+    /// must be objects of these `aot type` layouts: checked here, then the
+    /// native function is called directly; else a call of `callee` (its
+    /// function object) with the same arguments. `Any`.
+    CallChecked {
+        func: FuncId,
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        checks: Vec<(usize, u32)>,
+    },
+    /// An array of objects of layout `k` with the elements of an array
+    /// (a literal or `new Array(n)`, see `structs::array_sites`).
+    StructArrFrom(u32, Box<Expr>),
+    /// `a[i]` (`StructOrUndef`), `a[i] = v` (the value), `a.length`,
+    /// `a.push(v)` on an array of layout `k`.
+    StructArrGet(u32, Box<Expr>, Box<Expr>),
+    StructArrSet(u32, Box<Expr>, Box<Expr>, Box<Expr>),
+    StructArrLen(Box<Expr>),
+    StructArrPush(u32, Box<Expr>, Box<Expr>),
+    /// A `StructOrUndef` value that is an object (`Ty::Struct`): else what
+    /// JS throws reading property `atom` of it, or converting it to an
+    /// object (`None`).
+    NonNull(Option<AtomId>, Box<Expr>),
     /// A value converted for field `field` of layout `layout` as a store
     /// would convert it (an `int` wraps; TypeError if not of its type): of
     /// the field's type (see `scalar_replace_structs`).
@@ -805,12 +834,29 @@ macro_rules! visitor {
                     $name(expr, f);
                     $stmts(body, f);
                 }
+                CallChecked { callee, args, .. } => {
+                    $name(callee, f);
+                    for x in args {
+                        $name(x, f);
+                    }
+                }
                 StructNew { fields, .. } => {
                     for (_, x) in fields {
                         $name(x, f);
                     }
                 }
-                StructGet(_, a, _) | StructCoerce(_, _, a) => $name(a, f),
+                StructGet(_, a, _) | StructCoerce(_, _, a) | StructArrFrom(_, a) | StructArrLen(a) | NonNull(_, a) => {
+                    $name(a, f)
+                }
+                StructArrGet(_, a, b) | StructArrPush(_, a, b) => {
+                    $name(a, f);
+                    $name(b, f);
+                }
+                StructArrSet(_, a, b, c) => {
+                    $name(a, f);
+                    $name(b, f);
+                    $name(c, f);
+                }
                 StructSet(_, a, _, b) => {
                     $name(a, f);
                     $name(b, f);

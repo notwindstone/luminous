@@ -37,6 +37,12 @@ pub struct Structs {
     /// Object literals that make an object of a layout: by span start, the
     /// span end and the layout.
     pub sites: HashMap<u32, (u32, u32)>,
+    /// Array literals and `new Array(...)` that make arrays of objects of
+    /// a layout (`T[]` expected): by span start, the span end and layout.
+    pub array_sites: HashMap<u32, (u32, u32)>,
+    /// Bindings declared `T[]` (`let` / `const`) that only ever hold such
+    /// arrays: what they hold is always one (or they are in their TDZ).
+    pub sure_arrays: HashMap<SymbolId, u32>,
 }
 
 thread_local! {
@@ -96,7 +102,14 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         return (Structs::default(), errors);
     }
 
-    let mut decl_types = DeclTypes { scoping, ids: &ids, vars: HashMap::new(), fns: HashMap::new() };
+    let mut decl_types = DeclTypes {
+        scoping,
+        ids: &ids,
+        vars: HashMap::new(),
+        fns: HashMap::new(),
+        lexical: HashSet::new(),
+        inits: HashSet::new(),
+    };
     decl_types.visit_program(program);
     let mut sites = Sites {
         scoping,
@@ -104,12 +117,58 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         layouts: &layouts,
         returns: Vec::new(),
         sites: HashMap::new(),
+        array_sites: HashMap::new(),
+        writes: HashMap::new(),
         errors: Vec::new(),
     };
     sites.visit_program(program);
     errors.append(&mut sites.errors);
-    let sites = sites.sites;
-    (Structs { layouts, sites }, errors)
+    let sure_arrays = sure_arrays(scoping, &decl_types, &sites.writes);
+    let (struct_sites, array_sites) = (sites.sites, sites.array_sites);
+    (Structs { layouts, sites: struct_sites, array_sites, sure_arrays }, errors)
+}
+
+/// What a write to a binding stores, for `sure_arrays`.
+#[derive(Clone, Copy)]
+enum Write {
+    /// An array site of this layout.
+    Array(u32),
+    /// The value of this binding.
+    Binding(SymbolId),
+    Other,
+}
+
+/// The bindings declared `T[]` all of whose writes store arrays of T's
+/// layout (array sites, or bindings that are such themselves).
+fn sure_arrays(scoping: &Scoping, types: &DeclTypes, writes: &HashMap<SymbolId, Vec<Write>>) -> HashMap<SymbolId, u32> {
+    let mut sure: HashMap<SymbolId, u32> = types
+        .vars
+        .iter()
+        .filter_map(|(&s, t)| match t {
+            SiteTy::Array(k) if types.lexical.contains(&s) => Some((s, *k)),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let before = sure.len();
+        let current = sure.clone();
+        sure.retain(|s, k| {
+            let ws = writes.get(s).map_or(&[][..], |w| &w[..]);
+            // Every write is one recorded here (no `x++`, destructuring, ...).
+            let all = scoping.get_resolved_references(*s).filter(|r| r.is_write()).count();
+            let recorded = ws.len() - types.inits.contains(s) as usize;
+            all == recorded
+                && types.inits.contains(s)
+                && ws.iter().all(|w| match w {
+                    Write::Array(j) => j == k,
+                    Write::Binding(b) => current.get(b) == Some(k),
+                    Write::Other => false,
+                })
+        });
+        if sure.len() == before {
+            return sure;
+        }
+    }
 }
 
 /// A member being resolved: its fields.
@@ -365,6 +424,9 @@ struct DeclTypes<'s> {
     ids: &'s HashMap<String, u32>,
     vars: HashMap<SymbolId, SiteTy>,
     fns: HashMap<SymbolId, (Vec<Option<SiteTy>>, Option<SiteTy>)>,
+    /// `let` / `const` bindings, and the declared bindings with an initializer.
+    lexical: HashSet<SymbolId>,
+    inits: HashSet<SymbolId>,
 }
 
 impl DeclTypes<'_> {
@@ -387,6 +449,12 @@ impl<'a> Visit<'a> for DeclTypes<'_> {
         if let BindingPattern::BindingIdentifier(id) = &d.id
             && let Some(sym) = id.symbol_id.get()
         {
+            if self.scoping.symbol_flags(sym).is_block_scoped() {
+                self.lexical.insert(sym);
+            }
+            if d.init.is_some() {
+                self.inits.insert(sym);
+            }
             if let Some(t) = d.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids)) {
                 self.vars.insert(sym, t);
             }
@@ -420,7 +488,7 @@ impl<'a> Visit<'a> for DeclTypes<'_> {
             let s = self.signature(&f.params, f.return_type.as_deref());
             self.fns.insert(sym, s);
         }
-        let _ = self.scoping;
+
         walk::walk_function(self, f, flags);
     }
 }
@@ -438,6 +506,9 @@ struct Sites<'s> {
     /// The return types of the enclosing functions.
     returns: Vec<Option<SiteTy>>,
     sites: HashMap<u32, (u32, u32)>,
+    array_sites: HashMap<u32, (u32, u32)>,
+    /// Writes of the bindings declared `T[]`.
+    writes: HashMap<SymbolId, Vec<Write>>,
     errors: Vec<OxcDiagnostic>,
 }
 
@@ -469,6 +540,36 @@ impl Sites<'_> {
         ts.all(|t| *t == FieldType::Struct(*k2)).then_some(*k2)
     }
 
+    /// The global `Array` (not shadowed).
+    fn is_array_ctor(&self, e: &Expression) -> bool {
+        matches!(e.without_parentheses(), Expression::Identifier(id) if id.name == "Array" && self.symbol(id).is_none())
+    }
+
+    /// What storing `e` in a binding declared `T[]` stores.
+    fn write_of(&self, e: &Expression) -> Write {
+        let e = e.without_parentheses();
+        let e = match e {
+            Expression::TSAsExpression(a) => a.expression.without_parentheses(),
+            Expression::TSSatisfiesExpression(a) => a.expression.without_parentheses(),
+            Expression::TSNonNullExpression(a) => a.expression.without_parentheses(),
+            e => e,
+        };
+        if let Some(&(_, k)) = self.array_sites.get(&e.span().start) {
+            return Write::Array(k);
+        }
+        match e {
+            Expression::Identifier(id) => self.symbol(id).map_or(Write::Other, Write::Binding),
+            _ => Write::Other,
+        }
+    }
+
+    fn record_write(&mut self, sym: SymbolId, e: &Expression) {
+        if matches!(self.types.vars.get(&sym), Some(SiteTy::Array(_))) {
+            let w = self.write_of(e);
+            self.writes.entry(sym).or_default().push(w);
+        }
+    }
+
     fn mark(&mut self, e: &Expression, ty: SiteTy) {
         match (e, ty) {
             (Expression::ParenthesizedExpression(p), _) => self.mark(&p.expression, ty),
@@ -480,7 +581,14 @@ impl Sites<'_> {
                 self.mark(&c.alternate, ty);
             }
             (Expression::ObjectExpression(o), SiteTy::Struct(k)) => self.literal(o, k),
+            (Expression::NewExpression(n), SiteTy::Array(k)) if self.is_array_ctor(&n.callee) => {
+                self.array_sites.insert(n.span.start, (n.span.end, k));
+            }
+            (Expression::CallExpression(c), SiteTy::Array(k)) if self.is_array_ctor(&c.callee) => {
+                self.array_sites.insert(c.span.start, (c.span.end, k));
+            }
             (Expression::ArrayExpression(a), SiteTy::Array(k)) => {
+                self.array_sites.insert(a.span.start, (a.span.end, k));
                 for el in &a.elements {
                     if let Some(e) = el.as_expression() {
                         self.mark(e, SiteTy::Struct(k));
@@ -620,6 +728,7 @@ impl<'a> Visit<'a> for Sites<'_> {
             && let Some(init) = &d.init
         {
             self.mark(init, t);
+            self.record_write(sym, init);
         }
         walk::walk_variable_declarator(self, d);
     }
@@ -628,8 +737,11 @@ impl<'a> Visit<'a> for Sites<'_> {
         if a.operator == AssignmentOperator::Assign {
             match &a.left {
                 AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                    if let Some(&t) = self.symbol(id).and_then(|s| self.types.vars.get(&s)) {
+                    if let Some(sym) = self.symbol(id)
+                        && let Some(&t) = self.types.vars.get(&sym)
+                    {
                         self.mark(&a.right, t);
+                        self.record_write(sym, &a.right);
                     }
                 }
                 AssignmentTarget::ComputedMemberExpression(m) => {
@@ -661,9 +773,19 @@ impl<'a> Visit<'a> for Sites<'_> {
                     }
                 }
             }
-            Expression::StaticMemberExpression(m) if m.property.name == "push" => {
-                if let Some(SiteTy::Array(k)) = self.declared(&m.object) {
-                    for arg in &c.arguments {
+            // Elements stored by array methods.
+            Expression::StaticMemberExpression(m) => {
+                let first = match m.property.name.as_str() {
+                    "push" | "unshift" => Some(0),
+                    "splice" => Some(2),
+                    "fill" => Some(0),
+                    _ => None,
+                };
+                if let Some(first) = first
+                    && let Some(SiteTy::Array(k)) = self.declared(&m.object)
+                {
+                    let last = if m.property.name == "fill" { 1 } else { c.arguments.len() };
+                    for arg in c.arguments.iter().take(last).skip(first) {
                         if let Some(e) = arg.as_expression() {
                             self.mark(e, SiteTy::Struct(k));
                         }
