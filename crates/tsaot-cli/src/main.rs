@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use tsaot_codegen::{Backend, Output};
 use tsaot_front::Analysis;
 use tsaot_front::erase::NATIVE_MODULE;
 
@@ -70,6 +71,39 @@ struct BuildOpts {
     /// QuickJS-NG build directory (qjsc, libqjs.a). Default: $TSAOT_QUICKJS_BUILD.
     #[arg(long)]
     quickjs_build: Option<PathBuf>,
+    /// Code generator for the native functions: `cranelift` (compiles fast)
+    /// or `llvm` (optimizes further; needs clang). Default: $TSAOT_BACKEND,
+    /// else cranelift.
+    #[arg(long)]
+    backend: Option<Backend>,
+    /// The clang used by the LLVM backend. Default: $TSAOT_CLANG, else clang.
+    #[arg(long)]
+    clang: Option<PathBuf>,
+    /// The CPU the LLVM backend compiles for, as clang's `-march` (e.g.
+    /// `x86-64-v3`). Default: the host's.
+    #[arg(long)]
+    march: Option<String>,
+}
+
+impl BuildOpts {
+    fn backend(&self) -> Result<Backend> {
+        match (&self.backend, std::env::var("TSAOT_BACKEND")) {
+            (Some(b), _) => Ok(*b),
+            (None, Ok(b)) if !b.is_empty() => b.parse().map_err(anyhow::Error::msg),
+            _ => Ok(Backend::Cranelift),
+        }
+    }
+
+    fn codegen(&self) -> Result<tsaot_codegen::Options> {
+        let mut o = tsaot_codegen::Options { backend: self.backend()?, ..Default::default() };
+        if let Some(c) = self.clang.clone().or_else(|| std::env::var_os("TSAOT_CLANG").map(PathBuf::from)) {
+            o.llvm.clang = c;
+        }
+        if let Some(m) = &self.march {
+            o.llvm.march = m.clone();
+        }
+        Ok(o)
+    }
 }
 
 fn main() {
@@ -251,9 +285,17 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Opt
         link.args(["-O2", "-w"]).arg("-I").arg(&q.src).arg("-I").arg(&tmp);
         link.arg(tmp.join("main.c")).arg(tmp.join("glue.c")).arg(tmp.join("tsaot_rt.c"));
         if has_native {
-            let obj = tsaot_codegen::compile(&analysis.module, &Default::default())?;
-            std::fs::write(tmp.join("native.o"), obj)?;
-            link.arg(tmp.join("native.o"));
+            let cg = opts.codegen()?;
+            let obj = tmp.join("native.o");
+            match tsaot_codegen::compile(&analysis.module, &cg)? {
+                Output::Object(bytes) => std::fs::write(&obj, bytes)?,
+                Output::LlvmIr(ir) => {
+                    let ll = tmp.join("native.ll");
+                    std::fs::write(&ll, ir)?;
+                    tsaot_codegen::llvm::compile(&ll, &obj, &cg.llvm)?;
+                }
+            }
+            link.arg(&obj);
         }
         link.arg(q.build.join("libqjs-libc.a")).arg(q.build.join("libqjs.a"));
         link.args(["-lm", "-lpthread", "-ldl", "-o"]).arg(output);

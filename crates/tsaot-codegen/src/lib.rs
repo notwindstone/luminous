@@ -1,5 +1,11 @@
-//! Lowers typed IR to native code with Cranelift and emits a relocatable
-//! object file.
+//! Lowers typed IR to native code and emits a relocatable object file, with
+//! either of two backends:
+//! - Cranelift (`clif.rs`): fast compilation, in process;
+//! - LLVM (`llvm.rs`): LLVM IR compiled by `clang -O3`, slower to compile
+//!   but optimized much further.
+//!
+//! The lowering (`lower.rs`) builds a backend-neutral SSA IR (`mir.rs`),
+//! which each backend translates.
 //!
 //! Every IR function `i` produces two symbols:
 //! - `tsaot_fn_<i>(JSContext *ctx, params...)`: the function itself. `number`
@@ -16,21 +22,22 @@
 //! another exception (a `RangeError`, thrown when the stack pointer crosses
 //! `tsaot_stack_limit`).
 
+mod clif;
+pub mod llvm;
 mod lower;
+pub mod mir;
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result, anyhow};
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::types::{F64, I8, I32, I64};
-use cranelift_codegen::ir::{AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, Value};
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataId, FuncId, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use anyhow::{Context as _, Result};
+use mir::types::{F64, I8, I32, I64};
+use mir::{
+    AbiParam, Block, BlockArg, DataId, FloatCC, FuncId, FuncRef, FunctionBuilder, IntCC, Linkage, MemFlags, SigRef,
+    Signature, StackSlotData, StackSlotKind, Value,
+};
 use tsaot_front::ir::{self, Expr, ExprKind, MathFn, Stmt, Ty};
 
-use lower::{Env, Exit, Exits, Lower, V, clif_types, from_values};
+use lower::{Env, Exit, Exits, Lower, M_CONST, M_FLAG, M_HEADER, M_SLOT, M_STRUCT, V, clif_types, from_values};
 
 pub fn symbol_name(id: ir::FuncId) -> String {
     format!("tsaot_fn_{id}")
@@ -109,38 +116,67 @@ pub mod layout {
     ];
 }
 
+/// Which code generator compiles the native functions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Backend {
+    /// Cranelift: compiles fast, in process.
+    #[default]
+    Cranelift,
+    /// LLVM, through `clang`: compiles slower, optimizes much further.
+    Llvm,
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "cranelift" | "clif" => Ok(Backend::Cranelift),
+            "llvm" => Ok(Backend::Llvm),
+            _ => Err(format!("unknown backend `{s}` (expected `cranelift` or `llvm`)")),
+        }
+    }
+}
+
 pub struct Options {
+    pub backend: Backend,
     /// Cranelift `opt_level`: "none", "speed" or "speed_and_size".
     pub opt_level: String,
+    /// LLVM: how to run clang.
+    pub llvm: llvm::Options,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { opt_level: "speed".into() }
+        Options { backend: Backend::Cranelift, opt_level: "speed".into(), llvm: Default::default() }
     }
 }
 
-/// Compile `m` to an object file for the host.
-pub fn compile(m: &ir::Module, opts: &Options) -> Result<Vec<u8>> {
-    let mut flags = settings::builder();
-    flags.set("opt_level", &opts.opt_level)?;
-    flags.set("is_pic", "true")?;
-    // Hot functions start on a cache line: their speed then does not
-    // depend on where the code before them happens to end.
-    flags.set("log2_min_function_alignment", "6")?;
-    let isa = cranelift_native::builder()
-        .map_err(|e| anyhow!("unsupported host: {e}"))?
-        .finish(settings::Flags::new(flags))?;
-    let builder = ObjectBuilder::new(isa, "tsaot", cranelift_module::default_libcall_names())?;
-    let mut module = ObjectModule::new(builder);
+/// What a backend produced for the native functions.
+pub enum Output {
+    /// A relocatable object file.
+    Object(Vec<u8>),
+    /// An LLVM module (textual IR), compiled by `llvm::compile`.
+    LlvmIr(String),
+}
 
-    let mut cg = Codegen::new(&mut module, m)?;
+/// Lower `m` to the backend-neutral IR.
+pub fn lower_module(m: &ir::Module) -> Result<mir::Module> {
+    let mut cg = Codegen::new(m);
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
         cg.define(i, f).with_context(|| format!("compiling `{}`", f.name))?;
         cg.define_fast(i, f).with_context(|| format!("compiling the entry of `{}`", f.name))?;
     }
-    cg.define_ics()?;
-    Ok(module.finish().emit()?)
+    cg.define_ics();
+    Ok(cg.module)
+}
+
+/// Compile `m` for the host with the backend `opts` selects.
+pub fn compile(m: &ir::Module, opts: &Options) -> Result<Output> {
+    let module = lower_module(m)?;
+    Ok(match opts.backend {
+        Backend::Cranelift => Output::Object(clif::emit(&module, &opts.opt_level)?),
+        Backend::Llvm => Output::LlvmIr(llvm::emit(&module, &opts.llvm)?),
+    })
 }
 
 /// ABI parameters of a value of type `t`.
@@ -265,12 +301,13 @@ enum Arg {
     D,
 }
 
-struct Codegen<'m> {
-    module: &'m mut ObjectModule,
+struct Codegen {
+    module: mir::Module,
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
     data: [DataId; 11],
+    fast_sig: SigRef,
     /// Inline caches allocated so far (`tsaot_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
@@ -285,25 +322,27 @@ struct Codegen<'m> {
     /// `aot type` layouts.
     layouts: std::rc::Rc<Vec<ir::Layout>>,
     int_wrapping: bool,
-    fctx: FunctionBuilderContext,
 }
 
-impl<'m> Codegen<'m> {
-    fn new(module: &'m mut ObjectModule, m: &ir::Module) -> Result<Self> {
-        let ptr = module.target_config().pointer_type();
+impl Codegen {
+    fn new(m: &ir::Module) -> Self {
+        let mut module = mir::Module::new();
         let mut funcs = Vec::new();
         for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-            let sig = native_signature(module, f);
-            funcs.push(module.declare_function(&symbol_name(i), Linkage::Export, &sig)?);
+            // The step functions of async functions and generators are
+            // referenced by the C glue; the others only by native code.
+            let linkage = if f.is_async || f.is_generator { Linkage::Export } else { Linkage::Local };
+            funcs.push(module.declare_function(&symbol_name(i), linkage, &native_signature(f)));
         }
-        let fast_sig = fast_signature(module);
+        let fast_sig = fast_signature();
         let mut fast_funcs = Vec::new();
         for i in 0..m.funcs.len() + m.closures.len() {
-            fast_funcs.push(module.declare_function(&fast_symbol_name(i), Linkage::Export, &fast_sig)?);
+            fast_funcs.push(module.declare_function(&fast_symbol_name(i), Linkage::Export, &fast_sig));
         }
+        let fast_sig = module.import_signature(fast_sig);
         let mut helpers = HashMap::new();
         let ty = |a: &Arg| match a {
-            Arg::P => ptr,
+            Arg::P => I64,
             Arg::W => I64,
             Arg::Int => I32,
             Arg::D => F64,
@@ -319,20 +358,18 @@ impl<'m> Codegen<'m> {
                     assert!(!(pair && words == 5), "helper {name}: a JSValue would straddle the registers");
                 }
             }
-            let mut sig = module.make_signature();
-            sig.params.extend(params.iter().map(|a| AbiParam::new(ty(a))));
-            sig.returns.extend(rets.iter().map(|a| AbiParam::new(ty(a))));
-            helpers.insert(name, module.declare_function(name, Linkage::Import, &sig)?);
+            let param = |a: &Arg| if matches!(a, Arg::P) { AbiParam::pointer() } else { AbiParam::new(ty(a)) };
+            let sig =
+                Signature { params: params.iter().map(param).collect(), returns: rets.iter().map(param).collect() };
+            helpers.insert(name, module.declare_function(name, Linkage::Import, &sig));
         }
         // libm functions used by Math intrinsics.
         for mf in all_math(m) {
             if let Some(sym) = mf.symbol()
                 && !helpers.contains_key(sym)
             {
-                let mut sig = module.make_signature();
-                sig.params.extend(vec![AbiParam::new(F64); mf.arity()]);
-                sig.returns.push(AbiParam::new(F64));
-                helpers.insert(sym, module.declare_function(sym, Linkage::Import, &sig)?);
+                let sig = Signature { params: vec![AbiParam::new(F64); mf.arity()], returns: vec![AbiParam::new(F64)] };
+                helpers.insert(sym, module.declare_function(sym, Linkage::Import, &sig));
             }
         }
         let mut data = Vec::new();
@@ -348,11 +385,11 @@ impl<'m> Codegen<'m> {
             "tsaot_struct_class",
             "tsaot_sarr_class",
         ] {
-            data.push(module.declare_data(name, Linkage::Import, true, false)?);
+            data.push(module.declare_data(name, Linkage::Import, true));
         }
         // Defined here, once all sites are known (`define_ics`).
-        data.push(module.declare_data("tsaot_ics", Linkage::Export, true, false)?);
-        Ok(Codegen {
+        data.push(module.declare_data("tsaot_ics", Linkage::Export, true));
+        Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
             rets: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect()),
@@ -368,22 +405,18 @@ impl<'m> Codegen<'m> {
             fast_funcs,
             helpers,
             data: data.try_into().unwrap(),
+            fast_sig,
             ics: Default::default(),
             closure_base: m.funcs.len(),
-            fctx: FunctionBuilderContext::new(),
-        })
+        }
     }
 
-    fn env(&mut self, func: &mut cranelift_codegen::ir::Function) -> Env {
-        let helpers = self.helpers.iter().map(|(&n, &id)| (n, self.module.declare_func_in_func(id, func))).collect();
-        let funcs = self.funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
+    fn env(&self) -> Env {
         let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, struct_class, sarr_class, ics] =
-            self.data.map(|d| self.module.declare_data_in_func(d, func));
-        let fast_sig = func.import_signature(fast_signature(self.module));
-        let fast = self.fast_funcs.iter().map(|&id| self.module.declare_func_in_func(id, func)).collect();
+            self.data;
         Env {
-            helpers,
-            funcs,
+            helpers: self.helpers.clone(),
+            funcs: self.funcs.clone(),
             stack_limit,
             unwinding,
             cells,
@@ -400,27 +433,21 @@ impl<'m> Codegen<'m> {
             params: self.params.clone(),
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
-            fast,
+            fast: self.fast_funcs.clone(),
             rets: self.rets.clone(),
             layouts: self.layouts.clone(),
             int_wrapping: self.int_wrapping,
-            fast_sig,
+            fast_sig: self.fast_sig,
         }
     }
 
     /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, `IC_SIZE` bytes per
     /// entry, zeroed) and its length `tsaot_nics`.
-    fn define_ics(&mut self) -> Result<()> {
+    fn define_ics(&mut self) {
         let n = self.ics.get();
-        let mut table = cranelift_module::DataDescription::new();
-        table.define_zeroinit(n.max(1) * lower::IC_SIZE);
-        table.set_align(8);
-        self.module.define_data(self.data[10], &table)?;
-        let count = self.module.declare_data("tsaot_nics", Linkage::Export, false, false)?;
-        let mut desc = cranelift_module::DataDescription::new();
-        desc.define((n as i32).to_le_bytes().to_vec().into_boxed_slice());
-        self.module.define_data(count, &desc)?;
-        Ok(())
+        self.module.define_data(self.data[10], mir::DataInit::Zeroed { size: n.max(1) * lower::IC_SIZE }, 8);
+        let count = self.module.declare_data("tsaot_nics", Linkage::Export, false);
+        self.module.define_data(count, mir::DataInit::Bytes((n as i32).to_le_bytes().to_vec()), 4);
     }
 
     /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
@@ -428,12 +455,9 @@ impl<'m> Codegen<'m> {
         if f.is_async || f.is_generator {
             return self.define_step(index, f);
         }
-        let ptr = self.module.target_config().pointer_type();
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = native_signature(self.module, f);
-        let env = self.env(&mut ctx.func);
-        let mut fctx = std::mem::take(&mut self.fctx);
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let ptr = I64;
+        let env = self.env();
+        let mut b = self.module.builder(native_signature(f));
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -455,12 +479,8 @@ impl<'m> Codegen<'m> {
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
         l.this = this;
         l.stack_check();
-        let mut b = l.body(&f.body);
-        b.seal_all_blocks();
-        b.finalize(self.module.target_config());
-        self.module.define_function(self.funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
-        self.module.clear_context(&mut ctx);
-        self.fctx = fctx;
+        let b = l.body(&f.body);
+        self.module.define_function(self.funcs[index], b.finish());
         Ok(())
     }
 
@@ -468,12 +488,9 @@ impl<'m> Codegen<'m> {
     /// `tsaot_fn_<index>`): runs the body from the start (state 0) or from
     /// the await it suspended at, until it completes or suspends again.
     fn define_step(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        let ptr = self.module.target_config().pointer_type();
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = native_signature(self.module, f);
-        let env = self.env(&mut ctx.func);
-        let mut fctx = std::mem::take(&mut self.fctx);
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let ptr = I64;
+        let env = self.env();
+        let mut b = self.module.builder(native_signature(f));
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
@@ -483,12 +500,9 @@ impl<'m> Codegen<'m> {
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &[], None, exits);
         l.stack_check();
         l.enter_async(slots, state, value, is_throw, f);
-        let mut b = l.body(&f.body);
-        b.seal_all_blocks();
-        b.finalize(self.module.target_config());
-        self.module.define_function(self.funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
-        self.module.clear_context(&mut ctx);
-        self.fctx = fctx;
+        let mut func = l.body(&f.body).finish();
+        func.no_vectorize = true;
+        self.module.define_function(self.funcs[index], func);
         Ok(())
     }
 
@@ -496,13 +510,10 @@ impl<'m> Codegen<'m> {
     /// functions, then a new frame holding the arguments (and captured boxes,
     /// and `this`), the first step, and the promise as the result.
     fn define_async_entry(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        let ptr = self.module.target_config().pointer_type();
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = fast_signature(self.module);
-        let env = self.env(&mut ctx.func);
-        let mut fctx = std::mem::take(&mut self.fctx);
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mem = MemFlagsData::trusted();
+        let ptr = I64;
+        let env = self.env();
+        let mut b = self.module.builder(fast_signature());
+        let mem = MemFlags::trusted();
         let entry = b.create_block();
         let decline = b.create_block();
         b.set_cold_block(decline);
@@ -529,11 +540,7 @@ impl<'m> Codegen<'m> {
 
         // The frame and the promise.
         let (layout, this_slot, nslots) = lower::frame_layout(f);
-        let out = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            32,
-            4,
-        ));
+        let out = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 4));
         let promise_addr = b.ins().stack_addr(ptr, out, 0);
         let slots_addr = b.ins().stack_addr(ptr, out, 16);
         let fi = b.ins().iconst(I32, index as i64);
@@ -554,8 +561,8 @@ impl<'m> Codegen<'m> {
         let dup = env.helpers["JS_DupValue"];
         let store = |b: &mut FunctionBuilder, s: usize, p: Value, t: Value| {
             let at = (s * jsvalue::SIZE) as i32;
-            b.ins().store(mem, p, slots, at);
-            b.ins().store(mem, t, slots, at + jsvalue::TAG_OFFSET);
+            b.ins().store(M_SLOT, p, slots, at);
+            b.ins().store(M_SLOT, t, slots, at + jsvalue::TAG_OFFSET);
         };
         let dup_value = |b: &mut FunctionBuilder, p: Value, t: Value| {
             let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0);
@@ -591,9 +598,7 @@ impl<'m> Codegen<'m> {
                     (p, tag)
                 }
                 (_, V::Num(d)) if local_ty == Ty::Any => box_number(&mut b, d),
-                (_, V::Num(d)) => {
-                    (b.ins().bitcast(I64, MemFlagsData::new(), d), b.ins().iconst(I64, jsvalue::TAG_FLOAT64))
-                }
+                (_, V::Num(d)) => (b.ins().bitcast(I64, d), b.ins().iconst(I64, jsvalue::TAG_FLOAT64)),
                 (_, V::Bool(x)) => (b.ins().uextend(I64, x), b.ins().iconst(I64, jsvalue::TAG_BOOL)),
                 (_, V::Int(i)) if local_ty == Ty::Any => {
                     let i = b.ins().ireduce(I32, i);
@@ -609,9 +614,9 @@ impl<'m> Codegen<'m> {
             // Captured boxes: new references for the frame.
             for (c, &l) in f.captures.iter().enumerate() {
                 let at = (2 * c * jsvalue::SIZE) as i32;
-                let p = b.ins().load(I64, mem, data, at);
-                let t = b.ins().load(I64, mem, data, at + jsvalue::TAG_OFFSET);
-                let sp = b.ins().load(I64, mem, data, at + jsvalue::SIZE as i32);
+                let p = b.ins().load(I64, M_SLOT, data, at);
+                let t = b.ins().load(I64, M_SLOT, data, at + jsvalue::TAG_OFFSET);
+                let sp = b.ins().load(I64, M_SLOT, data, at + jsvalue::SIZE as i32);
                 dup_value(&mut b, p, t);
                 store(&mut b, layout[l], p, t);
                 let ft = b.ins().iconst(I64, jsvalue::TAG_FLOAT64);
@@ -631,11 +636,7 @@ impl<'m> Codegen<'m> {
             b.ins().return_(&r);
         } else {
             // First step, then drop this entry's reference to the frame.
-            let undef_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                16,
-                4,
-            ));
+            let undef_slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
             let zero = b.ins().iconst(I64, 0);
             let undef = b.ins().iconst(I64, jsvalue::TAG_UNDEFINED);
             b.ins().stack_store(ptr, zero, undef_slot, 0);
@@ -660,11 +661,7 @@ impl<'m> Codegen<'m> {
         let t = b.ins().iconst(I64, jsvalue::TAG_UNINITIALIZED);
         b.ins().return_(&[z, t]);
 
-        b.seal_all_blocks();
-        b.finalize(self.module.target_config());
-        self.module.define_function(self.fast_funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
-        self.module.clear_context(&mut ctx);
-        self.fctx = fctx;
+        self.module.define_function(self.fast_funcs[index], b.finish());
         Ok(())
     }
 
@@ -686,15 +683,11 @@ impl<'m> Codegen<'m> {
         if f.is_async || f.is_generator {
             return self.define_async_entry(index, f);
         }
-        let ptr = self.module.target_config().pointer_type();
-        let mut ctx = self.module.make_context();
-        ctx.func.signature = fast_signature(self.module);
-        let env = self.env(&mut ctx.func);
+        let ptr = I64;
+        let env = self.env();
         let unwinding = env.unwinding;
         let callee = env.funcs[index];
-        let mut fctx = std::mem::take(&mut self.fctx);
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let mem = MemFlagsData::trusted();
+        let mut b = self.module.builder(fast_signature());
 
         let entry = b.create_block();
         let decline = b.create_block();
@@ -773,7 +766,7 @@ impl<'m> Codegen<'m> {
             let call = b.ins().call(callee, &args);
             let r: Vec<BlockArg> = b.inst_results(call).iter().map(|&v| BlockArg::Value(v)).collect();
             let flag_addr = b.ins().symbol_value(ptr, unwinding);
-            let flag = b.ins().load(I8, mem, flag_addr, 0);
+            let flag = b.ins().load(I8, M_FLAG, flag_addr, 0);
             b.ins().brif(flag, exception, &[], boxing, &r);
             b
         };
@@ -799,7 +792,7 @@ impl<'m> Codegen<'m> {
         b.switch_to_block(exception);
         let flag_addr = b.ins().symbol_value(ptr, unwinding);
         let zero8 = b.ins().iconst(I8, 0);
-        b.ins().store(mem, zero8, flag_addr, 0);
+        b.ins().store(M_FLAG, zero8, flag_addr, 0);
         let payload = b.ins().iconst(I64, 0);
         let tag = b.ins().iconst(I64, jsvalue::TAG_EXCEPTION);
         b.ins().return_(&[payload, tag]);
@@ -809,36 +802,31 @@ impl<'m> Codegen<'m> {
         let tag = b.ins().iconst(I64, jsvalue::TAG_UNINITIALIZED);
         b.ins().return_(&[payload, tag]);
 
-        b.seal_all_blocks();
-        b.finalize(self.module.target_config());
-        self.module.define_function(self.fast_funcs[index], &mut ctx).map_err(|e| anyhow!("{e:?}"))?;
-        self.module.clear_context(&mut ctx);
-        self.fctx = fctx;
+        self.module.define_function(self.fast_funcs[index], b.finish());
         Ok(())
     }
 }
 
-fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
-    let ptr = module.target_config().pointer_type();
-    let mut sig = module.make_signature();
+fn native_signature(f: &ir::Func) -> Signature {
+    let mut sig = Signature::default();
     if f.is_async || f.is_generator {
         // The step function: (ctx, frame slots, state, value delivered on
         // resumption, whether to throw it) -> completion value, or
         // JS_UNINITIALIZED (suspended), or JS_EXCEPTION.
         sig.params.extend([
-            AbiParam::new(ptr),
-            AbiParam::new(ptr),
+            AbiParam::pointer(),
+            AbiParam::pointer(),
             AbiParam::new(I32),
-            AbiParam::new(ptr),
+            AbiParam::pointer(),
             AbiParam::new(I32),
         ]);
         sig.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
         return sig;
     }
-    sig.params.push(AbiParam::new(ptr));
+    sig.params.push(AbiParam::pointer());
     if f.is_closure {
         // The closure's data slots.
-        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::pointer());
     }
     if f.has_this {
         // The receiver (borrowed).
@@ -851,17 +839,16 @@ fn native_signature(module: &ObjectModule, f: &ir::Func) -> Signature {
     sig
 }
 
-fn fast_signature(module: &ObjectModule) -> Signature {
-    let ptr = module.target_config().pointer_type();
-    let mut sig = module.make_signature();
+fn fast_signature() -> Signature {
+    let mut sig = Signature::default();
     // (ctx, this_val [2 words], argc, argv, func_data)
     sig.params.extend([
-        AbiParam::new(ptr),
+        AbiParam::pointer(),
         AbiParam::new(I64),
         AbiParam::new(I64),
         AbiParam::new(I32),
-        AbiParam::new(ptr),
-        AbiParam::new(ptr),
+        AbiParam::pointer(),
+        AbiParam::pointer(),
     ]);
     // A 16-byte JSValue struct is returned in two integer registers (rax:rdx on
     // x86-64 SysV, x0:x1 on AArch64), which is what two I64 returns lower to.
@@ -872,7 +859,6 @@ fn fast_signature(module: &ObjectModule) -> Signature {
 /// Argument `k` from the interpreter's slots, borrowed; `undefined` if
 /// `k >= argc`.
 fn load_arg(b: &mut FunctionBuilder, argc: Value, argv: Value, k: usize) -> (Value, Value) {
-    let mem = MemFlagsData::trusted();
     let present = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, argc, k as i64);
     let yes = b.create_block();
     let join = b.create_block();
@@ -883,8 +869,8 @@ fn load_arg(b: &mut FunctionBuilder, argc: Value, argv: Value, k: usize) -> (Val
     b.ins().brif(present, yes, &[], join, &[BlockArg::Value(zero), BlockArg::Value(undef)]);
     b.switch_to_block(yes);
     let at = (k * jsvalue::SIZE) as i32;
-    let lp = b.ins().load(I64, mem, argv, at);
-    let lt = b.ins().load(I64, mem, argv, at + jsvalue::TAG_OFFSET);
+    let lp = b.ins().load(I64, M_SLOT, argv, at);
+    let lt = b.ins().load(I64, M_SLOT, argv, at + jsvalue::TAG_OFFSET);
     b.ins().jump(join, &[BlockArg::Value(lp), BlockArg::Value(lt)]);
     b.switch_to_block(join);
     (p, t)
@@ -902,9 +888,8 @@ fn unbox_arg(
     struct_class: Value,
     sarr_class: Value,
 ) -> V {
-    let mem = MemFlagsData::trusted();
     let at = (k * jsvalue::SIZE) as i32;
-    let tag = b.ins().load(I64, mem, argv, at + jsvalue::TAG_OFFSET);
+    let tag = b.ins().load(I64, M_SLOT, argv, at + jsvalue::TAG_OFFSET);
     match t {
         Ty::F64 => {
             let is_int = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_INT);
@@ -915,14 +900,14 @@ fn unbox_arg(
             let v = b.append_block_param(join, F64);
             b.ins().brif(is_int, int_blk, &[], not_int, &[]);
             b.switch_to_block(int_blk);
-            let i = b.ins().load(I32, mem, argv, at);
+            let i = b.ins().load(I32, M_SLOT, argv, at);
             let d = b.ins().fcvt_from_sint(F64, i);
             b.ins().jump(join, &[BlockArg::Value(d)]);
             b.switch_to_block(not_int);
             let is_float = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_FLOAT64);
             b.ins().brif(is_float, float_blk, &[], decline, &[]);
             b.switch_to_block(float_blk);
-            let d = b.ins().load(F64, mem, argv, at);
+            let d = b.ins().load(F64, M_SLOT, argv, at);
             b.ins().jump(join, &[BlockArg::Value(d)]);
             b.switch_to_block(join);
             V::Num(v)
@@ -937,20 +922,20 @@ fn unbox_arg(
             let v = b.append_block_param(join, I64);
             b.ins().brif(is_int, int_blk, &[], not_int, &[]);
             b.switch_to_block(int_blk);
-            let i = b.ins().load(I32, mem, argv, at);
+            let i = b.ins().load(I32, M_SLOT, argv, at);
             let i = b.ins().sextend(I64, i);
             b.ins().jump(join, &[BlockArg::Value(i)]);
             b.switch_to_block(not_int);
             let is_float = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_FLOAT64);
             b.ins().brif(is_float, float_blk, &[], decline, &[]);
             b.switch_to_block(float_blk);
-            let d = b.ins().load(F64, mem, argv, at);
+            let d = b.ins().load(F64, M_SLOT, argv, at);
             let i = b.ins().fcvt_to_sint_sat(I32, d);
             let back = b.ins().fcvt_from_sint(F64, i);
             let same = b.ins().fcmp(FloatCC::Equal, back, d);
             // -0 converts to 0 and back to +0, which compares equal: check
             // the bits.
-            let bits = b.ins().bitcast(I64, MemFlagsData::new(), d);
+            let bits = b.ins().bitcast(I64, d);
             let negzero = b.ins().icmp_imm_s(IntCC::Equal, bits, i64::MIN);
             let ok = b.ins().band_not(same, negzero);
             let i = b.ins().sextend(I64, i);
@@ -966,7 +951,7 @@ fn unbox_arg(
             let ok = b.create_block();
             b.ins().brif(is_bool, ok, &[], decline, &[]);
             b.switch_to_block(ok);
-            let i = b.ins().load(I32, mem, argv, at);
+            let i = b.ins().load(I32, M_SLOT, argv, at);
             V::Bool(b.ins().icmp_imm_s(IntCC::NotEqual, i, 0))
         }
         Ty::Arr(kind) => {
@@ -976,8 +961,8 @@ fn unbox_arg(
             let ok = b.create_block();
             b.ins().brif(is_obj, obj, &[], decline, &[]);
             b.switch_to_block(obj);
-            let p = b.ins().load(I64, mem, argv, at);
-            let class = b.ins().uload16(I32, mem, p, layout::OBJ_CLASS_ID);
+            let p = b.ins().load(I64, M_SLOT, argv, at);
+            let class = b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
             let want = layout::CLASS_TYPED_ARRAY + kind as i64;
             let is_kind = b.ins().icmp_imm_s(IntCC::Equal, class, want);
             b.ins().brif(is_kind, ok, &[], decline, &[]);
@@ -990,7 +975,7 @@ fn unbox_arg(
             let obj = b.create_block();
             b.ins().brif(is_obj, obj, &[], decline, &[]);
             b.switch_to_block(obj);
-            let p = b.ins().load(I64, mem, argv, at);
+            let p = b.ins().load(I64, M_SLOT, argv, at);
             let ok = sarr_check(b, p, k, sarr_class);
             let yes = b.create_block();
             b.ins().brif(ok, yes, &[], decline, &[]);
@@ -1003,7 +988,7 @@ fn unbox_arg(
             let obj = b.create_block();
             b.ins().brif(is_obj, obj, &[], decline, &[]);
             b.switch_to_block(obj);
-            let p = b.ins().load(I64, mem, argv, at);
+            let p = b.ins().load(I64, M_SLOT, argv, at);
             let ok = struct_check(b, p, k, struct_class);
             let yes = b.create_block();
             b.ins().brif(ok, yes, &[], decline, &[]);
@@ -1018,18 +1003,17 @@ fn unbox_arg(
 /// address of `tsaot_struct_class`). Its class first: the opaque of any
 /// other object may be anything.
 pub(crate) fn struct_check(b: &mut FunctionBuilder, p: Value, k: u32, struct_class: Value) -> Value {
-    let mem = MemFlagsData::trusted();
     let join = b.create_block();
     let r = b.append_block_param(join, I8);
-    let class = b.ins().uload16(I32, mem, p, layout::OBJ_CLASS_ID);
-    let want = b.ins().load(I32, mem, struct_class, 0);
+    let class = b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
+    let want = b.ins().load(I32, M_CONST, struct_class, 0);
     let same_class = b.ins().icmp(IntCC::Equal, class, want);
     let data = b.create_block();
     let no = b.ins().iconst(I8, 0);
     b.ins().brif(same_class, data, &[], join, &[BlockArg::Value(no)]);
     b.switch_to_block(data);
-    let s = b.ins().load(I64, mem, p, layout::OBJ_OPAQUE);
-    let l = b.ins().load(I32, mem, s, 0);
+    let s = b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
+    let l = b.ins().load(I32, M_STRUCT, s, 0);
     let same = b.ins().icmp_imm_s(IntCC::Equal, l, k as i64);
     b.ins().jump(join, &[BlockArg::Value(same)]);
     b.switch_to_block(join);
@@ -1044,7 +1028,7 @@ pub(crate) fn sarr_check(b: &mut FunctionBuilder, p: Value, k: u32, sarr_class: 
 
 /// `Lower::box_number` for code outside a lowered body.
 fn box_number(b: &mut FunctionBuilder, d: Value) -> (Value, Value) {
-    let u = b.ins().bitcast(I64, MemFlagsData::new(), d);
+    let u = b.ins().bitcast(I64, d);
     let e = b.ins().ushr_imm_u(u, 52);
     let e = b.ins().band_imm_u(e, 0x7ff);
     let e = b.ins().iadd_imm_s(e, -1023);
@@ -1131,7 +1115,7 @@ fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {
 /// The rest parameter `k`: the arguments from `k` on, in a new array.
 fn rest_arg(
     b: &mut FunctionBuilder,
-    rest: cranelift_codegen::ir::FuncRef,
+    rest: FuncRef,
     js_ctx: Value,
     argc: Value,
     argv: Value,

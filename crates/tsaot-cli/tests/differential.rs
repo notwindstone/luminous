@@ -1,8 +1,10 @@
-//! Differential tests: every case in `tests/cases` is built twice, with native
-//! compilation and fully interpreted, and both executables must print exactly
-//! the same output. `// @native a b` and `// @interpreted c` header lines pin
-//! down which functions the checker is expected to compile natively. `// @flags
-//! ...` passes options to the compiler.
+//! Differential tests: every case in `tests/cases` is built with native
+//! compilation, once per backend (Cranelift, and LLVM when clang is
+//! available), and fully interpreted; all executables must print exactly the
+//! same output. `// @native a b` and `// @interpreted c` header lines pin down
+//! which functions the checker is expected to compile natively. `// @flags
+//! ...` passes options to the compiler. `TSAOT_BACKENDS=cranelift` (or
+//! `llvm`) restricts the native builds to one backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,7 +31,23 @@ fn directive(src: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
+/// The backends to test: `TSAOT_BACKENDS` (comma-separated), else Cranelift
+/// and, if clang runs, LLVM.
+fn backends() -> Vec<String> {
+    if let Ok(list) = std::env::var("TSAOT_BACKENDS") {
+        return list.split(',').map(str::trim).filter(|b| !b.is_empty()).map(str::to_string).collect();
+    }
+    let clang = std::env::var("TSAOT_CLANG").unwrap_or_else(|_| "clang".into());
+    let has_clang = Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success());
+    if !has_clang {
+        eprintln!("note: {clang} not found, skipping the LLVM backend");
+    }
+    let mut list = vec!["cranelift".to_string()];
+    list.extend(has_clang.then(|| "llvm".to_string()));
+    list
+}
+
+fn run_case(case: &Path, out_dir: &Path, backends: &[String]) -> Result<(), String> {
     let src = std::fs::read_to_string(case).unwrap();
     let flags = directive(&src, "flags");
     let report = tsaot().arg("report").args(&flags).arg(case).output().unwrap();
@@ -55,8 +73,11 @@ fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
 
     let stem = case.file_stem().unwrap().to_string_lossy();
     let flags_all = flags;
+    let mut builds: Vec<(String, Vec<String>)> =
+        backends.iter().map(|b| (b.clone(), vec!["--backend".to_string(), b.clone()])).collect();
+    builds.push(("interp".into(), vec!["--no-native".into()]));
     let mut outputs = Vec::new();
-    for (suffix, flags) in [("native", &[][..]), ("interp", &["--no-native"][..])] {
+    for (suffix, flags) in &builds {
         let exe = out_dir.join(format!("{stem}-{suffix}"));
         let b = tsaot().arg("build").args(flags).args(&flags_all).arg(case).arg("-o").arg(&exe).output().unwrap();
         if !b.status.success() {
@@ -69,8 +90,11 @@ fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&r.stderr).into_owned(),
         ));
     }
-    let (native, interp) = (&outputs[0], &outputs[1]);
-    if native != interp {
+    let interp = outputs.last().unwrap();
+    for ((backend, _), native) in builds.iter().zip(&outputs) {
+        if native == interp {
+            continue;
+        }
         let diff: Vec<String> = native
             .1
             .lines()
@@ -81,7 +105,7 @@ fn run_case(case: &Path, out_dir: &Path) -> Result<(), String> {
             .map(|(i, (a, b))| format!("line {}:\n  native: {a:.300}\n  interp: {b:.300}", i + 1))
             .collect();
         return Err(format!(
-            "outputs differ (exit {:?} vs {:?})\n{}\nnative stderr: {}\ninterp stderr: {}",
+            "outputs differ with {backend} (exit {:?} vs {:?})\n{}\nnative stderr: {}\ninterp stderr: {}",
             native.0,
             interp.0,
             diff.join("\n"),
@@ -106,13 +130,14 @@ fn differential() {
         .collect();
     cases.sort();
     let filter = std::env::var("TSAOT_CASE").ok();
+    let backends = backends();
     let mut failures = Vec::new();
     for case in &cases {
         let name = case.file_name().unwrap().to_string_lossy().into_owned();
         if filter.as_ref().is_some_and(|f| !name.contains(f.as_str())) {
             continue;
         }
-        match run_case(case, &out_dir) {
+        match run_case(case, &out_dir, &backends) {
             Ok(()) => eprintln!("ok   {name}"),
             Err(e) => {
                 eprintln!("FAIL {name}: {e}");

@@ -2464,7 +2464,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         match t.as_simple_assignment_target() {
             Some(simple) => {
                 let mark = self.pre.len();
-                let (setup, place, sym) = self.place(simple)?;
+                let (setup, place, sym) = self.place(simple, false)?;
                 out.extend(self.pre.split_off(mark));
                 out.extend(setup.into_iter().map(Stmt::Expr));
                 out.push(Stmt::Expr(self.write(&place, sym, v, t.span())?));
@@ -2521,7 +2521,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     match r.target.as_simple_assignment_target() {
                         Some(simple) => {
                             let mark = self.pre.len();
-                            let (setup, place, sym) = self.place(simple)?;
+                            let (setup, place, sym) = self.place(simple, false)?;
                             body.extend(self.pre.split_off(mark));
                             body.extend(setup.into_iter().map(Stmt::Expr));
                             let rest = self.rest_of_iterator(iter, next, &mut body);
@@ -2561,7 +2561,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         match target.as_simple_assignment_target() {
             Some(simple) => {
                 let mark = self.pre.len();
-                let (setup, place, sym) = self.place(simple)?;
+                let (setup, place, sym) = self.place(simple, false)?;
                 out.extend(self.pre.split_off(mark));
                 out.extend(setup.into_iter().map(Stmt::Expr));
                 let value = read(self);
@@ -3496,7 +3496,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     /// Resolve an assignment target, evaluating its object and key (in
     /// order) into temporaries. Returns the setup expressions and the place.
-    fn place(&mut self, t: &'a SimpleAssignmentTarget<'a>) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
+    /// An assignment target. `reads_first`: the target's current value is
+    /// read before anything else is evaluated (compound assignments, `++`).
+    fn place(
+        &mut self,
+        t: &'a SimpleAssignmentTarget<'a>,
+        reads_first: bool,
+    ) -> R<(Vec<Expr>, Place, Option<SymbolId>)> {
         Ok(match t {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => return self.ident_place(id),
             SimpleAssignmentTarget::StaticMemberExpression(_) | SimpleAssignmentTarget::ComputedMemberExpression(_)
@@ -3523,7 +3529,16 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     return Ok((vec![], Place::Prop(l, atom), None));
                 }
                 let obj = self.expr(&m.object)?;
-                let obj = if matches!(obj.ty, Ty::Struct(_)) { obj } else { any(obj) };
+                let obj = match obj.ty {
+                    Ty::Struct(_) => obj,
+                    // An element of an array of an `aot type`, whose field
+                    // is read first: an object, else what JS throws reading
+                    // the field of `undefined`.
+                    Ty::StructOrUndef(k) if reads_first && self.struct_field(Ty::Struct(k), atom).is_some() => {
+                        Expr::new(Ty::Struct(k), ExprKind::NonNull(Some(atom), Box::new(obj)))
+                    }
+                    _ => any(obj),
+                };
                 let t = self.temp(obj.ty);
                 (vec![set(t, obj)], Place::Prop(t, atom), None)
             }
@@ -3692,7 +3707,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.pre.extend(stmts);
             return Ok(self.local(t));
         };
-        let (mut setup, place, sym) = self.place(target)?;
+        let (mut setup, place, sym) = self.place(target, a.operator != AssignmentOperator::Assign)?;
         let mark = self.pre.len();
         let value = if a.operator == AssignmentOperator::Assign {
             let v = self.expr(&a.right)?;
@@ -3753,7 +3768,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
 
     /// `x++` and friends; `used`: whether the value of the expression is.
     fn update(&mut self, u: &'a UpdateExpression<'a>, used: bool) -> R<Expr> {
-        let (mut setup, place, sym) = self.place(&u.argument)?;
+        let (mut setup, place, sym) = self.place(&u.argument, true)?;
         let inc = u.operator == UpdateOperator::Increment;
         let counter = matches!(place, Place::Local(l) if self.int_counter == Some((l, inc)));
         if self.wraps(sym) && !counter {
