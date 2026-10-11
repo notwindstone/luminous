@@ -124,6 +124,12 @@ regular call path's generated code alone.
   to a shape, which makes the engine clone that shape instead of modifying
   it in place, so every object with the shape has the property in the same
   slot;
+- the interpreter's own iteration (`for`-`of`, `for`-`in`, spread,
+  destructuring), CopyDataProperties (object spread and rest), property
+  access with a receiver (`super`), private field access and brand checks,
+  and reading a private name's value from a closure;
+- `JS_NewNativeGenerator`: generator objects whose body is native code,
+  driven by the engine's own `next` / `return` / `throw`;
 - `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
   counts, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
@@ -154,16 +160,29 @@ regular call path's generated code alone.
   their creator and capture loop variables (one binding per iteration, as in
   JS). Side effects on module-level bindings (`count++`) are shared with
   interpreted code.
-- **Class methods** (`this` included; static methods too).
-- **`async` functions and arrows**: `await` anywhere in an expression. Awaits
-  are hoisted into statements while keeping JS evaluation order, so microtask
-  ordering matches the interpreter exactly.
+- **Class methods** (`this` included; static methods too), with the class's
+  private fields, methods and accessors (`this.#x`, `this.#m()`,
+  `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
+- **`async` functions and arrows**: `await` anywhere in an expression,
+  including `finally` blocks and loop updates. Awaits are hoisted into
+  statements while keeping JS evaluation order, so microtask ordering
+  matches the interpreter exactly.
+- **Generators** (`function*`, generator methods and closures), with
+  `yield`, `yield*` and the exact `next` / `return` / `throw` behavior:
+  native generator objects are the engine's own.
+- **Iteration**: `for`-`of` and `for`-`in`; iterators are closed on `break`,
+  `return` and exceptions as in JS. Arrays are iterated directly while array
+  iteration is the original one (checked when a loop starts).
+- **Destructuring** in declarations, parameters, `catch`, loop heads and
+  assignments; **spread** in calls, `new`, and array and object literals;
+  **rest** parameters and elements; **optional chaining**; computed keys in
+  object literals.
 
-Not yet: `for`-`of` and `for`-`in`, generators, destructuring, spread and
-rest, optional chaining,
-private fields, `super`, getters and setters and methods in object literals,
-`arguments`, and `await` inside `finally` or in a `for` update. A function
-using one of these stays interpreted. `tsaot report file.ts` says, for every
+Not yet: async generators and `for await`, `super()` and class constructors
+(which stay interpreted), getters, setters and methods in object literals,
+classes inside functions, `arguments`, and `this` in arrow functions. A
+function using one of these stays interpreted (and functions that call it
+call it through its binding). `tsaot report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.
 
 ### Forcing native compilation: `aot`
@@ -222,7 +241,11 @@ others:
 - typed array conversions, detached and resizable buffers;
 - array holes and accessors;
 - exceptions through native frames;
-- async interleavings.
+- async interleavings and generator resumption (`return` / `throw` while
+  suspended in `try` / `finally`, `yield*` forwarding);
+- iterator closing on every kind of exit, and evaluation order in
+  destructuring;
+- private brand checks and `super` with receivers.
 
 - Functions are compiled only if their binding is never reassigned. Direct
   `eval` anywhere in the module disables native compilation for the module,
@@ -249,6 +272,9 @@ Known observable differences:
 - Native frames do not appear in `Error.stack`.
 - `Object.getOwnPropertyNames(Float64Array.prototype)` includes `length` (see
   above).
+- A class whose native methods use its private names or `super` gets a
+  static block first in its body (handing them to native code), which shows
+  in the class's `toString()`.
 
 ## Getting started
 
