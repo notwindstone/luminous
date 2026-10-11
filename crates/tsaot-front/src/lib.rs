@@ -29,6 +29,9 @@ pub enum NativeSite {
     ConstInit { init_span: (u32, u32) },
     /// A class method, installed after the class declaration ends.
     Method { class: String, is_static: bool, key: String, stmt_end: u32 },
+    /// Module-level statements (byte span), replaced by a call of the native
+    /// code.
+    Segment { span: (u32, u32) },
 }
 
 /// A natively compiled function, for source rewriting and reporting.
@@ -70,6 +73,8 @@ pub enum CellInitSite {
     Wrap(u32, u32),
     /// Byte offset after the declaring statement.
     After(u32),
+    /// Set by native code.
+    Native,
 }
 
 /// An interpreted reference to a mutable cell's binding.
@@ -152,9 +157,9 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     let source_type = SourceType::ts().with_module(true);
     let parsed = Parser::new(&allocator, &source, source_type).parse();
     if !parsed.diagnostics.is_empty() {
-        let misplaced = marker::misplaced(original).into_iter().map(|at| {
-            OxcDiagnostic::error("`aot` can only mark a function or an arrow function")
-                .with_label(Span::sized(at, marker::KEYWORD.len() as u32))
+        let misplaced = marker::misplaced(original).into_iter().map(|(at, keyword)| {
+            OxcDiagnostic::error(format!("`{keyword}` can only mark a function or an arrow function"))
+                .with_label(Span::sized(at, keyword.len() as u32))
         });
         return Err(parse_error(misplaced.chain(parsed.diagnostics), original, path));
     }
@@ -169,7 +174,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     // The `int` type, over the whole module.
     let mut ints = ints::check(program, &scoping, opts.int_wrapping);
     errors.append(&mut ints.errors);
-    let out = check::check(program, &scoping, &ints.vars);
+    let out = check::check(program, &scoping, &ints.vars, &stripped.interpreted);
 
     let line = |pos: u32| source[..pos as usize].matches('\n').count() as u32 + 1;
     let natives: Vec<NativeDecl> = out
@@ -189,6 +194,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
                     key: key.clone(),
                     stmt_end: *stmt_end,
                 },
+                check::Site::Segment { span } => NativeSite::Segment { span: (span.start, span.end) },
             },
             line: line(c.node.span().start),
         })
@@ -226,8 +232,9 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
             }
             None => {
                 OxcDiagnostic::error(format!("`aot` cannot be applied to {}", m.what)).with_label(m.span).with_help(
-                    "`aot` is supported on top-level function declarations and on top-level \
-                     `const` bindings of arrow functions and function expressions",
+                    "it is in code that always stays interpreted (a class constructor or field \
+                     initializer); `aot` applies to module code, top-level functions and class methods, \
+                     and to the functions nested in them",
                 )
             }
         });
@@ -258,6 +265,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
                 check::CellInit::Header => CellInitSite::Header,
                 check::CellInit::Wrap(s) => CellInitSite::Wrap(s.start, s.end),
                 check::CellInit::After(p) => CellInitSite::After(p),
+                check::CellInit::Native => CellInitSite::Native,
             },
             hoisted_undefined: c.hoisted_undefined,
         })
@@ -361,14 +369,7 @@ fn has_use_aot(body: Option<&FunctionBody>) -> bool {
 impl<'a> Visit<'a> for MarkedFunctions<'_> {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
         if self.marked.contains(&it.span.start) || has_use_aot(it.body.as_deref()) {
-            let what = if it.r#async {
-                "async functions (not supported yet)"
-            } else if it.generator {
-                "generators (not supported yet)"
-            } else {
-                "this function (nested functions, methods and callbacks are not supported yet)"
-            };
-            self.found.push(Mark { span: it.span, what });
+            self.found.push(Mark { span: it.span, what: "this function" });
         }
         walk::walk_function(self, it, flags);
     }
@@ -379,12 +380,7 @@ impl<'a> Visit<'a> for MarkedFunctions<'_> {
             _ => None,
         };
         if self.marked.contains(&it.span.start) || has_use_aot(body) {
-            let what = if it.r#async {
-                "async functions (not supported yet)"
-            } else {
-                "this arrow function (only top-level `const` arrow functions are supported yet)"
-            };
-            self.found.push(Mark { span: it.span, what });
+            self.found.push(Mark { span: it.span, what: "this arrow function" });
         }
         walk::walk_arrow_function_expression(self, it);
     }

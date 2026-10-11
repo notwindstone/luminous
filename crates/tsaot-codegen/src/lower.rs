@@ -1611,10 +1611,11 @@ impl<'a> Lower<'a> {
                 self.dup((p, t));
                 V::Any(p, t)
             }
-            ExprKind::SetCell(k, x) => {
+            ExprKind::SetCell(k, x) | ExprKind::InitCell(k, x) => {
                 let v = self.expr(x);
                 self.hold(v);
-                let old = self.load_cell(*k);
+                // A declaration replaces `uninitialized` (nothing to free).
+                let old = if let ExprKind::InitCell(..) = e.kind { self.raw_cell(*k) } else { self.load_cell(*k) };
                 let (p, t) = v.any();
                 self.dup((p, t));
                 let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
@@ -2380,6 +2381,15 @@ impl<'a> Lower<'a> {
     }
 
     /// A cell's value (borrowed); throws if it is uninitialized.
+    /// A cell's value, borrowed, without a TDZ check.
+    fn raw_cell(&mut self, k: ir::CellId) -> (Value, Value) {
+        let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
+        let off = (k * SIZE) as i32;
+        let p = self.b.ins().load(I64, Self::mem(), base, off);
+        let t = self.b.ins().load(I64, Self::mem(), base, off + TAG_OFFSET);
+        (p, t)
+    }
+
     fn load_cell(&mut self, k: ir::CellId) -> (Value, Value) {
         let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
         let off = (k * SIZE) as i32;

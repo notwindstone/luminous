@@ -47,6 +47,9 @@ fn callee_failed<T>(span: Span, name: &str) -> R<T> {
 pub enum FnNode<'a> {
     Function(&'a Function<'a>),
     Arrow(&'a ArrowFunctionExpression<'a>),
+    /// Module-level statements, compiled as a function without parameters
+    /// (spanning them).
+    Segment(Span, &'a [Statement<'a>]),
 }
 
 impl FnNode<'_> {
@@ -54,6 +57,7 @@ impl FnNode<'_> {
         match self {
             FnNode::Function(f) => f.r#async,
             FnNode::Arrow(a) => a.r#async,
+            FnNode::Segment(..) => false,
         }
     }
 
@@ -61,6 +65,7 @@ impl FnNode<'_> {
         match self {
             FnNode::Function(f) => f.span,
             FnNode::Arrow(a) => a.span,
+            FnNode::Segment(span, _) => *span,
         }
     }
 
@@ -79,6 +84,8 @@ pub enum Site {
     /// A method of top-level class `class`, installed over the original after
     /// the class declaration (which ends at `stmt_end`).
     Method { class: String, is_static: bool, key: String, stmt_end: u32 },
+    /// Module-level statements, replaced by a call of the native code.
+    Segment { span: Span },
 }
 
 struct Param<'a> {
@@ -110,6 +117,9 @@ pub struct Candidate<'a> {
     /// Methods: their class (index in `Outcome::classes`), and whether
     /// they are static.
     class: Option<(usize, bool)>,
+    /// Segments: the module bindings they declare that other code uses,
+    /// which live in cells (the others are locals).
+    cells: HashSet<SymbolId>,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +162,8 @@ pub enum CellInit {
     Wrap(Span),
     /// After the declaring statement.
     After(u32),
+    /// By native code: the binding is declared by a native segment.
+    Native,
 }
 
 #[derive(Clone, Debug)]
@@ -180,13 +192,33 @@ pub struct Outcome<'a> {
     pub class_uses: Vec<ClassUse>,
 }
 
-pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping, int_syms: &HashSet<SymbolId>) -> Outcome<'a> {
+/// `interpreted`: start offsets of the functions marked `interpreted`.
+pub fn check<'a>(
+    program: &'a Program<'a>,
+    scoping: &'a Scoping,
+    int_syms: &HashSet<SymbolId>,
+    interpreted: &HashSet<u32>,
+) -> Outcome<'a> {
     let mut candidates = Vec::new();
     let mut rejected = Vec::new();
     let mut consts = HashMap::new();
     let mut bindings = HashMap::new();
     let mut classes = Vec::new();
-    collect_toplevel(program, scoping, &mut classes, &mut candidates, &mut rejected, &mut consts, &mut bindings);
+    collect_toplevel(
+        program,
+        scoping,
+        interpreted,
+        &mut classes,
+        &mut candidates,
+        &mut rejected,
+        &mut consts,
+        &mut bindings,
+    );
+    // Module code, in runs of statements.
+    let uses = module_uses(program, scoping);
+    for run in segment_runs(&program.body, &bindings, &consts) {
+        candidates.push(segment(run, scoping, &uses));
+    }
 
     if scoping.root_unresolved_references().contains_key("eval") {
         // Direct eval can read and rebind module-level bindings, so nothing
@@ -210,6 +242,7 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping, int_syms: &Hash
         let mut cx = ModuleCx {
             scoping,
             int_syms,
+            interpreted,
             consts: &consts,
             bindings: &bindings,
             cands: &candidates,
@@ -274,7 +307,28 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping, int_syms: &Hash
         let mut keep = Vec::new();
         for (i, c) in candidates.into_iter().enumerate() {
             match reasons.remove(&i) {
-                Some(r) => rejected.push((c.name, c.node.span(), r)),
+                Some(r) => {
+                    // Module code: only the statement at fault stays
+                    // interpreted; the statements around it are tried again.
+                    let at = match c.node {
+                        FnNode::Segment(_, stmts) => stmts
+                            .iter()
+                            .position(|s| s.span().start <= r.span.start && r.span.end <= s.span().end)
+                            .map(|k| (stmts, k)),
+                        _ => None,
+                    };
+                    match at {
+                        Some((stmts, k)) => {
+                            rejected.push((c.name, stmts[k].span(), r));
+                            for piece in [&stmts[..k], &stmts[k + 1..]] {
+                                if piece.iter().any(|s| !matches!(s, Statement::EmptyStatement(_))) {
+                                    keep.push(segment(piece, scoping, &uses));
+                                }
+                            }
+                        }
+                        None => rejected.push((c.name, c.node.span(), r)),
+                    }
+                }
                 None => keep.push(c),
             }
         }
@@ -282,9 +336,11 @@ pub fn check<'a>(program: &'a Program<'a>, scoping: &'a Scoping, int_syms: &Hash
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_toplevel<'a>(
     program: &'a Program<'a>,
     scoping: &'a Scoping,
+    interpreted: &HashSet<u32>,
     classes: &mut Vec<ClassInfo>,
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
@@ -327,7 +383,13 @@ fn collect_toplevel<'a>(
                 ArrowFunctionBody::FunctionBody(b) => Some(&**b),
                 _ => None,
             },
+            FnNode::Segment(..) => None,
         };
+        if interpreted.contains(&node.span().start) {
+            let r = Reject { span: node.span(), msg: "marked `interpreted`".into(), retry: false, callee: false };
+            rejected.push((name, node.span(), r));
+            return;
+        }
         if body.is_some_and(|b| b.directives.iter().any(|d| d.directive.as_str() == "use no aot")) {
             let r = Reject { span: node.span(), msg: "marked \"use no aot\"".into(), retry: false, callee: false };
             rejected.push((name, node.span(), r));
@@ -345,6 +407,7 @@ fn collect_toplevel<'a>(
                 rest,
                 ret,
                 class: None,
+                cells: HashSet::new(),
             }),
             Err(r) => rejected.push((name, node.span(), r)),
         }
@@ -543,6 +606,7 @@ fn class_methods<'a>(
                 rest,
                 ret,
                 class: Some((index, m.r#static)),
+                cells: HashSet::new(),
             }),
             Err(r) => rejected.push((format!("{class}.{key}"), node.span(), r)),
         }
@@ -594,6 +658,7 @@ type Header<'a> = (Vec<Param<'a>>, bool, Option<Ty>);
 
 fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     let (span, is_async, generator, this_param, params, return_type) = match node {
+        FnNode::Segment(..) => return Ok((Vec::new(), false, None)),
         FnNode::Function(f) => (f.span, f.r#async, f.generator, f.this_param.is_some(), &f.params, &f.return_type),
         FnNode::Arrow(a) => (a.span, a.r#async, false, false, &a.params, &a.return_type),
     };
@@ -637,6 +702,8 @@ struct ModuleCx<'m, 'a> {
     scoping: &'a Scoping,
     /// Bindings declared `int` (stores into them wrap; see `ints`).
     int_syms: &'m HashSet<SymbolId>,
+    /// Functions marked `interpreted` (start offsets).
+    interpreted: &'m HashSet<u32>,
     consts: &'m HashMap<SymbolId, ConstVal>,
     bindings: &'m HashMap<SymbolId, Binding>,
     cands: &'m [Candidate<'a>],
@@ -674,7 +741,8 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         let params: Vec<ParamSpec<'a>> = c.params.iter().map(|p| (p.pattern, p.ty, p.default)).collect();
         let rest = c.rest;
         let class = c.class;
-        let caps = Rc::new(capture_info(node, self.scoping));
+        let cells = c.cells.clone();
+        let caps = Rc::new(capture_info(node, self.scoping, &cells));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
             let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
@@ -682,6 +750,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             fx.class = class;
             fx.has_this = has_this;
             fx.ret_int = ret_annot == Some(Ty::I32);
+            fx.seg_cells = cells.clone();
             let r = fx.function(node, name.clone(), params.clone());
             match (r, fx.widen_request) {
                 (Err(e), Some(s)) if e.retry => {
@@ -805,11 +874,15 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             .map(|&sym| {
                 let b = &self.bindings[&sym];
                 let native = self.cands.iter().find(|c| c.symbol == Some(sym));
+                // Declared by a native segment: interpreted code reaches it
+                // through the cells object only (its declaration is gone).
+                let segment = self.cands.iter().any(|c| c.cells.contains(&sym));
                 let init = match (b.kind, native) {
+                    _ if segment => CellInit::Native,
                     (BindingKind::Function | BindingKind::Import, _) => CellInit::Header,
                     (_, Some(c)) => match &c.site {
                         Site::ConstInit { init } => CellInit::Wrap(*init),
-                        Site::Declaration { .. } | Site::Method { .. } => CellInit::Header,
+                        Site::Declaration { .. } | Site::Method { .. } | Site::Segment { .. } => CellInit::Header,
                     },
                     (_, None) => match b.init {
                         Some(span) => CellInit::Wrap(span),
@@ -819,7 +892,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                 CellInfo {
                     symbol: sym,
                     name: b.name.clone(),
-                    mutable: b.written,
+                    mutable: b.written || segment,
                     init,
                     hoisted_undefined: b.kind == BindingKind::Var,
                 }
@@ -874,6 +947,8 @@ struct FnCx<'x, 'm, 'a> {
     returns: Vec<Ty>,
     /// The function is annotated to return `int`.
     ret_int: bool,
+    /// Segments: module bindings they declare that live in cells.
+    seg_cells: HashSet<SymbolId>,
     /// While checking a `for` update: the `int` loop counter it may step
     /// (`true`: up), proven to stay in range by the loop test.
     int_counter: Option<(ir::LocalId, bool)>,
@@ -896,11 +971,14 @@ struct CaptureInfo {
     free: HashMap<u32, Vec<SymbolId>>,
 }
 
-fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
+/// `cells`: module bindings a segment declares that live in cells (not
+/// captured: closures access the cell).
+fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> CaptureInfo {
     use oxc::ast_visit::{Visit, walk};
     use oxc::syntax::scope::ScopeFlags;
     struct V<'s> {
         scoping: &'s Scoping,
+        cells: &'s HashSet<SymbolId>,
         collect_refs: bool,
         stack: Vec<u32>,
         owner: HashMap<SymbolId, u32>,
@@ -926,6 +1004,7 @@ fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
         fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
             if !self.collect_refs
                 && let (Some(sym), Some(&cur)) = (it.symbol_id.get(), self.stack.last())
+                && !self.cells.contains(&sym)
             {
                 self.owner.entry(sym).or_insert(cur);
             }
@@ -953,12 +1032,18 @@ fn capture_info(node: FnNode, scoping: &Scoping) -> CaptureInfo {
             }
         }
     }
-    let mut v = V { scoping, collect_refs: false, stack: Vec::new(), owner: HashMap::new(), info: Default::default() };
+    let mut v =
+        V { scoping, cells, collect_refs: false, stack: Vec::new(), owner: HashMap::new(), info: Default::default() };
     for pass in [false, true] {
         v.collect_refs = pass;
         match node {
             FnNode::Function(f) => v.visit_function(f, ScopeFlags::Function),
             FnNode::Arrow(a) => v.visit_arrow_function_expression(a),
+            FnNode::Segment(span, stmts) => {
+                v.stack.push(span.start);
+                stmts.iter().for_each(|s| v.visit_statement(s));
+                v.stack.pop();
+            }
         }
     }
     v.info
@@ -1064,6 +1149,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             label: None,
             returns: Vec::new(),
             ret_int: false,
+            seg_cells: HashSet::new(),
             int_counter: None,
             in_finally: 0,
             name_hint: None,
@@ -1072,10 +1158,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     fn function(&mut self, node: FnNode<'a>, name: String, params: Vec<ParamSpec<'a>>) -> R<ir::Func> {
-        self.is_async = match node {
-            FnNode::Function(f) => f.r#async,
-            FnNode::Arrow(a) => a.r#async,
-        };
+        self.is_async = node.is_async();
         self.is_generator = matches!(node, FnNode::Function(f) if f.generator);
         let mut abi = Vec::new();
         let mut prologue = Vec::new();
@@ -1148,6 +1231,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
         }
         let body = match node {
+            FnNode::Segment(_, stmts) => {
+                prologue.extend(self.hoist_vars(stmts)?);
+                self.block(stmts)?
+            }
             FnNode::Function(f) if f.generator => {
                 // Parameters and declarations are set up when the generator
                 // is created; the body runs from the first `next`.
@@ -1379,7 +1466,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         }
         let mut boxes = Vec::new();
         for sym in v.0 {
-            if !self.sym_local.contains_key(&sym) {
+            if !self.sym_local.contains_key(&sym) && !self.seg_cells.contains(&sym) {
                 let l = self.declare(sym, Ty::Any, true);
                 if self.boxed[l] {
                     boxes.push(l);
@@ -1881,6 +1968,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 continue;
             };
             let sym = id.symbol_id.get().unwrap();
+            if self.seg_cells.contains(&sym) {
+                // A module binding of a segment that other code uses: its cell.
+                self.name_hint = Some(id.name.to_string());
+                let init = match &d.init {
+                    Some(init) => self.expr(init)?,
+                    None if is_var => continue,
+                    None => undefined(),
+                };
+                self.name_hint = None;
+                let init = if self.wraps(Some(sym)) && init.ty != Ty::I32 { wrap(init) } else { init };
+                let k = self.m.cell(sym, d.span)?;
+                out.extend(self.pre.drain(base..));
+                out.push(Stmt::Expr(init_cell(k, init, is_var)));
+                continue;
+            }
             if let Some(Expression::AwaitExpression(aw)) = d.init.as_ref().map(|i| i.without_parentheses()) {
                 let value = any(self.expr(&aw.argument)?);
                 let l = match self.sym_local.get(&sym) {
@@ -1951,6 +2053,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// the variables it captures.
     fn closure(&mut self, node: FnNode<'a>, name: String) -> R<Expr> {
         let key = node.span().start;
+        if self.m.interpreted.contains(&key) {
+            return reject(node.span(), "contains a function marked `interpreted`");
+        }
         let (params, rest, ret) = header(node)?;
         // There is no interpreted fallback to decline to: every parameter is
         // a JS value.
@@ -2170,6 +2275,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// Initialize one name.
     fn bind_ident(&mut self, id: &'a BindingIdentifier<'a>, v: Expr, kind: BindKind, out: &mut Vec<Stmt>) -> R<()> {
         let sym = id.symbol_id.get().unwrap();
+        if self.seg_cells.contains(&sym) {
+            let k = self.m.cell(sym, id.span)?;
+            out.push(Stmt::Expr(init_cell(k, v, kind == BindKind::Var)));
+            return Ok(());
+        }
         if kind == BindKind::Var {
             let l = self.sym_local[&sym];
             out.push(Stmt::Expr(self.set_local(Some(sym), l, v, id.span)?));
@@ -3745,6 +3855,13 @@ impl LoopTest {
     }
 }
 
+/// The declaration of the module binding in cell `k` (a `var` is only
+/// assigned: it was initialized to `undefined` when the module started).
+fn init_cell(k: ir::CellId, v: Expr, is_var: bool) -> Expr {
+    let v = Box::new(any(v));
+    Expr::new(Ty::Any, if is_var { ExprKind::SetCell(k, v) } else { ExprKind::InitCell(k, v) })
+}
+
 /// `x | 0`.
 fn wrap(x: Expr) -> Expr {
     arith(AnyBinOp::BitOr, x, Expr::num(0.0))
@@ -4078,4 +4195,147 @@ fn array_parts(parts: Vec<Option<bool>>, values: Vec<Expr>) -> Expr {
         })
         .collect();
     Expr::new(Ty::Any, ExprKind::ArrayParts(parts))
+}
+
+// ---- module code ----
+
+/// Positions of every declaration of and reference to each module-level
+/// binding.
+fn module_uses(program: &Program, scoping: &Scoping) -> HashMap<SymbolId, Vec<u32>> {
+    use oxc::ast_visit::Visit;
+    struct V<'s> {
+        scoping: &'s Scoping,
+        uses: HashMap<SymbolId, Vec<u32>>,
+    }
+    impl V<'_> {
+        fn add(&mut self, sym: SymbolId, at: u32) {
+            if self.scoping.symbol_scope_id(sym) == self.scoping.root_scope_id() {
+                self.uses.entry(sym).or_default().push(at);
+            }
+        }
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+            if let Some(sym) = it.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id()) {
+                self.add(sym, it.span.start);
+            }
+        }
+        fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+            if let Some(sym) = it.symbol_id.get() {
+                self.add(sym, it.span.start);
+            }
+        }
+    }
+    let mut v = V { scoping, uses: HashMap::new() };
+    v.visit_program(program);
+    v.uses
+}
+
+/// Whether a module-level statement may be part of native module code: it
+/// runs in order with its neighbours (no hoisting), does not wait (no
+/// top-level `await`), and declares nothing that stays a binding of the
+/// interpreted module (functions, classes, exports, folded constants).
+fn segment_stmt(s: &Statement, bindings: &HashMap<SymbolId, Binding>, consts: &HashMap<SymbolId, ConstVal>) -> bool {
+    use oxc::ast_visit::{Visit, walk};
+    struct Awaits(bool);
+    impl<'a> Visit<'a> for Awaits {
+        fn visit_await_expression(&mut self, _: &AwaitExpression<'a>) {
+            self.0 = true;
+        }
+        fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+            self.0 |= it.r#await;
+            walk::walk_for_of_statement(self, it);
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: oxc::syntax::scope::ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    }
+    let ok = match s {
+        Statement::ExpressionStatement(_)
+        | Statement::IfStatement(_)
+        | Statement::ForStatement(_)
+        | Statement::ForInStatement(_)
+        | Statement::ForOfStatement(_)
+        | Statement::WhileStatement(_)
+        | Statement::DoWhileStatement(_)
+        | Statement::BlockStatement(_)
+        | Statement::LabeledStatement(_)
+        | Statement::SwitchStatement(_)
+        | Statement::TryStatement(_)
+        | Statement::ThrowStatement(_)
+        | Statement::EmptyStatement(_) => true,
+        Statement::VariableDeclaration(v) => {
+            !v.declare
+                && matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const | VariableDeclarationKind::Var
+                )
+                && v.declarations.iter().all(|d| {
+                    !matches!(
+                        d.init.as_ref().map(|i| i.without_parentheses()),
+                        Some(Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_))
+                    ) && d.id.get_binding_identifiers().iter().all(|id| {
+                        let sym = id.symbol_id.get().unwrap();
+                        !consts.contains_key(&sym) && bindings.get(&sym).is_none_or(|b| !b.exported)
+                    })
+                })
+        }
+        _ => false,
+    };
+    if !ok {
+        return false;
+    }
+    let mut a = Awaits(false);
+    a.visit_statement(s);
+    !a.0
+}
+
+/// The maximal runs of `segment_stmt`s, with something to run.
+fn segment_runs<'a>(
+    body: &'a [Statement<'a>],
+    bindings: &HashMap<SymbolId, Binding>,
+    consts: &HashMap<SymbolId, ConstVal>,
+) -> Vec<&'a [Statement<'a>]> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, s) in body.iter().enumerate() {
+        match (segment_stmt(s, bindings, consts), start) {
+            (true, None) => start = Some(i),
+            (false, Some(st)) => {
+                runs.push(&body[st..i]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        runs.push(&body[st..]);
+    }
+    runs.retain(|r| r.iter().any(|s| !matches!(s, Statement::EmptyStatement(_))));
+    runs
+}
+
+/// Native module code for these statements. The module bindings they
+/// declare are locals, unless code elsewhere uses them (then cells).
+fn segment<'a>(stmts: &'a [Statement<'a>], scoping: &Scoping, uses: &HashMap<SymbolId, Vec<u32>>) -> Candidate<'a> {
+    let span = Span::new(stmts[0].span().start, stmts[stmts.len() - 1].span().end);
+    let mut cells = HashSet::new();
+    for (&sym, at) in uses {
+        let declared_here = scoping.symbol_span(sym).start >= span.start && scoping.symbol_span(sym).end <= span.end;
+        if declared_here && at.iter().any(|&p| p < span.start || p >= span.end) {
+            cells.insert(sym);
+        }
+    }
+    Candidate {
+        name: "<module code>".into(),
+        node: FnNode::Segment(span, stmts),
+        symbol: None,
+        has_this: false,
+        site: Site::Segment { span },
+        direct_callable: false,
+        params: Vec::new(),
+        rest: false,
+        ret: None,
+        class: None,
+        cells,
+    }
 }

@@ -120,8 +120,14 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
             }
         }
     }
+    // Native module code: its statements become one call (a native
+    // function without parameters never declines to its fallback).
+    let mut segments = Vec::new();
     for (i, n) in a.natives.iter().enumerate() {
         match &n.site {
+            &NativeSite::Segment { span: (s, e) } => {
+                segments.push((s as usize, e as usize, format!("{BIND_FN}({i}, () => {{}})();")));
+            }
             &NativeSite::Declaration { id_span, export_prefix } => {
                 edits.push((id_span.0 as usize, id_span.1 as usize, fallback_name(&n.name)));
                 if let Some((s, e)) = export_prefix {
@@ -157,6 +163,7 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
             CellInitSite::After(p) => {
                 suffixes.entry(p as usize).or_default().push(format!(";{INIT_FN}({k}, {});", c.name));
             }
+            CellInitSite::Native => {}
         }
     }
     for r in &a.cell_refs {
@@ -187,6 +194,9 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     for (pos, v) in suffixes {
         edits.push((pos, pos, v.concat()));
     }
+    // Nothing else of a segment's statements remains.
+    edits.retain(|&(s, e, _)| !segments.iter().any(|&(ss, se, _)| ss <= s && e <= se));
+    edits.extend(segments);
     // Back to front; at equal starts, the replacement before the insertion.
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     let mut out = source.to_string();

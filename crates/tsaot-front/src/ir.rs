@@ -300,6 +300,8 @@ pub enum ExprKind {
     /// Read of a module-level binding (ReferenceError while uninitialized).
     Cell(CellId),
     SetCell(CellId, Box<Expr>),
+    /// The declaration of a module-level binding (ends its TDZ).
+    InitCell(CellId, Box<Expr>),
     /// Global variable (ReferenceError if it does not exist).
     Global(AtomId),
     /// `typeof` operand: a global variable that may not exist (undefined).
@@ -664,6 +666,7 @@ macro_rules! visitor {
                 | Box(a)
                 | AnyUnary(_, a)
                 | SetCell(_, a)
+                | InitCell(_, a)
                 | SetGlobal(_, a)
                 | GetProp(a, _)
                 | Length(a, _)

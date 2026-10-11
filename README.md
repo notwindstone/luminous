@@ -36,7 +36,14 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 1. **Selection.** The candidates are:
    - top-level `function` declarations;
    - top-level `const` bindings of arrow functions and function expressions;
-   - class methods.
+   - class methods;
+   - module code: each run of top-level statements (loops, `if`s, expression
+     statements, `let` / `const` / `var` declarations) becomes a native
+     function without parameters, called where the statements were. Class
+     declarations, exports and top-level `await` end a run and stay
+     interpreted. When the checker rejects a statement, only that statement
+     stays interpreted. A module binding that only its run uses is a native
+     local; one that other code uses lives in a cell (see 6).
 
    The checker (`crates/tsaot-front/src/check.rs`) lowers each one to a typed
    IR, together with the functions nested in it, which become native closures.
@@ -244,9 +251,20 @@ directly precedes one on the same line (`aot function`, `aot async function`,
 still a call. The keyword is not TypeScript syntax, so `tsc`, editors and
 formatters reject it. Use `"use aot"` where that matters.
 
-A nested function can be marked when its enclosing function is compiled. A
-callback written in top-level code (`xs.map(aot (x) => …)`) cannot be marked
-yet. `"use no aot"` keeps a function interpreted.
+A nested function can be marked when its enclosing function (or module
+code) is compiled, so `xs.map(aot (x) => …)` works at the top level too.
+Functions in code that always stays interpreted (class constructors and field
+initializers) cannot be marked.
+
+### Keeping a function interpreted: `interpreted`
+
+The opposite keyword keeps a function in the interpreter, with the same
+syntax (`interpreted function f() {}`, `interpreted (x) => …`). The directive
+form is `"use no aot"`, which also works on class methods. A native function
+cannot contain an interpreted one, so marking a nested function keeps its
+enclosing function interpreted as well (a build error if that one is marked
+`aot`). Native code calls an interpreted function through its binding, as it
+calls any function that is not native.
 
 ### Semantics and soundness
 

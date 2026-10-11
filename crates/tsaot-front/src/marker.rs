@@ -1,5 +1,5 @@
-//! The `aot` contextual keyword: `aot function f() {}`, `aot (x) => x`,
-//! `aot async function g() {}`, ...
+//! The `aot` and `interpreted` contextual keywords: `aot function f() {}`,
+//! `aot (x) => x`, `interpreted async function g() {}`, ...
 //!
 //! Like `async`, `aot` is only a keyword directly before a function: no line
 //! break may follow it, and everywhere else it is an ordinary identifier. The
@@ -24,15 +24,21 @@ use oxc::span::SourceType;
 use oxc::syntax::scope::ScopeFlags;
 
 pub const KEYWORD: &str = "aot";
+/// Keeps a function interpreted.
+pub const INTERPRETED: &str = "interpreted";
+const KEYWORDS: [&str; 2] = [KEYWORD, INTERPRETED];
 
 pub struct Stripped {
-    /// The source with every `aot` marker replaced by spaces.
+    /// The source with every marker replaced by spaces.
     pub source: String,
-    /// Start offsets of the marked functions (the token after `aot`).
+    /// Start offsets of the functions marked `aot` (the token after it).
     pub marked: HashSet<u32>,
+    /// Start offsets of the functions marked `interpreted`.
+    pub interpreted: HashSet<u32>,
 }
 
 struct Candidate {
+    keyword: &'static str,
     at: usize,
     /// Offset of the first token after the keyword.
     next: usize,
@@ -43,13 +49,22 @@ fn is_ident_byte(b: u8) -> bool {
 }
 
 fn candidates(src: &str) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = KEYWORDS.iter().flat_map(|k| keyword_candidates(src, k)).collect();
+    out.sort_by_key(|c| c.at);
+    out
+}
+
+fn keyword_candidates(src: &str, keyword: &'static str) -> Vec<Candidate> {
     let bytes = src.as_bytes();
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(i) = src[from..].find(KEYWORD).map(|i| i + from) {
-        from = i + KEYWORD.len();
-        let end = i + KEYWORD.len();
+    while let Some(i) = src[from..].find(keyword).map(|i| i + from) {
+        from = i + keyword.len();
+        let end = i + keyword.len();
         if i > 0 && (is_ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.') {
+            continue;
+        }
+        if bytes.get(end).is_some_and(|&b| is_ident_byte(b)) {
             continue;
         }
         let mut next = end;
@@ -62,7 +77,7 @@ fn candidates(src: &str) -> Vec<Candidate> {
             _ => next > end && is_ident_byte(b),
         };
         if ok {
-            out.push(Candidate { at: i, next });
+            out.push(Candidate { keyword, at: i, next });
         }
     }
     out
@@ -71,7 +86,7 @@ fn candidates(src: &str) -> Vec<Candidate> {
 fn blank(src: &str, cands: &[&Candidate]) -> String {
     let mut out = src.to_string();
     for c in cands {
-        out.replace_range(c.at..c.at + KEYWORD.len(), &" ".repeat(KEYWORD.len()));
+        out.replace_range(c.at..c.at + c.keyword.len(), &" ".repeat(c.keyword.len()));
     }
     out
 }
@@ -131,12 +146,14 @@ pub fn strip(src: &str) -> Stripped {
             }
         }
     }
-    Stripped { source: blank(src, &active), marked: active.iter().map(|c| c.next as u32).collect() }
+    let of = |k: &str| active.iter().filter(|c| c.keyword == k).map(|c| c.next as u32).collect();
+    Stripped { source: blank(src, &active), marked: of(KEYWORD), interpreted: of(INTERPRETED) }
 }
 
-/// Offsets of `aot` directly followed by a keyword that cannot start a
-/// function (`aot class`, `aot const`, ...). Used to explain parse errors.
-pub fn misplaced(src: &str) -> Vec<u32> {
+/// Markers directly followed by a keyword that cannot start a function
+/// (`aot class`, `interpreted const`, ...): offset and keyword. Used to
+/// explain parse errors.
+pub fn misplaced(src: &str) -> Vec<(u32, &'static str)> {
     const NOT_FUNCTIONS: &[&str] = &[
         "class",
         "const",
@@ -161,6 +178,6 @@ pub fn misplaced(src: &str) -> Vec<u32> {
             let word: String = rest.bytes().take_while(|&b| is_ident_byte(b)).map(char::from).collect();
             NOT_FUNCTIONS.contains(&word.as_str())
         })
-        .map(|c| c.at as u32)
+        .map(|c| (c.at as u32, c.keyword))
         .collect()
 }

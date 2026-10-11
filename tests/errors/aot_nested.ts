@@ -1,11 +1,13 @@
 // @error `aot` cannot be applied to this arrow function
 // @error `aot` cannot be applied to this function
-const xs = [1, 2, 3].map(aot (x: number): number => x * 2);
-function outer(): number {
-  function inner(y: number): number {
-    "use aot";
-    return y;
+class A {
+  f = aot (x: number): number => x * 2;
+  g: () => number;
+  constructor() {
+    this.g = aot function (): number {
+      return 1;
+    };
   }
-  return inner(1);
 }
-console.log(xs, outer());
+const a = new A();
+console.log(a.f(1), a.g());
