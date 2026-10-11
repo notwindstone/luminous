@@ -159,8 +159,10 @@ regular call path's generated code alone.
   range check disappears when loop trip counts bound the value statically.
 - **Objects that do not escape**: a local initialized with an object
   literal and only used as `local.key` (and reassigned only literals with
-  the same keys) is never allocated: each property becomes a local, an
-  unboxed number when it only ever holds numbers. Elsewhere, `o.k++`,
+  the same keys, or destructured: `const { x, y } = p`) is never
+  allocated: each property becomes a local, an unboxed number when it only
+  ever holds numbers. Untyped locals that only ever hold numbers become
+  number locals too. Elsewhere, `o.k++`,
   `o.k += n` update a cached data property in place.
 - **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
@@ -168,7 +170,9 @@ regular call path's generated code alone.
   - string, template, object and array literals;
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
-    check, then a load or store;
+    check, then a load or store. A cache also covers methods, getters and
+    setters found on the first or second prototype (checking the shapes on
+    the way), and private fields and `super.name`;
   - `typeof`, `in`, `instanceof`, `new`;
   - calls to any function: native functions directly, interpreted ones
     through the engine;
@@ -183,7 +187,8 @@ regular call path's generated code alone.
   their creator and capture loop variables (one binding per iteration, as in
   JS). Side effects on module-level bindings (`count++`) are shared with
   interpreted code.
-- **Class methods** (`this` included; static methods too), with the class's
+- **Class methods, getters and setters** (`this` included; static ones
+  too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
   `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
 - **`async` functions and arrows**: `await` anywhere in an expression,

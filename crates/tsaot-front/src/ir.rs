@@ -956,6 +956,7 @@ fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
 /// which evaluates the literal.) It may be reassigned other literals with
 /// the same keys, in statements.
 pub fn scalar_replace(f: &mut Func) {
+    alias_destructuring(f);
     let n = f.locals.len();
     let mut ok: Vec<bool> =
         (0..n).map(|l| l >= f.params.len() && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)).collect();
@@ -1258,4 +1259,64 @@ pub fn number_locals(f: &mut Func) {
             return;
         }
     }
+}
+
+/// Destructuring reads its source through a temporary: `t = ToObject(l)`,
+/// then `t.a`, `t.b`... When `l` is only ever the object of its literal
+/// initializer, `ToObject(l)` is that object and `t.a` reads `l.a`: such
+/// temporaries (written once, only read as `t.key`) are replaced by `l`, so
+/// that `scalar_replace` sees through the destructuring.
+fn alias_destructuring(f: &mut Func) {
+    let n = f.locals.len();
+    // Locals only written by one `InitLocal(l, {...})`.
+    let mut literal_inits = vec![0usize; n];
+    let mut other_writes = vec![false; n];
+    // Candidate temporaries: their source local, writes, and other uses.
+    let mut source: Vec<Option<LocalId>> = vec![None; n];
+    let mut writes = vec![0usize; n];
+    let mut as_object = vec![0usize; n];
+    let mut total = vec![0usize; n];
+    stmt_locals(&f.body, &mut |l| other_writes[l] = true);
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) => {
+            writes[*l] += 1;
+            match (&e.kind, &x.kind) {
+                (ExprKind::InitLocal(..), ExprKind::Object(_)) => literal_inits[*l] += 1,
+                (ExprKind::SetLocal(..), ExprKind::ToObject(inner)) => match inner.kind {
+                    ExprKind::Local(m) => source[*l] = Some(m),
+                    _ => other_writes[*l] = true,
+                },
+                _ => other_writes[*l] = true,
+            }
+        }
+        ExprKind::Update { local, .. } => other_writes[*local] = true,
+        ExprKind::GetProp(o, _) => {
+            if let ExprKind::Local(l) = o.kind {
+                as_object[l] += 1;
+            }
+        }
+        ExprKind::Local(l) => total[*l] += 1,
+        _ => {}
+    });
+    let alias: Vec<Option<LocalId>> = (0..n)
+        .map(|t| {
+            let m = source[t]?;
+            let literal = literal_inits[m] == 1 && writes[m] == 1 && !other_writes[m] && !f.boxed[m];
+            (literal && writes[t] == 1 && !other_writes[t] && !f.boxed[t] && total[t] == as_object[t]).then_some(m)
+        })
+        .collect();
+    if alias.iter().all(Option::is_none) {
+        return;
+    }
+    visit_stmts_mut(&mut f.body, &mut |e| match &mut e.kind {
+        ExprKind::SetLocal(t, _) if alias[*t].is_some() => e.kind = ExprKind::Undefined,
+        ExprKind::GetProp(o, _) => {
+            if let ExprKind::Local(t) = o.kind
+                && let Some(m) = alias[t]
+            {
+                o.kind = ExprKind::Local(m);
+            }
+        }
+        _ => {}
+    });
 }

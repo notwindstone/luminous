@@ -1,4 +1,4 @@
-// @native counter arith strings retypeMixed order dupKeys perIteration escapes missing zeros postfix gen asyncFields reassign swap otherKeys asValue inUpdate
+// @native counter arith strings retypeMixed order dupKeys perIteration escapes missing zeros postfix gen asyncFields reassign swap otherKeys asValue inUpdate destructured
 function counter(): number {
   const hi: { value: number } = { value: 0 };
   for (let i = 0; i < 1000; i++) {
@@ -167,7 +167,34 @@ function inUpdate(): string {
   return out;
 }
 
+function toJson(o: object): string {
+  return JSON.stringify(o);
+}
+
+function destructured(): string {
+  let acc = 0;
+  for (let i = 0; i < 5; i++) {
+    const p = { x: i, y: i + 1, z: i * 2 };
+    const { x, y, z } = p;
+    acc += x + y + z;
+  }
+  const q = { a: 1, b: "two" };
+  const { a, b: renamed, c = "default" } = q as { a: number; b: string; c?: string };
+  const r = { m: 1, n: 2 };
+  const { m, ...rest } = r;
+  const s = { u: 3 };
+  const { u } = s;
+  const t = { v: 4 };
+  const { v } = t;
+  const seen = toJson(t);
+  let w = { k: 1 };
+  const { k } = w;
+  w = { k: 2 };
+  return [acc, a, renamed, c, m, toJson(rest), u, v, seen, k, w.k].join(",");
+}
+
 console.log(counter());
+console.log(destructured());
 console.log(arith());
 console.log(strings());
 console.log(retypeMixed(false), retypeMixed(true));
