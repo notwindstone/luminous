@@ -573,22 +573,12 @@ impl Codegen {
         b.ins().brif(failed, exception, &[], ok, &[]);
         b.switch_to_block(ok);
         let slots = b.ins().load(ptr, mem, slots_addr, 0);
-        let dup = env.helpers["JS_DupValue"];
         let store = |b: &mut FunctionBuilder, s: usize, p: Value, t: Value| {
             let at = (s * jsvalue::SIZE) as i32;
             b.ins().store(M_SLOT, p, slots, at);
             b.ins().store(M_SLOT, t, slots, at + jsvalue::TAG_OFFSET);
         };
-        let dup_value = |b: &mut FunctionBuilder, p: Value, t: Value| {
-            let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0);
-            let yes = b.create_block();
-            let join = b.create_block();
-            b.ins().brif(rc, yes, &[], join, &[]);
-            b.switch_to_block(yes);
-            b.ins().call(dup, &[js_ctx, p, t]);
-            b.ins().jump(join, &[]);
-            b.switch_to_block(join);
-        };
+        let dup_value = |b: &mut FunctionBuilder, p: Value, t: Value| dup_inline(b, p, t);
         if f.rest {
             // The rest array; if it cannot be allocated, drop the frame.
             let failed = b.create_block();
@@ -749,15 +739,7 @@ impl Codegen {
                 && !(f.rest && k + 1 == f.params.len())
             {
                 let (p, tag) = load_arg(&mut b, argc, argv, k);
-                let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, tag, 0);
-                let dup = b.create_block();
-                let join = b.create_block();
-                b.ins().brif(rc, dup, &[], join, &[]);
-                b.switch_to_block(dup);
-                let dupf = env.helpers["JS_DupValue"];
-                b.ins().call(dupf, &[js_ctx, p, tag]);
-                b.ins().jump(join, &[]);
-                b.switch_to_block(join);
+                dup_inline(&mut b, p, tag);
                 params[k] = V::Any(p, tag);
             }
         }
@@ -1145,4 +1127,19 @@ fn rest_arg(
     b.ins().brif(failed, exception, &[], ok, &[]);
     b.switch_to_block(ok);
     V::Any(r[0], r[1])
+}
+
+/// A new reference to `(p, t)`: its count incremented inline, as
+/// `Lower::dup` does.
+fn dup_inline(b: &mut FunctionBuilder, p: Value, t: Value) {
+    let rc = b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0);
+    let yes = b.create_block();
+    let join = b.create_block();
+    b.ins().brif(rc, yes, &[], join, &[]);
+    b.switch_to_block(yes);
+    let n = b.ins().load(I32, lower::M_RC, p, layout::REF_COUNT);
+    let n = b.ins().iadd_imm_s(n, 1);
+    b.ins().store(lower::M_RC, n, p, layout::REF_COUNT);
+    b.ins().jump(join, &[]);
+    b.switch_to_block(join);
 }

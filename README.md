@@ -9,9 +9,9 @@ machine code with [Cranelift](https://cranelift.dev), or with
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
 
-Whatever the compiler does not handle (`eval`, class constructors, and every
-function it cannot compile) keeps running in the QuickJS interpreter, linked
-into the same executable.
+Whatever the compiler does not handle (`eval`, constructors of derived
+classes, and every function it cannot compile) keeps running in the QuickJS
+interpreter, linked into the same executable.
 
 ```console
 $ tsaot report bench/primes.ts
@@ -166,7 +166,25 @@ fast paths that keep the engine's semantics:
   `JS_DupObjectShape` for caching their shape;
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
-  at the index where the property was last found first.
+  at the index where the property was last found first;
+- `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
+  `Array.prototype`, `Map.prototype`, …) shared shapes once their lazily
+  created members exist, so that inline caches can hold their methods;
+  prototype caches also accept arrays, which are exotic only for their
+  indices and `length`;
+- `JS_CallBuiltin`: calls a builtin (a C function object) without the
+  interpreter's call path, and `JS_Call` (which builtins use to call back:
+  `sort` comparators, `map` callbacks) enters native functions' fast
+  entries first;
+- `JS_ArrayPushFast`: `push`'s own fast path, for native code;
+- faster engine internals that every program benefits from, interpreted
+  or not: 64KB allocator arenas handed out by a bump index, with one empty
+  arena kept per size class (allocation-heavy code used to create and free
+  an arena every few dozen objects); plain objects that keep their
+  property array in their own allocation until it grows; defining the next
+  element of a fast array (`map`, `filter`, …) appends it; forward
+  `indexOf` searches by its first character with `memchr`;
+  `x ** 2` is the correctly rounded square (as native code computes it).
 
 ## Backends
 
@@ -272,6 +290,28 @@ The differential tests run every case with both.
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
   `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
+- **Class constructors** of base classes whose instances are plain objects
+  with public fields (no private names, accessors or computed keys,
+  initializers that do not use `this`, a constructor that returns nothing
+  but the instance). Native `new C(args)` calls the native constructor
+  directly (after reading `C`, which may be in its TDZ): the instance is
+  made with the class's fields, initializers evaluated first, through an
+  allocation site that caches the instance's final shape, then the body
+  runs. Interpreted code keeps the class's own constructor.
+- **Predictions from type annotations**: where an annotation names a
+  top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
+  method or function returning `Vec3`, `Node | null`), calls on those
+  values are predicted to reach that class's native methods, as for
+  `this`: a small method is inlined behind a check that the method reached
+  is that one. Annotations are never trusted otherwise: a wrong one only
+  costs the check.
+- **Builtins**: method calls on strings read `String.prototype`'s methods
+  through their inline caches; `s.charCodeAt(i)` runs inline and
+  `arr.push(x)` takes the engine's fast path while they are the original
+  builtins (checked at each call); `===`, `!==` and `switch` against
+  string constants compare pointers, then lengths, before characters; a
+  direct call with a JS value for a `number` or `boolean` parameter checks
+  it at the call instead of going through the callee's JS entry.
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering
@@ -300,8 +340,8 @@ The differential tests run every case with both.
   generator and async methods too; `super` in them
   is not supported yet).
 
-Not yet: `super()` and class constructors
-(which stay interpreted), computed method and accessor names in object
+Not yet: `super()` and the constructors of derived classes or of classes
+with private names (which stay interpreted), computed method and accessor names in object
 literals, classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `tsaot report file.ts` says, for every
@@ -353,8 +393,8 @@ formatters reject it. Use `"use aot"` where that matters.
 
 A nested function can be marked when its enclosing function (or module
 code) is compiled, so `xs.map(aot (x) => …)` works at the top level too.
-Functions in code that always stays interpreted (class constructors and field
-initializers) cannot be marked.
+Functions in class constructors and field initializers cannot be marked:
+interpreted code constructing the class runs them interpreted.
 
 ### Keeping a function interpreted: `interpreted`
 

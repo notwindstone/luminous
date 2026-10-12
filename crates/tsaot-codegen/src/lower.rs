@@ -4998,7 +4998,9 @@ impl Lower {
         // On the prototype: its value; or a call of a getter (own or on the
         // prototype).
         self.b.switch_to_block(proto);
-        if receiver.is_none() {
+        // (Caches hold fields of `aot type` objects only in modules that
+        // have such types.)
+        if receiver.is_none() && !self.env.layouts.is_empty() {
             // A field of an `aot type` object.
             let low = self.b.ins().band_imm_u(kind, 0xff);
             let is_struct = self.b.ins().icmp_imm_s(IntCC::Equal, low, IC_STRUCT);

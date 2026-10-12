@@ -932,7 +932,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18443,59 @@
+@@ -18047,6 +18443,92 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -983,16 +983,49 @@
 +JSValue JS_CallBuiltin(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
 +                       int argc, JSValueConst *argv)
 +{
++    JSRuntime *rt = ctx->rt;
++    JSObject *p = JS_VALUE_GET_OBJ(func_obj);
++    JSStackFrame sf;
++    JSValueConst buf[4];
++    JSValue ret;
++    int cproto = p->u.cfunc.cproto, n = p->u.cfunc.length, i;
++
 +    /* What JS_CallInternal does for one, before its class's call. */
 +    if (js_poll_interrupts(ctx))
 +        return JS_EXCEPTION;
-+    return js_call_c_function(ctx, func_obj, this_obj, argc, argv, 0);
++    /* Methods (the usual builtins): js_call_c_function's work, in a
++       smaller function. */
++    if (unlikely((cproto != JS_CFUNC_generic && cproto != JS_CFUNC_generic_magic) || (argc < n && n > 4)))
++        return js_call_c_function(ctx, func_obj, this_obj, argc, argv, 0);
++    if (js_check_stack_overflow(rt, 0))
++        return JS_ThrowStackOverflow(ctx);
++    sf.arg_count = argc;
++    if (argc < n) {
++        for (i = 0; i < argc; i++)
++            buf[i] = argv[i];
++        for (; i < n; i++)
++            buf[i] = JS_UNDEFINED;
++        argv = buf;
++        sf.arg_count = n;
++    }
++    sf.prev_frame = rt->current_stack_frame;
++    sf.is_strict_mode = false;
++    sf.is_constructor = false;
++    sf.cur_func = unsafe_unconst(func_obj);
++    sf.arg_buf = (JSValue *)argv;
++    rt->current_stack_frame = &sf;
++    if (cproto == JS_CFUNC_generic)
++        ret = p->u.cfunc.c_function.generic(p->u.cfunc.realm, this_obj, argc, argv);
++    else
++        ret = p->u.cfunc.c_function.generic_magic(p->u.cfunc.realm, this_obj, argc, argv, p->u.cfunc.magic);
++    rt->current_stack_frame = sf.prev_frame;
++    return ret;
 +}
 +
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +18997,12 @@
+@@ -18548,9 +19030,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1005,7 +1038,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +19037,12 @@
+@@ -18585,9 +19070,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1018,7 +1051,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +19053,21 @@
+@@ -18598,6 +19086,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -1040,7 +1073,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -20983,18 +21453,18 @@
+@@ -20983,18 +21486,18 @@
      return ret_val;
  }
  
@@ -1063,7 +1096,7 @@
      JS_FreeValue(ctx, func_obj);
      return res;
  }
-@@ -21274,13 +21744,21 @@
+@@ -21274,13 +21777,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -1086,7 +1119,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21785,10 @@
+@@ -21307,7 +21818,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -1098,7 +1131,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21796,56 @@
+@@ -21315,6 +21829,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -1155,7 +1188,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21857,8 @@
+@@ -21326,6 +21890,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -1164,7 +1197,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +21973,61 @@
+@@ -21440,6 +22006,61 @@
      return JS_EXCEPTION;
  }
  
@@ -1226,7 +1259,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22260,12 @@
+@@ -21672,6 +22293,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -1239,7 +1272,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22282,11 @@
+@@ -21688,8 +22315,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -1253,7 +1286,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22315,11 @@
+@@ -21718,8 +22348,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -1267,7 +1300,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22432,12 @@
+@@ -21832,7 +22465,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -1281,7 +1314,7 @@
      }
  }
  
-@@ -21874,6 +22479,55 @@
+@@ -21874,6 +22512,55 @@
      return res;
  }
  
@@ -1337,7 +1370,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +22564,12 @@
+@@ -21910,6 +22597,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -1350,7 +1383,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +22582,20 @@
+@@ -21922,10 +22615,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -1372,7 +1405,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +22669,12 @@
+@@ -21999,6 +22702,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -1385,7 +1418,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +22771,37 @@
+@@ -22095,6 +22804,37 @@
      return JS_EXCEPTION;
  }
  
@@ -1423,7 +1456,7 @@
  /* JS parser */
  
  enum {
-@@ -44171,6 +44878,30 @@
+@@ -44171,6 +44911,30 @@
      return JS_EXCEPTION;
  }
  
@@ -1454,7 +1487,7 @@
  static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int unshift)
  {
-@@ -44978,6 +45709,15 @@
+@@ -44978,6 +45742,15 @@
      return JS_EXCEPTION;
  }
  
@@ -1470,7 +1503,36 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -56073,6 +56813,48 @@
+@@ -47273,11 +48046,10 @@
+                 return i;
+         }
+     } else {
+-        if ((c & ~0xff) == 0) {
+-            for (i = from; i < len; i++) {
+-                if (str8(p)[i] == (uint8_t)c)
+-                    return i;
+-            }
++        if ((c & ~0xff) == 0 && from < len) {
++            /* tsaot: memchr (vectorized) rather than a byte loop. */
++            const uint8_t *s8 = str8(p), *q = memchr(s8 + from, c, len - from);
++            return q ? q - s8 : -1;
+         }
+     }
+     return -1;
+@@ -47431,7 +48203,11 @@
+         inc = 1;
+     }
+     ret = -1;
+-    if (len >= v_len && inc * (stop - start) >= 0) {
++    if (inc > 0) {
++        /* tsaot: forward, by the first character (string_indexof). */
++        if (len >= v_len && start <= stop)
++            ret = string_indexof(p, p1, start);
++    } else if (len >= v_len && inc * (stop - start) >= 0) {
+         for (i = start;; i += inc) {
+             if (!string_cmp(p, p1, i, 0, v_len)) {
+                 ret = i;
+@@ -56073,6 +56849,48 @@
      return result_promise;
  }
  
@@ -1519,7 +1581,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +56863,24 @@
+@@ -56081,14 +56899,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -1549,7 +1611,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +56898,454 @@
+@@ -56106,6 +56934,454 @@
      return result_promise;
  }
  
@@ -2004,7 +2066,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +57719,25 @@
+@@ -56479,6 +57755,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -2030,7 +2092,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +57757,8 @@
+@@ -56498,23 +57793,8 @@
          rd_array[i] = rd;
      }
  
