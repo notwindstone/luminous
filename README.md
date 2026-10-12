@@ -126,8 +126,11 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/0001-tsaot-engine-support.patch`, which adds API and a few
-fast paths that keep the engine's semantics:
+`patches/0001-tsaot-engine-support.patch` and builds the engine without
+the stack protector and semantic interposition distribution compilers
+default to (it is linked statically: its exported functions inline into
+each other). The patch adds API and a few fast paths that keep the
+engine's semantics:
 
 - `JSCFunctionFast` and `JS_NewCFunctionDataFast`, the call hook above;
 - `JS_BinaryOperator` / `JS_UnaryOperator`: every JS operator, with exactly

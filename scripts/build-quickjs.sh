@@ -13,11 +13,15 @@ for p in patches/*.patch; do
   echo "applying $p"
   patch -d build/quickjs-src -p1 --quiet < "$p"
 done
-cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release
+# No stack protector or semantic interposition (distribution compilers'
+# defaults): the engine is linked statically, so its exported functions
+# can be inlined into each other, and its hot paths keep no canaries.
+FLAGS="-fno-stack-protector -fno-semantic-interposition"
+cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$FLAGS"
 ninja -C build/quickjs qjsc qjs qjs_exe
 
 # Variant with assertions enabled (no NDEBUG), used by the test suite: the
 # engine then aborts at exit if any object leaked, which catches reference
 # counting bugs in generated code.
-cmake -S build/quickjs-src -B build/quickjs-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-O1
+cmake -S build/quickjs-src -B build/quickjs-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_C_FLAGS_RELEASE=-O1
 ninja -C build/quickjs-check qjsc qjs qjs-libc
