@@ -148,8 +148,9 @@ pub enum Region {
     /// `JSValue` words: properties (data or accessor), array elements,
     /// cells, boxes, closure data, async frames, argument slots.
     Slot,
-    /// The engine's metadata, which native code only reads: object, shape,
-    /// string, typed array, array buffer and function data headers.
+    /// The engine's metadata, which native code only reads (but in objects
+    /// it allocates): object, shape, string, typed array, array buffer and
+    /// function data headers.
     Header,
     /// Typed array elements.
     Elem,
@@ -168,10 +169,15 @@ pub enum Region {
     Flag,
     /// `tsaot_stack_limit`.
     Limit,
+    /// The allocator's state that native code allocating objects inline
+    /// reads and writes: the runtime's counters and free-block caches, the
+    /// free blocks' links, and the GC object list's links (which a free
+    /// block's link becomes).
+    Alloc,
 }
 
 impl Region {
-    pub const ALL: [Region; 10] = [
+    pub const ALL: [Region; 11] = [
         Region::RefCount,
         Region::Slot,
         Region::Header,
@@ -182,6 +188,7 @@ impl Region {
         Region::Const,
         Region::Flag,
         Region::Limit,
+        Region::Alloc,
     ];
 }
 

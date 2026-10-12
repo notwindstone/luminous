@@ -1,4 +1,6 @@
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tsaot_rt.h"
@@ -491,6 +493,11 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
     JSClassDef def = { "TsaotState", .finalizer = tsaot_state_finalizer, .gc_mark = tsaot_state_mark };
     int i;
 
+    /* Native code allocates objects as the engine's layout says. */
+    if (!JS_LayoutCheck()) {
+        fprintf(stderr, "tsaot: the engine's object layout is not the one native code was compiled for\n");
+        abort();
+    }
     if (tsaot_lock_builtins(ctx) < 0)
         return -1;
     /* Absolute limit for native frames, below the stack in use now. */
@@ -1558,8 +1565,11 @@ static JSValue tsaot_new_object_proto(JSContext *ctx, TsaotIC *ic, JSValue obj, 
             return JS_EXCEPTION;
         }
     }
-    if (JS_CachePlainShape(ctx, obj, n, &shape) == 0)
+    if (JS_CachePlainShape(ctx, obj, n, &shape) == 0) {
         tsaot_ic_store(ctx, ic, shape, NULL, NULL, 0, TSAOT_IC_OWN);
+        /* How native code allocates the next ones inline. */
+        ic->slot = JS_ShapeAllocInfo(JS_GetRuntime(ctx), shape);
+    }
     return obj;
 }
 

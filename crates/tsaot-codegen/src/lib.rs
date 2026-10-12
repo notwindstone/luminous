@@ -96,6 +96,22 @@ pub mod layout {
     pub const CLASS_C_FUNCTION: i64 = 12;
     pub const STRING_KIND: i32 = 4;
     pub const STRING_DATA: i32 = 24;
+    // Allocating plain objects inline (see `JS_ShapeAllocInfo`).
+    pub const CTX_RT: i32 = 16;
+    pub const RT_MALLOC_COUNT: i32 = 40;
+    pub const RT_MALLOC_SIZE: i32 = 48;
+    pub const RT_MALLOC_LIMIT: i32 = 56;
+    pub const RT_ARENA_CACHE: i32 = 72;
+    pub const ARENA_CACHE_SIZE: i32 = 16;
+    pub const ARENA_CACHE_COUNT: i32 = 8;
+    pub const RT_GC_OBJ_LIST: i32 = 1968;
+    pub const RT_GC_THRESHOLD: i32 = 2024;
+    pub const OBJ_GC_BYTE: i32 = -5;
+    pub const OBJ_FLAGS: i32 = 16;
+    pub const OBJ_PLAIN_FLAGS: i64 = 0x10002;
+    pub const OBJ_WEAK_REF: i32 = 40;
+    pub const OBJ_OPAQUE_WORD: i32 = 48;
+    pub const OBJ_SIZE: i32 = 72;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -120,6 +136,21 @@ pub mod layout {
         ("CLASS_C_FUNCTION", CLASS_C_FUNCTION),
         ("STRING_KIND", STRING_KIND as i64),
         ("STRING_DATA", STRING_DATA as i64),
+        ("CTX_RT", CTX_RT as i64),
+        ("RT_MALLOC_COUNT", RT_MALLOC_COUNT as i64),
+        ("RT_MALLOC_SIZE", RT_MALLOC_SIZE as i64),
+        ("RT_MALLOC_LIMIT", RT_MALLOC_LIMIT as i64),
+        ("RT_ARENA_CACHE", RT_ARENA_CACHE as i64),
+        ("ARENA_CACHE_SIZE", ARENA_CACHE_SIZE as i64),
+        ("ARENA_CACHE_COUNT", ARENA_CACHE_COUNT as i64),
+        ("RT_GC_OBJ_LIST", RT_GC_OBJ_LIST as i64),
+        ("RT_GC_THRESHOLD", RT_GC_THRESHOLD as i64),
+        ("OBJ_GC_BYTE", OBJ_GC_BYTE as i64),
+        ("OBJ_FLAGS", OBJ_FLAGS as i64),
+        ("OBJ_PLAIN_FLAGS", OBJ_PLAIN_FLAGS),
+        ("OBJ_WEAK_REF", OBJ_WEAK_REF as i64),
+        ("OBJ_OPAQUE_WORD", OBJ_OPAQUE_WORD as i64),
+        ("OBJ_SIZE", OBJ_SIZE as i64),
     ];
 }
 

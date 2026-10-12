@@ -77,6 +77,7 @@ pub(crate) const M_TABLE: MemFlags = MemFlags::of(Region::Table);
 pub(crate) const M_CONST: MemFlags = MemFlags::of(Region::Const);
 pub(crate) const M_FLAG: MemFlags = MemFlags::of(Region::Flag);
 pub(crate) const M_LIMIT: MemFlags = MemFlags::of(Region::Limit);
+pub(crate) const M_ALLOC: MemFlags = MemFlags::of(Region::Alloc);
 
 /// A lowered value.
 #[derive(Clone, Copy, Debug)]
@@ -3538,7 +3539,6 @@ impl Lower {
         for &v in held.iter().rev() {
             self.release(v);
         }
-        let values = self.values_slot(&vals);
         let ic = self.new_ic();
         let ctx = self.ctx;
         let join = self.b.create_block();
@@ -3550,9 +3550,22 @@ impl Lower {
         let shape = self.b.ins().load(I64, M_IC, ic, 0);
         self.b.ins().brif(shape, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
+        let call = self.b.create_block();
+        self.b.set_cold_block(call);
+        let p = self.alloc_object(ic, shape, call);
+        let at = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        for (i, &(vp, vt)) in vals.iter().enumerate() {
+            self.b.ins().store(M_SLOT, vp, at, (i * SIZE) as i32);
+            self.b.ins().store(M_SLOT, vt, at, (i * SIZE) as i32 + TAG_OFFSET);
+        }
+        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(tag)]);
+        self.b.switch_to_block(call);
+        let values = self.values_slot(&vals);
         let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
         self.b.switch_to_block(slow);
+        let values = self.values_slot(&vals);
         let n = props.len();
         let atoms =
             self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (n.max(1) * 4) as u32, 2));
@@ -3573,6 +3586,78 @@ impl Lower {
         self.b.switch_to_block(join);
         self.check_value(rt);
         V::Any(rp, rt)
+    }
+
+    /// A new plain object of the shape `shape` that allocation site `ic`
+    /// cached, allocated inline as `JS_NewObjectWithCachedShape`'s fast path
+    /// would (a block from the allocator's cache for its size class, while
+    /// no collection is due): its address, with every field but the
+    /// properties set. Else (or if objects of the shape are too big) it
+    /// goes to `call`.
+    fn alloc_object(&mut self, ic: Value, shape: Value, call: Block) -> Value {
+        // The site's size class and accounted bytes (`JS_ShapeAllocInfo`).
+        let info = self.b.ins().uload32(M_IC, ic, 8);
+        let alloc = self.b.create_block();
+        self.b.ins().brif(info, alloc, &[], call, &[]);
+        self.b.switch_to_block(alloc);
+        let idx = self.b.ins().band_imm_u(info, 0xff);
+        let used = self.b.ins().ushr_imm_u(info, 8);
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        let off = self.b.ins().imul_imm_s(idx, layout::ARENA_CACHE_SIZE as i64);
+        let entry = self.b.ins().iadd(rt, off);
+        let p = self.b.ins().load(I64, M_ALLOC, entry, layout::RT_ARENA_CACHE);
+        let size = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_SIZE);
+        let new_size = self.b.ins().iadd(size, used);
+        let threshold = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_THRESHOLD);
+        let limit = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_LIMIT);
+        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, p, 0);
+        let no_gc = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_size, threshold);
+        // (As the engine compares: a limit of 0 is none.)
+        let limit = self.b.ins().iadd_imm_s(limit, -1);
+        let in_limit = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_size, limit);
+        let ok = self.b.ins().band(has, no_gc);
+        let ok = self.b.ins().band(ok, in_limit);
+        let init = self.b.create_block();
+        self.b.ins().brif(ok, init, &[], call, &[]);
+        self.b.switch_to_block(init);
+        // Take the block from the cache; account for it.
+        let next = self.b.ins().load(I64, M_ALLOC, p, 0);
+        self.b.ins().store(M_ALLOC, next, entry, layout::RT_ARENA_CACHE);
+        let count_at = layout::RT_ARENA_CACHE + layout::ARENA_CACHE_COUNT;
+        let count = self.b.ins().load(I32, M_ALLOC, entry, count_at);
+        let count = self.b.ins().iadd_imm_s(count, -1);
+        self.b.ins().store(M_ALLOC, count, entry, count_at);
+        let n = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_COUNT);
+        let n = self.b.ins().iadd_imm_s(n, 1);
+        self.b.ins().store(M_ALLOC, n, rt, layout::RT_MALLOC_COUNT);
+        self.b.ins().store(M_ALLOC, new_size, rt, layout::RT_MALLOC_SIZE);
+        // The object: a JS object (unmarked) with one reference, extensible,
+        // of class Object, with the shape (referenced) and its properties
+        // after it, no weak references.
+        let zero8 = self.b.ins().iconst(I32, 0);
+        self.b.ins().istore8(M_RC, zero8, p, layout::OBJ_GC_BYTE);
+        let one = self.b.ins().iconst(I32, 1);
+        self.b.ins().store(M_RC, one, p, layout::REF_COUNT);
+        let flags = self.b.ins().iconst(I32, layout::OBJ_PLAIN_FLAGS);
+        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
+        let rc = self.b.ins().load(I32, M_RC, shape, layout::REF_COUNT);
+        let rc = self.b.ins().iadd_imm_s(rc, 1);
+        self.b.ins().store(M_RC, rc, shape, layout::REF_COUNT);
+        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
+        let null = self.b.ins().iconst(I64, 0);
+        self.b.ins().store(M_HEADER, null, p, layout::OBJ_WEAK_REF);
+        self.b.ins().store(M_HEADER, null, p, layout::OBJ_OPAQUE_WORD);
+        // At the end of the GC object list.
+        let head = self.b.ins().iadd_imm_s(rt, layout::RT_GC_OBJ_LIST as i64);
+        let tail = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_OBJ_LIST);
+        self.b.ins().store(M_ALLOC, tail, p, 0);
+        self.b.ins().store(M_ALLOC, head, p, 8);
+        self.b.ins().store(M_ALLOC, p, tail, 8);
+        self.b.ins().store(M_ALLOC, p, rt, layout::RT_GC_OBJ_LIST);
+        p
     }
 
     /// `recv.method(callback)` as a native loop over the elements of an

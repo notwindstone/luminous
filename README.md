@@ -185,7 +185,8 @@ fast paths that keep the engine's semantics:
   or not: 64KB allocator arenas handed out by a bump index, with one empty
   arena kept per size class (allocation-heavy code used to create and free
   an arena every few dozen objects), and recently freed blocks cached per
-  size class (a free and the next allocation are a push and a pop); plain
+  size class, up to 64MB each (a free and the next allocation are a push
+  and a pop, even after a large structure is freed at once); plain
   objects made from an allocation site's shape in one short function, and
   freed (with the plain objects only they referenced) in a loop rather than
   through the collector's queue; arrays freed the same way with their
@@ -278,7 +279,9 @@ The differential tests run every case with both.
     fields and `super.name`. Sites that never cache stop trying;
   - object literals: each site caches the literal's final shape, and
     later objects are made with it directly (as JSC's allocation profiles
-    do);
+    do), allocated inline: a block popped from the allocator's cache for
+    the shape's size class and the object's fields stored in place
+    (`JS_ShapeAllocInfo`; the engine call otherwise);
   - `typeof`, `in`, `instanceof`, `new`;
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them); a callee only known
