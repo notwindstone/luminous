@@ -211,7 +211,10 @@ engine's semantics:
   `filter`, `forEach`, `some`, `every`, `reduce` and `sort` read the
   elements of fast arrays in place and call a native callback's fast entry
   directly; forward `indexOf` searches by its first character with
-  `memchr`; `parseInt`, `Number(s)` and `+s` read small decimal integers
+  `memchr` (8-bit strings: only where a match can start), and native
+  code's `indexOf`, `includes`, `startsWith` and `endsWith` with a string
+  argument skip the conversions; 8-bit strings of up to 16 characters
+  compared for equality (`===`, `Map` keys) with a few word loads; `parseInt`, `Number(s)` and `+s` read small decimal integers
   directly; the cycle collector first runs at 4MB and then whenever the
   heap has doubled, or quadrupled after a collection that freed little
   (rather than from 256KB, at every 50% growth);
