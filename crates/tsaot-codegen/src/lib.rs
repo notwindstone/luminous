@@ -327,7 +327,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_CallBuiltin", &[P, W, W, W, W, Int, P], &[W, W]),
         ("JS_IsStrictEqual", &[P, W, W, W, W], &[Int]),
         ("JS_ArrayPushFast", &[P, W, W, W, W], &[W, W]),
-        ("JS_ArraySpeciesCreateRoom", &[P, W, W, P], &[W, W]),
+        ("JS_ArraySpeciesCreateRoom", &[P, W, W, P, P], &[W, W]),
         ("JS_TryGetElement", &[P, W, W, P, P], &[W, W]),
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
         ("JS_SortNative", &[P, W, W, P, Int, P], &[Int]),

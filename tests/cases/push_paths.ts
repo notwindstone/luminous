@@ -1,10 +1,12 @@
 // @interpreted installSetter removeSetter
-// @native pushes pushObjects lengthened withProp frozenPush sealedPush subclassPush mapObjects filterObjects reassign keepRefs shrinking protoSetter
+// @native pushes pushObjects lengthened withProp frozenPush sealedPush subclassPush mapObjects filterObjects reassign keepRefs shrinking protoSetter leakedResult bigFilter
 // Appending to arrays: `push` onto fresh arrays and `map` / `filter`
 // results are appended inline; arrays with other shapes, frozen or
 // non-extensible ones, a `length` past the elements, subclasses and index
 // setters on Array.prototype take the engine's paths, with the same
-// results. Callback parameters keep their element alive.
+// results. Callback parameters keep their element alive. A result the
+// Array constructor made is private to the loop (only room is checked);
+// one a species constructor made, which other code may hold, is not.
 
 type P = { x: number; y: number };
 
@@ -145,6 +147,39 @@ function protoSetter(): string {
   return r + " " + xs.length + " " + JSON.stringify(xs) + " " + ys.join(",") + " " + setterCalls;
 }
 
+let leaked: number[] = [];
+class Leaky extends Array<number> {
+  static get [Symbol.species](): ArrayConstructor {
+    return function (n: number): number[] {
+      leaked = [];
+      leaked.length = n;
+      return leaked;
+    } as unknown as ArrayConstructor;
+  }
+}
+
+function leakedResult(): string {
+  const src = Leaky.from([1, 2, 3, 4]) as Leaky;
+  const out = src.map((v, i) => {
+    if (i === 1) leaked.push(100);
+    return v * 10;
+  });
+  const kept = src.filter((v) => {
+    leaked.unshift(-v);
+    return v % 2 === 0;
+  });
+  return JSON.stringify(out) + " " + (out === leaked) + " " + JSON.stringify(kept) + " " + kept.length;
+}
+
+function bigFilter(n: number): string {
+  const xs: number[] = [];
+  for (let i = 0; i < n; i++) xs.push(i);
+  const odd = xs.filter((v) => v % 2 === 1);
+  const all = xs.filter(() => true);
+  const doubled = all.map((v) => v * 2);
+  return odd.length + " " + all.length + " " + doubled.length + " " + doubled[n - 1] + " " + odd[odd.length - 1] + " " + JSON.stringify(doubled.slice(-3));
+}
+
 const ps: P[] = [{ x: 1, y: 2 }, { x: 2, y: 3 }, { x: 3, y: 4 }];
 console.log(pushes(6));
 console.log(pushObjects(4));
@@ -158,3 +193,5 @@ console.log(reassign(ps));
 console.log(keepRefs([{ x: 2, y: 0 }, { x: 3, y: 0 }, { x: 4, y: 0 }]));
 console.log(shrinking());
 console.log(protoSetter());
+console.log(leakedResult());
+console.log(bigFilter(1000));

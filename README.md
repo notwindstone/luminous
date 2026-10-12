@@ -435,7 +435,10 @@ The differential tests run every case with both.
   its callback; it runs while `xs` is an array without holes and the
   method is the original builtin, reading each element afresh (the
   callback may change the array), and calls the builtin otherwise. The
-  results of `map` and `filter` are appended to inline.
+  results of `map` and `filter` are appended to inline: when the Array
+  constructor made the result itself (no species constructor ran), no
+  other code holds it, so an element is stored wherever there is room,
+  with no other check.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
   engine sort calling the compiled comparator directly: a merge sort per
   comparator signature (and per borrowing) with the call inlined and its

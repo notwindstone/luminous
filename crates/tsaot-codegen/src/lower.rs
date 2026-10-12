@@ -3806,17 +3806,23 @@ impl Lower {
         self.b.ins().brif(dense, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let len = count;
-        // The result array (`map`: with room for every element).
-        let out = match kind {
+        // The result array (`map`: with room for every element), and
+        // whether the Array constructor made it itself: then no other code
+        // holds it, and an element goes where there is room.
+        let (out, fresh) = match kind {
             LoopKind::Map | LoopKind::Filter => {
                 let n = if kind == LoopKind::Map { len } else { self.b.ins().iconst(I64, -1) };
-                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, op_, ot, n]);
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+                let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
+                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, op_, ot, n, addr]);
                 self.check_value(r[1]);
+                let made = self.b.ins().stack_load(self.ptr, I32, slot, 0);
+                let fresh = self.b.ins().icmp_imm_s(IntCC::NotEqual, made, 0);
                 let a = V::Any(r[0], r[1]);
                 self.hold(a);
-                Some(a)
+                (Some(a), Some(fresh))
             }
-            _ => None,
+            _ => (None, None),
         };
         let head = self.b.create_block();
         let k = self.b.append_block_param(head, I64);
@@ -3967,6 +3973,8 @@ impl Lower {
                 }
                 let define = self.b.create_block();
                 self.b.set_cold_block(define);
+                // (Its `length` is the source's already.)
+                self.append_fresh(fresh.unwrap(), ap, k, (resp, rest), false, next, &[k1, n]);
                 self.append_inline((ap, at), Some(k), (resp, rest), true, define);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
                 self.b.switch_to_block(define);
@@ -3990,6 +3998,7 @@ impl Lower {
                 let n1 = self.b.ins().iadd_imm_s(n, 1);
                 let define = self.b.create_block();
                 self.b.set_cold_block(define);
+                self.append_fresh(fresh.unwrap(), ap, n, (ep_, et_), true, next, &[k1, n1]);
                 self.append_inline((ap, at), Some(n), (ep_, et_), true, define);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
                 self.b.switch_to_block(define);
@@ -6727,6 +6736,45 @@ impl Lower {
         self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
         k1
+    }
+
+    /// Append `v` (taken) at index `k` of fast array `ap`, which no other
+    /// code holds (`fresh`, else this goes on), when it has room: its
+    /// element count grows, and its `length` too if `length` (else that
+    /// stays). Then jumps to `next` with `args`; when there is no room,
+    /// carries on in a new block.
+    #[allow(clippy::too_many_arguments)]
+    fn append_fresh(
+        &mut self,
+        fresh: Value,
+        ap: Value,
+        k: Value,
+        (vp, vt): (Value, Value),
+        length: bool,
+        next: Block,
+        args: &[Value],
+    ) {
+        let private = self.b.create_block();
+        let store = self.b.create_block();
+        let other = self.b.create_block();
+        self.b.ins().brif(fresh, private, &[], other, &[]);
+        self.b.switch_to_block(private);
+        let size = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_SIZE);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThan, k, size);
+        self.b.ins().brif(room, store, &[], other, &[]);
+        self.b.switch_to_block(store);
+        let at = self.array_slot(ap, k);
+        self.b.ins().store(M_SLOT, vp, at, 0);
+        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        let k1 = self.b.ins().iadd_imm_s(k, 1);
+        self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
+        if length {
+            let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
+            self.b.ins().istore32(M_SLOT, k1, prop, 0);
+        }
+        let args: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
+        self.b.ins().jump(next, &args);
+        self.b.switch_to_block(other);
     }
 
     /// Address of fast array element `idx`.
