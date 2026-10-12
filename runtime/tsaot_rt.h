@@ -130,6 +130,7 @@ extern const int32_t tsaot_nfn_caches __attribute__((weak));
 JSValue tsaot_new_closure(JSContext *ctx, TsaotFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
                           const char *name, int length, int magic, int n, JSValue *data);
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
+JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
 JSValue tsaot_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, TsaotIC *ic);
 int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic);

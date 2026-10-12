@@ -285,6 +285,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_TryGetElement", &[P, W, W, P, P], &[W, W]),
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
         ("JS_SortNative", &[P, W, W, P, Int, P], &[Int]),
+        ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),

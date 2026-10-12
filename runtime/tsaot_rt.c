@@ -690,6 +690,16 @@ static bool tsaot_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int ki
     return true;
 }
 
+/* A cache miss reading own data property obj.prop (obj borrowed), where
+ * no getter may run: its value (a new reference), cached, or undefined if
+ * it is not one. */
+JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
+{
+    if (!tsaot_ic_fill(ctx, obj, prop, 0, ic))
+        return JS_UNDEFINED;
+    return JS_GetProperty(ctx, obj, prop);
+}
+
 /* A cache miss reading obj.prop (obj borrowed). */
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {

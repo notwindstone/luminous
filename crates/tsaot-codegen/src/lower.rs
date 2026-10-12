@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use crate::mir::types::{F32, F64, I8, I32, I64};
 use crate::mir::{
     Block, BlockArg, FloatCC, FuncRef, FunctionBuilder, GlobalValue, Ins, IntCC, MemFlags, Region, SigRef,
-    StackSlotData, StackSlotKind, Type, Value, Variable,
+    StackSlot, StackSlotData, StackSlotKind, Type, Value, Variable,
 };
 use tsaot_front::ir::{
     self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, LoopKind,
@@ -882,16 +882,39 @@ impl Lower {
         }
         self.emit_dispatch();
 
-        // Exception edges: free their live temporaries, then go to the handler.
+        // Exception edges: free their live temporaries, then go to the
+        // handler. Edges share the blocks freeing the temporaries they have
+        // in common (held temporaries form a stack), as landing pads chain:
+        // the code stays linear in the number of throwing points.
         let pending = std::mem::take(&mut self.pending);
+        let mut chains: HashMap<(Block, Vec<(Value, Value)>), Block> = HashMap::new();
         for (blk, temps, target) in pending {
+            let to = self.cleanup_chain(target, &temps, &mut chains);
             self.b.switch_to_block(blk);
-            for t in temps.into_iter().rev() {
-                self.free(t);
-            }
-            self.b.ins().jump(target, &[]);
+            self.b.ins().jump(to, &[]);
         }
         self.b
+    }
+
+    /// A block that frees `temps` (last first), then goes to `target`.
+    fn cleanup_chain(
+        &mut self,
+        target: Block,
+        temps: &[(Value, Value)],
+        chains: &mut HashMap<(Block, Vec<(Value, Value)>), Block>,
+    ) -> Block {
+        let Some((&last, rest)) = temps.split_last() else { return target };
+        if let Some(&b) = chains.get(&(target, temps.to_vec())) {
+            return b;
+        }
+        let next = self.cleanup_chain(target, rest, chains);
+        let b = self.b.create_block();
+        self.b.set_cold_block(b);
+        self.b.switch_to_block(b);
+        self.free(last);
+        self.b.ins().jump(next, &[]);
+        chains.insert((target, temps.to_vec()), b);
+        b
     }
 
     // ---- statements ----
@@ -1966,6 +1989,8 @@ impl Lower {
                 self.array_loop(*kind, recv, *method, callback, *func, body, locals)
             }
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
+            ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
+            ExprKind::Lazy(x) => self.expr(x),
             ExprKind::NumArith(op, x, y) => {
                 let a = self.expr(x);
                 self.hold(a);
@@ -3815,10 +3840,122 @@ impl Lower {
         V::Any(rp, rt)
     }
 
+    /// Whether class `class`'s prototype has native function `func` as its
+    /// own data property `method`: through an inline cache of own data
+    /// properties, filled on a miss without running any getter.
+    fn proto_method_is(&mut self, class: usize, method: ir::AtomId, func: usize) -> Value {
+        let ic = self.new_ic();
+        let (pp, pt) = self.table_value(self.env.homes, 2 * class);
+        let join = self.b.create_block();
+        let fp = self.b.append_block_param(join, I64);
+        let ft = self.b.append_block_param(join, I64);
+        let miss = self.b.create_block();
+        self.b.set_cold_block(miss);
+        let not_obj = self.b.create_block();
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, pt, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
+        self.b.switch_to_block(obj);
+        let shape = self.b.ins().load(I64, M_HEADER, pp, layout::OBJ_SHAPE);
+        let cached = self.b.ins().load(I64, M_IC, ic, 0);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+        let hit = self.b.create_block();
+        self.b.ins().brif(same, hit, &[], miss, &[]);
+        self.b.switch_to_block(hit);
+        let at = self.ic_slot_addr(pp, ic);
+        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
+        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.b.switch_to_block(miss);
+        let ctx = self.ctx;
+        let atom = self.atom(method);
+        let r = self.helper("tsaot_ic_own_data", &[ctx, pp, pt, atom, ic]);
+        // (Still referenced by the prototype.)
+        self.free((r[0], r[1]));
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(not_obj);
+        let undef = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().jump(join, &[BlockArg::Value(undef.0), BlockArg::Value(undef.1)]);
+        self.b.switch_to_block(join);
+        self.is_native(fp, ft, func)
+    }
+
     /// Call `f` (held) with `this` (borrowed) and `args`; frees `f`.
     fn call_values(&mut self, f: V, this: V, args: &[Expr], pred: Option<Pred>) -> V {
+        if args.iter().any(|a| lazy_part(a).is_some()) {
+            return self.call_lazy(f, this, args, pred);
+        }
         let held = self.held_args(args);
         self.call_held(f, this, held, pred)
+    }
+
+    /// `call_values` with `Lazy` arguments: evaluated only for the call (an
+    /// inline body gets `undefined` for their parameters).
+    fn call_lazy(&mut self, f: V, this: V, args: &[Expr], pred: Option<Pred>) -> V {
+        let mut held = Vec::new();
+        let undef = self.konst(0, TAG_UNDEFINED).any();
+        let mut vals = vec![f.any(), this.any()];
+        for a in args {
+            if let Some((first, _)) = lazy_part(a) {
+                for x in first {
+                    self.effect(x);
+                }
+                vals.push(undef);
+            } else {
+                let v = self.expr(a);
+                self.hold(v);
+                held.push(v);
+                vals.push(v.any());
+            }
+        }
+        let (stack, slot) = self.values_slot_raw(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, args.len() as i64);
+        let ctx = self.ctx;
+        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let guard = pred.as_ref().and_then(|p| self.pred_guard(p, f.any().0, f.any().1, &js_args));
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let call = self.b.create_block();
+        if let (Some(pred), Some(ok)) = (pred.as_ref(), guard) {
+            let inline = self.b.create_block();
+            self.b.ins().brif(ok, inline, &[], call, &[]);
+            self.b.switch_to_block(inline);
+            let (p, t) = self.inline_method(pred, this.any(), &js_args);
+            self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+        } else {
+            self.b.ins().jump(call, &[]);
+        }
+        self.b.switch_to_block(call);
+        let mut lazy = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if let Some((_, x)) = lazy_part(a) {
+                let v = self.expr(x);
+                self.hold(v);
+                let (p, t) = v.any();
+                self.b.ins().stack_store_pair(p, t, stack, ((2 + i) * SIZE) as i32);
+                lazy.push(v);
+            }
+        }
+        let (gp, gt) = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        for v in lazy.into_iter().rev() {
+            self.release(v);
+            self.free_v(v);
+        }
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        self.check_value(rt);
+        for v in held.into_iter().rev() {
+            self.release(v);
+            self.free_v(v);
+        }
+        self.release(f);
+        self.free_v(f);
+        V::Any(rp, rt)
     }
 
     /// Evaluate call arguments, holding them.
@@ -4147,6 +4284,11 @@ impl Lower {
 
     /// Spill JS values into a fresh stack slot; returns its address.
     fn values_slot(&mut self, vals: &[(Value, Value)]) -> Value {
+        self.values_slot_raw(vals).1
+    }
+
+    /// `values_slot`, also giving the slot.
+    fn values_slot_raw(&mut self, vals: &[(Value, Value)]) -> (StackSlot, Value) {
         let size = (vals.len().max(1) * SIZE) as u32;
         let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 4));
         for (i, &(p, t)) in vals.iter().enumerate() {
@@ -4155,7 +4297,7 @@ impl Lower {
             let off = (i * SIZE) as i32;
             self.b.ins().stack_store_pair(p, t, slot, off);
         }
-        self.b.ins().stack_addr(self.ptr, slot, 0)
+        (slot, self.b.ins().stack_addr(self.ptr, slot, 0))
     }
 
     fn atom(&mut self, a: ir::AtomId) -> Value {
@@ -5551,12 +5693,19 @@ impl Lower {
         self.nonnull(g, slow);
         let ctx = self.ctx;
         let (thp, tht) = receiver.unwrap_or((p, t));
-        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-        let none = self.b.ins().iconst(I64, 0);
-        let (gp, gt) = self.call_or_inline(pred.as_ref(), (g, tag), (thp, tht), &[], none, true, |l| {
-            let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
+        let (gp, gt) = if pred.is_some() {
+            let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+            let none = self.b.ins().iconst(I64, 0);
+            self.call_or_inline(pred.as_ref(), (g, tag), (thp, tht), &[], none, true, |l| {
+                let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
+                (r[0], r[1])
+            })
+        } else {
+            // (A getter nothing predicts: called by the runtime, keeping
+            // every property read small.)
+            let r = self.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
             (r[0], r[1])
-        });
+        };
         self.check_value(gt);
         let ja = args(self, gp, gt, true);
         self.b.ins().jump(join, &ja);
@@ -6063,6 +6212,19 @@ fn float_cc(op: CmpOp) -> FloatCC {
         CmpOp::Ge => FloatCC::GreaterThanOrEqual,
         CmpOp::Eq => FloatCC::Equal,
         CmpOp::Ne => FloatCC::NotEqual,
+    }
+}
+
+/// An argument evaluated in part only for a call (see `ExprKind::Lazy`):
+/// what is evaluated first, and the lazy value.
+fn lazy_part(a: &Expr) -> Option<(&[Expr], &Expr)> {
+    match &a.kind {
+        ExprKind::Lazy(x) => Some((&[], x)),
+        ExprKind::Seq(xs) => match &xs.last()?.kind {
+            ExprKind::Lazy(x) => Some((&xs[..xs.len() - 1], x)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

@@ -602,6 +602,19 @@ pub enum ExprKind {
         callback: Box<Expr>,
         func: usize,
     },
+    /// An argument of a predicted method call that is evaluated only when
+    /// the call is made, not when the prediction holds and the body runs
+    /// inline (which does not use its parameter): see
+    /// `virtualize_instances`. Elsewhere, the value itself.
+    Lazy(Box<Expr>),
+    /// Whether the prototype of class `class` still has native function
+    /// `func` as its own data property `method` (no getter runs). `Bool`.
+    /// (See `virtualize_instances`.)
+    ProtoMethodIs {
+        class: usize,
+        method: AtomId,
+        func: usize,
+    },
     /// An object of `aot type` `layout` from a literal with the fields in
     /// `mask`: (field, value) in source order. `Ty::Struct(layout)`.
     StructNew {
@@ -921,6 +934,7 @@ macro_rules! visitor {
                 | IterClose(..)
                 | IterCloseQuiet(_)
                 | SuperGetAtom(..)
+                | ProtoMethodIs { .. }
                 | Closure(..) => {}
                 Inline { body, .. } => $stmts(body, f),
                 Predicted { expr, body, .. } => {
@@ -989,6 +1003,7 @@ macro_rules! visitor {
                 | AsyncIterator(a)
                 | AsyncIterResult(a, _)
                 | CheckObject(a)
+                | Lazy(a)
                 | Void(a) => $name(a, f),
                 ArrayParts(parts) => {
                     for p in parts {
@@ -2214,6 +2229,7 @@ pub fn predict_calls(m: &mut Module) {
     let get = func_at;
     let typed = |f: &Func| f.params.iter().all(|t| matches!(t, Ty::Any | Ty::F64 | Ty::MaybeF64 | Ty::Bool));
     let small: Vec<bool> = (0..total).map(|g| inline_ok(get(m, g), INLINE_SIZE, true) && typed(get(m, g))).collect();
+    let orig: Vec<usize> = (0..total).map(|g| get(m, g).locals.len()).collect();
     for _ in 0..2 {
         let templates: Vec<Option<Func>> = (0..total)
             .map(|g| (small[g] && inline_ok(get(m, g), usize::MAX, true)).then(|| get(m, g).clone()))
@@ -2222,6 +2238,17 @@ pub fn predict_calls(m: &mut Module) {
             let (this, recv, supers) = receivers(get(m, g));
             let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
             let mut body = std::mem::take(&mut f.body);
+            // The predictions of the round before are made again, from this
+            // round's templates, which carry the callees' own predictions.
+            visit_stmts_mut(&mut body, &mut |e| {
+                while let ExprKind::Predicted { expr, .. } = &mut e.kind {
+                    let x = std::mem::replace(&mut **expr, Expr::new(Ty::Void, ExprKind::Undefined));
+                    *e = x;
+                }
+            });
+            f.locals.truncate(orig[g]);
+            f.boxed.truncate(orig[g]);
+            f.local_names.truncate(orig[g]);
             let base0 = f.locals.len();
             let m_ref: &Module = m;
             let fg = get(m_ref, g);
@@ -2313,6 +2340,86 @@ pub fn predict_calls(m: &mut Module) {
             f.local_names.extend(added.iter().map(|_| None));
             f.locals.extend(added);
         }
+    }
+}
+
+/// A value whose evaluation cannot run code, throw or observe an object
+/// being built: constants and unboxed locals, and numbers made of them.
+fn pure_value(e: &Expr, boxed: &[bool]) -> bool {
+    match &e.kind {
+        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Undefined | ExprKind::Null => true,
+        ExprKind::Local(l) => !boxed[*l],
+        ExprKind::Box(x) | ExprKind::Unary(_, x) => pure_value(x, boxed),
+        ExprKind::Binary(_, x, y) => pure_value(x, boxed) && pure_value(y, boxed),
+        _ => false,
+    }
+}
+
+/// Constructors that only assign their fields: `this.f = v` statements
+/// right after the instance is made (`NewInstance`, its fields
+/// `undefined` until then) put `v` in the instance as it is made, when `v`
+/// cannot run code; then `return this` right after returns the instance
+/// expression itself. So `new Vec(x, y)` inlines to an object expression.
+pub fn fold_new_instances(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    for g in 0..nfuncs + m.closures.len() {
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        let boxed = f.boxed.clone();
+        let mut uses = vec![0usize; f.locals.len()];
+        visit_stmts(&f.body, &mut |e| {
+            if let ExprKind::Local(l) = e.kind {
+                uses[l] += 1;
+            }
+        });
+        stmt_lists_mut(&mut f.body, &mut |list| {
+            let mut i = 0;
+            while i < list.len() {
+                let Stmt::Expr(Expr { kind: ExprKind::InitLocal(n, inst), .. }) = &list[i] else {
+                    i += 1;
+                    continue;
+                };
+                let n = *n;
+                if boxed[n] || !matches!(inst.kind, ExprKind::NewInstance { .. }) {
+                    i += 1;
+                    continue;
+                }
+                // Fold the assignments that follow.
+                let mut j = i + 1;
+                let mut folded = 0;
+                while j < list.len() {
+                    let Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) = &list[j] else { break };
+                    let (a, v) = (*a, (**v).clone());
+                    if !matches!(o.kind, ExprKind::Local(l) if l == n) || !pure_value(&v, &boxed) {
+                        break;
+                    }
+                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = &mut list[i] else { unreachable!() };
+                    let ExprKind::NewInstance { fields, .. } = &mut inst.kind else { unreachable!() };
+                    let Some((_, slot)) = fields.iter_mut().find(|(b, x)| *b == a && matches!(x.kind, ExprKind::Undefined))
+                    else {
+                        break;
+                    };
+                    *slot = v;
+                    folded += 1;
+                    j += 1;
+                }
+                if folded > 0 {
+                    // (The `Local(n)` of each assignment is gone.)
+                    uses[n] -= folded;
+                    list.drain(i + 1..j);
+                }
+                // `return this` right after, its only other use.
+                if let Some(Stmt::Return(Some(Expr { kind: ExprKind::Local(r), .. }))) = list.get(i + 1)
+                    && *r == n
+                    && uses[n] == 1
+                {
+                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = list.remove(i) else {
+                        unreachable!()
+                    };
+                    list[i] = Stmt::Return(Some(*inst));
+                }
+                i += 1;
+            }
+        });
     }
 }
 
@@ -2808,4 +2915,514 @@ fn promote_loop(s: &mut Stmt, f: &mut Func, layouts: &[Layout]) -> Option<Stmt> 
     before.push(lp);
     before.extend(after);
     Some(Stmt::Block(before))
+}
+
+/// The class and fields of the new instance `e` evaluates to, where it
+/// makes one: a `NewInstance`, or a sequence, inlined body, predicted call
+/// (inline) or conditional that does on some path. Other paths may give
+/// other values (see `virtual_value`).
+fn fresh_instance(e: &Expr) -> Option<(usize, Vec<AtomId>)> {
+    fn returns(stmts: &[Stmt], out: &mut Vec<(usize, Vec<AtomId>)>) {
+        for s in stmts {
+            match s {
+                Stmt::Return(Some(x)) => out.extend(fresh_instance(x)),
+                Stmt::If(_, a, b) => {
+                    returns(a, out);
+                    returns(b, out);
+                }
+                Stmt::Block(b) => returns(b, out),
+                _ => {}
+            }
+        }
+    }
+    match &e.kind {
+        ExprKind::NewInstance { class, fields } => Some((*class, fields.iter().map(|(a, _)| *a).collect())),
+        ExprKind::Seq(xs) => fresh_instance(xs.last()?),
+        ExprKind::Cond(_, a, b) => {
+            let (x, y) = (fresh_instance(a), fresh_instance(b));
+            match (x, y) {
+                (Some(x), Some(y)) => (x == y).then_some(x),
+                (x, y) => x.or(y),
+            }
+        }
+        ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } => {
+            let mut out = Vec::new();
+            returns(body, &mut out);
+            let first = out.first()?.clone();
+            out.iter().all(|x| *x == first).then_some(first)
+        }
+        _ => None,
+    }
+}
+
+/// For `virtualize_instances`: `e` (see `fresh_instance`) with its new
+/// instances of class `class` put in the field locals `slots` instead,
+/// setting `flag` (the value is then `undefined`).
+fn virtual_value(e: Expr, class: usize, slots: &[LocalId], flag: LocalId) -> Expr {
+    fn returns(stmts: &mut [Stmt], class: usize, slots: &[LocalId], flag: LocalId) {
+        for s in stmts {
+            match s {
+                Stmt::Return(Some(x)) => {
+                    let v = std::mem::replace(x, Expr::new(Ty::Any, ExprKind::Undefined));
+                    *x = virtual_value(v, class, slots, flag);
+                }
+                Stmt::If(_, a, b) => {
+                    returns(a, class, slots, flag);
+                    returns(b, class, slots, flag);
+                }
+                Stmt::Block(b) => returns(b, class, slots, flag),
+                _ => {}
+            }
+        }
+    }
+    let ty = e.ty;
+    match e.kind {
+        ExprKind::NewInstance { class: k, fields } if k == class => {
+            let mut seq: Vec<Expr> = fields
+                .into_iter()
+                .zip(slots)
+                .map(|((_, v), &s)| Expr::new(Ty::Any, ExprKind::SetLocal(s, Box::new(v))))
+                .collect();
+            seq.push(Expr::new(Ty::Bool, ExprKind::SetLocal(flag, Box::new(Expr::new(Ty::Bool, ExprKind::Bool(true))))));
+            seq.push(Expr::new(Ty::Any, ExprKind::Undefined));
+            Expr::new(Ty::Any, ExprKind::Seq(seq))
+        }
+        ExprKind::Seq(mut xs) => {
+            let last = xs.pop().unwrap();
+            xs.push(virtual_value(last, class, slots, flag));
+            Expr::new(ty, ExprKind::Seq(xs))
+        }
+        ExprKind::Cond(c, a, b) => Expr::new(
+            ty,
+            ExprKind::Cond(
+                c,
+                Box::new(virtual_value(*a, class, slots, flag)),
+                Box::new(virtual_value(*b, class, slots, flag)),
+            ),
+        ),
+        ExprKind::Inline { mut body, locals } => {
+            returns(&mut body, class, slots, flag);
+            Expr::new(ty, ExprKind::Inline { body, locals })
+        }
+        ExprKind::Predicted { expr, func, mut body, locals } => {
+            returns(&mut body, class, slots, flag);
+            Expr::new(ty, ExprKind::Predicted { expr, func, body, locals })
+        }
+        kind => Expr::new(ty, kind),
+    }
+}
+
+/// Replace `This` in `body` with `Local(l)`, except inside the bodies of
+/// predicted calls (their own `this`).
+fn this_to_local(body: &mut Vec<Stmt>, l: LocalId) {
+    let mut stash: Vec<Vec<Stmt>> = Vec::new();
+    // A predicted body is set aside behind a marker (a `Void`-typed number,
+    // which the IR has nowhere else) while `this` is replaced.
+    let marker = |i: usize| vec![Stmt::Expr(Expr::new(Ty::Void, ExprKind::Num(i as f64)))];
+    visit_stmts_mut(body, &mut |e| match &mut e.kind {
+        ExprKind::Predicted { body, .. } => {
+            let b = std::mem::replace(body, marker(stash.len()));
+            stash.push(b);
+        }
+        ExprKind::This => e.kind = ExprKind::Local(l),
+        _ => {}
+    });
+    let mut stash: Vec<Option<Vec<Stmt>>> = stash.into_iter().map(Some).collect();
+    visit_stmts_mut(body, &mut |e| {
+        if let ExprKind::Predicted { body, .. } = &mut e.kind
+            && let [Stmt::Expr(Expr { ty: Ty::Void, kind: ExprKind::Num(i) })] = body.as_slice()
+        {
+            *body = stash[*i as usize].take().unwrap();
+        }
+    });
+}
+
+/// `x` without the boxing of a number or boolean for a JS value.
+fn unboxed(x: &Expr) -> &Expr {
+    match &x.kind {
+        ExprKind::Box(y) => y,
+        _ => x,
+    }
+}
+
+/// What `virtualize_instances` needs of the module.
+struct VirtCx {
+    params: Vec<Vec<Ty>>,
+    rets: Vec<Ty>,
+    /// Per class: its instance methods (own), by atom.
+    methods: Vec<HashMap<AtomId, usize>>,
+}
+
+/// Scalar replacement of class instances, as JIT compilers' escape analysis
+/// does: a local holding a new instance of a class (a `NewInstance`, also
+/// as the value of an inlined or predicted call) that is only used for its
+/// fields and for predicted calls of its class's own methods keeps its
+/// fields in locals of their own while it is virtual (a flag local): reads
+/// and writes of the fields use them, and a method runs inline over them
+/// behind a check that the class's prototype still has it. Where the
+/// object itself is needed (a method that is not the predicted one, a call
+/// that a prediction declines), it is made first ("materialized", as
+/// deoptimization does), and the uses then work on it.
+pub fn virtualize_instances(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    let all = || m.funcs.iter().chain(&m.closures);
+    let atom_of: HashMap<&str, AtomId> = m.atoms.iter().enumerate().map(|(i, a)| (a.as_str(), i)).collect();
+    let cx = VirtCx {
+        params: all().map(|f| f.params.clone()).collect(),
+        rets: all().map(|f| f.ret).collect(),
+        methods: m
+            .classes
+            .iter()
+            .map(|c| {
+                c.members
+                    .iter()
+                    .filter(|(_, kind, is_static, _)| *kind == 0 && !is_static)
+                    .filter_map(|(n, _, _, f)| Some((*atom_of.get(n.as_str())?, *f)))
+                    .collect()
+            })
+            .collect(),
+    };
+    for g in 0..nfuncs + m.closures.len() {
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        if f.is_async || f.is_generator {
+            continue;
+        }
+        hoist_fresh_receivers(f);
+        // Locals initialized once (a statement, or a value discarded in a
+        // sequence) by a value that may be a new instance, and never
+        // assigned otherwise.
+        let mut inits = vec![0usize; f.locals.len()];
+        let mut assigns = vec![0usize; f.locals.len()];
+        let mut fresh = vec![false; f.locals.len()];
+        let mut discarded: Vec<LocalId> = Vec::new();
+        let mut statements = |stmts: &[Stmt]| {
+            top_exprs(stmts, &mut |e| {
+                if let ExprKind::InitLocal(l, _) = e.kind {
+                    discarded.push(l);
+                }
+            })
+        };
+        statements(&f.body);
+        visit_stmts(&f.body, &mut |e| {
+            if let ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } | ExprKind::ArrayLoop { body, .. } =
+                &e.kind
+            {
+                statements(body);
+            }
+        });
+        visit_stmts(&f.body, &mut |e| match &e.kind {
+            ExprKind::InitLocal(l, x) => {
+                inits[*l] += 1;
+                fresh[*l] |= fresh_instance(x).is_some();
+            }
+            ExprKind::SetLocal(l, _) | ExprKind::Update { local: l, .. } | ExprKind::ArrayPush(l, _) => assigns[*l] += 1,
+            ExprKind::Seq(xs) => {
+                for x in &xs[..xs.len().saturating_sub(1)] {
+                    if let ExprKind::InitLocal(l, _) = x.kind {
+                        discarded.push(l);
+                    }
+                }
+            }
+            _ => {}
+        });
+        let mut owned = vec![false; f.locals.len()];
+        stmt_locals(&f.body, &mut |l| owned[l] = true);
+        let candidates: Vec<LocalId> = (f.params.len()..f.locals.len())
+            .filter(|&l| {
+                fresh[l]
+                    && inits[l] == 1
+                    && assigns[l] == 0
+                    && !owned[l]
+                    && !f.boxed[l]
+                    && f.locals[l] == Ty::Any
+                    && f.ret_slot != Some(l)
+                    && discarded.contains(&l)
+            })
+            .collect();
+        for l in candidates {
+            try_virtualize(f, l, &cx);
+        }
+    }
+}
+
+/// Give a new instance that receives a predicted call (`(new V(...)).m()`,
+/// `a.add(b).scale(k)`), or is an argument of one (`a.add(b.scale(k))`), a
+/// local of its own, for `virtualize_instances`: the receiver before the
+/// call (it is evaluated first), an argument in place.
+fn hoist_fresh_receivers(f: &mut Func) {
+    let base = f.locals.len();
+    let mut added = 0;
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let ExprKind::Predicted { expr, .. } = &mut e.kind else { return };
+        let ExprKind::CallMethod(o, _, args) = &mut expr.kind else { return };
+        for x in args.iter_mut() {
+            if !matches!(x.kind, ExprKind::Local(_)) && fresh_instance(x).is_some() {
+                let t = base + added;
+                added += 1;
+                let r = std::mem::replace(x, Expr::new(Ty::Any, ExprKind::Local(t)));
+                *x = Expr::new(
+                    Ty::Any,
+                    ExprKind::Seq(vec![Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(r))), local_expr(t)]),
+                );
+            }
+        }
+        if matches!(o.kind, ExprKind::Local(_) | ExprKind::This) || fresh_instance(o).is_none() {
+            return;
+        }
+        let t = base + added;
+        added += 1;
+        let r = std::mem::replace(&mut **o, local_expr(t));
+        let call = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
+        let ty = call.ty;
+        *e = Expr::new(ty, ExprKind::Seq(vec![Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(r))), call]));
+    });
+    f.locals.extend(std::iter::repeat_n(Ty::Any, added));
+    f.boxed.extend(std::iter::repeat_n(false, added));
+    f.local_names.extend(std::iter::repeat_n(None, added));
+}
+
+fn local_expr(l: LocalId) -> Expr {
+    Expr::new(Ty::Any, ExprKind::Local(l))
+}
+
+/// `virtualize_instances` for local `l`, if all its uses allow it.
+fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
+    // The producer's class and fields.
+    let mut found = None;
+    visit_stmts(&f.body, &mut |e| {
+        if let ExprKind::InitLocal(m, x) = &e.kind
+            && *m == l
+        {
+            found = fresh_instance(x);
+        }
+    });
+    let Some((class, fields)) = found else { return false };
+    let Some(methods) = cx.methods.get(class) else { return false };
+    let base = f.locals.len();
+    let flag = base;
+    let slots: Vec<LocalId> = (base + 1..base + 1 + fields.len()).collect();
+    // The object itself while being rewritten (renamed `l` at the end).
+    let ph = base + 1 + fields.len();
+    let mut types = f.locals.clone();
+    types.push(Ty::Bool);
+    types.extend(std::iter::repeat_n(Ty::Any, fields.len() + 1));
+    let local = |x: LocalId| Expr::new(Ty::Any, ExprKind::Local(x));
+    let bool_ = |b: bool| Expr::new(Ty::Bool, ExprKind::Bool(b));
+    let flag_e = || Expr::new(Ty::Bool, ExprKind::Local(flag));
+    // The object, made from the fields if it is virtual.
+    let materialize = || {
+        let make = Expr::new(
+            Ty::Any,
+            ExprKind::NewInstance { class, fields: fields.iter().zip(&slots).map(|(&a, &s)| (a, local(s))).collect() },
+        );
+        Expr::new(
+            Ty::Any,
+            ExprKind::Cond(
+                Box::new(flag_e()),
+                Box::new(Expr::new(
+                    Ty::Any,
+                    ExprKind::Seq(vec![
+                        Expr::new(Ty::Any, ExprKind::SetLocal(ph, Box::new(make))),
+                        Expr::new(Ty::Bool, ExprKind::SetLocal(flag, Box::new(bool_(false)))),
+                        local(ph),
+                    ]),
+                )),
+                Box::new(local(ph)),
+            ),
+        )
+    };
+    let field = |a: AtomId| fields.iter().position(|&b| b == a);
+    let mut ok = true;
+    let mut virtual_uses = 0;
+    let mut reason = String::new();
+    let debug = std::env::var_os("TSAOT_DEBUG_VIRT").is_some();
+    let mut body = f.body.clone();
+    visit_stmts_mut(&mut body, &mut |e| {
+        if !ok {
+            return;
+        }
+        if debug {
+            reason = format!("{:?}", e.kind);
+        }
+        let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
+        let ty = e.ty;
+        match &mut e.kind {
+            ExprKind::Local(m) | ExprKind::SetLocal(m, _) | ExprKind::Update { local: m, .. } if *m == l => ok = false,
+            ExprKind::InitLocal(m, x) if *m == l => {
+                let x = std::mem::replace(&mut **x, Expr::new(Ty::Any, ExprKind::Undefined));
+                let mut seq = vec![Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(bool_(false))))];
+                for &s in &slots {
+                    seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(s, Box::new(Expr::new(Ty::Any, ExprKind::Undefined)))));
+                }
+                seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(ph, Box::new(virtual_value(x, class, &slots, flag)))));
+                *e = Expr::new(Ty::Any, ExprKind::Seq(seq));
+            }
+            ExprKind::GetProp(o, a) if is_l(o) => {
+                let Some(i) = field(*a) else {
+                    ok = false;
+                    return;
+                };
+                let a = *a;
+                virtual_uses += 1;
+                *e = Expr::new(
+                    ty,
+                    ExprKind::Cond(
+                        Box::new(flag_e()),
+                        Box::new(local(slots[i])),
+                        Box::new(Expr::new(ty, ExprKind::GetProp(Box::new(local(ph)), a))),
+                    ),
+                );
+            }
+            ExprKind::SetProp(o, a, v) if is_l(o) => {
+                let Some(i) = field(*a) else {
+                    ok = false;
+                    return;
+                };
+                let a = *a;
+                let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
+                *e = Expr::new(
+                    ty,
+                    ExprKind::Cond(
+                        Box::new(flag_e()),
+                        Box::new(Expr::new(Ty::Any, ExprKind::SetLocal(slots[i], Box::new(v.clone())))),
+                        Box::new(Expr::new(ty, ExprKind::SetProp(Box::new(local(ph)), a, Box::new(v)))),
+                    ),
+                );
+            }
+            ExprKind::Predicted { expr, func, body: pbody, locals } => {
+                let ExprKind::CallMethod(o, Key::Atom(a), args) = &mut expr.kind else { return };
+                if !is_l(o) {
+                    // The object passed to a method of another receiver: its
+                    // parameter is the object inline; the object is made only
+                    // for the call (a lazy argument).
+                    let params = &cx.params[*func];
+                    for i in 0..args.len() {
+                        // (The object itself, or made in place: `Seq[init, it]`.)
+                        let direct = is_l(&args[i]);
+                        let in_seq = matches!(&args[i].kind, ExprKind::Seq(xs) if xs.last().is_some_and(is_l));
+                        if !direct && !in_seq {
+                            continue;
+                        }
+                        let p = locals[i];
+                        let mut assigned = false;
+                        visit_stmts(pbody, &mut |x| assigned |= assigns_local(x, p));
+                        if params.get(i) != Some(&Ty::Any) || assigned {
+                            ok = false;
+                            return;
+                        }
+                        visit_stmts_mut(pbody, &mut |y| {
+                            if matches!(y.kind, ExprKind::Local(q) if q == p) {
+                                y.kind = ExprKind::Local(l);
+                            }
+                        });
+                        let lazy = Expr::new(Ty::Any, ExprKind::Lazy(Box::new(materialize())));
+                        match &mut args[i].kind {
+                            ExprKind::Seq(xs) if in_seq => *xs.last_mut().unwrap() = lazy,
+                            _ => args[i] = lazy,
+                        }
+                        virtual_uses += 1;
+                    }
+                    return;
+                }
+                let (a, func) = (*a, *func);
+                let params = &cx.params[func];
+                if methods.get(&a) != Some(&func) || args.len() > params.len() {
+                    ok = false;
+                    return;
+                }
+                // The method inline over the fields: parameters bound to the
+                // arguments (the object itself: an alias), `this` the object.
+                let mut inner = pbody.clone();
+                let mut binds = Vec::new();
+                for (i, &pt) in params.iter().enumerate() {
+                    let p = locals[i];
+                    let arg = args.get(i);
+                    let mut assigned = false;
+                    visit_stmts(&inner, &mut |x| assigned |= assigns_local(x, p));
+                    let v = match (arg, pt) {
+                        (Some(x), Ty::Any) if is_l(x) && !assigned => {
+                            visit_stmts_mut(&mut inner, &mut |y| {
+                                if matches!(y.kind, ExprKind::Local(q) if q == p) {
+                                    y.kind = ExprKind::Local(l);
+                                }
+                            });
+                            Expr::new(Ty::Any, ExprKind::Undefined)
+                        }
+                        (Some(x), Ty::Any) if types[p] == Ty::Any => match x.ty {
+                            Ty::F64 | Ty::Bool => Expr::new(Ty::Any, ExprKind::Box(Box::new(x.clone()))),
+                            Ty::Any => x.clone(),
+                            _ => {
+                                ok = false;
+                                return;
+                            }
+                        },
+                        // (Arguments are JS values: a number boxed for the call.)
+                        (Some(x), Ty::F64 | Ty::Bool) if types[p] == pt && unboxed(x).ty == pt => unboxed(x).clone(),
+                        (None, Ty::Any) if types[p] == Ty::Any => Expr::new(Ty::Any, ExprKind::Undefined),
+                        _ => {
+                            ok = false;
+                            return;
+                        }
+                    };
+                    binds.push(Stmt::Expr(Expr::new(types[p], ExprKind::InitLocal(p, Box::new(v)))));
+                }
+                this_to_local(&mut inner, l);
+                binds.extend(inner);
+                let ret = cx.rets[func];
+                let mut inline = Expr::new(ret, ExprKind::Inline { body: binds, locals: locals.clone() });
+                match ret {
+                    Ty::Any => {}
+                    Ty::F64 | Ty::Bool => inline = Expr::new(Ty::Any, ExprKind::Box(Box::new(inline))),
+                    _ => {
+                        ok = false;
+                        return;
+                    }
+                }
+                // Otherwise the call, on the object (made if virtual).
+                let mut args2 = args.clone();
+                for x in &mut args2 {
+                    visit_mut(x, &mut |y| {
+                        if matches!(y.kind, ExprKind::Local(q) if q == l) {
+                            y.kind = ExprKind::Local(ph);
+                        }
+                    });
+                }
+                // (Not predicted: the method changed, or the object came from
+                // a call, both rare; the body is not copied again.)
+                let call = Expr::new(ty, ExprKind::CallMethod(Box::new(materialize()), Key::Atom(a), args2));
+                let check = Expr::new(
+                    Ty::Bool,
+                    ExprKind::Cond(
+                        Box::new(flag_e()),
+                        Box::new(Expr::new(Ty::Bool, ExprKind::ProtoMethodIs { class, method: a, func })),
+                        Box::new(bool_(false)),
+                    ),
+                );
+                virtual_uses += 1;
+                *e = Expr::new(ty, ExprKind::Cond(Box::new(check), Box::new(inline), Box::new(call)));
+            }
+            _ => {}
+        }
+    });
+    if debug {
+        eprintln!("virtualize {} local {l}: {}", f.name, if ok { "yes" } else { "no" });
+        if !ok {
+            eprintln!("  at {}", reason.chars().take(300).collect::<String>());
+        }
+    }
+    if !ok || virtual_uses == 0 {
+        return false;
+    }
+    // The object local is `l` again.
+    visit_stmts_mut(&mut body, &mut |e| match &mut e.kind {
+        ExprKind::Local(m) | ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) if *m == ph => *m = l,
+        _ => {}
+    });
+    f.body = body;
+    f.locals.push(Ty::Bool);
+    f.locals.extend(std::iter::repeat_n(Ty::Any, fields.len() + 1));
+    let n = fields.len() + 2;
+    f.boxed.extend(std::iter::repeat_n(false, n));
+    f.local_names.extend(std::iter::repeat_n(None, n));
+    true
 }

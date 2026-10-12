@@ -326,9 +326,11 @@ pub fn check<'a>(
             };
             ir::capture_values(&mut module);
             ir::infer_hints(&mut module);
+            ir::fold_new_instances(&mut module);
             ir::inline_calls(&mut module);
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
+            ir::virtualize_instances(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
@@ -3917,6 +3919,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A local that `e` names and that only this function's own code can
     /// assign (not captured), holding a JS value.
     fn plain_local(&self, e: &'a Expression<'a>) -> Option<ir::LocalId> {
+        // A constructor's `this`: the instance, in a local never reassigned.
+        if let Expression::ThisExpression(_) = e.without_parentheses()
+            && let Some(l) = self.this_local
+            && !self.boxed[l]
+        {
+            return Some(l);
+        }
         let Expression::Identifier(id) = e.without_parentheses() else { return None };
         let &l = self.sym_local.get(&self.resolve(id)?)?;
         (!self.boxed[l] && matches!(self.locals[l], Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_)))

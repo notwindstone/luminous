@@ -321,7 +321,22 @@ The differential tests run every case with both.
   directly (after reading `C`, which may be in its TDZ): the instance is
   made with the class's fields, initializers evaluated first, through an
   allocation site that caches the instance's final shape, then the body
-  runs. Interpreted code keeps the class's own constructor.
+  runs. A constructor that only assigns its fields (`this.x = x`, values
+  that run no code) makes the instance with them directly, so an inlined
+  `new V(a, b)` is an object expression. Interpreted code keeps the
+  class's own constructor.
+- **Class instances that do not escape** (scalar replacement, as JIT
+  compilers' escape analysis): a local holding a new instance (`new V()`,
+  or the result of an inlined or predicted method that makes one, such as
+  `a.sub(b)`) and only used for its fields, its class's methods and as an
+  argument of predicted methods keeps its fields in locals of its own while
+  a flag says it is virtual. Field reads and writes use them; its methods
+  run inline over them behind a check that the class's prototype still has
+  the method; a method of another object that receives it reads them
+  through its parameter. Where the object itself is needed (a method that
+  changed, a prediction that fails, a call that is not inlined) it is made
+  then ("materialized", as deoptimization does), and later uses work on
+  it, so identity and mutations stay right.
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those
