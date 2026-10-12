@@ -1,4 +1,4 @@
-// @native mk main typedNumbers
+// @native mk main typedNumbers fractions
 // Native comparators for `sort`: the engine calls the compiled arrow function
 // directly (objects and numbers, NaN and undefined, stability, exceptions,
 // elements of other types).
@@ -60,5 +60,19 @@ function typedNumbers(): string {
   return [ok, asc.slice(0, 4).join(","), desc.slice(0, 4).join(","), asc.length].join(" ");
 }
 
+// Results that are not int32s: fractions on either side of 0, infinities,
+// -0, NaN (for equal keys: as 0), and strings converted to numbers.
+function fractions(): string {
+  const es = mk(40);
+  const a = es.slice().sort((x, y) => (x.salary - y.salary) / 1000);
+  const b = es.slice().sort((x, y) => (x.salary === y.salary ? -0 : x.salary < y.salary ? -Infinity : Infinity));
+  const key = (e: E) => (e.id % 7 === 3 ? 0 : e.salary + 1);
+  const c = es.slice().sort((x, y) => (key(x) === key(y) ? NaN : (key(y) - key(x)) * 0.5));
+  const d = es.slice().sort((x, y) => (String(x.salary - y.salary) as unknown as number));
+  const ids = (xs: E[]) => xs.map((e) => e.id).join(",");
+  return [ids(a), ids(b), ids(c), ids(d)].join(" | ");
+}
+
 console.log(main());
 console.log(typedNumbers());
+console.log(fractions());

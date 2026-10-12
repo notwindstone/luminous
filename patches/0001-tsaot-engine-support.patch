@@ -1323,7 +1323,20 @@
  }
  
  /* garbage collection */
-@@ -9947,6 +10523,11 @@
+@@ -7266,6 +7842,12 @@
+             mark_func(rt, &sh->header);
+             /* mark all the fields */
+             prs = get_shape_prop(sh);
++            if (likely(!sh->special_props)) {
++                /* tsaot: data properties only (a deleted one holds
++                   undefined). */
++                for(i = 0; i < sh->prop_count; i++)
++                    JS_MarkValue(rt, p->prop[i].u.value, mark_func);
++            } else
+             for(i = 0; i < sh->prop_count; i++) {
+                 JSProperty *pr = &p->prop[i];
+                 if (prs->atom != JS_ATOM_NULL) {
+@@ -9947,6 +10529,11 @@
      } else if (tag == JS_TAG_SYMBOL) {
          JSAtomStruct *p = JS_VALUE_GET_PTR(val);
          atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
@@ -1335,7 +1348,7 @@
      } else {
          JSValue str;
          str = JS_ToPropertyKeyInternal(ctx, val, flags);
-@@ -10173,8 +10754,7 @@
+@@ -10173,8 +10760,7 @@
              /*  the property array may need to be resized */
              if (new_sh->prop_size != sh->prop_size) {
                  JSProperty *new_prop;
@@ -1345,7 +1358,7 @@
                  if (!new_prop)
                      return NULL;
                  p->prop = new_prop;
-@@ -10465,7 +11045,8 @@
+@@ -10465,7 +11051,8 @@
          JS_ThrowOutOfMemory(ctx);
          return -1;
      }
@@ -1355,7 +1368,7 @@
      new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
      if (!new_array_prop)
          return -1;
-@@ -10827,6 +11408,20 @@
+@@ -10827,6 +11414,20 @@
  }
  
  /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -1376,7 +1389,7 @@
  int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                          JSValue prop, JSValue val, int flags)
  {
-@@ -11214,6 +11809,8 @@
+@@ -11214,6 +11815,8 @@
          if (js_shape_prepare_update(ctx, p, pprs))
              return -1;
          (*pprs)->flags = flags;
@@ -1385,7 +1398,7 @@
      }
      return 0;
  }
-@@ -11300,6 +11897,7 @@
+@@ -11300,6 +11903,7 @@
                      prs->flags = (prs->flags &
                                    (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) |
                          JS_PROP_GETSET;
@@ -1393,7 +1406,7 @@
                      pr->u.getset.getter = NULL;
                      pr->u.getset.setter = NULL;
                  } else {
-@@ -11558,9 +12156,27 @@
+@@ -11558,9 +12162,27 @@
      return ret;
  }
  
@@ -1421,7 +1434,7 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_uint32(idx),
                                         val, flags);
  }
-@@ -11568,6 +12184,9 @@
+@@ -11568,6 +12190,9 @@
  int JS_DefinePropertyValueInt64(JSContext *ctx, JSValueConst this_obj,
                                  int64_t idx, JSValue val, int flags)
  {
@@ -1431,7 +1444,7 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_int64(idx),
                                         val, flags);
  }
-@@ -11605,7 +12224,8 @@
+@@ -11605,7 +12230,8 @@
  static int JS_CreateDataPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                                         int64_t idx, JSValue val, int flags)
  {
@@ -1441,7 +1454,7 @@
                                         val, flags | JS_PROP_CONFIGURABLE |
                                         JS_PROP_ENUMERABLE | JS_PROP_WRITABLE);
  }
-@@ -11616,6 +12236,9 @@
+@@ -11616,6 +12242,9 @@
  {
      JSAtom atom;
      int ret;
@@ -1451,7 +1464,7 @@
      atom = JS_ValueToAtom(ctx, js_int64(idx));
      if (unlikely(atom == JS_ATOM_NULL))
          return -1;
-@@ -13955,6 +14578,43 @@
+@@ -13955,6 +14584,43 @@
      TON_FLAG_NUMERIC,
  } JSToNumberHintEnum;
  
@@ -1495,7 +1508,7 @@
  static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                                     JSToNumberHintEnum flag)
  {
-@@ -13995,7 +14655,13 @@
+@@ -13995,7 +14661,13 @@
              const char *str;
              const char *p;
              size_t len;
@@ -1509,7 +1522,7 @@
              str = JS_ToCStringLen(ctx, &len, val);
              JS_FreeValue(ctx, val);
              if (!str)
-@@ -14662,6 +15328,9 @@
+@@ -14662,6 +15334,9 @@
  
  JSValue JS_ToString(JSContext *ctx, JSValueConst val)
  {
@@ -1519,7 +1532,7 @@
      return JS_ToStringInternal(ctx, val, /*flags*/0);
  }
  
-@@ -14695,6 +15364,8 @@
+@@ -14695,6 +15370,8 @@
  static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
  {
      uint32_t tag = JS_VALUE_GET_TAG(val);
@@ -1528,7 +1541,7 @@
      if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
          return JS_ThrowTypeError(ctx, "null or undefined are forbidden");
      return JS_ToString(ctx, val);
-@@ -15015,11 +15686,29 @@
+@@ -15015,11 +15692,29 @@
      }
  }
  
@@ -1559,7 +1572,7 @@
      }
      return false;
  }
-@@ -15033,7 +15722,7 @@
+@@ -15033,7 +15728,7 @@
          if (unlikely(p->class_id == JS_CLASS_PROXY))
              return js_proxy_isArray(ctx, val);
          else
@@ -1568,7 +1581,7 @@
      } else {
          return false;
      }
-@@ -15046,6 +15735,10 @@
+@@ -15046,6 +15741,10 @@
      if (unlikely(!isfinite(b)) && fabs(a) == 1) {
          /* not compatible with IEEE 754 */
          d = NAN;
@@ -1579,7 +1592,7 @@
      } else {
          JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
          d = pow(a, b);
-@@ -16550,6 +17243,165 @@
+@@ -16550,6 +17249,165 @@
      return atom;
  }
  
@@ -1745,7 +1758,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -16757,6 +17609,13 @@
+@@ -16757,6 +17615,13 @@
      return JS_EXCEPTION;
  }
  
@@ -1759,7 +1772,7 @@
  static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
  {
      JSObject *p;
-@@ -16785,6 +17644,8 @@
+@@ -16785,6 +17650,8 @@
      it->is_array = false;
      it->obj = obj;
      it->idx = 0;
@@ -1768,7 +1781,7 @@
      p = JS_VALUE_GET_OBJ(enum_obj);
      p->u.for_in_iterator = it;
  
-@@ -16906,7 +17767,20 @@
+@@ -16906,7 +17773,20 @@
      it = p->u.for_in_iterator;
  
      for(;;) {
@@ -1790,7 +1803,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18921,96 @@
+@@ -18047,6 +18927,96 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -1887,7 +1900,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +19512,12 @@
+@@ -18548,9 +19518,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1900,7 +1913,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +19552,12 @@
+@@ -18585,9 +19558,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1913,7 +1926,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +19568,21 @@
+@@ -18598,6 +19574,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -1935,7 +1948,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -20983,18 +21968,18 @@
+@@ -20983,18 +21974,18 @@
      return ret_val;
  }
  
@@ -1958,7 +1971,7 @@
      JS_FreeValue(ctx, func_obj);
      return res;
  }
-@@ -21274,13 +22259,21 @@
+@@ -21274,13 +22265,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -1981,7 +1994,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +22300,10 @@
+@@ -21307,7 +22306,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -1993,7 +2006,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +22311,56 @@
+@@ -21315,6 +22317,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -2050,7 +2063,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +22372,8 @@
+@@ -21326,6 +22378,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -2059,7 +2072,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +22488,61 @@
+@@ -21440,6 +22494,61 @@
      return JS_EXCEPTION;
  }
  
@@ -2121,7 +2134,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22775,12 @@
+@@ -21672,6 +22781,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -2134,7 +2147,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22797,11 @@
+@@ -21688,8 +22803,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -2148,7 +2161,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22830,11 @@
+@@ -21718,8 +22836,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -2162,7 +2175,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22947,12 @@
+@@ -21832,7 +22953,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -2176,7 +2189,7 @@
      }
  }
  
-@@ -21874,6 +22994,55 @@
+@@ -21874,6 +23000,55 @@
      return res;
  }
  
@@ -2232,7 +2245,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +23079,12 @@
+@@ -21910,6 +23085,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -2245,7 +2258,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +23097,20 @@
+@@ -21922,10 +23103,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -2267,7 +2280,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +23184,12 @@
+@@ -21999,6 +23190,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -2280,7 +2293,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +23286,37 @@
+@@ -22095,6 +23292,37 @@
      return JS_EXCEPTION;
  }
  
@@ -2318,7 +2331,7 @@
  /* JS parser */
  
  enum {
-@@ -43563,6 +44785,16 @@
+@@ -43563,6 +44791,16 @@
          ret = JS_ArraySpeciesCreate(ctx, obj, js_int64(len));
          if (JS_IsException(ret))
              goto exception;
@@ -2335,7 +2348,7 @@
          break;
      case special_filter:
          ret = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
-@@ -43584,6 +44816,18 @@
+@@ -43584,6 +44822,18 @@
      }
      n = 0;
  
@@ -2354,7 +2367,7 @@
      for(k = 0; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43592,6 +44836,12 @@
+@@ -43592,6 +44842,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -2367,7 +2380,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k, &val);
              if (present < 0)
-@@ -43602,7 +44852,11 @@
+@@ -43602,7 +44858,11 @@
              args[0] = val;
              args[1] = index_val;
              args[2] = obj;
@@ -2380,7 +2393,7 @@
              JS_FreeValue(ctx, index_val);
              if (JS_IsException(res))
                  goto exception;
-@@ -43622,6 +44876,17 @@
+@@ -43622,6 +44882,17 @@
                  }
                  break;
              case special_map:
@@ -2398,7 +2411,7 @@
                  if (JS_DefinePropertyValueInt64(ctx, ret, k, res,
                                                  JS_PROP_C_W_E | JS_PROP_THROW) < 0)
                      goto exception;
-@@ -43730,6 +44995,17 @@
+@@ -43730,6 +45001,17 @@
              }
          }
      }
@@ -2416,7 +2429,7 @@
      for (; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43739,6 +45015,12 @@
+@@ -43739,6 +45021,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -2429,7 +2442,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k1, &val);
              if (present < 0)
-@@ -43750,7 +45032,11 @@
+@@ -43750,7 +45038,11 @@
              args[1] = val;
              args[2] = index_val;
              args[3] = obj;
@@ -2442,7 +2455,7 @@
              JS_FreeValue(ctx, index_val);
              JS_FreeValue(ctx, val);
              val = JS_UNDEFINED;
-@@ -44171,6 +45457,72 @@
+@@ -44171,6 +45463,72 @@
      return JS_EXCEPTION;
  }
  
@@ -2515,7 +2528,7 @@
  static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int unshift)
  {
-@@ -44694,8 +46046,29 @@
+@@ -44694,8 +46052,29 @@
      int exception;
      int has_method;
      JSValueConst method;
@@ -2545,7 +2558,7 @@
  static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
      struct array_sort_context *psc = opaque;
      JSContext *ctx = psc->ctx;
-@@ -44711,7 +46084,11 @@
+@@ -44711,7 +46090,11 @@
      if (psc->has_method) {
          argv[0] = ap->val;
          argv[1] = bp->val;
@@ -2558,7 +2571,7 @@
          if (JS_IsException(res))
              goto exception;
          if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-@@ -44751,6 +46128,193 @@
+@@ -44751,6 +46134,197 @@
      return 0;
  }
  
@@ -2569,120 +2582,126 @@
 +typedef JSValue JSNativeCmpAnyV(JSContext *ctx, void *data, JSValue a, JSValue b);
 +typedef JSValue JSNativeCmpNumV(JSContext *ctx, void *data, double a, double b);
 +
-+typedef struct JSNativeSort {
-+    JSContext *ctx;
-+    void *cmp;
-+    int mode;
-+    const uint8_t *unwinding;
-+    bool failed;
-+    /* (Mode 4: the comparator borrows its arguments, which the sort holds.) */
-+    bool borrowed;
-+} JSNativeSort;
-+
 +static inline double js_native_number(JSValueConst v)
 +{
 +    return JS_VALUE_GET_TAG(v) == JS_TAG_INT ? JS_VALUE_GET_INT(v) : JS_VALUE_GET_FLOAT64(v);
 +}
 +
-+/* The comparator's result for (a, b) as a number (NaN: 0); `failed` on an
-+   exception. `mode` is a constant where it is inlined (each mode's merge
-+   sort is its own copy). */
-+static inline __attribute__((always_inline)) double
-+js_native_compare(JSNativeSort *s, JSValueConst a, JSValueConst b, int mode)
++/* Whether the comparator orders `a` after `b`: its result for (a, b) is
++   above 0 (NaN counts as 0); `*failed` on an exception. `mode` is a
++   constant where it is inlined (each mode's merge sort is its own copy):
++   bits 0-1 the comparator's signature, bit 2 set when it borrows its
++   arguments (which the sort holds). The sort's state is passed by value,
++   so that it stays in registers across the comparator's calls. */
++static inline __attribute__((always_inline)) bool
++js_native_after(JSContext *ctx, void *cmp, const uint8_t *unwinding, bool *failed,
++                JSValueConst a, JSValueConst b, int mode)
 +{
-+    JSContext *ctx = s->ctx;
 +    double r = 0;
 +    JSValue v = JS_UNDEFINED;
-+    if (!(mode & 1) && !s->borrowed) {
++    if (!(mode & 5)) {
 +        js_dup(a);
 +        js_dup(b);
 +    }
-+    switch (mode) {
++    switch (mode & 3) {
 +    case 0:
-+        r = ((JSNativeCmpAny *)s->cmp)(ctx, NULL, a, b);
++        r = ((JSNativeCmpAny *)cmp)(ctx, NULL, a, b);
 +        break;
 +    case 1:
-+        r = ((JSNativeCmpNum *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
++        r = ((JSNativeCmpNum *)cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
 +        break;
 +    case 2:
-+        v = ((JSNativeCmpAnyV *)s->cmp)(ctx, NULL, a, b);
++        v = ((JSNativeCmpAnyV *)cmp)(ctx, NULL, a, b);
 +        break;
 +    default:
-+        v = ((JSNativeCmpNumV *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
++        v = ((JSNativeCmpNumV *)cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
 +        break;
 +    }
-+    if (unlikely(*s->unwinding)) {
-+        s->failed = true;
-+        return 0;
++    if (unlikely(*unwinding)) {
++        *failed = true;
++        return false;
 +    }
 +    if (mode & 2) {
 +        if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_INT))
-+            return JS_VALUE_GET_INT(v);
++            return JS_VALUE_GET_INT(v) > 0;
 +        if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
 +            r = JS_VALUE_GET_FLOAT64(v);
 +        } else if (JS_ToFloat64Free(ctx, &r, v)) {
-+            s->failed = true;
-+            return 0;
++            *failed = true;
++            return false;
 +        }
 +    }
-+    return isnan(r) ? 0 : r;
++    return r > 0;
 +}
 +
 +/* Stable merge sort of a[0..n) (tmp: room for n / 2 + 1 values), for each
-+   mode. */
++   mode; true when the comparator threw. */
 +#define JS_NATIVE_MERGE_SORT(MODE)                                              \
-+static void js_native_merge_sort_##MODE(JSNativeSort *s, JSValue *a,            \
++static bool js_native_merge_sort_##MODE(JSContext *ctx, void *cmp,              \
++                                        const uint8_t *unwinding, JSValue *a,   \
 +                                        JSValue *tmp, size_t n)                 \
 +{                                                                               \
 +    size_t i, j, k, m;                                                          \
++    bool failed = false;                                                        \
 +    if (n <= 8) {                                                               \
-+        for (i = 1; i < n && !s->failed; i++) {                                 \
++        for (i = 1; i < n; i++) {                                               \
 +            JSValue x = a[i];                                                   \
 +            for (j = i; j > 0; j--) {                                           \
-+                if (js_native_compare(s, a[j - 1], x, MODE) <= 0 || s->failed)  \
++                if (!js_native_after(ctx, cmp, unwinding, &failed, a[j - 1], x, \
++                                     MODE))                                     \
 +                    break;                                                      \
 +                a[j] = a[j - 1];                                                \
 +            }                                                                   \
 +            a[j] = x;                                                           \
++            if (failed)                                                         \
++                return true;                                                    \
 +        }                                                                       \
-+        return;                                                                 \
++        return false;                                                           \
 +    }                                                                           \
 +    m = n / 2;                                                                  \
-+    js_native_merge_sort_##MODE(s, a, tmp, m);                                  \
-+    if (!s->failed)                                                             \
-+        js_native_merge_sort_##MODE(s, a + m, tmp, n - m);                      \
-+    if (s->failed || js_native_compare(s, a[m - 1], a[m], MODE) <= 0 ||         \
-+        s->failed)                                                              \
-+        return;                                                                 \
++    if (js_native_merge_sort_##MODE(ctx, cmp, unwinding, a, tmp, m) ||          \
++        js_native_merge_sort_##MODE(ctx, cmp, unwinding, a + m, tmp, n - m))    \
++        return true;                                                            \
++    if (!js_native_after(ctx, cmp, unwinding, &failed, a[m - 1], a[m], MODE))   \
++        return failed;                                                          \
 +    memcpy(tmp, a, m * sizeof(JSValue));                                        \
 +    i = 0; j = m; k = 0;                                                        \
 +    while (i < m && j < n) {                                                    \
-+        double c = js_native_compare(s, tmp[i], a[j], MODE);                    \
-+        if (s->failed) {                                                        \
++        bool after = js_native_after(ctx, cmp, unwinding, &failed, tmp[i],      \
++                                     a[j], MODE);                               \
++        if (unlikely(failed)) {                                                 \
 +            /* (Every value back in the array, in some order.) */              \
 +            memcpy(a + k, tmp + i, (m - i) * sizeof(JSValue));                  \
-+            return;                                                             \
++            return true;                                                        \
 +        }                                                                       \
-+        if (c <= 0)                                                             \
-+            a[k++] = tmp[i++];                                                  \
-+        else                                                                    \
++        if (after)                                                              \
 +            a[k++] = a[j++];                                                    \
++        else                                                                    \
++            a[k++] = tmp[i++];                                                  \
 +    }                                                                           \
 +    while (i < m)                                                               \
 +        a[k++] = tmp[i++];                                                      \
++    return false;                                                               \
 +}
 +JS_NATIVE_MERGE_SORT(0)
 +JS_NATIVE_MERGE_SORT(1)
 +JS_NATIVE_MERGE_SORT(2)
 +JS_NATIVE_MERGE_SORT(3)
++JS_NATIVE_MERGE_SORT(4)
++JS_NATIVE_MERGE_SORT(6)
 +
-+static void js_native_merge_sort(JSNativeSort *s, JSValue *a, JSValue *tmp, size_t n)
++/* (Modes 1 and 3 take numbers: nothing to hold, borrowed or not.) */
++static bool js_native_merge_sort(JSContext *ctx, void *cmp, int mode,
++                                 const uint8_t *unwinding, JSValue *a,
++                                 JSValue *tmp, size_t n)
 +{
-+    switch (s->mode & 3) {
-+    case 0: js_native_merge_sort_0(s, a, tmp, n); break;
-+    case 1: js_native_merge_sort_1(s, a, tmp, n); break;
-+    case 2: js_native_merge_sort_2(s, a, tmp, n); break;
-+    default: js_native_merge_sort_3(s, a, tmp, n); break;
++    switch (mode & 7) {
++    case 0: return js_native_merge_sort_0(ctx, cmp, unwinding, a, tmp, n);
++    case 2: return js_native_merge_sort_2(ctx, cmp, unwinding, a, tmp, n);
++    case 4: return js_native_merge_sort_4(ctx, cmp, unwinding, a, tmp, n);
++    case 6: return js_native_merge_sort_6(ctx, cmp, unwinding, a, tmp, n);
++    case 1: case 5: return js_native_merge_sort_1(ctx, cmp, unwinding, a, tmp, n);
++    default: return js_native_merge_sort_3(ctx, cmp, unwinding, a, tmp, n);
 +    }
 +}
 +
@@ -2691,7 +2710,6 @@
 +    JSObject *p;
 +    JSValue *tab;
 +    uint32_t len, i, n = 0;
-+    JSNativeSort s = { ctx, cmp, mode & 3, unwinding, false, (mode & 4) != 0 };
 +
 +    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
 +        return 0;
@@ -2720,8 +2738,7 @@
 +        if (!JS_IsUndefined(v))
 +            tab[n++] = js_dup(v);
 +    }
-+    js_native_merge_sort(&s, tab, tab + len, n);
-+    if (s.failed) {
++    if (js_native_merge_sort(ctx, cmp, mode, unwinding, tab, tab + len, n)) {
 +        for (i = 0; i < n; i++)
 +            JS_FreeValue(ctx, tab[i]);
 +        js_free(ctx, tab);
@@ -2752,7 +2769,7 @@
  static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -44795,6 +46359,8 @@
+@@ -44795,6 +46369,8 @@
          array[pos].pos = i;
          pos++;
      }
@@ -2761,7 +2778,7 @@
      rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
      if (asc.exception)
          goto exception;
-@@ -44978,6 +46544,15 @@
+@@ -44978,6 +46554,15 @@
      return JS_EXCEPTION;
  }
  
@@ -2777,7 +2794,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -46732,6 +48307,14 @@
+@@ -46732,6 +48317,14 @@
      int32_t radix;
      JSValue ret;
  
@@ -2792,7 +2809,7 @@
      str = JS_ToCString(ctx, argv[0]);
      if (!str)
          return JS_EXCEPTION;
-@@ -47273,27 +48856,54 @@
+@@ -47273,27 +48866,54 @@
                  return i;
          }
      } else {
@@ -2853,7 +2870,7 @@
              return j;
      }
      return -1;
-@@ -47431,7 +49041,11 @@
+@@ -47431,7 +49051,11 @@
          inc = 1;
      }
      ret = -1;
@@ -2866,7 +2883,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -47998,6 +49612,65 @@
+@@ -47998,6 +49622,65 @@
      return ret;
  }
  
@@ -2932,7 +2949,7 @@
  static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int padEnd)
  {
-@@ -56073,6 +57746,48 @@
+@@ -56073,6 +57756,48 @@
      return result_promise;
  }
  
@@ -2981,7 +2998,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +57796,24 @@
+@@ -56081,14 +57806,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -3011,7 +3028,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +57831,530 @@
+@@ -56106,6 +57841,530 @@
      return result_promise;
  }
  
@@ -3542,7 +3559,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +58728,25 @@
+@@ -56479,6 +58738,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -3568,7 +3585,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +58766,8 @@
+@@ -56498,23 +58776,8 @@
          rd_array[i] = rd;
      }
  
@@ -3594,7 +3611,7 @@
      s->is_handled = true;
      return 0;
  }
-@@ -63041,6 +65294,8 @@
+@@ -63041,6 +65304,8 @@
  
  bool JS_IsStrictEqual(JSContext *ctx, JSValueConst op1, JSValueConst op2)
  {

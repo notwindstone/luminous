@@ -84,6 +84,11 @@ pub fn compile(ll: &Path, obj: &Path, opts: &Options) -> Result<()> {
         // time quadratic in the size of a function.
         cmd.args(["-mllvm", "-disable-x86-domain-reassignment"]);
     }
+    // Most calls in generated code are on cold paths (caches that miss,
+    // values of other types): a callee-saved register costs a save and a
+    // restore on every call of the function, a spill around a cold call
+    // costs only there.
+    cmd.args(["-mllvm", "-regalloc-csr-first-time-cost=20"]);
     let out = cmd
         .arg(ll)
         .arg("-o")

@@ -195,7 +195,8 @@ engine's semantics:
   objects made from an allocation site's shape in one short function, and
   freed (with the plain objects only they referenced) in a loop rather than
   through the collector's queue, without a look at each property's kind
-  when the shape never had an accessor, and the allocator's counts updated
+  when the shape never had an accessor (nor does the cycle collector), and
+  the allocator's counts updated
   once per loop; arrays freed the same way with their
   plain elements; an empty size-class cache refilled 32 blocks at a time,
   in address order; strings allocated from the cache inline, in a path
@@ -253,7 +254,10 @@ The differential tests run every case with both.
     pointers (`getelementptr`), and the tables filled before any native code
     runs (atoms, strings, shapes) are invariant loads, hoisted out of loops
     and across calls;
-  - slow and exception paths become branch weights (laid out of line);
+  - slow and exception paths become branch weights (laid out of line), and
+    the register allocator charges for a function's first callee-saved
+    register, so values live across the calls of slow paths are spilled
+    there rather than held in registers every call saves and restores;
   - libm and the runtime's numeric helpers are declared pure, so their
     results are reused and hoisted;
   - and the usual pipeline applies: GVN, LICM, induction variable
@@ -432,9 +436,10 @@ The differential tests run every case with both.
   results of `map` and `filter` are appended to inline.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
   engine sort calling the compiled comparator directly: a merge sort per
-  comparator signature with the call inlined, and a copy of the
-  comparator that borrows the elements the sort holds (no reference
-  taken or released per comparison).
+  comparator signature (and per borrowing) with the call inlined and its
+  state in registers, and a copy of the comparator that borrows the
+  elements the sort holds (no reference taken or released per
+  comparison).
 - **Leaf functions** that can neither throw nor call (only unboxed numbers
   and booleans) skip the stack check, and their callers the exception
   check after the call.
