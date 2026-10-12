@@ -4179,8 +4179,18 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 (p, _) if let Some(y) = fit(p, &x) => y,
                 // A JS value for an `aot type` parameter: checked at the call.
                 (Ty::Struct(l), Ty::Any | Ty::StructOrUndef(_)) if callee.is_some() => {
-                    checks.push((k, l));
+                    checks.push((k, ir::ArgCheck::Struct(l)));
                     any(x)
+                }
+                // A JS value for a `number` or `boolean` parameter: checked
+                // at the call, as the function's entry would.
+                (Ty::F64 | Ty::MaybeF64, Ty::Any) if callee.is_some() => {
+                    checks.push((k, ir::ArgCheck::Number));
+                    x
+                }
+                (Ty::Bool, Ty::Any) if callee.is_some() => {
+                    checks.push((k, ir::ArgCheck::Bool));
+                    x
                 }
                 // An unproven argument for an unboxed parameter: the caller
                 // checks the arguments again.

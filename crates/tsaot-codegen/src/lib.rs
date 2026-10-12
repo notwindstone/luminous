@@ -92,6 +92,9 @@ pub mod layout {
     pub const FDATA_DATA: i32 = 32;
     pub const CLASS_C_FUNCTION_DATA: i64 = 15;
     pub const OBJ_OPAQUE: i32 = 48;
+    pub const CLASS_C_FUNCTION: i64 = 12;
+    pub const STRING_KIND: i32 = 4;
+    pub const STRING_DATA: i32 = 24;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -113,6 +116,9 @@ pub mod layout {
         ("FDATA_DATA", FDATA_DATA as i64),
         ("CLASS_C_FUNCTION_DATA", CLASS_C_FUNCTION_DATA),
         ("OBJ_OPAQUE", OBJ_OPAQUE as i64),
+        ("CLASS_C_FUNCTION", CLASS_C_FUNCTION),
+        ("STRING_KIND", STRING_KIND as i64),
+        ("STRING_DATA", STRING_DATA as i64),
     ];
 }
 
@@ -271,6 +277,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
+        ("JS_CallBuiltin", &[P, W, W, W, W, Int, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
         ("tsaot_new_array", &[P, Int, P], &[W, W]),
@@ -317,6 +324,7 @@ struct Codegen {
     value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     /// The atoms `Promise` and `resolve`, if used.
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
+    methods: std::rc::Rc<HashMap<ir::AtomId, lower::Method>>,
     /// Return types, by `FuncId`.
     rets: std::rc::Rc<Vec<Ty>>,
     /// `aot type` layouts.
@@ -400,6 +408,9 @@ impl Codegen {
                 .iter()
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
+            methods: std::rc::Rc::new(
+                m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
+            ),
             module,
             funcs,
             fast_funcs,
@@ -433,6 +444,7 @@ impl Codegen {
             params: self.params.clone(),
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
+            methods: self.methods.clone(),
             fast: self.fast_funcs.clone(),
             rets: self.rets.clone(),
             layouts: self.layouts.clone(),

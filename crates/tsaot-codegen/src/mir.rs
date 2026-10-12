@@ -801,6 +801,10 @@ impl Ins<'_> {
         let c = self.imm(a, imm.into());
         self.binary(BinOp::Band, a, c)
     }
+    pub fn bor_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
+        let c = self.imm(a, imm.into());
+        self.binary(BinOp::Bor, a, c)
+    }
     pub fn bxor_imm_u(mut self, a: Value, imm: impl Into<i64>) -> Value {
         let c = self.imm(a, imm.into());
         self.binary(BinOp::Bxor, a, c)

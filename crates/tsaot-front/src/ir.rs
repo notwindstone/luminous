@@ -538,14 +538,14 @@ pub enum ExprKind {
     /// evaluates to the value.
     StructSet(u32, Box<Expr>, u32, Box<Expr>),
     /// A direct call of native function `func` whose arguments at `checks`
-    /// must be objects of these `aot type` layouts: checked here, then the
-    /// native function is called directly; else a call of `callee` (its
-    /// function object) with the same arguments. `Any`.
+    /// (JS values) must be as these say: checked here, then the native
+    /// function is called directly; else a call of `callee` (its function
+    /// object) with the same arguments. `Any`.
     CallChecked {
         func: FuncId,
         callee: Box<Expr>,
         args: Vec<Expr>,
-        checks: Vec<(usize, u32)>,
+        checks: Vec<(usize, ArgCheck)>,
     },
     /// An array of objects of layout `k` with the elements of an array
     /// (a literal or `new Array(n)`, see `structs::array_sites`).
@@ -696,6 +696,17 @@ pub enum CmpOp {
     Ge,
     Eq,
     Ne,
+}
+
+/// What `ExprKind::CallChecked` requires of an argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgCheck {
+    /// An object of this `aot type` layout.
+    Struct(u32),
+    /// A number (for an unboxed `number` parameter).
+    Number,
+    /// A boolean.
+    Bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

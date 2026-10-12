@@ -336,7 +336,7 @@ static int tsaot_structs_init(JSContext *ctx);
 static void tsaot_structs_free(JSRuntime *rt);
 static int tsaot_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
-static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL;
+static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL, tsaot_atom_string_length = JS_ATOM_NULL;
 /* `length`, for arrays of `aot type` objects. */
 static JSAtom tsaot_atom_length = JS_ATOM_NULL;
 
@@ -379,7 +379,8 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeAtomRT(rt, tsaot_atoms[i]);
     JS_FreeAtomRT(rt, tsaot_atom_iterator);
     JS_FreeAtomRT(rt, tsaot_atom_next);
-    tsaot_atom_iterator = tsaot_atom_next = JS_ATOM_NULL;
+    JS_FreeAtomRT(rt, tsaot_atom_string_length);
+    tsaot_atom_iterator = tsaot_atom_next = tsaot_atom_string_length = JS_ATOM_NULL;
     for (i = 0; i < TSAOT_PINS; i++) {
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
@@ -567,13 +568,25 @@ int tsaot_lock_builtins(JSContext *ctx)
         "    fresh.push(new C(0));\n"
         "  }\n"
         "  var arrayIteratorProto = Object.getPrototypeOf([][Symbol.iterator]());\n"
+        "  var protos = [g.Object.prototype, g.Array.prototype, g.String.prototype, g.Number.prototype,\n"
+        "    g.Boolean.prototype, g.Function.prototype, g.Map.prototype, g.Set.prototype,\n"
+        "    g.WeakMap.prototype, g.WeakSet.prototype, g.Promise.prototype, g.RegExp.prototype,\n"
+        "    g.Date.prototype, g.Symbol.prototype, g.Error.prototype, arrayIteratorProto,\n"
+        "    Object.getPrototypeOf(arrayIteratorProto), Object.getPrototypeOf(new g.Map().entries()),\n"
+        "    Object.getPrototypeOf(new g.Set().values()), Object.getPrototypeOf(''[Symbol.iterator]())];\n"
+        "  for (var i = 0; i < protos.length; i++) {\n"
+        "    var keys = Reflect.ownKeys(protos[i]);\n"
+        "    for (var j = 0; j < keys.length; j++)\n"
+        "      Object.getOwnPropertyDescriptor(protos[i], keys[j]);\n"
+        "  }\n"
         "  fresh.push([], g.Array.prototype, g.Array.prototype[Symbol.iterator],\n"
         "             arrayIteratorProto, arrayIteratorProto.next, Symbol.iterator,\n"
         "             Object.getPrototypeOf(async function () {}),\n"
         "             Object.getPrototypeOf(function* () {}),\n"
         "             Object.getPrototypeOf(function* () {}).prototype.next,\n"
         "             Object.getPrototypeOf(async function* () {}),\n"
-        "             g.Promise, g.Promise.resolve);\n"
+        "             g.Promise, g.Promise.resolve, g.String.prototype, g.String.prototype.charCodeAt);\n"
+        "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
     JSValue r = JS_Eval(ctx, src, sizeof(src) - 1, "<tsaot>", JS_EVAL_TYPE_GLOBAL);
@@ -586,9 +599,26 @@ int tsaot_lock_builtins(JSContext *ctx)
             return JS_FreeValue(ctx, r), -1;
         if (i <= TSAOT_SHAPE_ARRAY)
             tsaot_shapes[i] = *(void **)((char *)JS_VALUE_GET_PTR(tsaot_pins[i]) + JS_LAYOUT_OBJ_SHAPE);
+        else
+            tsaot_shapes[i] = JS_VALUE_GET_PTR(tsaot_pins[i]);
+    }
+    /* Their members all created (above), the builtin prototypes keep their
+       shapes: their methods can be cached. */
+    {
+        JSValue protos = JS_GetPropertyUint32(ctx, r, TSAOT_PINS);
+        int64_t n = 0;
+        if (JS_GetLength(ctx, protos, &n) < 0)
+            return JS_FreeValue(ctx, protos), JS_FreeValue(ctx, r), -1;
+        for (i = 0; i < n; i++) {
+            JSValue p = JS_GetPropertyUint32(ctx, protos, i);
+            JS_ShareObjectShape(ctx, p);
+            JS_FreeValue(ctx, p);
+        }
+        JS_FreeValue(ctx, protos);
     }
     tsaot_atom_iterator = JS_ValueToAtom(ctx, tsaot_pins[TSAOT_PIN_SYMBOL_ITERATOR]);
     tsaot_atom_next = JS_NewAtom(ctx, "next");
+    tsaot_atom_string_length = JS_NewAtom(ctx, "length");
     JS_FreeValue(ctx, r);
     return 0;
 }
@@ -1287,12 +1317,12 @@ _Static_assert(sizeof(TsaotIC) == 32 && offsetof(TsaotIC, slot) == 8 && offsetof
 
 static bool tsaot_ic_gave_up(TsaotIC *ic)
 {
-    return !ic->shape && ic->slot >= TSAOT_IC_GIVE_UP;
+    return !ic->shape && !ic->proto_shape && ic->slot >= TSAOT_IC_GIVE_UP;
 }
 
 static void tsaot_ic_count_miss(TsaotIC *ic)
 {
-    if (!ic->shape)
+    if (!ic->shape && !ic->proto_shape)
         ic->slot++;
 }
 
@@ -1312,6 +1342,23 @@ JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic
         tsaot_ic_store(ctx, ic, JS_DupObjectShape(obj), NULL, NULL, s->layout | f->offset << 16,
                        TSAOT_IC_STRUCT | fi << 8 | f->storage << 16);
         return tsaot_field_get(ctx, s, f);
+    }
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_STRING) {
+        /* A method of a string: a data property of String.prototype (not
+           one strings have: an index or `length`). */
+        uint32_t idx;
+        void *shape;
+        int slot;
+        v = JS_GetProperty(ctx, obj, prop);
+        if (!JS_IsException(v) && !tsaot_ic_gave_up(ic) && prop != tsaot_atom_string_length &&
+            !JS_AtomToArrayIndex(ctx, &idx, prop)) {
+            slot = JS_CacheOwnProperty(ctx, tsaot_pins[TSAOT_PIN_STRING_PROTO], prop, 0, &shape);
+            if (slot >= 0)
+                tsaot_ic_store(ctx, ic, NULL, shape, NULL, slot, TSAOT_IC_STRING);
+            else
+                tsaot_ic_count_miss(ic);
+        }
+        return v;
     }
     if (tsaot_ic_gave_up(ic)) {
         /* `kind` holds the index of the property last found */

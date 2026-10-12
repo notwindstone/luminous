@@ -71,12 +71,16 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define TSAOT_PIN_ASYNC_GENERATOR_FUNCTION_PROTO 21
 #define TSAOT_PIN_PROMISE 22
 #define TSAOT_PIN_PROMISE_RESOLVE 23
-#define TSAOT_PINS 24
+#define TSAOT_PIN_STRING_PROTO 24
+#define TSAOT_PIN_CHAR_CODE_AT 25
+#define TSAOT_PINS 26
 int tsaot_is_promise_resolve(JSValue promise, JSValue resolve);
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
 int tsaot_array_iter_ok(JSContext *ctx);
 extern JSValue tsaot_pins[];
+/* The shapes of the pristine objects (up to TSAOT_SHAPE_ARRAY), then the
+ * pointers of the other pins. */
 extern void *tsaot_shapes[];
 
 /* Inline caches, one per property access site in native code (defined by
@@ -102,6 +106,9 @@ typedef struct TsaotIC {
  * and the field's offset (high 16 bits), `kind` bits 8-15 the field and
  * bits 16-17 its storage. */
 #define TSAOT_IC_STRUCT 7
+/* A data property of String.prototype read from a string: `shape` is NULL,
+ * `proto_shape` String.prototype's shape. */
+#define TSAOT_IC_STRING 8
 extern TsaotIC tsaot_ics[] __attribute__((weak));
 extern const int32_t tsaot_nics __attribute__((weak));
 /* Per native function: the shape of its closures (referenced) and its name
