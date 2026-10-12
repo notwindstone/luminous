@@ -292,7 +292,19 @@
  typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
-@@ -1736,6 +1770,7 @@
+@@ -1692,8 +1726,9 @@
+         }
+ #endif
+         JS_RunGC(rt);
+-        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+-            (rt->malloc_state.malloc_size >> 1);
++        /* tsaot: the next collection when the heap has doubled (rather
++           than grown by half): fewer scans of large live heaps. */
++        rt->malloc_gc_threshold = rt->malloc_state.malloc_size * 2;
+     }
+ }
+ 
+@@ -1736,6 +1771,7 @@
      for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
          init_list_head(&s->arena_list[i]);
          init_list_head(&s->free_arena_list[i]);
@@ -300,7 +312,7 @@
      }
  }
  
-@@ -1747,9 +1782,8 @@
+@@ -1747,9 +1783,8 @@
  
  static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
  {
@@ -311,7 +323,7 @@
  
      block_size = arena_block_sizes[block_size_idx];
      n_blocks = (JS_ARENA_SIZE - sizeof(JSArena)) / block_size;
-@@ -1760,15 +1794,8 @@
+@@ -1760,15 +1795,8 @@
      ar->block_size_idx = block_size_idx;
      ar->n_blocks = n_blocks;
      ar->n_used_blocks = 0;
@@ -329,7 +341,7 @@
      list_add(&ar->link, &rt->arena_state.arena_list[block_size_idx]);
      list_add(&ar->free_link, &rt->arena_state.free_arena_list[block_size_idx]);
      return ar;
-@@ -1823,10 +1850,19 @@
+@@ -1823,10 +1851,19 @@
                  return NULL;
          } else {
              ar = list_entry(el, JSArena, free_link);
@@ -351,7 +363,7 @@
          b->u.block_idx = block_idx;
          ar->n_used_blocks++;
          if (unlikely(ar->n_used_blocks == ar->n_blocks))
-@@ -1865,9 +1901,17 @@
+@@ -1865,9 +1902,17 @@
                       &rt->arena_state.free_arena_list[block_size_idx]);
          ar->n_used_blocks--;
          if (unlikely(ar->n_used_blocks == 0)) {
@@ -372,7 +384,7 @@
          }
      }
  }
-@@ -1972,6 +2016,7 @@
+@@ -1972,6 +2017,7 @@
          }
          init_list_head(&s->arena_list[i]);
          init_list_head(&s->free_arena_list[i]);
@@ -380,7 +392,7 @@
      }
  }
  
-@@ -5842,6 +5887,27 @@
+@@ -5842,6 +5888,27 @@
  }
  
  /* make space to hold at least 'count' properties */
@@ -408,7 +420,7 @@
  static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                                         JSObject *p, uint32_t count)
  {
-@@ -5857,7 +5923,7 @@
+@@ -5857,7 +5924,7 @@
         in case of memory allocation failure */
      if (p) {
          JSProperty *new_prop;
@@ -417,7 +429,7 @@
          if (unlikely(!new_prop))
              return -1;
          p->prop = new_prop;
-@@ -5985,7 +6051,7 @@
+@@ -5985,7 +6052,7 @@
      js_free(ctx, get_alloc_from_shape(old_sh));
  
      /* reduce the size of the object properties */
@@ -426,7 +438,7 @@
      if (new_prop)
          p->prop = new_prop;
      return 0;
-@@ -6140,7 +6206,7 @@
+@@ -6140,7 +6207,7 @@
      int i;
  
      js_trigger_gc(ctx->rt, sizeof(JSObject) + sizeof(JSProperty) * sh->prop_size);
@@ -435,7 +447,7 @@
      if (unlikely(!p))
          goto fail;
      p->class_id = class_id;
-@@ -6156,7 +6222,10 @@
+@@ -6156,7 +6223,10 @@
      p->first_weak_ref = NULL;
      p->u.opaque = NULL;
      p->shape = sh;
@@ -447,7 +459,7 @@
      if (unlikely(!p->prop)) {
          js_free(ctx, p);
      fail:
-@@ -6560,12 +6629,20 @@
+@@ -6560,12 +6630,20 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
@@ -468,7 +480,7 @@
  static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
  {
      JSCFunctionDataRecord *s = JS_GetOpaque(val, JS_CLASS_C_FUNCTION_DATA);
-@@ -6608,6 +6685,11 @@
+@@ -6608,6 +6686,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -480,7 +492,7 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6735,8 @@
+@@ -6653,6 +6736,8 @@
          return JS_EXCEPTION;
      }
      s->func = func;
@@ -489,7 +501,7 @@
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6756,73 @@
+@@ -6672,6 +6757,73 @@
      return func_obj;
  }
  
@@ -563,7 +575,7 @@
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -7036,6 +7187,8 @@
+@@ -7036,6 +7188,8 @@
      JSObject *p = JS_VALUE_GET_OBJ(val);
      JSForInIterator *it = p->u.for_in_iterator;
      JS_FreeValueRT(rt, it->obj);
@@ -572,7 +584,7 @@
      js_free_rt(rt, it);
  }
  
-@@ -7045,6 +7198,8 @@
+@@ -7045,6 +7199,8 @@
      JSObject *p = JS_VALUE_GET_OBJ(val);
      JSForInIterator *it = p->u.for_in_iterator;
      JS_MarkValue(rt, it->obj, mark_func);
@@ -581,7 +593,7 @@
  }
  
  static void free_object(JSRuntime *rt, JSObject *p)
-@@ -7063,7 +7218,8 @@
+@@ -7063,7 +7219,8 @@
          free_property(rt, &p->prop[i], pr->flags);
          pr++;
      }
@@ -591,7 +603,7 @@
      /* as an optimization we destroy the shape immediately without
         putting it in gc_zero_ref_count_list */
      js_free_shape(rt, sh);
-@@ -10173,8 +10329,7 @@
+@@ -10173,8 +10330,7 @@
              /*  the property array may need to be resized */
              if (new_sh->prop_size != sh->prop_size) {
                  JSProperty *new_prop;
@@ -601,7 +613,7 @@
                  if (!new_prop)
                      return NULL;
                  p->prop = new_prop;
-@@ -10827,6 +10982,20 @@
+@@ -10827,6 +10983,20 @@
  }
  
  /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -622,7 +634,7 @@
  int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                          JSValue prop, JSValue val, int flags)
  {
-@@ -11558,9 +11727,27 @@
+@@ -11558,9 +11728,27 @@
      return ret;
  }
  
@@ -650,7 +662,7 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_uint32(idx),
                                         val, flags);
  }
-@@ -11568,6 +11755,9 @@
+@@ -11568,6 +11756,9 @@
  int JS_DefinePropertyValueInt64(JSContext *ctx, JSValueConst this_obj,
                                  int64_t idx, JSValue val, int flags)
  {
@@ -660,7 +672,7 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_int64(idx),
                                         val, flags);
  }
-@@ -11616,6 +11806,9 @@
+@@ -11616,6 +11807,9 @@
  {
      JSAtom atom;
      int ret;
@@ -670,7 +682,7 @@
      atom = JS_ValueToAtom(ctx, js_int64(idx));
      if (unlikely(atom == JS_ATOM_NULL))
          return -1;
-@@ -15015,11 +15208,29 @@
+@@ -15015,11 +15209,29 @@
      }
  }
  
@@ -701,7 +713,7 @@
      }
      return false;
  }
-@@ -15033,7 +15244,7 @@
+@@ -15033,7 +15245,7 @@
          if (unlikely(p->class_id == JS_CLASS_PROXY))
              return js_proxy_isArray(ctx, val);
          else
@@ -710,7 +722,7 @@
      } else {
          return false;
      }
-@@ -15046,6 +15257,10 @@
+@@ -15046,6 +15258,10 @@
      if (unlikely(!isfinite(b)) && fabs(a) == 1) {
          /* not compatible with IEEE 754 */
          d = NAN;
@@ -721,7 +733,7 @@
      } else {
          JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
          d = pow(a, b);
-@@ -16550,6 +16765,165 @@
+@@ -16550,6 +16766,165 @@
      return atom;
  }
  
@@ -887,7 +899,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -16757,6 +17131,13 @@
+@@ -16757,6 +17132,13 @@
      return JS_EXCEPTION;
  }
  
@@ -901,7 +913,7 @@
  static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
  {
      JSObject *p;
-@@ -16785,6 +17166,8 @@
+@@ -16785,6 +17167,8 @@
      it->is_array = false;
      it->obj = obj;
      it->idx = 0;
@@ -910,7 +922,7 @@
      p = JS_VALUE_GET_OBJ(enum_obj);
      p->u.for_in_iterator = it;
  
-@@ -16906,7 +17289,20 @@
+@@ -16906,7 +17290,20 @@
      it = p->u.for_in_iterator;
  
      for(;;) {
@@ -932,7 +944,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18443,92 @@
+@@ -18047,6 +18444,92 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -1025,7 +1037,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +19030,12 @@
+@@ -18548,9 +19031,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1038,7 +1050,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +19070,12 @@
+@@ -18585,9 +19071,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1051,7 +1063,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +19086,21 @@
+@@ -18598,6 +19087,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -1073,7 +1085,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -20983,18 +21486,18 @@
+@@ -20983,18 +21487,18 @@
      return ret_val;
  }
  
@@ -1096,7 +1108,7 @@
      JS_FreeValue(ctx, func_obj);
      return res;
  }
-@@ -21274,13 +21777,21 @@
+@@ -21274,13 +21778,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -1119,7 +1131,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21818,10 @@
+@@ -21307,7 +21819,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -1131,7 +1143,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21829,56 @@
+@@ -21315,6 +21830,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -1188,7 +1200,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +21890,8 @@
+@@ -21326,6 +21891,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -1197,7 +1209,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +22006,61 @@
+@@ -21440,6 +22007,61 @@
      return JS_EXCEPTION;
  }
  
@@ -1259,7 +1271,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22293,12 @@
+@@ -21672,6 +22294,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -1272,7 +1284,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22315,11 @@
+@@ -21688,8 +22316,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -1286,7 +1298,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22348,11 @@
+@@ -21718,8 +22349,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -1300,7 +1312,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22465,12 @@
+@@ -21832,7 +22466,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -1314,7 +1326,7 @@
      }
  }
  
-@@ -21874,6 +22512,55 @@
+@@ -21874,6 +22513,55 @@
      return res;
  }
  
@@ -1370,7 +1382,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +22597,12 @@
+@@ -21910,6 +22598,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -1383,7 +1395,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +22615,20 @@
+@@ -21922,10 +22616,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -1405,7 +1417,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +22702,12 @@
+@@ -21999,6 +22703,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -1418,7 +1430,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +22804,37 @@
+@@ -22095,6 +22805,37 @@
      return JS_EXCEPTION;
  }
  
@@ -1456,7 +1468,7 @@
  /* JS parser */
  
  enum {
-@@ -43584,6 +44324,18 @@
+@@ -43584,6 +44325,18 @@
      }
      n = 0;
  
@@ -1475,7 +1487,7 @@
      for(k = 0; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43592,6 +44344,12 @@
+@@ -43592,6 +44345,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -1488,7 +1500,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k, &val);
              if (present < 0)
-@@ -43602,7 +44360,11 @@
+@@ -43602,7 +44361,11 @@
              args[0] = val;
              args[1] = index_val;
              args[2] = obj;
@@ -1501,7 +1513,7 @@
              JS_FreeValue(ctx, index_val);
              if (JS_IsException(res))
                  goto exception;
-@@ -43730,6 +44492,17 @@
+@@ -43730,6 +44493,17 @@
              }
          }
      }
@@ -1519,7 +1531,7 @@
      for (; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43739,6 +44512,12 @@
+@@ -43739,6 +44513,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -1532,7 +1544,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k1, &val);
              if (present < 0)
-@@ -43750,7 +44529,11 @@
+@@ -43750,7 +44530,11 @@
              args[1] = val;
              args[2] = index_val;
              args[3] = obj;
@@ -1545,7 +1557,7 @@
              JS_FreeValue(ctx, index_val);
              JS_FreeValue(ctx, val);
              val = JS_UNDEFINED;
-@@ -44171,6 +44954,30 @@
+@@ -44171,6 +44955,30 @@
      return JS_EXCEPTION;
  }
  
@@ -1576,7 +1588,59 @@
  static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int unshift)
  {
-@@ -44978,6 +45785,15 @@
+@@ -44694,8 +45502,29 @@
+     int exception;
+     int has_method;
+     JSValueConst method;
++    /* tsaot: the method's native fast entry, if it has one (see
++       js_sort_fast_entry). */
++    JSCFunctionDataRecord *fast_rec;
+ };
+ 
++/* tsaot: a comparator with a native fast entry is called directly, after
++   one stack check (as js_array_every does). */
++static int js_sort_fast_entry(JSContext *ctx, struct array_sort_context *psc)
++{
++    psc->fast_rec = NULL;
++    if (psc->has_method && js_is_c_function_data(psc->method)) {
++        JSCFunctionDataRecord *s = JS_VALUE_GET_OBJ(psc->method)->u.c_function_data_record;
++        if (s->fast) {
++            if (js_check_stack_overflow(ctx->rt, 0)) {
++                JS_ThrowStackOverflow(ctx);
++                return -1;
++            }
++            psc->fast_rec = s;
++        }
++    }
++    return 0;
++}
++
+ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
+     struct array_sort_context *psc = opaque;
+     JSContext *ctx = psc->ctx;
+@@ -44711,7 +45540,11 @@
+     if (psc->has_method) {
+         argv[0] = ap->val;
+         argv[1] = bp->val;
+-        res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
++        res = JS_UNINITIALIZED;
++        if (psc->fast_rec)
++            res = psc->fast_rec->fast(ctx, JS_UNDEFINED, 2, argv, vc(psc->fast_rec->data));
++        if (JS_IsUninitialized(res))
++            res = JS_Call(ctx, psc->method, JS_UNDEFINED, 2, argv);
+         if (JS_IsException(res))
+             goto exception;
+         if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
+@@ -44795,6 +45628,8 @@
+         array[pos].pos = i;
+         pos++;
+     }
++    if (js_sort_fast_entry(ctx, &asc))
++        goto exception;
+     rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
+     if (asc.exception)
+         goto exception;
+@@ -44978,6 +45813,15 @@
      return JS_EXCEPTION;
  }
  
@@ -1592,7 +1656,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -47273,11 +48089,10 @@
+@@ -47273,11 +48117,10 @@
                  return i;
          }
      } else {
@@ -1608,7 +1672,7 @@
          }
      }
      return -1;
-@@ -47431,7 +48246,11 @@
+@@ -47431,7 +48274,11 @@
          inc = 1;
      }
      ret = -1;
@@ -1621,7 +1685,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -56073,6 +56892,48 @@
+@@ -56073,6 +56920,48 @@
      return result_promise;
  }
  
@@ -1670,7 +1734,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +56942,24 @@
+@@ -56081,14 +56970,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -1700,7 +1764,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +56977,454 @@
+@@ -56106,6 +57005,454 @@
      return result_promise;
  }
  
@@ -2155,7 +2219,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +57798,25 @@
+@@ -56479,6 +57826,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -2181,7 +2245,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +57836,8 @@
+@@ -56498,23 +57864,8 @@
          rd_array[i] = rd;
      }
  
