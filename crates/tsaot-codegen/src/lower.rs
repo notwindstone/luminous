@@ -941,8 +941,9 @@ impl Lower {
             Stmt::Await { value, target } => self.await_stmt(value, *target),
             Stmt::Yield { value, kind, target } => self.yield_stmt(value, *kind, *target),
             Stmt::Block(b) => self.stmts(b),
-            Stmt::If(Expr { kind: ExprKind::SpecGuard { objs, distinct, fields, nums }, .. }, fast, slow) => {
-                self.spec_region(objs, *distinct, fields, nums, fast, slow)
+            Stmt::If(Expr { kind: ExprKind::SpecGuard { objs, distinct, fields, nums, strs, char_code_at }, .. }, fast, slow) => {
+                let guard = SpecGuard { objs, distinct: *distinct, fields, nums, strs, char_code_at: *char_code_at };
+                self.spec_region(&guard, fast, slow)
             }
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
@@ -2503,6 +2504,17 @@ impl Lower {
                 v
             }
             ExprKind::SpecGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::StrLen { s } => {
+                let (p, _) = self.use_local(*s).any();
+                let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
+                let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
+                V::Num(self.b.ins().fcvt_from_sint(F64, len))
+            }
+            ExprKind::StrCharCode { s, idx } => {
+                let d = self.expr(idx).num();
+                let (p, _) = self.use_local(*s).any();
+                V::Num(self.flat_char_code(p, d))
+            }
             ExprKind::SlotLoad { obj, slot } => {
                 let props = self.spec_src[obj];
                 let off = (*slot as usize * SIZE) as i32;
@@ -3996,17 +4008,33 @@ impl Lower {
     /// and storing floats as the interpreter's float arithmetic does, and
     /// for when some are int32s, converting what it reads and storing
     /// int32s where the numbers are.
-    fn spec_region(
-        &mut self,
-        objs: &[(ir::LocalId, usize)],
-        distinct: bool,
-        fields: &[(ir::LocalId, u32)],
-        nums: &[(ir::LocalId, ir::LocalId)],
-        fast: &[Stmt],
-        slow: &[Stmt],
-    ) {
+    fn spec_region(&mut self, g: &SpecGuard, fast: &[Stmt], slow: &[Stmt]) {
+        let SpecGuard { objs, distinct, fields, nums, .. } = *g;
         let slow_b = self.b.create_block();
         let join = self.b.create_block();
+        // Strings: flat ones, read with the builtin `charCodeAt`.
+        for &l in g.strs {
+            let (p, t) = self.use_local(l).any();
+            let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING);
+            let next = self.b.create_block();
+            self.b.ins().brif(is_str, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+            let word = self.b.ins().uload32(M_CONST, p, layout::STRING_KIND);
+            let kind = self.b.ins().ushr_imm_u(word, 28);
+            let kind = self.b.ins().band_imm_u(kind, 3);
+            let flat = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+            let next = self.b.create_block();
+            self.b.ins().brif(flat, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
+        if g.char_code_at {
+            let ctx = self.ctx;
+            let ok = self.helper("tsaot_char_code_at_ok", &[ctx])[0];
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs = Vec::new();
         for &(o, r) in objs {
@@ -4098,6 +4126,44 @@ impl Lower {
             self.b.ins().jump(join, &[]);
         }
         self.b.switch_to_block(join);
+    }
+
+    /// `charCodeAt` of flat string `p` at position `d` (a number): the code
+    /// unit, or NaN outside the string.
+    fn flat_char_code(&mut self, p: Value, d: Value) -> Value {
+        // ToIntegerOrInfinity (NaN: 0), saturating: outside when negative.
+        let idx = match self.int_of.get(&d) {
+            Some(&i) => i,
+            None => self.b.ins().fcvt_to_sint_sat(I64, d),
+        };
+        // (A string's length and kind never change: invariant loads.)
+        let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
+        let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+        let load = self.b.create_block();
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, F64);
+        let nan = self.b.ins().f64const(f64::NAN);
+        self.b.ins().brif(inside, load, &[], join, &[BlockArg::Value(nan)]);
+        self.b.switch_to_block(load);
+        // A 16-bit load at the character: an 8-bit string ends with a NUL,
+        // so it stays inside; masked to 8 bits for those.
+        let wide = self.b.ins().ushr_imm_u(head, 31);
+        let off = self.b.ins().ishl(idx, wide);
+        let base = self.b.ins().iadd_imm_s(p, layout::STRING_DATA as i64);
+        let at = self.b.ins().iadd(base, off);
+        let c = self.b.ins().uload16(I32, M_CONST, at, 0);
+        let shift = self.b.ins().ishl_imm_u(wide, 3);
+        let shift = self.b.ins().ireduce(I32, shift);
+        let m8 = self.b.ins().iconst(I32, 0xff);
+        let mask = self.b.ins().ishl(m8, shift);
+        let mask = self.b.ins().bor_imm_u(mask, 0xff);
+        let c = self.b.ins().band(c, mask);
+        let c = self.b.ins().uextend(I64, c);
+        let cd = self.int_f64(c);
+        self.b.ins().jump(join, &[BlockArg::Value(cd)]);
+        self.b.switch_to_block(join);
+        r
     }
 
     /// The double of a JS value known to be an int32 or a float.
@@ -7316,4 +7382,14 @@ pub(crate) struct Pred {
     func: usize,
     body: Vec<Stmt>,
     locals: Vec<ir::LocalId>,
+}
+
+/// The parts of a speculative region's guard (`ExprKind::SpecGuard`).
+struct SpecGuard<'a> {
+    objs: &'a [(ir::LocalId, usize)],
+    distinct: bool,
+    fields: &'a [(ir::LocalId, u32)],
+    nums: &'a [(ir::LocalId, ir::LocalId)],
+    strs: &'a [ir::LocalId],
+    char_code_at: bool,
 }

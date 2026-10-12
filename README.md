@@ -371,8 +371,13 @@ The differential tests run every case with both.
   results are). Nothing in the run can call, throw or allocate, so what the
   guard checked holds throughout. When it fails (a string, a BigInt, the
   same object twice, a getter), the statements run as before. Runs may
-  contain `if`, `?:`, `&&`, `||`, comparisons and `return`; one that
-  stores no field needs enough arithmetic to be worth its guard.
+  contain `if`, `?:`, `&&`, `||`, comparisons, `return`, loops (with
+  `break` and `continue`), calls of leaf functions on numbers, and
+  `s.charCodeAt(i)` / `s.length` of strings in locals: the guard then also
+  checks that those are flat strings and that `charCodeAt` is the builtin,
+  so a scanning loop such as `while (i < n && isDigit(s.charCodeAt(i)))
+  i++` runs as integer code. A run that stores no field needs enough
+  arithmetic (or a loop) to be worth its guard.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline and
   `arr.push(x)` takes the engine's fast path while they are the original

@@ -338,7 +338,8 @@ static int tsaot_structs_init(JSContext *ctx);
 static void tsaot_structs_free(JSRuntime *rt);
 static int tsaot_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
-static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL, tsaot_atom_string_length = JS_ATOM_NULL;
+static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL, tsaot_atom_string_length = JS_ATOM_NULL,
+              tsaot_atom_char_code_at = JS_ATOM_NULL;
 /* `length`, for arrays of `aot type` objects. */
 static JSAtom tsaot_atom_length = JS_ATOM_NULL;
 
@@ -388,7 +389,8 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     JS_FreeAtomRT(rt, tsaot_atom_iterator);
     JS_FreeAtomRT(rt, tsaot_atom_next);
     JS_FreeAtomRT(rt, tsaot_atom_string_length);
-    tsaot_atom_iterator = tsaot_atom_next = tsaot_atom_string_length = JS_ATOM_NULL;
+    JS_FreeAtomRT(rt, tsaot_atom_char_code_at);
+    tsaot_atom_iterator = tsaot_atom_next = tsaot_atom_string_length = tsaot_atom_char_code_at = JS_ATOM_NULL;
     for (i = 0; i < TSAOT_PINS; i++) {
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
@@ -644,6 +646,7 @@ int tsaot_lock_builtins(JSContext *ctx)
     tsaot_atom_iterator = JS_ValueToAtom(ctx, tsaot_pins[TSAOT_PIN_SYMBOL_ITERATOR]);
     tsaot_atom_next = JS_NewAtom(ctx, "next");
     tsaot_atom_string_length = JS_NewAtom(ctx, "length");
+    tsaot_atom_char_code_at = JS_NewAtom(ctx, "charCodeAt");
     JS_FreeValue(ctx, r);
     return 0;
 }
@@ -730,6 +733,14 @@ void tsaot_record_learn(JSContext *ctx, JSValue obj, int r)
         tsaot_record_shapes[r] = shape;
     else if (shape)
         JS_FreeCachedShape(rt, shape);
+}
+
+/* Whether String.prototype.charCodeAt is still the builtin, as an own
+ * data property: speculative regions read characters directly then. */
+int tsaot_char_code_at_ok(JSContext *ctx)
+{
+    return JS_OwnDataIs(ctx, tsaot_pins[TSAOT_PIN_STRING_PROTO], tsaot_atom_char_code_at,
+                        tsaot_pins[TSAOT_PIN_CHAR_CODE_AT]);
 }
 
 /* A cache miss reading own data property obj.prop (obj borrowed), where

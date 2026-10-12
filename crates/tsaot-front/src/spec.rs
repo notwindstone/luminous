@@ -2,12 +2,15 @@
 //! hold: a run of statements that only computes numbers from the number
 //! fields of objects of record types (`ShapeGet` / `ShapeSet` of fields
 //! annotated `number`), number locals, JS-valued locals and constants (with
-//! comparisons, `if`, `?:`, `&&`, `||` and `return` among them) gets a copy
+//! comparisons, `if`, `?:`, `&&`, `||`, `return`, loops, the characters and
+//! lengths of strings, and calls of leaf functions on numbers among them)
+//! gets a copy
 //! where those fields are read as numbers (`SlotLoad`) and kept in `F64`
 //! locals once written, as JS-valued locals are. A guard before it
 //! (`SpecGuard`) checks the objects' shapes, that they are distinct objects
-//! if fields are written, and that the fields and the JS-valued locals it
-//! reads hold numbers; the copy then runs as plain float code and stores the
+//! if fields are written, that the fields and the JS-valued locals it reads
+//! hold numbers, and that the strings it reads are flat strings (with
+//! `charCodeAt` the builtin); the copy then runs as plain float code and stores the
 //! fields and locals it changed where it ends or returns (`SlotStore`).
 //! When the guard fails, the statements run as they are. Nothing in the
 //! copy can run code, throw or allocate, so what the guard checked holds
@@ -29,6 +32,10 @@ const MIN_PURE_WORK: usize = 6;
 pub fn speculate_numbers(m: &mut Module) {
     let nums: Vec<Vec<bool>> = m.records.iter().map(|r| r.nums.clone()).collect();
     let rets: Vec<Ty> = m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect();
+    // Native functions a region may call: they can neither throw nor call.
+    let leaves: Vec<Option<(Vec<Ty>, Ty)>> =
+        m.funcs.iter().map(|f| nothrow_leaf(f).then(|| (f.params.clone(), f.ret))).collect();
+    let atoms = std::mem::take(&mut m.atoms);
     for f in m.funcs.iter_mut().chain(m.closures.iter_mut()) {
         if f.is_async || f.is_generator {
             continue;
@@ -36,7 +43,7 @@ pub fn speculate_numbers(m: &mut Module) {
         let refs = mentions(&f.body, f.locals.len());
         let mut body = std::mem::take(&mut f.body);
         let ret = f.ret;
-        let mut cx = Cx { f, nums: &nums, refs };
+        let mut cx = Cx { f, nums: &nums, refs, atoms: &atoms, leaves: &leaves, next_loop: FIRST_COPY_LOOP };
         cx.list(&mut body, Some(ret));
         // The statement lists inside expressions (inlined bodies, whose
         // `return`s give the expression's value).
@@ -47,7 +54,11 @@ pub fn speculate_numbers(m: &mut Module) {
         });
         cx.f.body = body;
     }
+    m.atoms = atoms;
 }
+
+/// The ids of the loops in regions' copies: above any the front end makes.
+const FIRST_COPY_LOOP: LoopId = 1 << 40;
 
 /// How many times each local is named in `stmts`.
 fn mentions(stmts: &[Stmt], n: usize) -> Vec<usize> {
@@ -122,6 +133,11 @@ fn stmt_mentions(stmts: &[Stmt], add: &mut impl FnMut(LocalId)) {
 struct Cx<'a> {
     f: &'a mut Func,
     nums: &'a [Vec<bool>],
+    atoms: &'a [String],
+    /// Per module function: its parameter and return types if it is a
+    /// leaf (see `nothrow_leaf`).
+    leaves: &'a [Option<(Vec<Ty>, Ty)>],
+    next_loop: LoopId,
     /// How many times each local is named in the function (before any
     /// region is made).
     refs: Vec<usize>,
@@ -146,7 +162,12 @@ struct Region {
     assigned: Vec<LocalId>,
     /// The JS-valued locals surely assigned here.
     defined: HashSet<LocalId>,
-    /// Whether every path so far has returned.
+    /// Locals that must hold flat strings, and whether `charCodeAt` is used.
+    strs: Vec<LocalId>,
+    char_code_at: bool,
+    /// The loops in it, and their ids in the copy.
+    loops: HashMap<LoopId, LoopId>,
+    /// Whether every path so far has left (returned, or jumped).
     returned: bool,
     accesses: usize,
     work: usize,
@@ -223,7 +244,10 @@ impl Cx<'_> {
             return;
         }
         let stores = r.fields.iter().any(|f| f.2.is_some());
-        if r.accesses < MIN_ACCESSES || r.accesses + r.work < MIN_WORK || (!stores && r.work < MIN_PURE_WORK) {
+        let looped = !r.loops.is_empty() && r.accesses > 0;
+        if !looped
+            && (r.accesses < MIN_ACCESSES || r.accesses + r.work < MIN_WORK || (!stores && r.work < MIN_PURE_WORK))
+        {
             self.truncate_locals(base);
             list.extend(run);
             return;
@@ -231,6 +255,17 @@ impl Cx<'_> {
         if !r.returned {
             fast.extend(r.leave(self, &run));
         }
+        // A field the region writes is read from its local everywhere (in a
+        // loop, a read before the write sees the previous iteration's).
+        let locals: HashMap<(LocalId, u32), LocalId> =
+            r.fields.iter().filter_map(|&(o, s, c)| Some(((o, s), c?.0))).collect();
+        visit_stmts_mut(&mut fast, &mut |e| {
+            if let ExprKind::SlotLoad { obj, slot } = e.kind
+                && let Some(&c) = locals.get(&(obj, slot))
+            {
+                e.kind = ExprKind::Local(c);
+            }
+        });
         // The fields written start as they are (a write may be skipped).
         let mut init: Vec<Stmt> = r
             .fields
@@ -248,6 +283,8 @@ impl Cx<'_> {
             objs: r.objs,
             fields: r.fields.iter().map(|&(o, s, _)| (o, s)).collect(),
             nums: r.nums,
+            strs: r.strs,
+            char_code_at: r.char_code_at,
         };
         list.push(Stmt::If(Expr::new(Ty::Bool, guard), init, run));
     }
@@ -328,7 +365,7 @@ impl Region {
     /// The copy of a statement, if it can be in a region.
     fn stmt(&mut self, s: &Stmt, cx: &mut Cx) -> Option<Stmt> {
         match s {
-            Stmt::Expr(e) => Some(Stmt::Expr(if e.ty == Ty::Bool { self.cond(e, cx)? } else { self.num(e, cx)? })),
+            Stmt::Expr(e) => Some(Stmt::Expr(self.effect(e, cx)?)),
             Stmt::Block(b) => Some(Stmt::Block(self.stmts(b, cx)?)),
             Stmt::If(c, a, b) => {
                 let c = self.cond(c, cx)?;
@@ -347,6 +384,41 @@ impl Region {
                     (false, false) => self.defined.retain(|l| after_a.0.contains(l)),
                 }
                 Some(Stmt::If(c, a, b))
+            }
+            Stmt::Loop { id, test, post_test, body, update, per_iteration } if per_iteration.is_empty() => {
+                let fresh = cx.next_loop;
+                cx.next_loop += 1;
+                self.loops.insert(*id, fresh);
+                // (What the loop assigns is not sure after it.)
+                let defined = self.defined.clone();
+                let test = match test {
+                    Some(t) => Some(self.cond(t, cx)?),
+                    None => None,
+                };
+                let body = self.stmts(body, cx)?;
+                self.returned = false;
+                let update = match update {
+                    Some(u) => Some(self.effect(u, cx)?),
+                    None => None,
+                };
+                self.defined = defined;
+                Some(Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() })
+            }
+            Stmt::Break(id) | Stmt::Continue(id) => {
+                let out = match self.loops.get(id) {
+                    Some(&f) => match s {
+                        Stmt::Break(_) => Stmt::Break(f),
+                        _ => Stmt::Continue(f),
+                    },
+                    // Leaving the region.
+                    None => {
+                        let mut out = self.leave(cx, std::slice::from_ref(s));
+                        out.push(s.clone());
+                        Stmt::Block(out)
+                    }
+                };
+                self.returned = true;
+                Some(out)
             }
             Stmt::Return(e) => {
                 let ret = self.ret?;
@@ -370,8 +442,78 @@ impl Region {
         }
     }
 
+    /// The copies of statements (those after a jump, unreachable, left out).
     fn stmts(&mut self, list: &[Stmt], cx: &mut Cx) -> Option<Vec<Stmt>> {
-        list.iter().map(|s| if self.returned { Some(s.clone()) } else { self.stmt(s, cx) }).collect()
+        let mut out = Vec::new();
+        for s in list {
+            if self.returned {
+                break;
+            }
+            out.push(self.stmt(s, cx)?);
+        }
+        Some(out)
+    }
+
+    /// The copy of an expression evaluated for its effects.
+    fn effect(&mut self, e: &Expr, cx: &mut Cx) -> Option<Expr> {
+        if e.ty == Ty::Bool { self.cond(e, cx) } else { self.num(e, cx) }
+    }
+
+    /// The copy of a call of a leaf function, if its arguments have copies
+    /// of its parameters' types.
+    fn leaf_call(&mut self, e: &Expr, cx: &mut Cx) -> Option<Expr> {
+        let (ExprKind::Call(g, args) | ExprKind::CallChecked { func: g, args, .. }) = &e.kind else { return None };
+        let (params, ret) = cx.leaves.get(*g)?.clone()?;
+        if args.len() != params.len() || !matches!(ret, Ty::F64 | Ty::Bool) {
+            return None;
+        }
+        let mut copies = Vec::new();
+        for (a, t) in args.iter().zip(&params) {
+            let c = match t {
+                Ty::F64 => self.num(a, cx).filter(|c| c.ty == Ty::F64)?,
+                Ty::Bool => self.cond(a, cx)?,
+                _ => return None,
+            };
+            copies.push(c);
+        }
+        self.work += 1;
+        Some(Expr::new(ret, ExprKind::Call(*g, copies)))
+    }
+
+    /// The `Bool` copy of the truthiness of a value made only of numbers
+    /// and booleans.
+    fn truth(&mut self, x: &Expr, cx: &mut Cx) -> Option<Expr> {
+        use ExprKind::*;
+        if x.ty == Ty::Bool {
+            return self.cond(x, cx);
+        }
+        match &x.kind {
+            Box(b) if b.ty == Ty::Bool => self.cond(b, cx),
+            // The value of `a && b` or `a || b` is one of them.
+            Logical(op @ (LogicalOp::And | LogicalOp::Or), a, b) => {
+                let a = self.truth(a, cx)?;
+                let b = self.maybe(|r| r.truth(b, cx))?;
+                Some(bool(Logical(*op, bx(a), bx(b))))
+            }
+            Call(..) | CallChecked { .. } => {
+                let c = self.leaf_call(x, cx)?;
+                Some(if c.ty == Ty::Bool { c } else { bool(Truthy(bx(c))) })
+            }
+            _ => Some(bool(Truthy(bx(self.num(x, cx)?)))),
+        }
+    }
+
+    /// The local holding a string read in the region, if it can be guarded.
+    fn string(&mut self, s: &Expr, cx: &Cx) -> Option<LocalId> {
+        let ExprKind::Local(l) = s.kind else { return None };
+        let ok = cx.f.locals[l] == Ty::Any
+            && !cx.f.boxed[l]
+            && !self.copies.contains_key(&l)
+            && !self.objs.iter().any(|&(o, _)| o == l);
+        if ok && !self.strs.contains(&l) {
+            self.strs.push(l);
+        }
+        ok.then_some(l)
     }
 
     /// The `F64` copy of a JS-valued local, created as assigned or (if
@@ -395,6 +537,7 @@ impl Region {
         let ok = cx.f.locals[o] == Ty::Any
             && !cx.f.boxed[o]
             && !self.copies.contains_key(&o)
+            && !self.strs.contains(&o)
             && self.objs.iter().all(|&(p, r)| p != o || r == record);
         if ok && !self.objs.iter().any(|&(p, _)| p == o) {
             self.objs.push((o, record));
@@ -451,8 +594,8 @@ impl Region {
                 self.work += 1;
                 bool(Compare(op, bx(a), bx(b)))
             }
-            Truthy(x) if x.ty == Ty::Bool => self.cond(x, cx)?,
-            Truthy(x) => bool(Truthy(bx(self.num(x, cx)?))),
+            Truthy(x) => self.truth(x, cx)?,
+            Call(..) => self.leaf_call(e, cx)?,
             Unary(UnOp::Not, x) => bool(Unary(UnOp::Not, bx(self.cond(x, cx)?))),
             Logical(op @ (LogicalOp::And | LogicalOp::Or), a, b) => {
                 let a = self.cond(a, cx)?;
@@ -481,7 +624,9 @@ impl Region {
             Num(_) => e.clone(),
             Local(l) if !cx.f.boxed[*l] => match cx.f.locals[*l] {
                 Ty::F64 | Ty::I32 => e.clone(),
-                Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) => f64(Local(self.copy(*l, true, cx))),
+                Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) && !self.strs.contains(l) => {
+                    f64(Local(self.copy(*l, true, cx)))
+                }
                 _ => return None,
             },
             Update { local, .. } if cx.f.locals[*local] == Ty::F64 && !cx.f.boxed[*local] => e.clone(),
@@ -529,6 +674,21 @@ impl Region {
                 let b = self.maybe(|r| r.num(b, cx))?;
                 f64(Cond(bx(c), bx(a), bx(b)))
             }
+            Call(..) | CallChecked { .. } => self.leaf_call(e, cx).filter(|c| c.ty == Ty::F64)?,
+            CallMethod(s, Key::Atom(a), args) if cx.atoms[*a] == "charCodeAt" && args.len() <= 1 => {
+                let idx = match args.first() {
+                    Some(x) => self.num(x, cx)?,
+                    None => Expr::num(0.0),
+                };
+                let s = self.string(s, cx)?;
+                self.char_code_at = true;
+                self.accesses += 1;
+                f64(StrCharCode { s, idx: bx(idx) })
+            }
+            Length(s, _) if matches!(s.kind, Local(l) if self.strs.contains(&l)) => {
+                let s = self.string(s, cx)?;
+                f64(StrLen { s })
+            }
             ShapeGet { obj, record, slot, .. } if cx.nums[*record][*slot as usize] => {
                 let o = self.obj(obj, *record, cx)?;
                 match self.field(o, *slot, None, cx) {
@@ -550,7 +710,7 @@ impl Region {
                         let v = bx(self.num(x, cx)?);
                         f64(if init { InitLocal(*l, v) } else { SetLocal(*l, v) })
                     }
-                    Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) => {
+                    Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) && !self.strs.contains(l) => {
                         let v = self.num(x, cx)?;
                         let c = self.copy(*l, false, cx);
                         if !self.assigned.contains(l) {

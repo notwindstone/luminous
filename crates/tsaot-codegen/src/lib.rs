@@ -287,6 +287,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_SortNative", &[P, W, W, P, Int, P], &[Int]),
         ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
         ("tsaot_record_learn", &[P, W, W, Int], &[]),
+        ("tsaot_char_code_at_ok", &[P], &[Int]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
@@ -443,7 +444,7 @@ impl Codegen {
                 .iter()
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
-            nothrow: std::rc::Rc::new(m.funcs.iter().map(nothrow_leaf).collect()),
+            nothrow: std::rc::Rc::new(m.funcs.iter().map(ir::nothrow_leaf).collect()),
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
             ),
@@ -1194,45 +1195,3 @@ fn dup_inline(b: &mut FunctionBuilder, p: Value, t: Value) {
     b.switch_to_block(join);
 }
 
-/// A function that can neither throw nor call: only unboxed numbers and
-/// booleans, arithmetic, comparisons and control flow. Callers skip the
-/// unwinding check after calling it, and it skips the stack check.
-fn nothrow_leaf(f: &ir::Func) -> bool {
-    use ir::{ExprKind as K, Stmt};
-    fn expr_ok(e: &ir::Expr) -> bool {
-        e.ty != Ty::Any
-            && match &e.kind {
-                K::Num(_) | K::Bool(_) | K::Local(_) | K::Update { .. } => true,
-                K::SetLocal(_, x) | K::InitLocal(_, x) | K::Unary(_, x) | K::Truthy(x) => expr_ok(x),
-                K::Binary(_, x, y) | K::Compare(_, x, y) | K::Logical(_, x, y) => expr_ok(x) && expr_ok(y),
-                K::Cond(c, x, y) => expr_ok(c) && expr_ok(x) && expr_ok(y),
-                K::Math(_, xs) | K::Seq(xs) => xs.iter().all(expr_ok),
-                _ => false,
-            }
-    }
-    fn stmts_ok(ss: &[Stmt]) -> bool {
-        ss.iter().all(|s| match s {
-            Stmt::Expr(e) => expr_ok(e),
-            Stmt::If(c, a, b) => expr_ok(c) && stmts_ok(a) && stmts_ok(b),
-            Stmt::Loop { test, body, update, per_iteration, .. } => {
-                per_iteration.is_empty()
-                    && test.as_ref().is_none_or(expr_ok)
-                    && stmts_ok(body)
-                    && update.as_ref().is_none_or(expr_ok)
-            }
-            Stmt::Break(_) | Stmt::Continue(_) => true,
-            Stmt::Return(e) => e.as_ref().is_none_or(expr_ok),
-            Stmt::Block(b) => stmts_ok(b),
-            _ => false,
-        })
-    }
-    !f.is_async
-        && !f.is_generator
-        && !f.is_closure
-        && !f.has_this
-        && f.ret_slot.is_none()
-        && f.boxed.iter().all(|b| !b)
-        && f.locals.iter().all(|t| matches!(t, Ty::F64 | Ty::I32 | Ty::Bool))
-        && matches!(f.ret, Ty::F64 | Ty::I32 | Ty::Bool | Ty::Void)
-        && stmts_ok(&f.body)
-}

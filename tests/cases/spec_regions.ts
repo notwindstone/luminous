@@ -1,4 +1,4 @@
-// @native advance energy count alias negZero swap kick inlined bounce clampAll pick
+// @native advance energy count alias negZero swap kick inlined bounce clampAll pick settle
 // Speculative numeric regions: straight-line arithmetic on number fields
 // of annotated object types runs as float code behind one guard (shapes,
 // number tags, distinct objects); anything else (ints, strings, BigInts,
@@ -147,6 +147,23 @@ function pick(a: P, b: P): number {
   return da < db ? da - db * 0.5 : (a.vx - b.vx) * 3 || a.vy + b.vy;
 }
 
+// A loop inside a region: fields carried from one iteration to the
+// next, a write under a condition, an early return.
+function settle(p: P, steps: number): number {
+  let bounces = 0;
+  for (let k = 0; k < steps; k++) {
+    if (p.y <= 0) {
+      p.y = 0;
+      p.vy = -p.vy * 0.5;
+      bounces = bounces + 1;
+      if (p.vy < 0.5) return k * 100 + bounces;
+    }
+    p.vy = p.vy - 9.81 * 0.1;
+    p.y = p.y + p.vy * 0.1;
+  }
+  return -bounces;
+}
+
 const ps = [make(0, 0, 10), make(1, 0, 1), make(0, 2, 1), make(3, 3, 0.5)];
 for (let k = 0; k < 200; k++) advance(ps, 0.01);
 console.log(energy(ps).toFixed(9), ps.map((p) => p.x.toFixed(6) + "," + p.y.toFixed(6)).join(" "));
@@ -209,3 +226,6 @@ bs[2].vx = 0.5;
 console.log(bs.map((p) => bounce(p, 10)).join(" "), JSON.stringify(bs));
 console.log(clampAll([make(0, -5, 1), make(0, 3, 2), make(0, 12.5, 0.5), make(0, 7, 1)], 0, 10));
 console.log(pick(make(1, 2, 1), make(3, 4, 1)), pick(make(3, 4, 1), make(1, 2, 1)), pick(make(2, 2, 4), make(2, 2, 4)), pick(make(1, 1, 1), q));
+const fall = make(0, 10, 1);
+const short = make(0, 3, 1);
+console.log(settle(fall, 1000), JSON.stringify(fall), settle(short, 5), JSON.stringify(short));
