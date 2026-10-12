@@ -1444,12 +1444,27 @@ int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn,
     return r;
 }
 
+static JSValue tsaot_new_object_proto(JSContext *ctx, TsaotIC *ic, JSValue obj, int n, JSAtom *atoms,
+                                      JSValue *values);
+
 /* An object literal { atoms[i]: values[i] } (values taken) at an allocation
  * site that caches the literal's final shape in `ic`: later objects are
  * made with it directly (JS_NewObjectWithCachedShape). */
 JSValue tsaot_new_object(JSContext *ctx, TsaotIC *ic, int n, JSAtom *atoms, JSValue *values)
 {
-    JSValue obj = JS_NewObject(ctx);
+    return tsaot_new_object_proto(ctx, ic, JS_NewObject(ctx), n, atoms, values);
+}
+
+/* An instance of a class with a native constructor: { atoms[i]: values[i] }
+ * (values taken) with prototype proto (borrowed), as tsaot_new_object. */
+JSValue tsaot_new_instance(JSContext *ctx, TsaotIC *ic, JSValue proto, int n, JSAtom *atoms, JSValue *values)
+{
+    return tsaot_new_object_proto(ctx, ic, JS_NewObjectProto(ctx, proto), n, atoms, values);
+}
+
+static JSValue tsaot_new_object_proto(JSContext *ctx, TsaotIC *ic, JSValue obj, int n, JSAtom *atoms,
+                                      JSValue *values)
+{
     void *shape;
     int i;
     for (i = 0; i < n; i++) {

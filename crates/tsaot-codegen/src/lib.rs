@@ -278,6 +278,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
         ("JS_CallBuiltin", &[P, W, W, W, W, Int, P], &[W, W]),
+        ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
         ("tsaot_new_array", &[P, Int, P], &[W, W]),

@@ -132,6 +132,7 @@ JSValue tsaot_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAto
 int tsaot_call_setter(JSContext *ctx, void *setter, JSValue this_obj, JSValue val);
 int tsaot_define_accessor(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue fn, int is_setter);
 JSValue tsaot_new_object(JSContext *ctx, TsaotIC *ic, int n, JSAtom *atoms, JSValue *values);
+JSValue tsaot_new_instance(JSContext *ctx, TsaotIC *ic, JSValue proto, int n, JSAtom *atoms, JSValue *values);
 JSValue tsaot_global_get(JSContext *ctx, JSAtom prop, TsaotIC *ic);
 
 /* Spread, rest and iteration. */

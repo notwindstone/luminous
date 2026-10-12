@@ -34,6 +34,8 @@ pub enum NativeSite {
     /// Module-level statements (byte span), replaced by a call of the native
     /// code.
     Segment { span: (u32, u32) },
+    /// The constructor of class `class`, called by native `new` only.
+    Ctor { class: String },
 }
 
 /// A natively compiled function, for source rewriting and reporting.
@@ -215,6 +217,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
                     accessor: *accessor,
                 },
                 check::Site::Segment { span } => NativeSite::Segment { span: (span.start, span.end) },
+                check::Site::Ctor { class } => NativeSite::Ctor { class: class.clone() },
             },
             line: line(c.node.span().start),
         })
@@ -223,8 +226,18 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     // Functions marked `aot` must have been compiled natively.
     let mut marks = MarkedFunctions { marked: &stripped.marked, found: Vec::new() };
     marks.visit_program(program);
+    let inside = |outer: Span, inner: Span| outer.start <= inner.start && inner.end <= outer.end;
+    // Functions in a constructor or field initializer run interpreted when
+    // the class is constructed by interpreted code, even if native `new`
+    // compiles them.
+    let in_ctor = |span: Span| {
+        out.native.iter().filter_map(|c| c.ctor_class()).any(|class| inside(class, span))
+            && !out.native.iter().any(|c| matches!(c.site, check::Site::Method { .. }) && inside(c.node.span(), span))
+    };
     for m in marks.found {
-        if out.native.iter().any(|c| c.node.span() == m.span) || out.closure_spans.contains(&m.span) {
+        if out.native.iter().any(|c| c.node.span() == m.span)
+            || (out.closure_spans.contains(&m.span) && !in_ctor(m.span))
+        {
             continue;
         }
         // A nested function is compiled together with its enclosing
@@ -254,9 +267,9 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
             None => OxcDiagnostic::error(format!("`{}` cannot be applied to {}", m.keyword, m.what))
                 .with_label(m.span)
                 .with_help(
-                    "it is in code that always stays interpreted (a class constructor or field \
-                     initializer); `aot` applies to module code, top-level functions and class methods, \
-                     and to the functions nested in them",
+                    "it is in a class constructor or field initializer, which stay interpreted when \
+                     interpreted code constructs the class; `aot` applies to module code, top-level \
+                     functions and class methods, and to the functions nested in them",
                 ),
         });
     }

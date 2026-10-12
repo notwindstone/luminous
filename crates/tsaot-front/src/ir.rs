@@ -422,6 +422,13 @@ pub enum ExprKind {
     New(Box<Expr>, Vec<Expr>),
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
+    /// A new instance of top-level class `class` (whose prototype is home
+    /// object `2 * class`) with these own fields, in order (enumerable,
+    /// writable, configurable), as its constructor makes it. `Any`.
+    NewInstance {
+        class: usize,
+        fields: Vec<(AtomId, Expr)>,
+    },
     /// Array literal without holes or spreads.
     Array(Vec<Expr>),
     /// Array literal with holes or spreads.
@@ -996,7 +1003,7 @@ macro_rules! visitor {
                         $name(x, f);
                     }
                 }
-                Object(props) => {
+                Object(props) | NewInstance { fields: props, .. } => {
                     for (_, x) in props {
                         $name(x, f);
                     }

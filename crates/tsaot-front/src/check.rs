@@ -87,6 +87,9 @@ pub enum Site {
     Method { class: String, is_static: bool, key: String, stmt_end: u32, accessor: u8 },
     /// Module-level statements, replaced by a call of the native code.
     Segment { span: Span },
+    /// The constructor of top-level class `class`, which native `new`
+    /// expressions call directly (interpreted code keeps the class's own).
+    Ctor { class: String },
 }
 
 struct Param<'a> {
@@ -121,6 +124,29 @@ pub struct Candidate<'a> {
     /// Segments: the module bindings they declare that other code uses,
     /// which live in cells (the others are locals).
     cells: HashSet<SymbolId>,
+    /// Native constructors: what the instance is made with.
+    ctor: Option<CtorInfo<'a>>,
+}
+
+/// A class constructor compiled natively (see `class_ctor`): it makes the
+/// instance, with the class's fields defined in order to their
+/// initializers' values, then runs the body with `this` the instance.
+#[derive(Clone)]
+pub struct CtorInfo<'a> {
+    /// The class's binding.
+    pub symbol: SymbolId,
+    /// The class (its declaration).
+    pub span: Span,
+    /// Index in `Outcome::classes`.
+    pub class: usize,
+    pub fields: Vec<(String, Option<&'a Expression<'a>>)>,
+}
+
+impl Candidate<'_> {
+    /// Native constructors: the span of their class.
+    pub fn ctor_class(&self) -> Option<Span> {
+        self.ctor.as_ref().map(|c| c.span)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -420,6 +446,7 @@ fn collect_toplevel<'a>(
                 ret,
                 class: None,
                 cells: HashSet::new(),
+                ctor: None,
             }),
             Err(r) => rejected.push((name, node.span(), r)),
         }
@@ -509,6 +536,9 @@ fn collect_toplevel<'a>(
                     bind(id, BindingKind::Class, None, end, exported);
                     if c.decorators.is_empty() && !c.declare {
                         class_methods(c, &id.name, classes.len(), end, &mut methods, &mut method_rejects);
+                        if !written(id.symbol_id.get().unwrap()) {
+                            class_ctor(c, id, classes.len(), interpreted, &mut methods, &mut method_rejects);
+                        }
                     }
                     let info = class_info(c, &id.name, classes);
                     classes.push(info);
@@ -638,10 +668,119 @@ fn class_methods<'a>(
                 ret,
                 class: Some((index, m.r#static)),
                 cells: HashSet::new(),
+                ctor: None,
             }),
             Err(r) => rejected.push((format!("{class}.{name}"), node.span(), r)),
         }
     }
+}
+
+/// The constructor of a top-level base class, as a native function that
+/// makes the instance itself: for classes whose instances are plain
+/// objects with their public fields (no private names, accessors or
+/// computed keys) whose initializers cannot see the instance, and whose
+/// constructor returns nothing but the instance.
+fn class_ctor<'a>(
+    c: &'a Class<'a>,
+    id: &BindingIdentifier<'a>,
+    index: usize,
+    interpreted: &HashSet<u32>,
+    out: &mut Vec<Candidate<'a>>,
+    rejected: &mut Vec<(String, Span, Reject)>,
+) {
+    if c.heritage.is_some() {
+        return;
+    }
+    let mut fields = Vec::new();
+    let mut ctor = None;
+    for el in &c.body.body {
+        match el {
+            ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => ctor = Some(m),
+            ClassElement::MethodDefinition(m) if !m.r#static && matches!(m.key, PropertyKey::PrivateIdentifier(_)) => {
+                return;
+            }
+            ClassElement::PropertyDefinition(p) if p.r#static || p.declare => {}
+            ClassElement::PropertyDefinition(p) if p.r#type == PropertyDefinitionType::TSAbstractPropertyDefinition => {
+            }
+            ClassElement::PropertyDefinition(p) => {
+                let key = match &p.key {
+                    PropertyKey::StaticIdentifier(k) if !p.computed => k.name.to_string(),
+                    _ => return,
+                };
+                if !p.decorators.is_empty() || p.value.as_ref().is_some_and(|v| mentions_this(v)) {
+                    return;
+                }
+                fields.push((key, p.value.as_ref()));
+            }
+            ClassElement::AccessorProperty(a) if !a.r#static => return,
+            _ => {}
+        }
+    }
+    let node = match ctor {
+        Some(m) => {
+            let f = &m.value;
+            if !m.decorators.is_empty() || f.body.is_none() || interpreted.contains(&f.span.start) {
+                return;
+            }
+            let body = f.body.as_ref().unwrap();
+            if body.directives.iter().any(|d| d.directive.as_str() == "use no aot") {
+                return;
+            }
+            // TS parameter properties assign the instance from the
+            // parameters.
+            if f.params.items.iter().any(|p| p.accessibility.is_some() || p.readonly || p.r#override) {
+                return;
+            }
+            FnNode::Function(f)
+        }
+        // The default constructor: no parameters, nothing to run.
+        None => FnNode::Segment(c.span, &[]),
+    };
+    let name = id.name.to_string();
+    match header(node) {
+        Ok((mut params, rest, _)) => {
+            // Called only directly by native code, with JS values.
+            for p in &mut params {
+                p.ty = Ty::Any;
+            }
+            out.push(Candidate {
+                name: name.clone(),
+                node,
+                symbol: None,
+                has_this: false,
+                site: Site::Ctor { class: name },
+                direct_callable: true,
+                params,
+                rest,
+                // (So that recursive constructors need no annotation.)
+                ret: Some(Ty::Any),
+                class: None,
+                cells: HashSet::new(),
+                ctor: Some(CtorInfo { symbol: id.symbol_id.get().unwrap(), span: c.span, class: index, fields }),
+            });
+        }
+        Err(r) => rejected.push((name, node.span(), r)),
+    }
+}
+
+/// Whether `this` appears in `e` outside nested non-arrow functions.
+fn mentions_this(e: &Expression) -> bool {
+    use oxc::ast_visit::Visit;
+    use oxc::syntax::scope::ScopeFlags;
+    struct Finder(bool);
+    impl<'a> Visit<'a> for Finder {
+        fn visit_this_expression(&mut self, _: &ThisExpression) {
+            self.0 = true;
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+        fn visit_class(&mut self, _: &Class<'a>) {
+            // (Its computed keys and field initializers could see it.)
+            self.0 = true;
+        }
+    }
+    let mut f = Finder(false);
+    f.visit_expression(e);
+    f.0
 }
 
 fn literal(e: &Expression) -> Option<ConstVal> {
@@ -792,6 +931,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         let params: Vec<ParamSpec<'a>> = c.params.iter().map(|p| (p.pattern, p.ty, p.default)).collect();
         let rest = c.rest;
         let class = c.class;
+        let ctor = c.ctor.clone();
         let cells = c.cells.clone();
         let caps = Rc::new(capture_info(node, self.scoping, &cells));
         let result = loop {
@@ -800,6 +940,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             fx.rest = rest;
             fx.class = class;
             fx.has_this = has_this;
+            fx.ctor = ctor.clone();
             fx.ret_int = ret_annot == Some(Ty::I32);
             fx.seg_cells = cells.clone();
             let r = fx.function(node, name.clone(), params.clone());
@@ -933,7 +1074,9 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                     (BindingKind::Function | BindingKind::Import, _) => CellInit::Header,
                     (_, Some(c)) => match &c.site {
                         Site::ConstInit { init } => CellInit::Wrap(*init),
-                        Site::Declaration { .. } | Site::Method { .. } | Site::Segment { .. } => CellInit::Header,
+                        Site::Declaration { .. } | Site::Method { .. } | Site::Segment { .. } | Site::Ctor { .. } => {
+                            CellInit::Header
+                        }
                     },
                     (_, None) => match b.init {
                         Some(span) => CellInit::Wrap(span),
@@ -972,6 +1115,10 @@ struct FnCx<'x, 'm, 'a> {
     /// Methods (and the closures in them): their class, and whether the
     /// method is static.
     class: Option<(usize, bool)>,
+    /// Native constructors: the instance to make, then the local holding
+    /// it (`this`).
+    ctor: Option<CtorInfo<'a>>,
+    this_local: Option<ir::LocalId>,
     /// Enclosing `for`-`in` loops: their key variable and iterator.
     for_in_keys: Vec<(SymbolId, ir::LocalId)>,
     /// The last parameter is a rest parameter.
@@ -1181,6 +1328,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             key,
             is_closure,
             has_this: false,
+            ctor: None,
+            this_local: None,
             is_async: false,
             is_generator: false,
             ret_slot: None,
@@ -1232,6 +1381,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         }
         if self.suspends() {
             self.ret_slot = Some(self.temp(Ty::Any));
+        }
+        if let Some(ctor) = self.ctor.take() {
+            // The instance, first: its fields' initializers run before the
+            // parameters' defaults.
+            prologue.extend(self.new_instance(&ctor)?);
         }
         // Closures: locals bound to the captured boxes.
         if self.is_closure {
@@ -1321,6 +1475,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
             },
         };
+        let mut body = body;
+        if let Some(l) = self.this_local
+            && completes_list(&body)
+        {
+            body.push(Stmt::Return(Some(self.local(l))));
+            self.returns.push(Ty::Any);
+        }
         let mut ret = None;
         for &t in &self.returns {
             ret = Some(ret.map_or(t, |r| join(r, t)));
@@ -1768,6 +1929,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     self.returns.push(Ty::Any);
                     return Ok(Some(Stmt::Await { value, target: ir::AwaitTarget::Return }));
                 }
+                if let Some(l) = self.this_local {
+                    // A constructor returns the instance.
+                    if let Some(a) = &r.argument {
+                        return reject(a.span(), "constructors returning a value are not supported");
+                    }
+                    self.returns.push(Ty::Any);
+                    return Ok(Some(Stmt::Return(Some(self.local(l)))));
+                }
                 let mut arg = r.argument.as_ref().map(|a| self.expr(a)).transpose()?;
                 if self.ret_int {
                     arg = Some(self.int_return(arg));
@@ -2118,6 +2287,62 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             out.extend(self.pre.drain(base..));
             out.push(Stmt::Expr(Expr::new(ty, ExprKind::InitLocal(local, Box::new(coerce(init, ty))))));
         }
+        Ok(out)
+    }
+
+    /// `new C(args)` of a class with a native constructor: a direct call
+    /// of it, once the binding `C` is read (it may be in its TDZ).
+    fn native_new(&mut self, n: &'a NewExpression<'a>) -> R<Option<Expr>> {
+        let Expression::Identifier(id) = n.callee.without_parentheses() else { return Ok(None) };
+        // (Spills for `await` would run before the binding is read.)
+        if self.suspends() || has_spread(&n.arguments) {
+            return Ok(None);
+        }
+        let Some(sym) = self.resolve(id) else { return Ok(None) };
+        let Some(i) = self.m.cands.iter().position(|c| c.ctor.as_ref().is_some_and(|k| k.symbol == sym)) else {
+            return Ok(None);
+        };
+        let class = any(self.ident(id)?);
+        Ok(self
+            .direct_call(i, &n.arguments, n.span, None)?
+            .map(|call| seq(vec![Expr::new(Ty::Void, ExprKind::Void(Box::new(class))), call])))
+    }
+
+    /// A native constructor's prologue: its fields' initializers, in order,
+    /// then the instance with their values in `this_local`.
+    fn new_instance(&mut self, ctor: &CtorInfo<'a>) -> R<Vec<Stmt>> {
+        let mut out = Vec::new();
+        let mut fields = Vec::new();
+        for &(ref name, init) in &ctor.fields {
+            let atom = self.m.atom(name);
+            let v = match init {
+                None => undefined(),
+                Some(e) => {
+                    let outer = std::mem::take(&mut self.pre);
+                    self.name_hint = Some(name.clone());
+                    let r = self.expr(e);
+                    self.name_hint = None;
+                    out.extend(std::mem::replace(&mut self.pre, outer));
+                    let v = any(r?);
+                    if matches!(v.kind, ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Null) {
+                        v
+                    } else {
+                        // Evaluated in order, before the instance exists.
+                        let t = self.temp(Ty::Any);
+                        out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(v)))));
+                        self.local(t)
+                    }
+                }
+            };
+            fields.push((atom, v));
+        }
+        if !self.m.homes_used.contains(&ctor.class) {
+            self.m.homes_used.push(ctor.class);
+        }
+        let this = self.temp(Ty::Any);
+        self.this_local = Some(this);
+        let inst = Expr::new(Ty::Any, ExprKind::NewInstance { class: ctor.class, fields });
+        out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(inst)))));
         Ok(out)
     }
 
@@ -2793,6 +3018,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             Expression::NumericLiteral(n) => Expr::num(n.value),
             Expression::ThisExpression(_) if self.has_this => Expr::new(Ty::Any, ExprKind::This),
+            Expression::ThisExpression(_) if let Some(l) = self.this_local => self.local(l),
             Expression::AwaitExpression(aw) => {
                 // Hoisted into a statement that runs before the current one,
                 // with no expression temporaries live across the suspension.
@@ -2958,6 +3184,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let [callee] = earlier;
                 Expr::new(Ty::Any, ExprKind::NewSpread(Box::new(callee), Box::new(arr)))
             }
+            Expression::NewExpression(n) if let Some(x) = self.native_new(n)? => x,
             Expression::NewExpression(n) => {
                 let mut v = vec![any(self.expr(&n.callee)?)];
                 self.push_args(&mut v, &n.arguments)?;
@@ -4747,6 +4974,7 @@ fn segment<'a>(stmts: &'a [Statement<'a>], scoping: &Scoping, uses: &HashMap<Sym
         ret: None,
         class: None,
         cells,
+        ctor: None,
     }
 }
 

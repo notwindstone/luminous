@@ -152,6 +152,8 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
                 prefixes.entry(s as usize).or_default().push(format!("{BIND_FN}({i}, "));
                 suffixes.entry(e as usize).or_default().push(")".into());
             }
+            // Interpreted code keeps the class's own constructor.
+            NativeSite::Ctor { .. } => {}
             NativeSite::Method { class, is_static, key, stmt_end, accessor } => {
                 // Over the interpreted method or accessor, which becomes the
                 // fallback.

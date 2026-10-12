@@ -2673,58 +2673,8 @@ impl Lower {
                 self.free_v(fv);
                 V::Any(r[0], r[1])
             }
-            ExprKind::Object(props) => {
-                // The values first (the object is unobservable until made),
-                // then the object: an allocation site caches the literal's
-                // final shape, and later objects are made with it directly,
-                // as JSC's allocation profiles do.
-                let held: Vec<V> = props
-                    .iter()
-                    .map(|(_, x)| {
-                        let (p, t) = self.expr(x).any();
-                        let v = V::Any(p, t);
-                        self.hold(v);
-                        v
-                    })
-                    .collect();
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
-                // Both paths take the values.
-                for &v in held.iter().rev() {
-                    self.release(v);
-                }
-                let values = self.values_slot(&vals);
-                let ic = self.new_ic();
-                let ctx = self.ctx;
-                let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
-                let fast = self.b.create_block();
-                let slow = self.b.create_block();
-                self.b.set_cold_block(slow);
-                let shape = self.b.ins().load(I64, M_IC, ic, 0);
-                self.b.ins().brif(shape, fast, &[], slow, &[]);
-                self.b.switch_to_block(fast);
-                let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
-                self.b.switch_to_block(slow);
-                let n = props.len();
-                let atoms = self.b.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    (n.max(1) * 4) as u32,
-                    2,
-                ));
-                for (i, (a, _)) in props.iter().enumerate() {
-                    let atom = self.atom(*a);
-                    self.b.ins().stack_store(self.ptr, atom, atoms, (i * 4) as i32);
-                }
-                let atoms = self.b.ins().stack_addr(self.ptr, atoms, 0);
-                let count = self.b.ins().iconst(I32, n as i64);
-                let r = self.helper("tsaot_new_object", &[ctx, ic, count, atoms, values]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
-                self.b.switch_to_block(join);
-                self.check_value(rt);
-                V::Any(rp, rt)
-            }
+            ExprKind::Object(props) => self.new_object(props, None),
+            ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
             ExprKind::Array(elems) => {
                 let held: Vec<V> = elems
                     .iter()
@@ -3344,6 +3294,64 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
         self.b.switch_to_block(join);
         (rp, rt)
+    }
+
+    /// An object literal (`class`: `None`), or an instance of a class with
+    /// a native constructor, with these fields.
+    fn new_object(&mut self, props: &[(ir::AtomId, Expr)], class: Option<usize>) -> V {
+        // The values first (the object is unobservable until made),
+        // then the object: an allocation site caches the literal's
+        // final shape, and later objects are made with it directly,
+        // as JSC's allocation profiles do.
+        let held: Vec<V> = props
+            .iter()
+            .map(|(_, x)| {
+                let (p, t) = self.expr(x).any();
+                let v = V::Any(p, t);
+                self.hold(v);
+                v
+            })
+            .collect();
+        let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+        // Both paths take the values.
+        for &v in held.iter().rev() {
+            self.release(v);
+        }
+        let values = self.values_slot(&vals);
+        let ic = self.new_ic();
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let fast = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let shape = self.b.ins().load(I64, M_IC, ic, 0);
+        self.b.ins().brif(shape, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(slow);
+        let n = props.len();
+        let atoms =
+            self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (n.max(1) * 4) as u32, 2));
+        for (i, (a, _)) in props.iter().enumerate() {
+            let atom = self.atom(*a);
+            self.b.ins().stack_store(self.ptr, atom, atoms, (i * 4) as i32);
+        }
+        let atoms = self.b.ins().stack_addr(self.ptr, atoms, 0);
+        let count = self.b.ins().iconst(I32, n as i64);
+        let r = match class {
+            None => self.helper("tsaot_new_object", &[ctx, ic, count, atoms, values]),
+            Some(k) => {
+                let (pp, pt) = self.table_value(self.env.homes, 2 * k);
+                self.helper("tsaot_new_instance", &[ctx, ic, pp, pt, count, atoms, values])
+            }
+        };
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(join);
+        self.check_value(rt);
+        V::Any(rp, rt)
     }
 
     /// Call `f` (held) with `this` (borrowed) and `args`; frees `f`.
