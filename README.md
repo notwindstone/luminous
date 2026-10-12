@@ -198,7 +198,12 @@ engine's semantics:
   when the shape never had an accessor, and the allocator's counts updated
   once per loop; arrays freed the same way with their
   plain elements; an empty size-class cache refilled 32 blocks at a time,
-  in address order; strings allocated from the cache inline; plain objects
+  in address order; strings allocated from the cache inline, in a path
+  that makes no calls (so it saves no registers); pieces of 8-bit strings
+  up to 32 bytes (`slice`, `substring`, `split`) copied with a few
+  overlapping moves into a block popped from the cache, and the last
+  reference to a plain string, released from native code, pushing its
+  block straight back; plain objects
   that keep their property array in their own allocation until it grows;
   defining the next element of a fast array (`map`, `filter`, `split`,
   `Array.from`, …) appends it, and a growing array makes room for 8
