@@ -325,6 +325,7 @@ pub fn check<'a>(
                 int_wrapping: true,
             };
             ir::capture_values(&mut module);
+            ir::infer_hints(&mut module);
             ir::inline_calls(&mut module);
             ir::predict_calls(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
@@ -575,6 +576,55 @@ pub struct ClassInfo {
     pub privates: Vec<(String, PrivateKind)>,
     /// `extends C` of an earlier top-level class `C`: its index.
     pub superclass: Option<usize>,
+    /// The classes the type annotations of its instance fields name.
+    pub fields: Vec<(String, HintName)>,
+}
+
+/// A class a type annotation names (resolved to an `ir::Hint` once all
+/// top-level classes are known).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HintName {
+    Class(String),
+    ArrayOf(String),
+}
+
+/// The class (or array of a class) annotation `t` names, if it does:
+/// `C`, `C[]`, `Array<C>`, and those or `null` / `undefined`.
+fn hint_name(t: &TSType) -> Option<HintName> {
+    let array = |h: HintName| match h {
+        HintName::Class(c) => Some(HintName::ArrayOf(c)),
+        HintName::ArrayOf(_) => None,
+    };
+    match t {
+        TSType::TSParenthesizedType(p) => hint_name(&p.type_annotation),
+        TSType::TSArrayType(a) => array(hint_name(&a.element_type)?),
+        TSType::TSTypeReference(r) => {
+            let TSTypeName::IdentifierReference(id) = &r.type_name else { return None };
+            match r.type_arguments.as_ref().map(|a| &a.params) {
+                None => Some(HintName::Class(id.name.to_string())),
+                Some(ps) if id.name == "Array" && ps.len() == 1 => array(hint_name(&ps[0])?),
+                Some(_) => None,
+            }
+        }
+        TSType::TSUnionType(u) => {
+            let mut rest =
+                u.types.iter().filter(|t| !matches!(t, TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_)));
+            let one = rest.next()?;
+            if rest.next().is_some() {
+                return None;
+            }
+            hint_name(one)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_hint(h: &HintName, classes: &[ClassInfo]) -> Option<ir::Hint> {
+    let find = |n: &str| classes.iter().rposition(|c| c.name == n);
+    Some(match h {
+        HintName::Class(n) => ir::Hint::Class(find(n)?),
+        HintName::ArrayOf(n) => ir::Hint::ArrayOf(find(n)?),
+    })
 }
 
 /// A class whose private names or home object native code uses: it gets
@@ -614,7 +664,17 @@ fn class_info(c: &Class, name: &str, earlier: &[ClassInfo]) -> ClassInfo {
         Some(Expression::Identifier(id)) => earlier.iter().rposition(|k| k.name == id.name.as_str()),
         _ => None,
     };
-    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates, superclass }
+    let mut fields = Vec::new();
+    for el in &c.body.body {
+        if let ClassElement::PropertyDefinition(p) = el
+            && !p.r#static
+            && let PropertyKey::StaticIdentifier(k) = &p.key
+            && let Some(h) = p.type_annotation.as_ref().and_then(|a| hint_name(&a.type_annotation))
+        {
+            fields.push((k.name.to_string(), h));
+        }
+    }
+    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates, superclass, fields }
 }
 
 /// Ordinary methods (static or not) of a top-level class.
@@ -1119,6 +1179,8 @@ struct FnCx<'x, 'm, 'a> {
     /// it (`this`).
     ctor: Option<CtorInfo<'a>>,
     this_local: Option<ir::LocalId>,
+    /// What the type annotations of parameters and variables say they hold.
+    sym_hints: HashMap<SymbolId, ir::Hint>,
     /// Enclosing `for`-`in` loops: their key variable and iterator.
     for_in_keys: Vec<(SymbolId, ir::LocalId)>,
     /// The last parameter is a rest parameter.
@@ -1330,6 +1392,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             has_this: false,
             ctor: None,
             this_local: None,
+            sym_hints: HashMap::new(),
             is_async: false,
             is_generator: false,
             ret_slot: None,
@@ -1358,6 +1421,18 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     fn function(&mut self, node: FnNode<'a>, name: String, params: Vec<ParamSpec<'a>>) -> R<ir::Func> {
+        self.collect_hints(node);
+        let annotated = match node {
+            FnNode::Function(f) => f.return_type.as_ref(),
+            FnNode::Arrow(a) => a.return_type.as_ref(),
+            FnNode::Segment(..) => None,
+        };
+        let ret_hint = match &self.ctor {
+            Some(c) => Some(ir::Hint::Class(c.class)),
+            None => {
+                annotated.and_then(|a| hint_name(&a.type_annotation)).and_then(|h| resolve_hint(&h, self.m.classes))
+            }
+        };
         self.is_async = node.is_async();
         self.is_generator = matches!(node, FnNode::Function(f) if f.generator);
         let mut abi = Vec::new();
@@ -1519,6 +1594,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             rest: self.rest,
             ret_slot: self.ret_slot,
             class: if self.has_this && !self.is_closure { self.class } else { None },
+            hints: self.sym_local.iter().filter_map(|(sym, &l)| Some((l, *self.sym_hints.get(sym)?))).collect(),
+            ret_hint,
             body: prologue,
         };
         ir::scalar_replace(&mut func);
@@ -2306,6 +2383,40 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         Ok(self
             .direct_call(i, &n.arguments, n.span, None)?
             .map(|call| seq(vec![Expr::new(Ty::Void, ExprKind::Void(Box::new(class))), call])))
+    }
+
+    /// The classes the type annotations of `node`'s parameters and
+    /// variables name (`sym_hints`).
+    fn collect_hints(&mut self, node: FnNode<'a>) {
+        use oxc::ast_visit::{Visit, walk};
+        struct Hints<'c>(&'c [ClassInfo], Vec<(SymbolId, ir::Hint)>);
+        impl Hints<'_> {
+            fn add(&mut self, id: &BindingPattern, t: Option<&TSTypeAnnotation>) {
+                if let BindingPattern::BindingIdentifier(id) = id
+                    && let Some(h) = t.and_then(|t| hint_name(&t.type_annotation))
+                    && let Some(h) = resolve_hint(&h, self.0)
+                {
+                    self.1.push((id.symbol_id.get().unwrap(), h));
+                }
+            }
+        }
+        impl<'a> Visit<'a> for Hints<'_> {
+            fn visit_formal_parameter(&mut self, p: &FormalParameter<'a>) {
+                self.add(&p.pattern, p.type_annotation.as_deref());
+                walk::walk_formal_parameter(self, p);
+            }
+            fn visit_variable_declarator(&mut self, d: &VariableDeclarator<'a>) {
+                self.add(&d.id, d.type_annotation.as_deref());
+                walk::walk_variable_declarator(self, d);
+            }
+        }
+        let mut v = Hints(self.m.classes, Vec::new());
+        match node {
+            FnNode::Function(f) => v.visit_function(f, oxc::syntax::scope::ScopeFlags::Function),
+            FnNode::Arrow(a) => v.visit_arrow_function_expression(a),
+            FnNode::Segment(_, stmts) => stmts.iter().for_each(|st| v.visit_statement(st)),
+        }
+        self.sym_hints.extend(v.1);
     }
 
     /// A native constructor's prologue: its fields' initializers, in order,
@@ -4980,8 +5091,14 @@ fn segment<'a>(stmts: &'a [Statement<'a>], scoping: &Scoping, uses: &HashMap<Sym
 
 /// The classes' superclasses and native members, for `ir::predict_calls`.
 fn class_tables(classes: &[ClassInfo], cands: &[Candidate]) -> Vec<ir::ClassTable> {
-    let mut tables: Vec<ir::ClassTable> =
-        classes.iter().map(|c| ir::ClassTable { superclass: c.superclass, members: Vec::new() }).collect();
+    let mut tables: Vec<ir::ClassTable> = classes
+        .iter()
+        .map(|c| ir::ClassTable {
+            superclass: c.superclass,
+            members: Vec::new(),
+            fields: c.fields.iter().filter_map(|(n, h)| Some((n.clone(), resolve_hint(h, classes)?))).collect(),
+        })
+        .collect();
     for (i, c) in cands.iter().enumerate() {
         if let (Some((k, is_static)), Site::Method { key, accessor, .. }) = (c.class, &c.site) {
             tables[k].members.push((key.clone(), *accessor, is_static, i));

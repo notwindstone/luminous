@@ -12,6 +12,8 @@ double tsaot_pow(double a, double b)
 {
     if (!isfinite(b) && fabs(a) == 1)
         return NAN;
+    if (b == 2)
+        return a * a; /* as the engine's pow */
     return pow(a, b);
 }
 
@@ -585,7 +587,8 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             Object.getPrototypeOf(function* () {}),\n"
         "             Object.getPrototypeOf(function* () {}).prototype.next,\n"
         "             Object.getPrototypeOf(async function* () {}),\n"
-        "             g.Promise, g.Promise.resolve, g.String.prototype, g.String.prototype.charCodeAt);\n"
+        "             g.Promise, g.Promise.resolve, g.String.prototype, g.String.prototype.charCodeAt,\n"
+        "             g.Array.prototype.push);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";

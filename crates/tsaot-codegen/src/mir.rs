@@ -537,6 +537,8 @@ pub struct FunctionBuilder {
     decls: Rc<Decls>,
     current: Option<Block>,
     entry: Option<Block>,
+    /// The `f64const`s made, by value.
+    f64_consts: std::collections::HashMap<Value, f64>,
 }
 
 impl FunctionBuilder {
@@ -553,6 +555,7 @@ impl FunctionBuilder {
                 vars: Vec::new(),
                 slots: Vec::new(),
             },
+            f64_consts: Default::default(),
             decls,
             current: None,
             entry: None,
@@ -578,6 +581,11 @@ impl FunctionBuilder {
 
     pub fn set_cold_block(&mut self, b: Block) {
         self.func.blocks[b.index()].cold = true;
+    }
+
+    /// The constant `v` is, if an `f64const` made it.
+    pub fn f64_value(&self, v: Value) -> Option<f64> {
+        self.f64_consts.get(&v).copied()
     }
 
     fn new_value(&mut self, ty: Type) -> Value {
@@ -700,7 +708,9 @@ impl Ins<'_> {
     }
 
     pub fn f64const(self, v: f64) -> Value {
-        self.b.push1(InstData::F64const(v.to_bits()), Type::F64)
+        let r = self.b.push1(InstData::F64const(v.to_bits()), Type::F64);
+        self.b.f64_consts.insert(r, v);
+        r
     }
 
     fn unary(self, op: UnOp, arg: Value) -> Value {

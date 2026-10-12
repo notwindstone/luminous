@@ -73,7 +73,8 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define TSAOT_PIN_PROMISE_RESOLVE 23
 #define TSAOT_PIN_STRING_PROTO 24
 #define TSAOT_PIN_CHAR_CODE_AT 25
-#define TSAOT_PINS 26
+#define TSAOT_PIN_ARRAY_PUSH 26
+#define TSAOT_PINS 27
 int tsaot_is_promise_resolve(JSValue promise, JSValue resolve);
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);

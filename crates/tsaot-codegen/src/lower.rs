@@ -186,12 +186,15 @@ pub(crate) struct Exits {
 pub(crate) enum Method {
     /// `String.prototype.charCodeAt`.
     CharCodeAt,
+    /// `Array.prototype.push` (one argument).
+    ArrayPush,
 }
 
 impl Method {
     pub(crate) fn named(name: &str) -> Option<Method> {
         match name {
             "charCodeAt" => Some(Method::CharCodeAt),
+            "push" => Some(Method::ArrayPush),
             _ => None,
         }
     }
@@ -200,6 +203,7 @@ impl Method {
 /// Indices in `tsaot_shapes` (see `tsaot_rt.h`).
 const PIN_STRING_PROTO: i32 = 24;
 const PIN_CHAR_CODE_AT: i32 = 25;
+const PIN_ARRAY_PUSH: i32 = 26;
 /// `TSAOT_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -1201,12 +1205,18 @@ impl Lower {
         // Tests, in order; then the default case (or the exit).
         for (i, (test, _)) in cases.iter().enumerate() {
             let Some(test) = test else { continue };
-            let v = self.expr(test);
-            self.hold(v);
-            let d = self.use_local(disc);
-            let eq = self.strict_eq(d.any(), v.any());
-            self.release(v);
-            self.free_v(v);
+            let eq = if let ExprKind::Str(id) = test.kind {
+                let d = self.use_local(disc);
+                self.eq_string_const(d.any(), id)
+            } else {
+                let v = self.expr(test);
+                self.hold(v);
+                let d = self.use_local(disc);
+                let eq = self.strict_eq(d.any(), v.any());
+                self.release(v);
+                self.free_v(v);
+                eq
+            };
             let next = self.b.create_block();
             self.b.ins().brif(eq, bodies[i], &[], next, &[]);
             self.b.switch_to_block(next);
@@ -1224,6 +1234,46 @@ impl Lower {
         }
         self.scopes.pop();
         self.b.switch_to_block(exit);
+    }
+
+    /// Whether `(p, t)` (borrowed) is string constant `id`: by pointer,
+    /// then length, before comparing characters.
+    fn eq_string_const(&mut self, (p, t): (Value, Value), id: ir::StrId) -> Value {
+        let base = self.b.ins().symbol_value(self.ptr, self.env.strings);
+        let kp = self.b.ins().load(I64, M_CONST, base, (id * SIZE) as i32);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, I8);
+        let yes = self.b.ins().iconst(I8, 1);
+        let no = self.b.ins().iconst(I8, 0);
+        let string = self.b.create_block();
+        let other_tag = self.b.create_block();
+        let slow = self.b.create_block();
+        let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING);
+        self.b.ins().brif(is_str, string, &[], other_tag, &[]);
+        // Ropes are compared by the engine; other values differ.
+        self.b.switch_to_block(other_tag);
+        let rope = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING_ROPE);
+        self.b.ins().brif(rope, slow, &[], join, &[BlockArg::Value(no)]);
+        self.b.switch_to_block(string);
+        let same = self.b.ins().icmp(IntCC::Equal, p, kp);
+        let lens = self.b.create_block();
+        self.b.ins().brif(same, join, &[BlockArg::Value(yes)], lens, &[]);
+        self.b.switch_to_block(lens);
+        let la = self.b.ins().uload32(M_HEADER, p, layout::STRING_LEN);
+        let la = self.b.ins().band_imm_u(la, 0x7fff_ffff);
+        let lb = self.b.ins().uload32(M_CONST, kp, layout::STRING_LEN);
+        let lb = self.b.ins().band_imm_u(lb, 0x7fff_ffff);
+        let same_len = self.b.ins().icmp(IntCC::Equal, la, lb);
+        self.b.ins().brif(same_len, slow, &[], join, &[BlockArg::Value(no)]);
+        self.b.switch_to_block(slow);
+        let ctx = self.ctx;
+        let kt = self.b.ins().iconst(I64, TAG_STRING);
+        let r = self.helper("JS_IsStrictEqual", &[ctx, p, t, kp, kt]);
+        let r = self.b.ins().ireduce(I8, r[0]);
+        let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(join);
+        res
     }
 
     /// `a === b` for borrowed values.
@@ -2200,6 +2250,22 @@ impl Lower {
                 self.drop_operand(v, owned);
                 V::Bool(r)
             }
+            ExprKind::AnyCompare(op @ (AnyCmpOp::StrictEq | AnyCmpOp::StrictNe), x, y)
+                if matches!(x.kind, ExprKind::Str(_)) || matches!(y.kind, ExprKind::Str(_)) =>
+            {
+                // With a string constant: by pointer, then length, before
+                // comparing characters.
+                let (other, id) = match (&x.kind, &y.kind) {
+                    (_, ExprKind::Str(id)) => (x, *id),
+                    (ExprKind::Str(id), _) => (y, *id),
+                    _ => unreachable!(),
+                };
+                let (v, owned) = self.operand(other, &[]);
+                let res = self.eq_string_const(v.any(), id);
+                self.drop_operand(v, owned);
+                let r = if *op == AnyCmpOp::StrictNe { self.b.ins().bxor_imm_u(res, 1) } else { res };
+                V::Bool(r)
+            }
             ExprKind::AnyCompare(op @ (AnyCmpOp::Eq | AnyCmpOp::Ne), x, y)
                 if matches!(x.kind, ExprKind::Undefined | ExprKind::Null)
                     || matches!(y.kind, ExprKind::Undefined | ExprKind::Null) =>
@@ -2642,7 +2708,8 @@ impl Lower {
                 };
                 let r = match method {
                     Some(Method::CharCodeAt) => self.char_code_at(fv, obj, args),
-                    None => self.call_values(fv, obj, args, pred),
+                    Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, obj, &args[0]),
+                    Some(Method::ArrayPush) | None => self.call_values(fv, obj, args, pred),
                 };
                 self.drop_operand(obj, owned);
                 r
@@ -3498,6 +3565,56 @@ impl Lower {
         V::Any(rp, rt)
     }
 
+    /// `this.push(arg)` with `f` (held) the method read: through the
+    /// engine's fast path (`JS_ArrayPushFast`) while it is the original
+    /// builtin, else called. Frees `f`.
+    fn array_push(&mut self, f: V, this: V, arg: &Expr) -> V {
+        let held = self.held_args(std::slice::from_ref(arg));
+        let (fp, ft) = f.any();
+        let (sp, st) = this.any();
+        let (ap, at) = held[0].any();
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, PIN_ARRAY_PUSH * 8);
+        let same = self.b.ins().icmp(IntCC::Equal, fp, orig);
+        let ok = self.b.ins().band(is_obj, same);
+        let fast = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let ctx = self.ctx;
+        let r = self.helper("JS_ArrayPushFast", &[ctx, sp, st, ap, at]);
+        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_UNINITIALIZED);
+        let done = self.b.create_block();
+        self.b.ins().brif(declined, slow, &[], done, &[]);
+        self.b.switch_to_block(done);
+        self.check_value(r[1]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(slow);
+        let vals = [(fp, ft), (sp, st), (ap, at)];
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        let (gp, gt) = self.call_linked((fp, ft), (sp, st), 1, argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        self.check_value(gt);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        for v in held.into_iter().rev() {
+            self.release(v);
+            self.free_v(v);
+        }
+        self.release(f);
+        self.free_v(f);
+        V::Any(rp, rt)
+    }
+
     /// Call `f` with `this` and `argc` arguments at `argv` (all borrowed;
     /// `f` held by the caller unless `borrowed`, then held here during the
     /// call). A native function (C function data with a fast entry) is
@@ -4183,6 +4300,8 @@ impl Lower {
             BinOp::Mul => self.b.ins().fmul(a, c),
             BinOp::Div => self.b.ins().fdiv(a, c),
             BinOp::Rem => self.rem(a, c),
+            // (Exactly `pow`'s correctly rounded square.)
+            BinOp::Pow if self.b.f64_value(c) == Some(2.0) => self.b.ins().fmul(a, a),
             BinOp::Pow => self.call_helper("tsaot_pow", &[a, c]),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Sar | BinOp::Shr => {
                 let x = self.toint32(a);

@@ -229,6 +229,18 @@ pub struct Layout {
 pub struct ClassTable {
     pub superclass: Option<usize>,
     pub members: Vec<(String, u8, bool, FuncId)>,
+    /// What the type annotations of its instance fields say they hold.
+    pub fields: Vec<(String, Hint)>,
+}
+
+/// What a type annotation says a value is, for predicting the methods it
+/// reaches (`predict_calls`). Only a hint: predictions are checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hint {
+    /// An instance of top-level class `k`.
+    Class(usize),
+    /// An array of them.
+    ArrayOf(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +282,11 @@ pub struct Func {
     /// In functions that suspend: holds the return value while `finally`
     /// blocks run on the way out (`Any`).
     pub ret_slot: Option<LocalId>,
+    /// What the locals hold, as far as type annotations (and values made
+    /// from annotated ones) say: see `infer_hints`.
+    pub hints: HashMap<LocalId, Hint>,
+    /// What the function returns, by its annotation.
+    pub ret_hint: Option<Hint>,
     pub body: Vec<Stmt>,
 }
 
@@ -1868,14 +1885,18 @@ pub fn inline_calls(m: &mut Module) {
                 let locals = (base..base + callee.locals.len().max(1)).collect();
                 e.kind = ExprKind::Inline { body, locals };
             });
+            let mut hints = Vec::new();
             visit_stmts_mut(&mut f.body, &mut |e| {
                 let ExprKind::Inline { body, locals } = &mut e.kind else { return };
                 let Some(k) = locals.first().and_then(|b| pending.remove(b)) else { return };
                 let base = locals[0];
-                let mut inner = callees[k].as_ref().unwrap().body.clone();
+                let callee = callees[k].as_ref().unwrap();
+                let mut inner = callee.body.clone();
                 visit_stmts_mut(&mut inner, &mut |x| shift_locals(x, base));
                 body.extend(inner);
+                hints.extend(callee.hints.iter().map(|(&l, &h)| (base + l, h)));
             });
+            f.hints.extend(hints);
             f.boxed.extend(added.iter().map(|_| false));
             f.local_names.extend(added.iter().map(|_| None));
             f.locals.extend(added);
@@ -1899,6 +1920,101 @@ enum Recv {
 
 /// A member `key` of `kind` (0 method, 1 getter, 2 setter) found from class
 /// `c` up its superclasses.
+/// What expression `x` of function `f` evaluates to, as far as type
+/// annotations say (`Func::hints`): an instance made by a native
+/// constructor, the annotated result of a call, field or element.
+fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> Option<Hint> {
+    let class_of = |o: &Expr| match expr_hint(m, f, hints, o)? {
+        Hint::Class(k) => Some(k),
+        Hint::ArrayOf(_) => None,
+    };
+    match &x.kind {
+        ExprKind::This => f.class.filter(|&(_, s)| f.has_this && !s).map(|(c, _)| Hint::Class(c)),
+        ExprKind::Local(l) => hints.get(l).copied(),
+        ExprKind::Box(e) | ExprKind::NonNull(_, e) | ExprKind::Predicted { expr: e, .. } => expr_hint(m, f, hints, e),
+        ExprKind::Seq(xs) => expr_hint(m, f, hints, xs.last()?),
+        ExprKind::NewInstance { class, .. } => Some(Hint::Class(*class)),
+        ExprKind::Call(g, _) | ExprKind::CallChecked { func: g, .. } => func_at(m, *g).ret_hint,
+        ExprKind::CallMethod(o, Key::Atom(a), _) => {
+            let g = class_member(m, Some(class_of(o)?), false, &m.atoms[*a], 0)?;
+            func_at(m, g).ret_hint
+        }
+        ExprKind::GetProp(o, a) => {
+            let k = class_of(o)?;
+            let name = &m.atoms[*a];
+            let mut c = Some(k);
+            while let Some(k) = c {
+                let t = m.classes.get(k)?;
+                if let Some((_, h)) = t.fields.iter().find(|(n, _)| n == name) {
+                    return Some(*h);
+                }
+                c = t.superclass;
+            }
+            func_at(m, class_member(m, Some(k), false, name, 1)?).ret_hint
+        }
+        ExprKind::GetElem(o, _) => match expr_hint(m, f, hints, o)? {
+            Hint::ArrayOf(k) => Some(Hint::Class(k)),
+            Hint::Class(_) => None,
+        },
+        ExprKind::Cond(_, a, b) => {
+            let h = expr_hint(m, f, hints, a)?;
+            (expr_hint(m, f, hints, b)? == h).then_some(h)
+        }
+        _ => None,
+    }
+}
+
+/// Extends `Func::hints` (from annotations) to the locals whose every
+/// value has the same hint (`null` and `undefined` aside).
+pub fn infer_hints(m: &mut Module) {
+    let total = m.funcs.len() + m.closures.len();
+    let mut all = Vec::with_capacity(total);
+    for g in 0..total {
+        let f = func_at(m, g);
+        let n = f.locals.len();
+        let mut other = f.boxed.clone();
+        visit_stmts(&f.body, &mut |e| {
+            if let ExprKind::Update { local, .. } = &e.kind {
+                other[*local] = true;
+            }
+        });
+        stmt_locals(&f.body, &mut |l| other[l] = true);
+        let mut hints = f.hints.clone();
+        loop {
+            // Per local: the hint all its values have so far, or a conflict.
+            let mut seen: Vec<Option<Option<Hint>>> = vec![None; n];
+            visit_stmts(&f.body, &mut |e| {
+                let (ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x)) = &e.kind else { return };
+                if hints.contains_key(l) || other[*l] || matches!(x.kind, ExprKind::Null | ExprKind::Undefined) {
+                    return;
+                }
+                let h = expr_hint(m, f, &hints, x);
+                seen[*l] = match seen[*l] {
+                    None => Some(h),
+                    Some(prev) if prev == h => Some(h),
+                    Some(_) => Some(None),
+                };
+            });
+            let mut changed = false;
+            for (l, s) in seen.into_iter().enumerate() {
+                if let Some(Some(h)) = s {
+                    hints.insert(l, h);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        all.push(hints);
+    }
+    let nfuncs = m.funcs.len();
+    for (g, hints) in all.into_iter().enumerate() {
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        f.hints = hints;
+    }
+}
+
 fn class_member(m: &Module, mut c: Option<usize>, is_static: bool, key: &str, kind: u8) -> Option<usize> {
     while let Some(k) = c {
         let t = m.classes.get(k)?;
@@ -2013,11 +2129,17 @@ pub fn predict_calls(m: &mut Module) {
             let mut body = std::mem::take(&mut f.body);
             let base0 = f.locals.len();
             let m_ref: &Module = m;
+            let fg = get(m_ref, g);
             let resolve = |e: &Expr| -> Option<usize> {
+                // Else what type annotations say it is.
+                let hinted = |o: &Expr| match expr_hint(m_ref, fg, &fg.hints, o)? {
+                    Hint::Class(k) => Some(Recv::Class(k, false)),
+                    Hint::ArrayOf(_) => None,
+                };
                 let of = |o: &Expr| match &o.kind {
                     ExprKind::This => this.clone(),
-                    ExprKind::Local(l) => recv.get(l).cloned(),
-                    _ => None,
+                    ExprKind::Local(l) => recv.get(l).cloned().or_else(|| hinted(o)),
+                    _ => hinted(o),
                 };
                 let member = |r: Recv, a: AtomId, kind: u8| match r {
                     Recv::Class(c, s) => class_member(m_ref, Some(c), s, &m_ref.atoms[a], kind),

@@ -59,6 +59,7 @@ pub mod jsvalue {
     pub const SIZE: usize = 16;
     pub const TAG_OFFSET: i32 = 8;
     pub const TAG_STRING: i64 = -7;
+    pub const TAG_STRING_ROPE: i64 = -6;
     pub const TAG_OBJECT: i64 = -1;
     pub const TAG_INT: i64 = 0;
     pub const TAG_BOOL: i64 = 1;
@@ -278,6 +279,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_delete_elem", &[P, P], &[Int]),
         ("tsaot_call", &[P, P, Int, P], &[W, W]),
         ("JS_CallBuiltin", &[P, W, W, W, W, Int, P], &[W, W]),
+        ("JS_IsStrictEqual", &[P, W, W, W, W], &[Int]),
+        ("JS_ArrayPushFast", &[P, W, W, W, W], &[W, W]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
