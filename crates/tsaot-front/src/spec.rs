@@ -13,8 +13,10 @@
 //! `charCodeAt` the builtin); the copy then runs as plain float code and stores the
 //! fields and locals it changed where it ends or returns (`SlotStore`).
 //! When the guard fails, the statements run as they are. Nothing in the
-//! copy can run code, throw or allocate, so what the guard checked holds
-//! throughout, and when the stores happen cannot be observed.
+//! copy can run code, so what the guard checked holds throughout, and when
+//! the stores happen cannot be observed (one that appends to arrays,
+//! `RegionPush`, may allocate, and so throw out of memory: it defers no
+//! store, and is not in `try`).
 //!
 //! Methods take part: `this` is an object as locals are, a predicted call
 //! of a class's method (`Predicted`) runs its body in the copy (the guard
@@ -55,6 +57,15 @@ pub fn speculate_numbers(m: &mut Module) {
         }
         let refs = mentions(&f.body, f.locals.len());
         let uses = local_uses(&f.body, f.locals.len());
+        let mut texts = HashSet::new();
+        visit_stmts(&f.body, &mut |e| {
+            if let ExprKind::CallMethod(s, Key::Atom(a), _) = &e.kind
+                && let ExprKind::Local(l) = s.kind
+                && atoms[*a] == "charCodeAt"
+            {
+                texts.insert(l);
+            }
+        });
         let mut body = std::mem::take(&mut f.body);
         let ret = f.ret;
         let this = f.has_this;
@@ -68,8 +79,11 @@ pub fn speculate_numbers(m: &mut Module) {
             methods: &methods,
             this,
             next_loop: FIRST_COPY_LOOP,
+            allocs: true,
+            texts,
         };
         cx.list(&mut body, Some(ret));
+        cx.allocs = false;
         // The statement lists inside expressions (inlined bodies, whose
         // `return`s give the expression's value; a predicted call's `this`
         // is its receiver).
@@ -190,6 +204,13 @@ struct Cx<'a> {
     /// leaf (see `nothrow_leaf`).
     leaves: &'a [Option<(Vec<Ty>, Ty)>],
     next_loop: LoopId,
+    /// Whether regions made now may allocate (`RegionPush`): in the
+    /// function's own statements, outside `try` (an allocation may throw,
+    /// out of memory, where nothing may observe what the region defers).
+    allocs: bool,
+    /// The locals whose characters the function reads (`charCodeAt`): their
+    /// `length` is a string's.
+    texts: HashSet<LocalId>,
     /// How many times each local is named in the function (before any
     /// region is made), by `mentions` and by `local_uses`.
     refs: Vec<usize>,
@@ -276,6 +297,9 @@ struct Region {
     /// been copied (nothing may follow it).
     branches: usize,
     closed: bool,
+    /// Arrays it appends to (`RegionPush`), and whether it does.
+    appends: Vec<LocalId>,
+    allocates: bool,
 }
 
 /// The loop whose iterations read objects from arrays.
@@ -340,16 +364,17 @@ impl Cx<'_> {
             let alone = run.is_empty();
             self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
             base = self.f.locals.len();
-            // A loop that reads elements may be a region on its own.
-            if !alone && matches!(s, Stmt::Loop { .. }) {
+            // It may start a run (a loop that reads elements, a region on
+            // its own).
+            if !alone {
                 r.may_elems = true;
-                if let Some(x) = r.stmt(&s, self)
-                    && r.bailed.is_some()
-                {
+                if let Some(x) = r.stmt(&s, self) {
                     run.push(s);
                     fast.push(x);
-                    self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
-                    base = self.f.locals.len();
+                    if r.bailed.is_some() {
+                        self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
+                        base = self.f.locals.len();
+                    }
                     continue;
                 }
                 self.truncate_locals(base);
@@ -374,9 +399,11 @@ impl Cx<'_> {
             Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => self.list(body, ret),
             Stmt::Switch { cases, .. } => cases.iter_mut().for_each(|(_, b)| self.list(b, ret)),
             Stmt::Try { body, catch, finally, .. } => {
+                let allocs = std::mem::replace(&mut self.allocs, false);
                 self.list(body, ret);
                 catch.iter_mut().for_each(|(_, c)| self.list(c, ret));
                 finally.iter_mut().for_each(|c| self.list(c, ret));
+                self.allocs = allocs;
             }
             _ => {}
         }
@@ -442,6 +469,7 @@ impl Cx<'_> {
             cells: r.cells,
             arrays: r.arrays,
             protos: r.protos,
+            appends: r.appends,
         };
         list.push(Stmt::If(Expr::new(Ty::Bool, guard), init, run));
     }
@@ -582,6 +610,7 @@ impl Region {
             && !self.is_obj(l)
             && !self.undef.contains(&l)
             && !self.assigned.contains(&l)
+            && !self.appends.contains(&l)
             && self.elem_loop.as_ref().is_none_or(|el| !el.assigned.contains(&l))
     }
 
@@ -856,6 +885,7 @@ impl Region {
             && !self.copies.contains_key(l)
             && !self.strs.contains(l)
             && !self.arrays.contains(l)
+            && !self.appends.contains(l)
         {
             self.elem(a, i, None, cx)?;
             self.aliases.insert(*l, ((**x).clone(), self.receivers.clone()));
@@ -876,7 +906,8 @@ impl Region {
                     && cx.f.locals[*l] == Ty::Any
                     && !self.is_obj(*l)
                     && !self.strs.contains(l)
-                    && !self.arrays.contains(l) =>
+                    && !self.arrays.contains(l)
+                    && !self.appends.contains(l) =>
             {
                 let v = self.void(x, cx)?;
                 if !self.assigned.contains(l) {
@@ -886,8 +917,53 @@ impl Region {
                 self.undef.insert(*l);
                 Some(v)
             }
+            CallMethod(..) => self.push(e, cx),
             _ => self.void(e, cx),
         }
+    }
+
+    /// The copy of `arr.push(v)` for an array in a JS-valued local (one the
+    /// region only appends to, guarded as one `push` appends to), `v` a
+    /// number or an object literal of numbers: where it may allocate, and
+    /// defers no field's store (the allocation may throw).
+    fn push(&mut self, e: &Expr, cx: &mut Cx) -> Option<Expr> {
+        let ExprKind::CallMethod(recv, Key::Atom(m), args) = &e.kind else { return None };
+        let (&ExprKind::Local(a), [v]) = (&recv.kind, args.as_slice()) else { return None };
+        if !cx.allocs || cx.atoms[*m] != "push" || self.fields.iter().any(|f| f.2.is_some()) {
+            return None;
+        }
+        let ok = cx.f.locals[a] == Ty::Any
+            && !cx.f.boxed[a]
+            && !self.copies.contains_key(&a)
+            && !self.strs.contains(&a)
+            && !self.is_obj(a)
+            && !self.is_elem(a)
+            && !self.undef.contains(&a)
+            && !self.arrays.contains(&a)
+            && !self.assigned.contains(&a);
+        if !ok {
+            return None;
+        }
+        let value = match &v.kind {
+            ExprKind::Object(props) => {
+                let mut out = Vec::new();
+                for (k, x) in props {
+                    if cx.atoms[*k] == "__proto__" {
+                        return None;
+                    }
+                    let n = self.num(x, cx)?;
+                    out.push((*k, Expr::new(Ty::Any, ExprKind::Box(bx(n)))));
+                }
+                Expr::new(Ty::Any, ExprKind::Object(out))
+            }
+            _ => Expr::new(Ty::Any, ExprKind::Box(bx(self.num(v, cx)?))),
+        };
+        if !self.appends.contains(&a) {
+            self.appends.push(a);
+        }
+        self.allocates = true;
+        self.accesses += 1;
+        Some(f64(ExprKind::RegionPush { arr: a, value: bx(value) }))
     }
 
     /// The expressions of an inlined body but the declarations of its
@@ -1166,6 +1242,7 @@ impl Region {
             && !cx.f.boxed[l]
             && !self.copies.contains_key(&l)
             && !self.arrays.contains(&l)
+            && !self.appends.contains(&l)
             && !self.objs.iter().any(|&(o, _)| o == l);
         if ok && !self.strs.contains(&l) {
             self.strs.push(l);
@@ -1209,6 +1286,7 @@ impl Region {
                     && !self.copies.contains_key(&o)
                     && !self.strs.contains(&o)
                     && !self.arrays.contains(&o)
+                    && !self.appends.contains(&o)
                     && !self.undef.contains(&o);
                 if !ok {
                     return None;
@@ -1353,7 +1431,8 @@ impl Region {
             Local(l) if !cx.f.boxed[*l] => match cx.f.locals[*l] {
                 Ty::F64 | Ty::I32 => e.clone(),
                 Ty::Any
-                    if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) && !self.arrays.contains(l) =>
+                    if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) && !self.arrays.contains(l)
+                        && !self.appends.contains(l) =>
                 {
                     f64(Local(self.copy(*l, true, cx)))
                 }
@@ -1437,7 +1516,7 @@ impl Region {
                 self.accesses += 1;
                 f64(StrCharCode { s, idx: bx(idx) })
             }
-            Length(s, _) if matches!(s.kind, Local(l) if self.strs.contains(&l)) => {
+            Length(s, _) if matches!(s.kind, Local(l) if self.strs.contains(&l) || cx.texts.contains(&l)) => {
                 let s = self.string(s, cx)?;
                 f64(StrLen { s })
             }
@@ -1462,6 +1541,8 @@ impl Region {
                 let v = self.num(value, cx)?;
                 let arith = matches!(v.kind, Binary(..) | Unary(..));
                 match self.field(o, *slot, Some(arith), cx) {
+                    // (Not where it may allocate: see `push`.)
+                    Some(_) if self.allocates => return None,
                     Some(c) => f64(SetLocal(c, bx(v))),
                     // An element's: in place.
                     None => f64(SlotStore { obj: o, slot: *slot, value: bx(v), arith }),
@@ -1474,7 +1555,7 @@ impl Region {
                         let v = bx(self.num(x, cx)?);
                         f64(if init { InitLocal(*l, v) } else { SetLocal(*l, v) })
                     }
-                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.arrays.contains(l) => {
+                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.arrays.contains(l) && !self.appends.contains(l) => {
                         let v = self.num(x, cx)?;
                         let c = self.copy(*l, false, cx);
                         if !self.assigned.contains(l) {

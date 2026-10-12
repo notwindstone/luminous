@@ -341,7 +341,7 @@ static void tsaot_structs_free(JSRuntime *rt);
 static int tsaot_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
 static JSAtom tsaot_atom_iterator = JS_ATOM_NULL, tsaot_atom_next = JS_ATOM_NULL, tsaot_atom_string_length = JS_ATOM_NULL,
-              tsaot_atom_char_code_at = JS_ATOM_NULL;
+              tsaot_atom_char_code_at = JS_ATOM_NULL, tsaot_atom_push = JS_ATOM_NULL;
 /* `length`, for arrays of `aot type` objects. */
 static JSAtom tsaot_atom_length = JS_ATOM_NULL;
 
@@ -392,7 +392,9 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     JS_FreeAtomRT(rt, tsaot_atom_next);
     JS_FreeAtomRT(rt, tsaot_atom_string_length);
     JS_FreeAtomRT(rt, tsaot_atom_char_code_at);
+    JS_FreeAtomRT(rt, tsaot_atom_push);
     tsaot_atom_iterator = tsaot_atom_next = tsaot_atom_string_length = tsaot_atom_char_code_at = JS_ATOM_NULL;
+    tsaot_atom_push = JS_ATOM_NULL;
     for (i = 0; i < TSAOT_PINS; i++) {
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
@@ -656,6 +658,7 @@ int tsaot_lock_builtins(JSContext *ctx)
     tsaot_atom_next = JS_NewAtom(ctx, "next");
     tsaot_atom_string_length = JS_NewAtom(ctx, "length");
     tsaot_atom_char_code_at = JS_NewAtom(ctx, "charCodeAt");
+    tsaot_atom_push = JS_NewAtom(ctx, "push");
     JS_FreeValue(ctx, r);
     return 0;
 }
@@ -750,6 +753,31 @@ int tsaot_char_code_at_ok(JSContext *ctx)
 {
     return JS_OwnDataIs(ctx, tsaot_pins[TSAOT_PIN_STRING_PROTO], tsaot_atom_char_code_at,
                         tsaot_pins[TSAOT_PIN_CHAR_CODE_AT]);
+}
+
+/* Whether Array.prototype.push is still the builtin, as an own data
+ * property, and the array prototypes have no index properties: speculative
+ * regions append to arrays directly then (`tsaot_region_push`). */
+int tsaot_array_push_ok(JSContext *ctx)
+{
+    return *((uint8_t *)ctx + JS_LAYOUT_CTX_STD_ARRAY_PROTO) &&
+           JS_OwnDataIs(ctx, tsaot_pins[TSAOT_PIN_ARRAY_PROTO], tsaot_atom_push, tsaot_pins[TSAOT_PIN_ARRAY_PUSH]);
+}
+
+/* arr.push(v) (v taken) in a speculative region, for an array without
+ * room for it, which the region's guard found `push` appends to: through
+ * the engine's fast path (which makes room), else the builtin. Returns -1
+ * on an exception (out of memory). */
+int tsaot_region_push(JSContext *ctx, JSValue arr, JSValue v)
+{
+    JSValue r = JS_ArrayPushFast(ctx, arr, v);
+    if (JS_VALUE_GET_TAG(r) == JS_TAG_UNINITIALIZED)
+        r = JS_Call(ctx, tsaot_pins[TSAOT_PIN_ARRAY_PUSH], arr, 1, (JSValueConst *)&v);
+    JS_FreeValue(ctx, v);
+    if (JS_IsException(r))
+        return -1;
+    JS_FreeValue(ctx, r);
+    return 0;
 }
 
 /* A cache miss reading own data property obj.prop (obj borrowed), where

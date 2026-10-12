@@ -397,8 +397,8 @@ The differential tests run every case with both.
   computes in registers, and stores the fields it changed at its end (as
   floats, as the interpreter's float arithmetic makes them, leaving their
   float tags in place; a copy for when some held int32s stores int32s
-  where the results are). Nothing in the run can call, throw or allocate, so what the
-  guard checked holds throughout. When it fails (a string, a BigInt, the
+  where the results are). Nothing in the run can call or run code, so
+  what the guard checked holds throughout. When it fails (a string, a BigInt, the
   same object twice, a getter), the statements run as before. Runs may
   contain `if`, `?:`, `&&`, `||`, comparisons, `return`, loops (with
   `break` and `continue`), calls of leaf functions on numbers, and
@@ -435,6 +435,16 @@ The differential tests run every case with both.
   the guard). With methods passing their parameters on to other inlined
   methods (`oc.dot(dir)`), the ray tracer's whole sphere loop
   (`spheres[i].hit(origin, dir)`) is one region.
+  A region may append numbers, or object literals of numbers, to arrays
+  in locals (`tokens.push({ kind: 1, start, end: i })`): the guard checks
+  that each is an extensible fast array of a fresh array's shape whose
+  `length` is its element count, that `Array.prototype.push` is the
+  builtin and that the array prototypes have no index properties (as the
+  engine's fast path); the region then stores each value directly (the
+  array growing through the engine when it is full), so a tokenizer's
+  whole scanning loop is one region. Such a region keeps no field's value
+  in a local and is not inside `try`, so an allocation that throws (out
+  of memory) leaves nothing undone that anything could see.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline,
   `arr.push(x)` appends inline to an extensible fast array of a fresh

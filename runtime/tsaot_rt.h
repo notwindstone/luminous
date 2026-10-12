@@ -143,6 +143,8 @@ JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 void tsaot_record_learn(JSContext *ctx, JSValue obj, int r);
 int tsaot_char_code_at_ok(JSContext *ctx);
+int tsaot_array_push_ok(JSContext *ctx);
+int tsaot_region_push(JSContext *ctx, JSValue arr, JSValue v);
 int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
 JSValue tsaot_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, TsaotIC *ic);
 int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic);

@@ -681,6 +681,11 @@ pub enum ExprKind {
         /// `(record, class)`: once its shape is known, `record`'s objects
         /// have `class`'s prototype (elements whose methods run inline).
         protos: Vec<(usize, usize)>,
+        /// Locals that must hold `Array`s `push` appends to (`RegionPush`):
+        /// fast, extensible, with a fresh array's shape and `length` their
+        /// element count, `Array.prototype.push` the builtin, and no index
+        /// properties on the array prototypes.
+        appends: Vec<LocalId>,
     },
     /// In a speculative region's loop, around each iteration: whether the
     /// objects the iteration reads from arrays hold what the region needs
@@ -715,6 +720,13 @@ pub enum ExprKind {
     /// `F64`.
     StrLen {
         s: LocalId,
+    },
+    /// In a speculative region: `arr.push(value)` for the array in local
+    /// `arr` (a guard's `appends`), `value` a JS value made of numbers (an
+    /// object literal, or a number). `F64` (0).
+    RegionPush {
+        arr: LocalId,
+        value: Box<Expr>,
     },
     /// In a speculative region: the number field `slot` of the object in
     /// local `obj` held when the region's guard checked it. `F64`.
@@ -1082,7 +1094,7 @@ macro_rules! visitor {
                     $name(callback, f);
                 }
                 ShapeGet { obj, .. } => $name(obj, f),
-                SlotStore { value, .. } | StrCharCode { idx: value, .. } => $name(value, f),
+                SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => $name(value, f),
                 ShapeSet { obj, value, .. } => {
                     $name(obj, f);
                     $name(value, f);
@@ -1438,6 +1450,7 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | StrCharCode { s: l, .. }
         | StrLen { s: l }
         | ArrLen { arr: l }
+        | RegionPush { arr: l, .. }
         | SlotLoad { obj: l, .. }
         | SlotStore { obj: l, .. } => f(*l),
         IterOpen(_, a, b, _) | IterClose(a, b) => {
@@ -1466,8 +1479,9 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             fields.iter().for_each(|&(l, _)| f(l));
             distinct.iter().for_each(|&l| f(l));
         }
-        SpecGuard { objs, fields, nums, strs, derived, methods, arrays, .. } => {
+        SpecGuard { objs, fields, nums, strs, derived, methods, arrays, appends, .. } => {
             arrays.iter().for_each(|&l| f(l));
+            appends.iter().for_each(|&l| f(l));
             objs.iter().for_each(|&(l, _)| f(l));
             derived.iter().for_each(|&(l, of, _, _)| {
                 f(l);

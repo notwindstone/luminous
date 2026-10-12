@@ -1024,6 +1024,7 @@ impl Lower {
                             cells,
                             arrays,
                             protos,
+                            appends,
                         },
                     ..
                 },
@@ -1042,6 +1043,7 @@ impl Lower {
                     cells,
                     arrays,
                     protos,
+                    appends,
                 };
                 self.spec_region(&guard, fast, slow)
             }
@@ -2655,6 +2657,36 @@ impl Lower {
                 let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
                 let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
                 V::Num(self.b.ins().fcvt_from_sint(F64, len))
+            }
+            ExprKind::RegionPush { arr, value } => {
+                let (vp, vt) = self.expr(value).any();
+                let (ap, at) = self.use_local(*arr).any();
+                // (As the guard found it: an extensible fast array whose
+                // `length` is its element count, an int32.)
+                let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
+                let size = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_SIZE);
+                let room = self.b.ins().icmp(IntCC::UnsignedLessThan, count, size);
+                let store = self.b.create_block();
+                let grow = self.b.create_block();
+                let join = self.b.create_block();
+                self.b.set_cold_block(grow);
+                self.b.ins().brif(room, store, &[], grow, &[]);
+                self.b.switch_to_block(store);
+                let slot = self.array_slot(ap, count);
+                self.b.ins().store(M_SLOT, vp, slot, 0);
+                self.b.ins().store(M_SLOT, vt, slot, TAG_OFFSET);
+                let k1 = self.b.ins().iadd_imm_s(count, 1);
+                self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
+                let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
+                self.b.ins().store(M_SLOT, k1, prop, 0);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(grow);
+                let ctx = self.ctx;
+                let r = self.helper("tsaot_region_push", &[ctx, ap, at, vp, vt]);
+                self.check_int(r[0]);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
+                V::Num(self.b.ins().f64const(0.0))
             }
             ExprKind::StrCharCode { s, idx } => {
                 let d = self.expr(idx).num();
@@ -4314,6 +4346,45 @@ impl Lower {
             let next = self.b.create_block();
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
+        }
+        // Arrays the region appends to (`RegionPush`): as `append_inline`
+        // finds them, with `push` the builtin (nothing else in the region
+        // changes them: they stay so).
+        if !g.appends.is_empty() {
+            let ctx = self.ctx;
+            let ok = self.helper("tsaot_array_push_ok", &[ctx])[0];
+            let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+            let shapes = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+            for &a in g.appends {
+                let (p, t) = self.use_local(a).any();
+                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+                let obj = self.b.create_block();
+                self.b.ins().brif(is_obj, obj, &[], slow_b, &[]);
+                self.b.switch_to_block(obj);
+                let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+                let fresh = self.b.ins().load(I64, M_CONST, shapes, SHAPE_ARRAY * 8);
+                let same = self.b.ins().icmp(IntCC::Equal, shape, fresh);
+                let word = self.b.ins().uload32(M_HEADER, p, layout::OBJ_FLAGS);
+                let bits = self.b.ins().band_imm_u(word, layout::OBJ_APPEND_MASK);
+                let fast = self.b.ins().icmp_imm_s(IntCC::Equal, bits, layout::OBJ_APPEND_FLAGS);
+                let ok = self.b.ins().band(same, fast);
+                let array = self.b.create_block();
+                self.b.ins().brif(ok, array, &[], slow_b, &[]);
+                self.b.switch_to_block(array);
+                let count = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
+                let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+                let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
+                let len = self.b.ins().uload32(M_SLOT, prop, 0);
+                let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
+                let dense = self.b.ins().icmp(IntCC::Equal, len, count);
+                let ok = self.b.ins().band(is_int, dense);
+                let next = self.b.create_block();
+                self.b.ins().brif(ok, next, &[], slow_b, &[]);
+                self.b.switch_to_block(next);
+            }
         }
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs = Vec::new();
@@ -8101,6 +8172,7 @@ struct SpecGuard<'a> {
     derived: &'a [(ir::LocalId, ir::LocalId, u32, usize)],
     methods: &'a [(Option<ir::LocalId>, usize, ir::AtomId, usize)],
     cells: &'a [ir::CellId],
+    appends: &'a [ir::LocalId],
 }
 
 /// The parts of a template literal's concatenation (`a${x}b` is checked as

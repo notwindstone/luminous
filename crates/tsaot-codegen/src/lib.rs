@@ -334,6 +334,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
         ("tsaot_record_learn", &[P, W, W, Int], &[]),
         ("tsaot_char_code_at_ok", &[P], &[Int]),
+        ("tsaot_array_push_ok", &[P], &[Int]),
+        ("tsaot_region_push", &[P, W, W, W, W], &[Int]),
         ("JS_CallStringFn", &[P, W, W, Int, Int, P], &[W, W]),
         ("JS_ConcatStrings", &[P, P, Int], &[W, W]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
