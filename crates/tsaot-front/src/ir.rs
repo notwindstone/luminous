@@ -162,6 +162,21 @@ pub struct Module {
     pub layouts: Vec<Layout>,
     /// Stores into `int`s wrap to int32 (no `--no-int-wrapping`).
     pub int_wrapping: bool,
+    /// Record types: object types with a name, then the instances of
+    /// classes made natively (see `class_records`).
+    pub records: Vec<Record>,
+    /// Per class: the record of its instances, if made natively.
+    pub class_records: Vec<Option<usize>>,
+}
+
+/// An object type with known fields in a known order (see
+/// `specialize_fields`): an object whose shape has these fields first, as
+/// plain writable data properties, has field `i` in slot `i`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    pub fields: Vec<AtomId>,
+    /// What the fields' annotations say they hold.
+    pub hints: Vec<Option<Hint>>,
 }
 
 /// How an `aot type` field is stored: unboxed when all members agree.
@@ -241,6 +256,10 @@ pub enum Hint {
     Class(usize),
     /// An array of them.
     ArrayOf(usize),
+    /// An object of record type `r` (`Module::records`).
+    Record(usize),
+    /// An array of them.
+    ArrayOfRecord(usize),
 }
 
 /// The array methods with native loops (`ExprKind::ArrayLoop`).
@@ -607,6 +626,25 @@ pub enum ExprKind {
     /// inline (which does not use its parameter): see
     /// `virtualize_instances`. Elsewhere, the value itself.
     Lazy(Box<Expr>),
+    /// `obj.atom`, with `obj` expected to be of record type `record` (by a
+    /// type annotation), where `atom` is field `slot`: read from that slot
+    /// when the object has the record's shape (`specialize_fields`), else
+    /// as `GetProp`. `Any`.
+    ShapeGet {
+        obj: Box<Expr>,
+        atom: AtomId,
+        record: usize,
+        slot: u32,
+    },
+    /// `obj.atom = value` likewise (as `SetProp` otherwise); evaluates to
+    /// the value.
+    ShapeSet {
+        obj: Box<Expr>,
+        atom: AtomId,
+        record: usize,
+        slot: u32,
+        value: Box<Expr>,
+    },
     /// Whether the prototype of class `class` still has native function
     /// `func` as its own data property `method` (no getter runs). `Bool`.
     /// (See `virtualize_instances`.)
@@ -949,6 +987,11 @@ macro_rules! visitor {
                 ArraySort { recv, callback, .. } => {
                     $name(recv, f);
                     $name(callback, f);
+                }
+                ShapeGet { obj, .. } => $name(obj, f),
+                ShapeSet { obj, value, .. } => {
+                    $name(obj, f);
+                    $name(value, f);
                 }
                 CallChecked { callee, args, .. } => {
                     $name(callee, f);
@@ -2036,7 +2079,14 @@ enum Recv {
 fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> Option<Hint> {
     let class_of = |o: &Expr| match expr_hint(m, f, hints, o)? {
         Hint::Class(k) => Some(k),
-        Hint::ArrayOf(_) => None,
+        _ => None,
+    };
+    let field_of_record = |o: &Expr, a: AtomId| match expr_hint(m, f, hints, o)? {
+        Hint::Record(r) => {
+            let rec = m.records.get(r)?;
+            rec.hints[rec.fields.iter().position(|&b| b == a)?]
+        }
+        _ => None,
     };
     match &x.kind {
         ExprKind::This => f.class.filter(|&(_, s)| f.has_this && !s).map(|(c, _)| Hint::Class(c)),
@@ -2049,6 +2099,11 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
             let g = class_member(m, Some(class_of(o)?), false, &m.atoms[*a], 0)?;
             func_at(m, g).ret_hint
         }
+        ExprKind::ShapeGet { obj, atom, .. } => field_of_record(obj, *atom).or_else(|| {
+            let k = class_of(obj)?;
+            m.classes.get(k)?.fields.iter().find(|(n, _)| *n == m.atoms[*atom]).map(|(_, h)| *h)
+        }),
+        ExprKind::GetProp(o, a) if field_of_record(o, *a).is_some() => field_of_record(o, *a),
         ExprKind::GetProp(o, a) => {
             let k = class_of(o)?;
             let name = &m.atoms[*a];
@@ -2064,7 +2119,8 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
         }
         ExprKind::GetElem(o, _) => match expr_hint(m, f, hints, o)? {
             Hint::ArrayOf(k) => Some(Hint::Class(k)),
-            Hint::Class(_) => None,
+            Hint::ArrayOfRecord(r) => Some(Hint::Record(r)),
+            Hint::Class(_) | Hint::Record(_) => None,
         },
         ExprKind::Cond(_, a, b) => {
             let h = expr_hint(m, f, hints, a)?;
@@ -2256,7 +2312,7 @@ pub fn predict_calls(m: &mut Module) {
                 // Else what type annotations say it is.
                 let hinted = |o: &Expr| match expr_hint(m_ref, fg, &fg.hints, o)? {
                     Hint::Class(k) => Some(Recv::Class(k, false)),
-                    Hint::ArrayOf(_) => None,
+                    _ => None,
                 };
                 let of = |o: &Expr| match &o.kind {
                     ExprKind::This => this.clone(),
@@ -2343,6 +2399,70 @@ pub fn predict_calls(m: &mut Module) {
     }
 }
 
+/// The records of classes made natively: a class's `NewInstance` gives its
+/// instances' fields in order (`Module::class_records`).
+pub fn class_records(m: &mut Module) {
+    m.class_records = vec![None; m.classes.len()];
+    let mut found: Vec<(usize, Vec<AtomId>)> = Vec::new();
+    for f in m.funcs.iter().chain(&m.closures) {
+        visit_stmts(&f.body, &mut |e| {
+            if let ExprKind::NewInstance { class, fields } = &e.kind {
+                found.push((*class, fields.iter().map(|(a, _)| *a).collect()));
+            }
+        });
+    }
+    for (k, fields) in found {
+        if k >= m.classes.len() || m.class_records[k].is_some() || fields.is_empty() {
+            continue;
+        }
+        let hints = fields
+            .iter()
+            .map(|&a| m.classes[k].fields.iter().find(|(n, _)| *n == m.atoms[a]).map(|(_, h)| *h))
+            .collect();
+        m.records.push(Record { fields, hints });
+        m.class_records[k] = Some(m.records.len() - 1);
+    }
+}
+
+/// Fast field access, as JIT compilers access the fields of objects of a
+/// known shape at fixed offsets: a property read or write of an object
+/// that type annotations say is of a record type (`Module::records`: a
+/// named object type, or a class made natively) becomes `ShapeGet` /
+/// `ShapeSet` with the field's slot. At run time the record's shape is the
+/// first one seen with its fields first, in order, as writable data
+/// properties; an object with that shape is read and written at the slot,
+/// any other one through the inline cache. Annotations are never trusted:
+/// a wrong one only costs the shape check.
+pub fn specialize_fields(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    for g in 0..nfuncs + m.closures.len() {
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        let mut body = std::mem::take(&mut f.body);
+        let meta = f.clone();
+        let m_ref: &Module = m;
+        let record_of = |o: &Expr| -> Option<usize> {
+            match expr_hint(m_ref, &meta, &meta.hints, o)? {
+                Hint::Record(r) => Some(r),
+                Hint::Class(k) => m_ref.class_records.get(k).copied().flatten(),
+                _ => None,
+            }
+        };
+        visit_stmts_mut(&mut body, &mut |e| {
+            let (ExprKind::GetProp(o, a) | ExprKind::SetProp(o, a, _)) = &e.kind else { return };
+            let Some(r) = record_of(o) else { return };
+            let Some(slot) = m_ref.records[r].fields.iter().position(|b| b == a) else { return };
+            let slot = slot as u32;
+            e.kind = match std::mem::replace(&mut e.kind, ExprKind::Undefined) {
+                ExprKind::GetProp(obj, atom) => ExprKind::ShapeGet { obj, atom, record: r, slot },
+                ExprKind::SetProp(obj, atom, value) => ExprKind::ShapeSet { obj, atom, record: r, slot, value },
+                _ => unreachable!(),
+            };
+        });
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        f.body = body;
+    }
+}
+
 /// A value whose evaluation cannot run code, throw or observe an object
 /// being built: constants and unboxed locals, and numbers made of them.
 fn pure_value(e: &Expr, boxed: &[bool]) -> bool {
@@ -2387,7 +2507,11 @@ pub fn fold_new_instances(m: &mut Module) {
                 let mut j = i + 1;
                 let mut folded = 0;
                 while j < list.len() {
-                    let Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) = &list[j] else { break };
+                    let (o, a, v) = match &list[j] {
+                        Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) => (o, a, v),
+                        Stmt::Expr(Expr { kind: ExprKind::ShapeSet { obj, atom, value, .. }, .. }) => (obj, atom, value),
+                        _ => break,
+                    };
                     let (a, v) = (*a, (**v).clone());
                     if !matches!(o.kind, ExprKind::Local(l) if l == n) || !pure_value(&v, &boxed) {
                         break;
@@ -3257,35 +3381,35 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
                 seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(ph, Box::new(virtual_value(x, class, &slots, flag)))));
                 *e = Expr::new(Ty::Any, ExprKind::Seq(seq));
             }
-            ExprKind::GetProp(o, a) if is_l(o) => {
+            ExprKind::GetProp(o, a) | ExprKind::ShapeGet { obj: o, atom: a, .. } if is_l(o) => {
                 let Some(i) = field(*a) else {
                     ok = false;
                     return;
                 };
-                let a = *a;
                 virtual_uses += 1;
-                *e = Expr::new(
-                    ty,
-                    ExprKind::Cond(
-                        Box::new(flag_e()),
-                        Box::new(local(slots[i])),
-                        Box::new(Expr::new(ty, ExprKind::GetProp(Box::new(local(ph)), a))),
-                    ),
-                );
+                // (The object's read, on the object: `ph`.)
+                let mut real = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
+                let (ExprKind::GetProp(o, _) | ExprKind::ShapeGet { obj: o, .. }) = &mut real.kind else { unreachable!() };
+                **o = local(ph);
+                *e = Expr::new(ty, ExprKind::Cond(Box::new(flag_e()), Box::new(local(slots[i])), Box::new(real)));
             }
-            ExprKind::SetProp(o, a, v) if is_l(o) => {
+            ExprKind::SetProp(o, a, _) | ExprKind::ShapeSet { obj: o, atom: a, .. } if is_l(o) => {
                 let Some(i) = field(*a) else {
                     ok = false;
                     return;
                 };
-                let a = *a;
-                let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
+                let mut real = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
+                let (ExprKind::SetProp(o, _, v) | ExprKind::ShapeSet { obj: o, value: v, .. }) = &mut real.kind else {
+                    unreachable!()
+                };
+                **o = local(ph);
+                let v = (**v).clone();
                 *e = Expr::new(
                     ty,
                     ExprKind::Cond(
                         Box::new(flag_e()),
-                        Box::new(Expr::new(Ty::Any, ExprKind::SetLocal(slots[i], Box::new(v.clone())))),
-                        Box::new(Expr::new(ty, ExprKind::SetProp(Box::new(local(ph)), a, Box::new(v)))),
+                        Box::new(Expr::new(Ty::Any, ExprKind::SetLocal(slots[i], Box::new(v)))),
+                        Box::new(real),
                     ),
                 );
             }

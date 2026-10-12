@@ -242,6 +242,8 @@ pub fn check<'a>(
         &mut consts,
         &mut bindings,
     );
+    let records = collect_records(program);
+    RECORD_NAMES.with(|r| *r.borrow_mut() = records.iter().map(|r| r.name.clone()).collect());
     // Module code, in runs of statements.
     let uses = module_uses(program, scoping);
     for run in segment_runs(&program.body, &bindings, &consts) {
@@ -312,6 +314,13 @@ pub fn check<'a>(
                 .collect();
             let cells = cx.cell_infos();
             let class_uses = cx.class_uses();
+            let records = records
+                .iter()
+                .map(|r| ir::Record {
+                    fields: r.fields.iter().map(|n| cx.atom(n)).collect(),
+                    hints: r.hints.iter().map(|h| h.as_ref().and_then(|h| resolve_hint(h, &classes))).collect(),
+                })
+                .collect();
             let mut module = ir::Module {
                 funcs,
                 closures: std::mem::take(&mut cx.closures),
@@ -323,9 +332,13 @@ pub fn check<'a>(
                 classes: class_tables(&classes, &candidates),
                 layouts: structs.layouts.clone(),
                 int_wrapping: true,
+                records,
+                class_records: Vec::new(),
             };
             ir::capture_values(&mut module);
             ir::infer_hints(&mut module);
+            ir::class_records(&mut module);
+            ir::specialize_fields(&mut module);
             ir::fold_new_instances(&mut module);
             ir::inline_calls(&mut module);
             ir::predict_calls(&mut module);
@@ -624,10 +637,87 @@ fn hint_name(t: &TSType) -> Option<HintName> {
 
 fn resolve_hint(h: &HintName, classes: &[ClassInfo]) -> Option<ir::Hint> {
     let find = |n: &str| classes.iter().rposition(|c| c.name == n);
+    let record = |n: &str| RECORD_NAMES.with(|r| r.borrow().iter().position(|x| x == n));
     Some(match h {
-        HintName::Class(n) => ir::Hint::Class(find(n)?),
-        HintName::ArrayOf(n) => ir::Hint::ArrayOf(find(n)?),
+        HintName::Class(n) => match find(n) {
+            Some(k) => ir::Hint::Class(k),
+            None => ir::Hint::Record(record(n)?),
+        },
+        HintName::ArrayOf(n) => match find(n) {
+            Some(k) => ir::Hint::ArrayOf(k),
+            None => ir::Hint::ArrayOfRecord(record(n)?),
+        },
     })
+}
+
+thread_local! {
+    /// The names of the module's record types (`collect_records`), for
+    /// `resolve_hint`.
+    static RECORD_NAMES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An object type with a name (`type T = { ... }`, `interface T { ... }`
+/// at the top level): its fields in declaration order, with the classes
+/// their annotations name. Objects made with the fields in this order get
+/// fast field access (see `ir::specialize_fields`).
+#[derive(Clone, Debug)]
+pub struct RecordInfo {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub hints: Vec<Option<HintName>>,
+}
+
+/// The record types of the module: object type literals of plain fields
+/// (no optional, computed or method members), not `aot type`s, generics or
+/// interfaces that extend others.
+fn collect_records(program: &Program) -> Vec<RecordInfo> {
+    fn members(ms: &[TSSignature]) -> Option<(Vec<String>, Vec<Option<HintName>>)> {
+        let mut fields: Vec<String> = Vec::new();
+        let mut hints = Vec::new();
+        for m in ms {
+            let TSSignature::TSPropertySignature(p) = m else { return None };
+            if p.optional || p.computed {
+                return None;
+            }
+            let name = p.key.static_name()?.to_string();
+            if fields.contains(&name) {
+                return None;
+            }
+            fields.push(name);
+            hints.push(p.type_annotation.as_ref().and_then(|t| hint_name(&t.type_annotation)));
+        }
+        (!fields.is_empty()).then_some((fields, hints))
+    }
+    let mut out = Vec::new();
+    for s in &program.body {
+        let decl = match s {
+            Statement::ExportDeclaration(e) => &e.declaration,
+            _ => match s.as_declaration() {
+                Some(d) => d,
+                None => continue,
+            },
+        };
+        let found = match decl {
+            Declaration::TSTypeAliasDeclaration(d)
+                if d.type_parameters.is_none() && crate::structs::struct_named(&d.id.name).is_none() =>
+            {
+                match &d.type_annotation {
+                    TSType::TSTypeLiteral(lit) => members(&lit.members).map(|m| (d.id.name.to_string(), m)),
+                    _ => None,
+                }
+            }
+            Declaration::TSInterfaceDeclaration(i) if i.type_parameters.is_none() && i.extends.is_empty() => {
+                members(&i.body.body).map(|m| (i.id.name.to_string(), m))
+            }
+            _ => None,
+        };
+        if let Some((name, (fields, hints))) = found
+            && !out.iter().any(|r: &RecordInfo| r.name == name)
+        {
+            out.push(RecordInfo { name, fields, hints });
+        }
+    }
+    out
 }
 
 /// A class whose private names or home object native code uses: it gets

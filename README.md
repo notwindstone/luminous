@@ -344,6 +344,15 @@ The differential tests run every case with both.
   `this`: a small method is inlined behind a check that the method reached
   is that one. Annotations are never trusted otherwise: a wrong one only
   costs the check.
+- **Fields of annotated object types**: where an annotation names an
+  object type alias, an interface or a class with plain public fields
+  (`b: Body`, `bs: Body[]`, a field `pos: Body`), its fields are read and
+  written at fixed slots. The first object of the type seen with exactly
+  the declared fields, in order, as writable data properties gives the
+  type's shape; each access then compares the object's shape with it (one
+  load and one comparison, shared by all the type's sites) and loads or
+  stores the slot. Any other object (fields in another order, missing or
+  extra ones, accessors, frozen) goes through the site's inline cache.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline and
   `arr.push(x)` takes the engine's fast path while they are the original

@@ -344,6 +344,12 @@ static JSAtom tsaot_atom_length = JS_ATOM_NULL;
 
 static int tsaot_ic_count(void);
 
+/* (No native code, no record types.) */
+static int tsaot_record_count(void)
+{
+    return &tsaot_nrecords ? tsaot_nrecords : 0;
+}
+
 static int tsaot_fn_cache_count(void)
 {
     return &tsaot_nfn_caches ? tsaot_nfn_caches : 0;
@@ -387,6 +393,11 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
     }
+    for (i = 0; i < tsaot_record_count(); i++) {
+        if (tsaot_record_shapes[i])
+            JS_FreeCachedShape(rt, tsaot_record_shapes[i]);
+        tsaot_record_shapes[i] = NULL;
+    }
     for (i = 0; i < tsaot_ic_count(); i++) {
         if (tsaot_ics[i].shape)
             JS_FreeCachedShape(rt, tsaot_ics[i].shape);
@@ -422,6 +433,10 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
         JS_MarkValue(rt, tsaot_homes[i], mark_func);
     for (i = 0; i < TSAOT_PINS; i++)
         JS_MarkValue(rt, tsaot_pins[i], mark_func);
+    for (i = 0; i < tsaot_record_count(); i++) {
+        if (tsaot_record_shapes[i])
+            JS_MarkCachedShape(rt, tsaot_record_shapes[i], mark_func);
+    }
     for (i = 0; i < tsaot_ic_count(); i++) {
         if (tsaot_ics[i].shape)
             JS_MarkCachedShape(rt, tsaot_ics[i].shape, mark_func);
@@ -688,6 +703,33 @@ static bool tsaot_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int ki
         return false;
     tsaot_ic_store(ctx, ic, shape, proto_shape, mid_shape, slot, kind);
     return true;
+}
+
+/* Learn record r's shape from obj if it has the record's fields first, in
+ * order, as writable data properties (of a shared shape). */
+void tsaot_record_learn(JSContext *ctx, JSValue obj, int r)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    const int *f = tsaot_record_fields + tsaot_record_index[r];
+    void *shape = NULL, *s;
+    int i;
+    if (tsaot_record_shapes[r] || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return;
+    for (i = 0; i < f[0]; i++) {
+        int slot = JS_CacheOwnProperty(ctx, obj, tsaot_atoms[f[1 + i]], 1, &s);
+        if (slot < 0)
+            break;
+        if (shape)
+            JS_FreeCachedShape(rt, s);
+        else
+            shape = s;
+        if (slot != i)
+            break;
+    }
+    if (i == f[0])
+        tsaot_record_shapes[r] = shape;
+    else if (shape)
+        JS_FreeCachedShape(rt, shape);
 }
 
 /* A cache miss reading own data property obj.prop (obj borrowed), where

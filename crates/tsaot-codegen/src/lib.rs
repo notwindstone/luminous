@@ -286,6 +286,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
         ("JS_SortNative", &[P, W, W, P, Int, P], &[Int]),
         ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
+        ("tsaot_record_learn", &[P, W, W, Int], &[]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
@@ -322,7 +323,7 @@ struct Codegen {
     funcs: Vec<FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 11],
+    data: [DataId; 12],
     fast_sig: SigRef,
     /// Inline caches allocated so far (`tsaot_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
@@ -407,6 +408,30 @@ impl Codegen {
         }
         // Defined here, once all sites are known (`define_ics`).
         data.push(module.declare_data("tsaot_ics", Linkage::Export, true));
+        // Record types: their shapes once learned, and their fields (per
+        // record: the field count, then the fields' atom indices).
+        data.push(module.declare_data("tsaot_record_shapes", Linkage::Export, true));
+        let nrec = m.records.len();
+        let shapes = data[data.len() - 1];
+        module.define_data(shapes, mir::DataInit::Zeroed { size: nrec.max(1) * 8 }, 8);
+        let mut fields: Vec<i32> = Vec::new();
+        let mut index: Vec<i32> = Vec::new();
+        for r in &m.records {
+            index.push(fields.len() as i32);
+            fields.push(r.fields.len() as i32);
+            fields.extend(r.fields.iter().map(|&a| a as i32));
+        }
+        let ints = |v: &[i32]| {
+            let mut b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            b.resize(b.len().max(4), 0);
+            b
+        };
+        let d = module.declare_data("tsaot_record_fields", Linkage::Export, false);
+        module.define_data(d, mir::DataInit::Bytes(ints(&fields)), 4);
+        let d = module.declare_data("tsaot_record_index", Linkage::Export, false);
+        module.define_data(d, mir::DataInit::Bytes(ints(&index)), 4);
+        let d = module.declare_data("tsaot_nrecords", Linkage::Export, false);
+        module.define_data(d, mir::DataInit::Bytes((nrec as i32).to_le_bytes().to_vec()), 4);
         Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
@@ -434,8 +459,20 @@ impl Codegen {
     }
 
     fn env(&self) -> Env {
-        let [stack_limit, unwinding, cells, strings, atoms, shapes, privates, homes, struct_class, sarr_class, ics] =
-            self.data;
+        let [
+            stack_limit,
+            unwinding,
+            cells,
+            strings,
+            atoms,
+            shapes,
+            privates,
+            homes,
+            struct_class,
+            sarr_class,
+            ics,
+            record_shapes,
+        ] = self.data;
         Env {
             helpers: self.helpers.clone(),
             funcs: self.funcs.clone(),
@@ -450,6 +487,7 @@ impl Codegen {
             struct_class,
             sarr_class,
             ics,
+            record_shapes,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
             params: self.params.clone(),

@@ -21,6 +21,13 @@ extern uint8_t tsaot_unwinding;
 extern JSValue tsaot_cells[];
 extern JSValue tsaot_strings[];
 extern JSAtom tsaot_atoms[];
+/* Record types (see ir::specialize_fields): per record, its shape once
+ * learned (defined by the native code), and its fields (count, then atom
+ * indices, from tsaot_record_index[r]). */
+extern void *tsaot_record_shapes[] __attribute__((weak));
+extern const int32_t tsaot_record_fields[] __attribute__((weak));
+extern const int32_t tsaot_record_index[] __attribute__((weak));
+extern const int32_t tsaot_nrecords __attribute__((weak));
 extern const char *const tsaot_cell_names[];
 extern const char *const tsaot_atom_names[];
 extern const char *const tsaot_string_data[];
@@ -131,6 +138,7 @@ JSValue tsaot_new_closure(JSContext *ctx, TsaotFnCache *c, JSCFunctionFast *fast
                           const char *name, int length, int magic, int n, JSValue *data);
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
 JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic);
+void tsaot_record_learn(JSContext *ctx, JSValue obj, int r);
 int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC *ic);
 JSValue tsaot_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, TsaotIC *ic);
 int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic);

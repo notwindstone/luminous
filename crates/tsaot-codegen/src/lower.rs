@@ -233,6 +233,8 @@ pub(crate) struct Env {
     pub struct_class: GlobalValue,
     /// `tsaot_sarr_class`: the class of arrays of `aot type` objects.
     pub sarr_class: GlobalValue,
+    /// `tsaot_record_shapes`: per record type, its shape once learned.
+    pub record_shapes: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -2437,41 +2439,44 @@ impl Lower {
                 // One reference for the property, one for the expression.
                 self.dup((vp, vt));
                 let (p, t) = obj.any();
-                let ic = self.new_ic();
+                self.prop_set_ic(p, t, *a, (vp, vt), pred);
+                self.release(v);
+                self.drop_operand(obj, owned);
+                v
+            }
+            ExprKind::ShapeGet { obj, atom, record, slot } => {
+                let (o, owned) = self.operand(obj, &[]);
+                let (p, t) = o.any();
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                let at = self.record_slot(p, t, *record, *slot, slow);
+                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
+                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+                self.dup((vp, vt));
+                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                self.b.switch_to_block(slow);
+                self.record_learn(p, t, *record);
+                let (gp, gt) = self.prop_get_from(p, t, None, *atom, None, false);
+                self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+                self.b.switch_to_block(join);
+                self.drop_operand(o, owned);
+                V::Any(rp, rt)
+            }
+            ExprKind::ShapeSet { obj, atom, record, slot, value } => {
+                let (o, owned) = self.operand(obj, &[value]);
+                let v = self.expr(value);
+                self.hold(v);
+                let (vp, vt) = v.any();
+                // One reference for the property, one for the expression.
+                self.dup((vp, vt));
+                let (p, t) = o.any();
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
-                // An own writable data property of a cached shape, or a setter
-                // (own or of the prototype).
-                let (shape, kind) = self.ic_shape_hit(p, t, ic, slow);
-                let own = self.b.create_block();
-                let proto = self.b.create_block();
-                let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
-                self.b.ins().brif(is_own, own, &[], proto, &[]);
-                self.b.switch_to_block(proto);
-                let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
-                let setter = self.b.ins().load(I64, M_SLOT, pat, 8);
-                self.nonnull(setter, slow);
-                let ctx = self.ctx;
-                // The property's reference is dropped after the call.
-                let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-                let argv = self.values_slot(&[(vp, vt)]);
-                let (sp, st) =
-                    self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
-                        l.dup((vp, vt));
-                        let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
-                        let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
-                        let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
-                        let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
-                        let zero = l.b.ins().iconst(I64, 0);
-                        (zero, l.b.ins().select(failed, exc, undef))
-                    });
-                self.free((vp, vt));
-                self.free((sp, st));
-                self.check_value(st);
-                self.b.ins().jump(join, &[]);
-                self.b.switch_to_block(own);
-                let at = self.ic_slot_addr(p, ic);
+                let at = self.record_slot(p, t, *record, *slot, slow);
                 let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
                 let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
                 self.b.ins().store(M_SLOT, vp, at, 0);
@@ -2479,14 +2484,12 @@ impl Lower {
                 self.free((old_p, old_t));
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
-                let atom = self.atom(*a);
-                let ctx = self.ctx;
-                let r = self.helper("tsaot_ic_set_proto", &[ctx, p, t, atom, vp, vt, ic]);
-                self.check_int(r[0]);
+                self.record_learn(p, t, *record);
+                self.prop_set_ic(p, t, *atom, (vp, vt), None);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
                 self.release(v);
-                self.drop_operand(obj, owned);
+                self.drop_operand(o, owned);
                 v
             }
             ExprKind::GetElem(o, k) => {
@@ -3878,6 +3881,95 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(undef.0), BlockArg::Value(undef.1)]);
         self.b.switch_to_block(join);
         self.is_native(fp, ft, func)
+    }
+
+    /// `p.a = v` (`(p, t)` borrowed; `v` taken by the property) through an
+    /// inline cache: an own writable data property of a cached shape, or a
+    /// setter (own or of the prototype), else the engine.
+    fn prop_set_ic(&mut self, p: Value, t: Value, a: ir::AtomId, (vp, vt): (Value, Value), pred: Option<Pred>) {
+        let ic = self.new_ic();
+        let join = self.b.create_block();
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        // An own writable data property of a cached shape, or a setter
+        // (own or of the prototype).
+        let (shape, kind) = self.ic_shape_hit(p, t, ic, slow);
+        let own = self.b.create_block();
+        let proto = self.b.create_block();
+        let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
+        self.b.ins().brif(is_own, own, &[], proto, &[]);
+        self.b.switch_to_block(proto);
+        let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
+        let setter = self.b.ins().load(I64, M_SLOT, pat, 8);
+        self.nonnull(setter, slow);
+        let ctx = self.ctx;
+        // The property's reference is dropped after the call.
+        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+        let argv = self.values_slot(&[(vp, vt)]);
+        let (sp, st) =
+            self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
+                l.dup((vp, vt));
+                let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
+                let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+                let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
+                let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
+                let zero = l.b.ins().iconst(I64, 0);
+                (zero, l.b.ins().select(failed, exc, undef))
+            });
+        self.free((vp, vt));
+        self.free((sp, st));
+        self.check_value(st);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(own);
+        let at = self.ic_slot_addr(p, ic);
+        let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
+        let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        self.b.ins().store(M_SLOT, vp, at, 0);
+        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        self.free((old_p, old_t));
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(slow);
+        let atom = self.atom(a);
+        let ctx = self.ctx;
+        let r = self.helper("tsaot_ic_set_proto", &[ctx, p, t, atom, vp, vt, ic]);
+        self.check_int(r[0]);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+    }
+
+    /// The address of slot `slot` of `p` if it is an object with the shape of
+    /// record `record` (see `ir::specialize_fields`), else go to `slow`.
+    fn record_slot(&mut self, p: Value, t: Value, record: usize, slot: u32, slow: Block) -> Value {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
+        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, want);
+        let hit = self.b.create_block();
+        self.b.ins().brif(same, hit, &[], slow, &[]);
+        self.b.switch_to_block(hit);
+        let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+        self.b.ins().iadd_imm_s(props, (slot as usize * SIZE) as i64)
+    }
+
+    /// While record `record`'s shape is unknown: learn it from `(p, t)`.
+    fn record_learn(&mut self, p: Value, t: Value, record: usize) {
+        let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
+        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
+        let unknown = self.b.ins().icmp_imm_s(IntCC::Equal, want, 0);
+        let learn = self.b.create_block();
+        let after = self.b.create_block();
+        self.b.set_cold_block(learn);
+        self.b.ins().brif(unknown, learn, &[], after, &[]);
+        self.b.switch_to_block(learn);
+        let ctx = self.ctx;
+        let r = self.b.ins().iconst(I32, record as i64);
+        self.helper("tsaot_record_learn", &[ctx, p, t, r]);
+        self.b.ins().jump(after, &[]);
+        self.b.switch_to_block(after);
     }
 
     /// Call `f` (held) with `this` (borrowed) and `args`; frees `f`.
