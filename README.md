@@ -65,7 +65,9 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
    backend-neutral SSA IR, which Cranelift or LLVM compiles (see
    [Backends](#backends)). Calls between native functions are direct machine
    calls. Exceptions propagate through native frames, freeing their
-   temporaries.
+   temporaries. What a loop body declares (`const`, `let`) is released when
+   its iteration ends, as the interpreter does, so two iterations' data are
+   never alive at once.
 4. **Interpreted code.** The whole module is type-erased (oxc transformer) and
    compiled by `qjsc` to bytecode. Each native function's binding is
    re-pointed at a function object whose entry is native code. The original

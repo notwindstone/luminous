@@ -1371,6 +1371,96 @@ fn stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
     }
 }
 
+/// Calls `f` on the locals expression `e` names itself (not through its
+/// subexpressions), and on those the statements of a body it holds name.
+fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
+    use ExprKind::*;
+    match &e.kind {
+        Local(l)
+        | SetLocal(l, _)
+        | InitLocal(l, _)
+        | ForInGet(l, ..)
+        | ArrayPush(l, _)
+        | AsyncIterResult(_, l)
+        | IterCloseQuiet(l)
+        | Update { local: l, .. }
+        | StrCharCode { s: l, .. }
+        | StrLen { s: l }
+        | SlotLoad { obj: l, .. }
+        | SlotStore { obj: l, .. } => f(*l),
+        IterOpen(_, a, b, _) | IterClose(a, b) => {
+            f(*a);
+            f(*b);
+        }
+        IterStep(a, b) => {
+            f(*a);
+            b.iter().for_each(|&b| f(b));
+        }
+        Closure(_, ls) => ls.iter().for_each(|&l| f(l)),
+        Inline { locals, body } | Predicted { locals, body, .. } | ArrayLoop { locals, body, .. } => {
+            locals.iter().for_each(|&l| f(l));
+            stmt_locals(body, f);
+        }
+        SpecGuard { objs, fields, nums, strs, .. } => {
+            objs.iter().for_each(|&(l, _)| f(l));
+            fields.iter().for_each(|&(l, _)| f(l));
+            nums.iter().for_each(|&(a, b)| {
+                f(a);
+                f(b);
+            });
+            strs.iter().for_each(|&l| f(l));
+        }
+        _ => {}
+    }
+}
+
+/// Calls `f` on every naming of a local in `stmts` (by statements, or
+/// expressions at any depth).
+fn each_local(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+    stmt_locals(stmts, f);
+    visit_stmts(stmts, &mut |e| expr_locals(e, f));
+}
+
+/// How many times each of the `n` locals is named in `stmts`.
+pub fn local_uses(stmts: &[Stmt], n: usize) -> Vec<usize> {
+    let mut uses = vec![0; n];
+    each_local(stmts, &mut |l| uses[l] += 1);
+    uses
+}
+
+/// The locals a loop body declares for each iteration: among those `cand`
+/// accepts, the ones a statement of the body itself (or of its blocks)
+/// declares (`InitLocal`, as `let` and `const` do) before anything else in
+/// the body names them, and that nothing outside the body names (`uses`:
+/// the function's counts). Their value is dead once an iteration ends: the
+/// next one declares them again.
+pub fn iteration_locals(body: &[Stmt], uses: &[usize], cand: impl Fn(LocalId) -> bool) -> Vec<LocalId> {
+    fn flat<'a>(stmts: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
+        for s in stmts {
+            match s {
+                Stmt::Block(b) => flat(b, out),
+                _ => out.push(s),
+            }
+        }
+    }
+    let mut seq = Vec::new();
+    flat(body, &mut seq);
+    let inside = local_uses(body, uses.len());
+    let mut seen = vec![false; uses.len()];
+    let mut out = Vec::new();
+    for s in seq {
+        if let Stmt::Expr(Expr { kind: ExprKind::InitLocal(l, x), .. }) = s {
+            let mut own = false;
+            visit(x, &mut |e| expr_locals(e, &mut |m| own |= m == *l));
+            if !seen[*l] && !own && inside[*l] == uses[*l] && cand(*l) {
+                out.push(*l);
+            }
+        }
+        each_local(std::slice::from_ref(s), &mut |l| seen[l] = true);
+    }
+    out
+}
+
 /// Calls `f` on the expressions that are statements.
 fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
     for s in stmts {

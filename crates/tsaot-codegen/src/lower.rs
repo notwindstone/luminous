@@ -347,6 +347,10 @@ pub(crate) struct Lower {
     async_gen: bool,
     /// See `ir::Func::ret_slot`.
     ret_slot: Option<ir::LocalId>,
+    /// How many times the function names each local (`ir::local_uses`),
+    /// and its number of parameters.
+    local_uses: Vec<usize>,
+    n_params: usize,
     /// `f64` values that are exact integers by construction (int locals,
     /// integral constants), and their `i64` value.
     int_of: HashMap<Value, Value>,
@@ -474,6 +478,8 @@ impl Lower {
             async_cx: None,
             async_gen: false,
             ret_slot: f.ret_slot,
+            local_uses: ir::local_uses(&f.body, f.locals.len()),
+            n_params: f.params.len(),
             int_of: HashMap::new(),
             i32s: Default::default(),
             wide_of: HashMap::new(),
@@ -1013,6 +1019,21 @@ impl Lower {
                 }
 
                 self.b.switch_to_block(cont);
+                // What the iteration declared for itself is released now,
+                // not when the next iteration declares it again (two
+                // iterations' data would be alive at once).
+                let fresh = ir::iteration_locals(body, &self.local_uses, |l| {
+                    l >= self.n_params
+                        && self.ret_slot != Some(l)
+                        && is_js(self.locals[l])
+                        && matches!(self.vars[l], LVar::Two(..))
+                });
+                for l in fresh {
+                    let old = self.use_local(l).any();
+                    let undef = self.konst(0, TAG_UNDEFINED);
+                    self.def_local(l, undef);
+                    self.free(old);
+                }
                 let counter = self.bounded_counter(test.as_ref().filter(|_| !post_test), body, update.as_ref());
                 self.bounded.extend(counter);
                 self.new_boxes(per_iteration, true);
