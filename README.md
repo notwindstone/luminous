@@ -127,9 +127,9 @@ regular call path's generated code alone.
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
 `patches/0001-tsaot-engine-support.patch` and builds the engine without
-the stack protector and semantic interposition distribution compilers
-default to (it is linked statically: its exported functions inline into
-each other). The patch adds API and a few fast paths that keep the
+the stack protector, semantic interposition and CET markers distribution
+compilers default to (it is linked statically: its exported functions
+inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
 engine's semantics:
 
 - `JSCFunctionFast` and `JS_NewCFunctionDataFast`, the call hook above;

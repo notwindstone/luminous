@@ -13,10 +13,12 @@ for p in patches/*.patch; do
   echo "applying $p"
   patch -d build/quickjs-src -p1 --quiet < "$p"
 done
-# No stack protector or semantic interposition (distribution compilers'
-# defaults): the engine is linked statically, so its exported functions
-# can be inlined into each other, and its hot paths keep no canaries.
-FLAGS="-fno-stack-protector -fno-semantic-interposition"
+# No stack protector, semantic interposition or CET markers (distribution
+# compilers' defaults): the engine is linked statically, so its exported
+# functions can be inlined into each other, and its hot paths keep no
+# canaries. No straight-line vectorization either: it packs the
+# allocator's counters into vector registers on every free.
+FLAGS="-fno-stack-protector -fno-semantic-interposition -fcf-protection=none -fno-tree-slp-vectorize"
 cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$FLAGS"
 ninja -C build/quickjs qjsc qjs qjs_exe
 
