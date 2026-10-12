@@ -301,6 +301,11 @@ pub(crate) struct Lower {
     /// payload, so arithmetic on boxed numbers needs no boxing in between
     /// (the boxing is left unused).
     num_shadow: HashMap<Value, Value>,
+    /// In a speculative region: the property array of each guarded object.
+    spec_src: HashMap<ir::LocalId, Value>,
+    /// In a speculative region: whether every value its guard checked is
+    /// a float (not an int32).
+    spec_floats: bool,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
     /// Inlined calls being lowered (innermost last): where their `return`s
@@ -436,6 +441,8 @@ impl Lower {
             vars,
             shadows,
             num_shadow: HashMap::new(),
+            spec_src: HashMap::new(),
+            spec_floats: false,
             loops: HashMap::new(),
             inline_rets: Vec::new(),
             pred: None,
@@ -934,6 +941,9 @@ impl Lower {
             Stmt::Await { value, target } => self.await_stmt(value, *target),
             Stmt::Yield { value, kind, target } => self.yield_stmt(value, *kind, *target),
             Stmt::Block(b) => self.stmts(b),
+            Stmt::If(Expr { kind: ExprKind::SpecGuard { objs, distinct, fields, nums }, .. }, fast, slow) => {
+                self.spec_region(objs, *distinct, fields, nums, fast, slow)
+            }
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
                 let tb = self.b.create_block();
@@ -2492,6 +2502,31 @@ impl Lower {
                 self.drop_operand(o, owned);
                 v
             }
+            ExprKind::SpecGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::SlotLoad { obj, slot } => {
+                let props = self.spec_src[obj];
+                let off = (*slot as usize * SIZE) as i32;
+                if self.spec_floats {
+                    V::Num(self.b.ins().load(F64, M_SLOT, props, off))
+                } else {
+                    let p = self.b.ins().load(I64, M_SLOT, props, off);
+                    let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
+                    V::Num(self.number_tagged(p, t))
+                }
+            }
+            ExprKind::SlotStore { obj, slot, value, arith } => {
+                let d = self.expr(value).num();
+                let (p, _) = self.use_local(*obj).any();
+                let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+                // A number replaces a number: nothing to free. Where only
+                // floats were read, the result is a float, as the
+                // interpreter's float arithmetic makes it.
+                let (vp, vt) = if self.spec_floats && *arith { self.box_float(d) } else { self.box_number(d) };
+                let off = (*slot as usize * SIZE) as i32;
+                self.b.ins().store(M_SLOT, vp, props, off);
+                self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
+                V::Num(d)
+            }
             ExprKind::GetElem(o, k) => {
                 let (obj, owned) = self.operand(o, &[k]);
                 let key = self.expr(k);
@@ -3955,6 +3990,126 @@ impl Lower {
         self.b.ins().iadd_imm_s(props, (slot as usize * SIZE) as i64)
     }
 
+    /// A speculative region (see `tsaot_front::spec`): its guard, then
+    /// `fast` where it holds, else `slow`. `fast` is lowered twice: for
+    /// when every value checked is a float, reading the fields as doubles
+    /// and storing floats as the interpreter's float arithmetic does, and
+    /// for when some are int32s, converting what it reads and storing
+    /// int32s where the numbers are.
+    fn spec_region(
+        &mut self,
+        objs: &[(ir::LocalId, usize)],
+        distinct: bool,
+        fields: &[(ir::LocalId, u32)],
+        nums: &[(ir::LocalId, ir::LocalId)],
+        fast: &[Stmt],
+        slow: &[Stmt],
+    ) {
+        let slow_b = self.b.create_block();
+        let join = self.b.create_block();
+        let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
+        let mut ptrs = Vec::new();
+        for &(o, r) in objs {
+            let (p, t) = self.use_local(o).any();
+            let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+            let next = self.b.create_block();
+            self.b.ins().brif(is_obj, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+            let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+            let want = self.b.ins().load(I64, M_IC, table, (r * 8) as i32);
+            let same = self.b.ins().icmp(IntCC::Equal, shape, want);
+            let next = self.b.create_block();
+            self.b.ins().brif(same, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+            let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+            ptrs.push((o, p, props));
+        }
+        if distinct {
+            let mut same = self.b.ins().iconst(I8, 0);
+            for i in 0..ptrs.len() {
+                for j in i + 1..ptrs.len() {
+                    let eq = self.b.ins().icmp(IntCC::Equal, ptrs[i].1, ptrs[j].1);
+                    same = self.b.ins().bor(same, eq);
+                }
+            }
+            let next = self.b.create_block();
+            self.b.ins().brif(same, slow_b, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        let props_of = |o: ir::LocalId| ptrs.iter().find(|x| x.0 == o).expect("guarded object").2;
+        let tags = |l: &mut Self| -> Vec<Value> {
+            fields
+                .iter()
+                .map(|&(o, slot)| l.b.ins().load(I64, M_SLOT, props_of(o), (slot as usize * SIZE) as i32 + TAG_OFFSET))
+                .collect()
+        };
+        let locals: Vec<(Value, Value)> = nums.iter().map(|&(from, _)| self.use_local(from).any()).collect();
+        // Floats are tagged FLOAT64: every value is one iff no tag differs.
+        let mut diff = self.b.ins().iconst(I64, 0);
+        for t in tags(self).into_iter().chain(locals.iter().map(|x| x.1)) {
+            let d = self.b.ins().bxor_imm_u(t, TAG_FLOAT64);
+            diff = self.b.ins().bor(diff, d);
+        }
+        let floats = self.b.create_block();
+        let check = self.b.create_block();
+        let all_floats = self.b.ins().icmp_imm_s(IntCC::Equal, diff, 0);
+        self.b.ins().brif(all_floats, floats, &[], check, &[]);
+        for &(o, _, props) in &ptrs {
+            self.spec_src.insert(o, props);
+        }
+
+        self.b.switch_to_block(floats);
+        for (&(_, to), &(p, _)) in nums.iter().zip(&locals) {
+            let d = self.b.ins().bitcast(F64, p);
+            self.def_local(to, V::Num(d));
+        }
+        self.spec_floats = true;
+        self.stmts(fast);
+        if !self.is_filled() {
+            self.b.ins().jump(join, &[]);
+        }
+
+        // Int32s (INT, 0) and floats are numbers: all are iff no tag has
+        // another bit set.
+        self.b.switch_to_block(check);
+        let tags = tags(self);
+        let mut any = self.b.ins().iconst(I64, 0);
+        for &t in tags.iter().chain(locals.iter().map(|x| &x.1)) {
+            any = self.b.ins().bor(any, t);
+        }
+        let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
+        let numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+        let mixed = self.b.create_block();
+        self.b.ins().brif(numbers, mixed, &[], slow_b, &[]);
+        self.b.switch_to_block(mixed);
+        for (&(_, to), &(p, t)) in nums.iter().zip(&locals) {
+            let d = self.number_tagged(p, t);
+            self.def_local(to, V::Num(d));
+        }
+        self.spec_floats = false;
+        self.stmts(fast);
+        if !self.is_filled() {
+            self.b.ins().jump(join, &[]);
+        }
+
+        self.b.switch_to_block(slow_b);
+        self.stmts(slow);
+        if !self.is_filled() {
+            self.b.ins().jump(join, &[]);
+        }
+        self.b.switch_to_block(join);
+    }
+
+    /// The double of a JS value known to be an int32 or a float.
+    fn number_tagged(&mut self, p: Value, t: Value) -> Value {
+        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
+        let i = self.b.ins().ireduce(I32, p);
+        let i = self.b.ins().sextend(I64, i);
+        let fi = self.b.ins().fcvt_from_sint(F64, i);
+        let ff = self.b.ins().bitcast(F64, p);
+        self.b.ins().select(is_int, fi, ff)
+    }
+
     /// While record `record`'s shape is unknown: learn it from `(p, t)`.
     fn record_learn(&mut self, p: Value, t: Value, record: usize) {
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
@@ -4917,21 +5072,13 @@ impl Lower {
         }
         let b = &mut self.b;
         let u = b.ins().bitcast(I64, d);
-        // Unbiased exponent; negative exponents wrap to huge unsigned values.
-        let e = b.ins().ushr_imm_u(u, 52);
-        let e = b.ins().band_imm_u(e, 0x7ff);
-        let e = b.ins().iadd_imm_s(e, -1023);
-        // |d| in [1, 2^31): integral iff no mantissa bits below the binary point.
-        let small = b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, e, 30);
-        let frac = b.ins().ishl_imm_u(u, 12);
-        let frac = b.ins().ishl(frac, e);
-        let small_int = b.ins().icmp_imm_s(IntCC::Equal, frac, 0);
-        // Otherwise only +0 and INT32_MIN are int32 (this rejects -0).
-        let is_zero = b.ins().icmp_imm_s(IntCC::Equal, u, 0);
-        let is_min = b.ins().icmp_imm_s(IntCC::Equal, u, 0xc1e0_0000_0000_0000_u64 as i64);
-        let big_int = b.ins().bor(is_zero, is_min);
-        let is_int = b.ins().select(small, small_int, big_int);
-        let i = b.ins().fcvt_to_sint_sat(I32, d);
+        // An int32 iff converting there and back gives the same number
+        // (never for NaN), and not -0.
+        let i = b.ins().fcvt_to_sint_any(I32, d);
+        let back = b.ins().fcvt_from_sint(F64, i);
+        let same = b.ins().fcmp(FloatCC::Equal, back, d);
+        let not_neg_zero = b.ins().icmp_imm_s(IntCC::NotEqual, u, i64::MIN);
+        let is_int = b.ins().band(same, not_neg_zero);
         let int_payload = b.ins().uextend(I64, i);
         let payload = b.ins().select(is_int, int_payload, u);
         let int_tag = b.ins().iconst(I64, TAG_INT);
@@ -6571,14 +6718,17 @@ fn int_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
 }
 
 /// The parameters of the bodies predicted calls inline (`Pred`), which
-/// `inline_method` binds to the arguments, and of native loops' callbacks
-/// (`array_loop`): not assignments of the IR.
+/// `inline_method` binds to the arguments, of native loops' callbacks
+/// (`array_loop`), and the locals guards of speculative regions load: not
+/// assignments of the IR.
 fn predicted_params(f: &ir::Func, params: &[Vec<Ty>]) -> Vec<ir::LocalId> {
     let mut out = Vec::new();
-    ir::visit_stmts(&f.body, &mut |e| {
-        if let ExprKind::Predicted { func, locals, .. } | ExprKind::ArrayLoop { func, locals, .. } = &e.kind {
+    ir::visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::Predicted { func, locals, .. } | ExprKind::ArrayLoop { func, locals, .. } => {
             out.extend(locals.iter().take(params[*func].len()));
         }
+        ExprKind::SpecGuard { nums, .. } => out.extend(nums.iter().map(|n| n.1)),
+        _ => {}
     });
     out
 }

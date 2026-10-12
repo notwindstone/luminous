@@ -155,6 +155,9 @@ fn real_main() -> Result<()> {
             for (i, f) in analysis.module.funcs.iter().enumerate() {
                 println!("// tsaot_fn_{i}\n{f:#?}\n");
             }
+            for (i, f) in analysis.module.closures.iter().enumerate() {
+                println!("// closure {i}\n{f:#?}\n");
+            }
             Ok(())
         }
     }

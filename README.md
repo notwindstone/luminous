@@ -343,7 +343,11 @@ The differential tests run every case with both.
   values are predicted to reach that class's native methods, as for
   `this`: a small method is inlined behind a check that the method reached
   is that one. Annotations are never trusted otherwise: a wrong one only
-  costs the check.
+  costs the check. What an annotation says follows the values: the
+  elements of an annotated array (`xs[i]`, `for (const x of xs)`, the
+  parameters of arrow functions passed to `xs.map`, `filter`, `forEach`,
+  `sort`, `reduce`, ...), and what `slice`, `filter`, `sort` or `find`
+  return.
 - **Fields of annotated object types**: where an annotation names an
   object type alias, an interface or a class with plain public fields
   (`b: Body`, `bs: Body[]`, a field `pos: Body`), its fields are read and
@@ -353,6 +357,22 @@ The differential tests run every case with both.
   load and one comparison, shared by all the type's sites) and loads or
   stores the slot. Any other object (fields in another order, missing or
   extra ones, accessors, frozen) goes through the site's inline cache.
+- **Speculative numeric regions**, as JIT compilers speculate on what
+  fields hold: a run of statements that only does arithmetic on fields
+  annotated `number` (of locals holding such objects), numbers and untyped
+  locals (`const dx = a.x - b.x; ... a.vx -= dx * b.m * f;`) gets a second
+  version where all of these are doubles. One guard before it checks the
+  objects' shapes, that they are distinct objects if fields are written,
+  and that every field and untyped local it reads holds a number (one OR
+  of the tags when all are floats); the run then reads the fields as
+  doubles where it uses them, computes in registers, and stores the fields
+  it changed at its end (as floats, as the interpreter's float arithmetic
+  makes them; a copy for when some held int32s stores int32s where the
+  results are). Nothing in the run can call, throw or allocate, so what the
+  guard checked holds throughout. When it fails (a string, a BigInt, the
+  same object twice, a getter), the statements run as before. Runs may
+  contain `if`, `?:`, `&&`, `||`, comparisons and `return`; one that
+  stores no field needs enough arithmetic to be worth its guard.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline and
   `arr.push(x)` takes the engine's fast path while they are the original

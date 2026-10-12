@@ -177,6 +177,8 @@ pub struct Record {
     pub fields: Vec<AtomId>,
     /// What the fields' annotations say they hold.
     pub hints: Vec<Option<Hint>>,
+    /// Which fields are annotated as numbers.
+    pub nums: Vec<bool>,
 }
 
 /// How an `aot type` field is stored: unboxed when all members agree.
@@ -246,6 +248,8 @@ pub struct ClassTable {
     pub members: Vec<(String, u8, bool, FuncId)>,
     /// What the type annotations of its instance fields say they hold.
     pub fields: Vec<(String, Hint)>,
+    /// Its instance fields annotated as numbers.
+    pub nums: Vec<String>,
 }
 
 /// What a type annotation says a value is, for predicting the methods it
@@ -645,6 +649,35 @@ pub enum ExprKind {
         slot: u32,
         value: Box<Expr>,
     },
+    /// The guard of a speculative region (see `spec::speculate_numbers`),
+    /// only as the condition of its `Stmt::If`: whether each local of
+    /// `objs` holds an object with the shape of its record (all distinct
+    /// objects if `distinct`), and its fields `(obj, slot)` in `fields` and
+    /// the JS-valued locals `(from, to)` in `nums` hold numbers. If so, the
+    /// numbers of `nums` are now in their `F64` locals `to`. `Bool`.
+    SpecGuard {
+        objs: Vec<(LocalId, usize)>,
+        distinct: bool,
+        fields: Vec<(LocalId, u32)>,
+        nums: Vec<(LocalId, LocalId)>,
+    },
+    /// In a speculative region: the number field `slot` of the object in
+    /// local `obj` held when the region's guard checked it. `F64`.
+    SlotLoad {
+        obj: LocalId,
+        slot: u32,
+    },
+    /// In a speculative region: store number `value` (`F64`) in field
+    /// `slot` of the object in local `obj`, which the region's guard
+    /// checked (the slot holds a number: nothing to free); as a float when
+    /// only floats were read and `arith` (the value is the result of
+    /// arithmetic, which makes floats of floats). Evaluates to the value.
+    SlotStore {
+        obj: LocalId,
+        slot: u32,
+        value: Box<Expr>,
+        arith: bool,
+    },
     /// Whether the prototype of class `class` still has native function
     /// `func` as its own data property `method` (no getter runs). `Bool`.
     /// (See `virtualize_instances`.)
@@ -973,6 +1006,8 @@ macro_rules! visitor {
                 | IterCloseQuiet(_)
                 | SuperGetAtom(..)
                 | ProtoMethodIs { .. }
+                | SpecGuard { .. }
+                | SlotLoad { .. }
                 | Closure(..) => {}
                 Inline { body, .. } => $stmts(body, f),
                 Predicted { expr, body, .. } => {
@@ -989,6 +1024,7 @@ macro_rules! visitor {
                     $name(callback, f);
                 }
                 ShapeGet { obj, .. } => $name(obj, f),
+                SlotStore { value, .. } => $name(value, f),
                 ShapeSet { obj, value, .. } => {
                     $name(obj, f);
                     $name(value, f);
@@ -2095,10 +2131,19 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
         ExprKind::Seq(xs) => expr_hint(m, f, hints, xs.last()?),
         ExprKind::NewInstance { class, .. } => Some(Hint::Class(*class)),
         ExprKind::Call(g, _) | ExprKind::CallChecked { func: g, .. } => func_at(m, *g).ret_hint,
-        ExprKind::CallMethod(o, Key::Atom(a), _) => {
-            let g = class_member(m, Some(class_of(o)?), false, &m.atoms[*a], 0)?;
-            func_at(m, g).ret_hint
-        }
+        ExprKind::CallMethod(o, Key::Atom(a), _) => match expr_hint(m, f, hints, o)? {
+            Hint::Class(k) => {
+                let g = class_member(m, Some(k), false, &m.atoms[*a], 0)?;
+                func_at(m, g).ret_hint
+            }
+            // Array methods that give the same elements, or one of them.
+            h @ (Hint::ArrayOf(_) | Hint::ArrayOfRecord(_)) => match m.atoms[*a].as_str() {
+                "slice" | "filter" | "sort" | "reverse" | "toSorted" | "toReversed" => Some(h),
+                "find" | "findLast" | "pop" | "shift" | "at" => element_hint(h),
+                _ => None,
+            },
+            _ => None,
+        },
         ExprKind::ShapeGet { obj, atom, .. } => field_of_record(obj, *atom).or_else(|| {
             let k = class_of(obj)?;
             m.classes.get(k)?.fields.iter().find(|(n, _)| *n == m.atoms[*atom]).map(|(_, h)| *h)
@@ -2117,11 +2162,7 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
             }
             func_at(m, class_member(m, Some(k), false, name, 1)?).ret_hint
         }
-        ExprKind::GetElem(o, _) => match expr_hint(m, f, hints, o)? {
-            Hint::ArrayOf(k) => Some(Hint::Class(k)),
-            Hint::ArrayOfRecord(r) => Some(Hint::Record(r)),
-            Hint::Class(_) | Hint::Record(_) => None,
-        },
+        ExprKind::GetElem(o, _) => element_hint(expr_hint(m, f, hints, o)?),
         ExprKind::Cond(_, a, b) => {
             let h = expr_hint(m, f, hints, a)?;
             (expr_hint(m, f, hints, b)? == h).then_some(h)
@@ -2130,54 +2171,109 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
     }
 }
 
+/// What an element of an array with hint `h` is.
+fn element_hint(h: Hint) -> Option<Hint> {
+    match h {
+        Hint::ArrayOf(k) => Some(Hint::Class(k)),
+        Hint::ArrayOfRecord(r) => Some(Hint::Record(r)),
+        Hint::Class(_) | Hint::Record(_) => None,
+    }
+}
+
 /// Extends `Func::hints` (from annotations) to the locals whose every
-/// value has the same hint (`null` and `undefined` aside).
+/// value has the same hint (`null` and `undefined` aside), including the
+/// variables of `for`-`of` loops over arrays, and to the element
+/// parameters of arrow functions passed to array methods (`xs.map((x) =>
+/// ...)`, `xs.sort((a, b) => ...)`).
 pub fn infer_hints(m: &mut Module) {
     let total = m.funcs.len() + m.closures.len();
-    let mut all = Vec::with_capacity(total);
-    for g in 0..total {
-        let f = func_at(m, g);
-        let n = f.locals.len();
-        let mut other = f.boxed.clone();
+    let nfuncs = m.funcs.len();
+    let mut seeds: Vec<HashMap<LocalId, Hint>> = (0..total).map(|g| func_at(m, g).hints.clone()).collect();
+    loop {
+        let all: Vec<HashMap<LocalId, Hint>> = (0..total).map(|g| infer_in(m, g, &seeds[g])).collect();
+        let mut changed = false;
+        for g in 0..total {
+            let f = func_at(m, g);
+            visit_stmts(&f.body, &mut |e| {
+                let ExprKind::CallMethod(recv, Key::Atom(a), args) = &e.kind else { return };
+                let Some(ExprKind::Closure(k, _)) = args.first().map(|x| &x.kind) else { return };
+                let Some(elem) = expr_hint(m, f, &all[g], recv).and_then(element_hint) else { return };
+                let params: &[LocalId] = match m.atoms[*a].as_str() {
+                    "forEach" | "map" | "filter" | "some" | "every" | "find" | "findIndex" | "findLast"
+                    | "findLastIndex" | "flatMap" => &[0],
+                    "sort" | "toSorted" => &[0, 1],
+                    "reduce" | "reduceRight" => &[1],
+                    _ => return,
+                };
+                let c = nfuncs + *k;
+                let n = func_at(m, c).params.len();
+                for &p in params {
+                    if p < n && !seeds[c].contains_key(&p) {
+                        seeds[c].insert(p, elem);
+                        changed = true;
+                    }
+                }
+            });
+        }
+        if !changed {
+            for (g, hints) in all.into_iter().enumerate() {
+                let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+                f.hints = hints;
+            }
+            return;
+        }
+    }
+}
+
+/// `infer_hints` in function `g`, from hints `seeds`.
+fn infer_in(m: &Module, g: usize, seeds: &HashMap<LocalId, Hint>) -> HashMap<LocalId, Hint> {
+    let f = func_at(m, g);
+    let n = f.locals.len();
+    let mut other = f.boxed.clone();
+    visit_stmts(&f.body, &mut |e| {
+        if let ExprKind::Update { local, .. } = &e.kind {
+            other[*local] = true;
+        }
+    });
+    stmt_locals(&f.body, &mut |l| other[l] = true);
+    let mut hints = seeds.clone();
+    loop {
+        // The elements of what iterators iterate.
+        let mut iters: HashMap<LocalId, Hint> = HashMap::new();
         visit_stmts(&f.body, &mut |e| {
-            if let ExprKind::Update { local, .. } = &e.kind {
-                other[*local] = true;
+            if let ExprKind::IterOpen(x, iter, _, _) = &e.kind
+                && let Some(h) = expr_hint(m, f, &hints, x).and_then(element_hint)
+            {
+                iters.insert(*iter, h);
             }
         });
-        stmt_locals(&f.body, &mut |l| other[l] = true);
-        let mut hints = f.hints.clone();
-        loop {
-            // Per local: the hint all its values have so far, or a conflict.
-            let mut seen: Vec<Option<Option<Hint>>> = vec![None; n];
-            visit_stmts(&f.body, &mut |e| {
-                let (ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x)) = &e.kind else { return };
-                if hints.contains_key(l) || other[*l] || matches!(x.kind, ExprKind::Null | ExprKind::Undefined) {
-                    return;
-                }
-                let h = expr_hint(m, f, &hints, x);
-                seen[*l] = match seen[*l] {
-                    None => Some(h),
-                    Some(prev) if prev == h => Some(h),
-                    Some(_) => Some(None),
-                };
-            });
-            let mut changed = false;
-            for (l, s) in seen.into_iter().enumerate() {
-                if let Some(Some(h)) = s {
-                    hints.insert(l, h);
-                    changed = true;
-                }
+        // Per local: the hint all its values have so far, or a conflict.
+        let mut seen: Vec<Option<Option<Hint>>> = vec![None; n];
+        visit_stmts(&f.body, &mut |e| {
+            let (ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x)) = &e.kind else { return };
+            if hints.contains_key(l) || other[*l] || matches!(x.kind, ExprKind::Null | ExprKind::Undefined) {
+                return;
             }
-            if !changed {
-                break;
+            let h = match &x.kind {
+                ExprKind::IterStep(iter, _) => iters.get(iter).copied(),
+                _ => expr_hint(m, f, &hints, x),
+            };
+            seen[*l] = match seen[*l] {
+                None => Some(h),
+                Some(prev) if prev == h => Some(h),
+                Some(_) => Some(None),
+            };
+        });
+        let mut changed = false;
+        for (l, s) in seen.into_iter().enumerate() {
+            if let Some(Some(h)) = s {
+                hints.insert(l, h);
+                changed = true;
             }
         }
-        all.push(hints);
-    }
-    let nfuncs = m.funcs.len();
-    for (g, hints) in all.into_iter().enumerate() {
-        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
-        f.hints = hints;
+        if !changed {
+            return hints;
+        }
     }
 }
 
@@ -2419,7 +2515,8 @@ pub fn class_records(m: &mut Module) {
             .iter()
             .map(|&a| m.classes[k].fields.iter().find(|(n, _)| *n == m.atoms[a]).map(|(_, h)| *h))
             .collect();
-        m.records.push(Record { fields, hints });
+        let nums = fields.iter().map(|&a| m.classes[k].nums.contains(&m.atoms[a])).collect();
+        m.records.push(Record { fields, hints, nums });
         m.class_records[k] = Some(m.records.len() - 1);
     }
 }

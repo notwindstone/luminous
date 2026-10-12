@@ -311,7 +311,7 @@ impl Translator<'_, '_> {
                     ConvOp::Ireduce => ins.ireduce(t, a),
                     ConvOp::FromSint => ins.fcvt_from_sint(t, a),
                     ConvOp::FromUint => ins.fcvt_from_uint(t, a),
-                    ConvOp::ToSintSat => ins.fcvt_to_sint_sat(t, a),
+                    ConvOp::ToSintSat | ConvOp::ToSintAny => ins.fcvt_to_sint_sat(t, a),
                     ConvOp::ToUintSat => ins.fcvt_to_uint_sat(t, a),
                     ConvOp::Fpromote => ins.fpromote(t, a),
                     ConvOp::Fdemote => ins.fdemote(t, a),

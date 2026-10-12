@@ -319,6 +319,7 @@ pub fn check<'a>(
                 .map(|r| ir::Record {
                     fields: r.fields.iter().map(|n| cx.atom(n)).collect(),
                     hints: r.hints.iter().map(|h| h.as_ref().and_then(|h| resolve_hint(h, &classes))).collect(),
+                    nums: r.nums.clone(),
                 })
                 .collect();
             let mut module = ir::Module {
@@ -344,6 +345,7 @@ pub fn check<'a>(
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
             ir::virtualize_instances(&mut module);
+            crate::spec::speculate_numbers(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
@@ -594,6 +596,8 @@ pub struct ClassInfo {
     pub superclass: Option<usize>,
     /// The classes the type annotations of its instance fields name.
     pub fields: Vec<(String, HintName)>,
+    /// Its instance fields annotated as numbers.
+    pub nums: Vec<String>,
 }
 
 /// A class a type annotation names (resolved to an `ir::Hint` once all
@@ -665,15 +669,19 @@ pub struct RecordInfo {
     pub name: String,
     pub fields: Vec<String>,
     pub hints: Vec<Option<HintName>>,
+    /// Which fields are annotated as numbers.
+    pub nums: Vec<bool>,
 }
 
 /// The record types of the module: object type literals of plain fields
 /// (no optional, computed or method members), not `aot type`s, generics or
 /// interfaces that extend others.
 fn collect_records(program: &Program) -> Vec<RecordInfo> {
-    fn members(ms: &[TSSignature]) -> Option<(Vec<String>, Vec<Option<HintName>>)> {
+    type Members = (Vec<String>, Vec<Option<HintName>>, Vec<bool>);
+    fn members(ms: &[TSSignature]) -> Option<Members> {
         let mut fields: Vec<String> = Vec::new();
         let mut hints = Vec::new();
+        let mut nums = Vec::new();
         for m in ms {
             let TSSignature::TSPropertySignature(p) = m else { return None };
             if p.optional || p.computed {
@@ -685,8 +693,9 @@ fn collect_records(program: &Program) -> Vec<RecordInfo> {
             }
             fields.push(name);
             hints.push(p.type_annotation.as_ref().and_then(|t| hint_name(&t.type_annotation)));
+            nums.push(p.type_annotation.as_ref().is_some_and(|t| is_number_type(&t.type_annotation)));
         }
-        (!fields.is_empty()).then_some((fields, hints))
+        (!fields.is_empty()).then_some((fields, hints, nums))
     }
     let mut out = Vec::new();
     for s in &program.body {
@@ -711,10 +720,10 @@ fn collect_records(program: &Program) -> Vec<RecordInfo> {
             }
             _ => None,
         };
-        if let Some((name, (fields, hints))) = found
+        if let Some((name, (fields, hints, nums))) = found
             && !out.iter().any(|r: &RecordInfo| r.name == name)
         {
-            out.push(RecordInfo { name, fields, hints });
+            out.push(RecordInfo { name, fields, hints, nums });
         }
     }
     out
@@ -758,16 +767,22 @@ fn class_info(c: &Class, name: &str, earlier: &[ClassInfo]) -> ClassInfo {
         _ => None,
     };
     let mut fields = Vec::new();
+    let mut nums = Vec::new();
     for el in &c.body.body {
         if let ClassElement::PropertyDefinition(p) = el
             && !p.r#static
             && let PropertyKey::StaticIdentifier(k) = &p.key
-            && let Some(h) = p.type_annotation.as_ref().and_then(|a| hint_name(&a.type_annotation))
+            && let Some(a) = &p.type_annotation
         {
-            fields.push((k.name.to_string(), h));
+            if let Some(h) = hint_name(&a.type_annotation) {
+                fields.push((k.name.to_string(), h));
+            }
+            if is_number_type(&a.type_annotation) {
+                nums.push(k.name.to_string());
+            }
         }
     }
-    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates, superclass, fields }
+    ClassInfo { name: name.to_string(), body_start: c.body.span.start + 1, privates, superclass, fields, nums }
 }
 
 /// Ordinary methods (static or not) of a top-level class.
@@ -946,6 +961,11 @@ fn literal(e: &Expression) -> Option<ConstVal> {
         },
         _ => None,
     }
+}
+
+/// Whether a TS annotation says `number` (or `int`, `double`).
+fn is_number_type(t: &TSType) -> bool {
+    matches!(ts_type(t), Some(Ty::F64 | Ty::I32))
 }
 
 /// The unboxed type a TS annotation allows, if any.
@@ -5197,6 +5217,7 @@ fn class_tables(classes: &[ClassInfo], cands: &[Candidate]) -> Vec<ir::ClassTabl
             superclass: c.superclass,
             members: Vec::new(),
             fields: c.fields.iter().filter_map(|(n, h)| Some((n.clone(), resolve_hint(h, classes)?))).collect(),
+            nums: c.nums.clone(),
         })
         .collect();
     for (i, c) in cands.iter().enumerate() {

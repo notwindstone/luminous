@@ -7,6 +7,7 @@ pub mod erase;
 pub mod ints;
 pub mod ir;
 pub mod marker;
+pub mod spec;
 pub mod structs;
 
 use std::collections::{HashMap, HashSet};

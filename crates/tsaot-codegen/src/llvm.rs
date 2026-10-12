@@ -789,6 +789,11 @@ impl<'a> FnEmitter<'a> {
                         self.intrinsic(format!("declare {tname} @llvm.{n}.sat.{ts}.{fs}({fname})"));
                         format!("call {tname} @llvm.{n}.sat.{ts}.{fs}({fname} {a})")
                     }
+                    ConvOp::ToSintAny => {
+                        // Poison when out of range: frozen to some value.
+                        self.line(format!("{name}.raw = fptosi {fname} {a} to {tname}"));
+                        format!("freeze {tname} {name}.raw")
+                    }
                     ConvOp::Fpromote => format!("fpext {fname} {a} to {tname}"),
                     ConvOp::Fdemote => format!("fptrunc {fname} {a} to {tname}"),
                     ConvOp::Bitcast => format!("bitcast {fname} {a} to {tname}"),

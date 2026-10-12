@@ -338,6 +338,9 @@ pub enum ConvOp {
     /// Saturating; NaN gives 0.
     ToSintSat,
     ToUintSat,
+    /// Some value of the type when out of range or NaN (for callers that
+    /// check the result).
+    ToSintAny,
     Fpromote,
     Fdemote,
     Bitcast,
@@ -901,6 +904,9 @@ impl Ins<'_> {
     }
     pub fn fcvt_to_sint_sat(self, ty: Type, a: Value) -> Value {
         self.conv(ConvOp::ToSintSat, ty, a)
+    }
+    pub fn fcvt_to_sint_any(self, ty: Type, a: Value) -> Value {
+        self.conv(ConvOp::ToSintAny, ty, a)
     }
     pub fn fcvt_to_uint_sat(self, ty: Type, a: Value) -> Value {
         self.conv(ConvOp::ToUintSat, ty, a)
