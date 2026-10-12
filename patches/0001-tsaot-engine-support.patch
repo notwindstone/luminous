@@ -2315,7 +2315,7 @@
          if (JS_IsException(res))
              goto exception;
          if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-@@ -44751,6 +45969,167 @@
+@@ -44751,6 +45969,187 @@
      return 0;
  }
  
@@ -2340,13 +2340,15 @@
 +}
 +
 +/* The comparator's result for (a, b) as a number (NaN: 0); `failed` on an
-+   exception. */
-+static double js_native_compare(JSNativeSort *s, JSValueConst a, JSValueConst b)
++   exception. `mode` is a constant where it is inlined (each mode's merge
++   sort is its own copy). */
++static inline __attribute__((always_inline)) double
++js_native_compare(JSNativeSort *s, JSValueConst a, JSValueConst b, int mode)
 +{
 +    JSContext *ctx = s->ctx;
 +    double r = 0;
 +    JSValue v = JS_UNDEFINED;
-+    switch (s->mode) {
++    switch (mode) {
 +    case 0:
 +        r = ((JSNativeCmpAny *)s->cmp)(ctx, NULL, js_dup(a), js_dup(b));
 +        break;
@@ -2364,10 +2366,10 @@
 +        s->failed = true;
 +        return 0;
 +    }
-+    if (s->mode & 2) {
-+        if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
-+            r = JS_VALUE_GET_INT(v);
-+        } else if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
++    if (mode & 2) {
++        if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_INT))
++            return JS_VALUE_GET_INT(v);
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
 +            r = JS_VALUE_GET_FLOAT64(v);
 +        } else if (JS_ToFloat64Free(ctx, &r, v)) {
 +            s->failed = true;
@@ -2377,44 +2379,62 @@
 +    return isnan(r) ? 0 : r;
 +}
 +
-+/* Stable merge sort of a[0..n) (tmp: room for n / 2 + 1 values). */
++/* Stable merge sort of a[0..n) (tmp: room for n / 2 + 1 values), for each
++   mode. */
++#define JS_NATIVE_MERGE_SORT(MODE)                                              \
++static void js_native_merge_sort_##MODE(JSNativeSort *s, JSValue *a,            \
++                                        JSValue *tmp, size_t n)                 \
++{                                                                               \
++    size_t i, j, k, m;                                                          \
++    if (n <= 8) {                                                               \
++        for (i = 1; i < n && !s->failed; i++) {                                 \
++            JSValue x = a[i];                                                   \
++            for (j = i; j > 0; j--) {                                           \
++                if (js_native_compare(s, a[j - 1], x, MODE) <= 0 || s->failed)  \
++                    break;                                                      \
++                a[j] = a[j - 1];                                                \
++            }                                                                   \
++            a[j] = x;                                                           \
++        }                                                                       \
++        return;                                                                 \
++    }                                                                           \
++    m = n / 2;                                                                  \
++    js_native_merge_sort_##MODE(s, a, tmp, m);                                  \
++    if (!s->failed)                                                             \
++        js_native_merge_sort_##MODE(s, a + m, tmp, n - m);                      \
++    if (s->failed || js_native_compare(s, a[m - 1], a[m], MODE) <= 0 ||         \
++        s->failed)                                                              \
++        return;                                                                 \
++    memcpy(tmp, a, m * sizeof(JSValue));                                        \
++    i = 0; j = m; k = 0;                                                        \
++    while (i < m && j < n) {                                                    \
++        double c = js_native_compare(s, tmp[i], a[j], MODE);                    \
++        if (s->failed) {                                                        \
++            /* (Every value back in the array, in some order.) */              \
++            memcpy(a + k, tmp + i, (m - i) * sizeof(JSValue));                  \
++            return;                                                             \
++        }                                                                       \
++        if (c <= 0)                                                             \
++            a[k++] = tmp[i++];                                                  \
++        else                                                                    \
++            a[k++] = a[j++];                                                    \
++    }                                                                           \
++    while (i < m)                                                               \
++        a[k++] = tmp[i++];                                                      \
++}
++JS_NATIVE_MERGE_SORT(0)
++JS_NATIVE_MERGE_SORT(1)
++JS_NATIVE_MERGE_SORT(2)
++JS_NATIVE_MERGE_SORT(3)
++
 +static void js_native_merge_sort(JSNativeSort *s, JSValue *a, JSValue *tmp, size_t n)
 +{
-+    size_t i, j, k, m;
-+    if (n <= 8) {
-+        for (i = 1; i < n && !s->failed; i++) {
-+            JSValue x = a[i];
-+            for (j = i; j > 0; j--) {
-+                if (js_native_compare(s, a[j - 1], x) <= 0 || s->failed)
-+                    break;
-+                a[j] = a[j - 1];
-+            }
-+            a[j] = x;
-+        }
-+        return;
++    switch (s->mode) {
++    case 0: js_native_merge_sort_0(s, a, tmp, n); break;
++    case 1: js_native_merge_sort_1(s, a, tmp, n); break;
++    case 2: js_native_merge_sort_2(s, a, tmp, n); break;
++    default: js_native_merge_sort_3(s, a, tmp, n); break;
 +    }
-+    m = n / 2;
-+    js_native_merge_sort(s, a, tmp, m);
-+    if (!s->failed)
-+        js_native_merge_sort(s, a + m, tmp, n - m);
-+    if (s->failed || js_native_compare(s, a[m - 1], a[m]) <= 0 || s->failed)
-+        return;
-+    memcpy(tmp, a, m * sizeof(JSValue));
-+    i = 0; j = m; k = 0;
-+    while (i < m && j < n) {
-+        double c = js_native_compare(s, tmp[i], a[j]);
-+        if (s->failed) {
-+            /* (Every value back in the array, in some order.) */
-+            memcpy(a + k, tmp + i, (m - i) * sizeof(JSValue));
-+            return;
-+        }
-+        if (c <= 0)
-+            a[k++] = tmp[i++];
-+        else
-+            a[k++] = a[j++];
-+    }
-+    while (i < m)
-+        a[k++] = tmp[i++];
 +}
 +
 +int JS_SortNative(JSContext *ctx, JSValueConst arr, void *cmp, int mode, const uint8_t *unwinding)
@@ -2483,7 +2503,7 @@
  static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -44795,6 +46174,8 @@
+@@ -44795,6 +46194,8 @@
          array[pos].pos = i;
          pos++;
      }
@@ -2492,7 +2512,7 @@
      rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
      if (asc.exception)
          goto exception;
-@@ -44978,6 +46359,15 @@
+@@ -44978,6 +46379,15 @@
      return JS_EXCEPTION;
  }
  
@@ -2508,7 +2528,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -46732,6 +48122,14 @@
+@@ -46732,6 +48142,14 @@
      int32_t radix;
      JSValue ret;
  
@@ -2523,7 +2543,7 @@
      str = JS_ToCString(ctx, argv[0]);
      if (!str)
          return JS_EXCEPTION;
-@@ -47273,11 +48671,10 @@
+@@ -47273,11 +48691,10 @@
                  return i;
          }
      } else {
@@ -2539,7 +2559,7 @@
          }
      }
      return -1;
-@@ -47431,7 +48828,11 @@
+@@ -47431,7 +48848,11 @@
          inc = 1;
      }
      ret = -1;
@@ -2552,7 +2572,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -47998,6 +49399,45 @@
+@@ -47998,6 +49419,45 @@
      return ret;
  }
  
@@ -2598,7 +2618,7 @@
  static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int padEnd)
  {
-@@ -56073,6 +57513,48 @@
+@@ -56073,6 +57533,48 @@
      return result_promise;
  }
  
@@ -2647,7 +2667,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +57563,24 @@
+@@ -56081,14 +57583,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -2677,7 +2697,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +57598,530 @@
+@@ -56106,6 +57618,530 @@
      return result_promise;
  }
  
@@ -3208,7 +3228,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +58495,25 @@
+@@ -56479,6 +58515,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -3234,7 +3254,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +58533,8 @@
+@@ -56498,23 +58553,8 @@
          rd_array[i] = rd;
      }
  
