@@ -283,6 +283,15 @@ pub(crate) struct Lower {
     locals: Vec<Ty>,
     names: Vec<Option<ir::AtomId>>,
     vars: Vec<LVar>,
+    /// `Any` locals: an `F64` variable holding the value's number whenever
+    /// it is one (see `num_shadow`).
+    shadows: Vec<Option<Variable>>,
+    /// Number "shadows" of JS values: for a payload (of a value made by
+    /// arithmetic, or read from an `Any` local), the number it holds when
+    /// its tag is a number's. `number_of` uses it instead of converting the
+    /// payload, so arithmetic on boxed numbers needs no boxing in between
+    /// (the boxing is left unused).
+    num_shadow: HashMap<Value, Value>,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
     /// Inlined calls being lowered (innermost last): where their `return`s
@@ -395,6 +404,12 @@ impl Lower {
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
             .collect();
+        let shadows = f
+            .locals
+            .iter()
+            .zip(&vars)
+            .map(|(&t, v)| (t == Ty::Any && matches!(v, LVar::Two(..))).then(|| b.declare_var(F64)))
+            .collect();
         let exc_exit = b.create_block();
         b.set_cold_block(exc_exit);
         let ret_block = b.create_block();
@@ -410,6 +425,8 @@ impl Lower {
             locals: f.locals.clone(),
             names: f.local_names.clone(),
             vars,
+            shadows,
+            num_shadow: HashMap::new(),
             loops: HashMap::new(),
             inline_rets: Vec::new(),
             pred: None,
@@ -546,6 +563,10 @@ impl Lower {
             (LVar::Two(p, t), V::Any(x, y)) => {
                 self.b.def_var(p, x);
                 self.b.def_var(t, y);
+                if let Some(sv) = self.shadows[l] {
+                    let d = self.number_of((x, y));
+                    self.b.def_var(sv, d);
+                }
             }
             _ => panic!("local {l} type mismatch"),
         }
@@ -570,7 +591,14 @@ impl Lower {
                 }
                 V::Num(d)
             }
-            (LVar::Two(p, t), _) => V::Any(self.b.use_var(p), self.b.use_var(t)),
+            (LVar::Two(p, t), _) => {
+                let (p, t) = (self.b.use_var(p), self.b.use_var(t));
+                if let Some(sv) = self.shadows[l] {
+                    let d = self.b.use_var(sv);
+                    self.num_shadow.insert(p, d);
+                }
+                V::Any(p, t)
+            }
             (LVar::Boxed { .. }, _) => {
                 let (p, t) = self.load_box(l);
                 self.check_tdz(l, t);
@@ -3812,6 +3840,9 @@ impl Lower {
 
     /// The number in a value known to hold one.
     fn number_of(&mut self, (p, t): (Value, Value)) -> Value {
+        if let Some(&d) = self.num_shadow.get(&p) {
+            return d;
+        }
         let i = self.b.ins().ireduce(I32, p);
         let fi = self.b.ins().fcvt_from_sint(F64, i);
         let ff = self.b.ins().bitcast(F64, p);
@@ -3875,6 +3906,8 @@ impl Lower {
         join: Block,
         f: impl FnOnce(&mut FunctionBuilder, &[Value]) -> Option<(Value, Value)>,
     ) {
+        // (A third parameter of `join`: the result's number.)
+        let shadow = self.b.block_params(join).len() == 3;
         let mut all = None;
         for &(_, t) in vals {
             let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
@@ -3895,7 +3928,11 @@ impl Lower {
                 self.b.switch_to_block(ok);
                 let p = self.b.ins().uextend(I64, r);
                 let t = self.b.ins().iconst(I64, TAG_INT);
-                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+                let mut args = vec![BlockArg::Value(p), BlockArg::Value(t)];
+                if shadow {
+                    args.push(BlockArg::Value(self.b.ins().fcvt_from_sint(F64, r)));
+                }
+                self.b.ins().jump(join, &args);
             }
             None => {
                 self.b.ins().jump(rest, &[]);
@@ -3914,6 +3951,7 @@ impl Lower {
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
+        let rd = self.b.append_block_param(join, F64);
         // Two int32s: integer ops, unless the result overflows.
         let int_op = |b: &mut FunctionBuilder, x: Value, y: Value| -> Option<(Value, Value)> {
             let no = b.ins().iconst(I8, 0);
@@ -3961,8 +3999,14 @@ impl Lower {
             AnyBinOp::BitXor => BinOp::BitXor,
         };
         let r = self.binary(bop, x, y);
-        let (p, t) = self.box_number(r);
-        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+        // As the interpreter boxes them: sums, differences and products of
+        // doubles stay doubles.
+        let (p, t) = if matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) {
+            self.box_float(r)
+        } else {
+            self.box_number(r)
+        };
+        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t), BlockArg::Value(r)]);
 
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
@@ -3986,8 +4030,10 @@ impl Lower {
         self.check_value(r[1]);
         self.free(c);
         self.free(a);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let d = self.number_of((r[0], r[1]));
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1]), BlockArg::Value(d)]);
         self.b.switch_to_block(join);
+        self.num_shadow.insert(rp, rd);
         (rp, rt)
     }
 
@@ -4185,6 +4231,21 @@ impl Lower {
     /// conversion that produces the int payload runs in parallel instead.
     /// Returns `(payload, tag)`.
     pub(crate) fn box_number(&mut self, d: Value) -> (Value, Value) {
+        let (p, t) = self.box_number_raw(d);
+        self.num_shadow.insert(p, d);
+        (p, t)
+    }
+
+    /// A double as a JS value, as is (the interpreter's `js_float64`):
+    /// integral values are not made int32s.
+    fn box_float(&mut self, d: Value) -> (Value, Value) {
+        let p = self.b.ins().bitcast(I64, d);
+        let t = self.b.ins().iconst(I64, TAG_FLOAT64);
+        self.num_shadow.insert(p, d);
+        (p, t)
+    }
+
+    fn box_number_raw(&mut self, d: Value) -> (Value, Value) {
         if let Some(&i) = self.int_of.get(&d) {
             let i32v = self.b.ins().ireduce(I32, i);
             let back = self.b.ins().sextend(I64, i32v);
@@ -4879,7 +4940,7 @@ impl Lower {
         // Numbers: the old value is not a reference, nothing to free.
         self.b.switch_to_block(num);
         let nd = self.b.ins().fadd(old_d, cd);
-        let (np, nt) = self.box_number(nd);
+        let (np, nt) = self.box_float(nd);
         self.b.ins().store(M_SLOT, np, at, 0);
         self.b.ins().store(M_SLOT, nt, at, TAG_OFFSET);
         self.b.ins().jump(join, &result(np, nt));
@@ -5856,6 +5917,10 @@ impl Lower {
                 LVar::Two(vp, vt) => {
                     self.b.def_var(vp, p);
                     self.b.def_var(vt, t);
+                    if let Some(sv) = self.shadows[l] {
+                        let d = self.number_of((p, t));
+                        self.b.def_var(sv, d);
+                    }
                 }
                 LVar::Int(v) => self.b.def_var(v, p),
                 LVar::One(v) => {
