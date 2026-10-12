@@ -182,16 +182,25 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
         writeln!(out, "!{ty} = !{{!\"{r:?}\", !4, i64 0}}").unwrap();
         writeln!(out, "!{} = !{{!{ty}, !{ty}, i64 0}}", ty + 1).unwrap();
     }
+    writeln!(out, "!{LIVE_COUNT} = !{{i32 1, i32 2147483647}}").unwrap();
     Ok(out)
 }
 
-/// The metadata of an access to `region`: its TBAA tag, and for memory
-/// that never changes while native code runs, `!invariant.load` (loads).
-fn mem_metadata(region: Region, load: bool) -> String {
+/// The range of a reference count native code loads: that of a live
+/// value (one it holds a reference to, or reads from a field), at least 1;
+/// a new reference and the release of one cancel out.
+const LIVE_COUNT: usize = 5 + 2 * Region::ALL.len();
+
+/// The metadata of an access to `region`: its TBAA tag, for memory that
+/// never changes while native code runs `!invariant.load`, and for
+/// reference counts their range (loads).
+fn mem_metadata(region: Region, load: bool, mem: Type) -> String {
     let Some(k) = Region::ALL.iter().position(|&r| r == region) else { return String::new() };
     let tag = 6 + 2 * k;
     if load && region == Region::Const {
         format!(", !tbaa !{tag}, !invariant.load !3")
+    } else if load && region == Region::RefCount && mem == Type::I32 {
+        format!(", !tbaa !{tag}, !range !{LIVE_COUNT}")
     } else {
         format!(", !tbaa !{tag}")
     }
@@ -853,7 +862,7 @@ impl<'a> FnEmitter<'a> {
             &InstData::Load { ty: t, mem, signed, flags, addr, off } => {
                 let p = self.address(addr, off);
                 let align = mem.bytes();
-                let md = mem_metadata(flags.region, true);
+                let md = mem_metadata(flags.region, true, mem);
                 if mem == t && t == Type::I64 && self.ptr_like[results[0].index()] {
                     // A pointer, loaded as one.
                     self.line(format!("{name}.p = load ptr, ptr {p}, align {align}{md}"));
@@ -880,7 +889,7 @@ impl<'a> FnEmitter<'a> {
                     self.line(line);
                     tmp
                 };
-                let md = mem_metadata(flags.region, false);
+                let md = mem_metadata(flags.region, false, mem);
                 self.line(format!("store {} {v}, ptr {p}, align {}{md}", ty(mem), mem.bytes()));
             }
             &InstData::StackAddr { slot, off } => {

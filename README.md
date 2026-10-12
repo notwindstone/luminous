@@ -189,7 +189,9 @@ fast paths that keep the engine's semantics:
   and a pop, even after a large structure is freed at once); plain
   objects made from an allocation site's shape in one short function, and
   freed (with the plain objects only they referenced) in a loop rather than
-  through the collector's queue; arrays freed the same way with their
+  through the collector's queue, without a look at each property's kind
+  when the shape never had an accessor, and the allocator's counts updated
+  once per loop; arrays freed the same way with their
   plain elements; an empty size-class cache refilled 32 blocks at a time,
   in address order; strings allocated from the cache inline; plain objects
   that keep their property array in their own allocation until it grows;
@@ -230,6 +232,10 @@ The differential tests run every case with both.
     elements, `aot type` storage, inline caches, constant tables. Values
     then stay in registers across stores to other regions (a field is not
     read again after a reference count update), and dead stores go;
+  - reference counts loaded by native code carry the range of a live value
+    (at least 1), so a new reference and its release with nothing in
+    between cancel out (`t.left === null` reads the field without touching
+    its count);
   - addresses derived from globals, stack slots and loaded pointers stay
     pointers (`getelementptr`), and the tables filled before any native code
     runs (atoms, strings, shapes) are invariant loads, hoisted out of loops
