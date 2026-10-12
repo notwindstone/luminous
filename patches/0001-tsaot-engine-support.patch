@@ -1456,7 +1456,96 @@
  /* JS parser */
  
  enum {
-@@ -44171,6 +44911,30 @@
+@@ -43584,6 +44324,18 @@
+     }
+     n = 0;
+ 
++    /* tsaot: a callback with a native fast entry is entered directly, and
++       the elements of a fast array read in place. */
++    JSCFunctionDataRecord *fast_rec = NULL;
++    if (!(special & special_TA) && js_is_c_function_data(func)) {
++        fast_rec = JS_VALUE_GET_OBJ(func)->u.c_function_data_record;
++        if (!fast_rec->fast) {
++            fast_rec = NULL;
++        } else if (js_check_stack_overflow(ctx->rt, 0)) {
++            JS_ThrowStackOverflow(ctx);
++            goto exception;
++        }
++    }
+     for(k = 0; k < len; k++) {
+         if (js_poll_interrupts(ctx))
+             goto exception;
+@@ -43592,6 +44344,12 @@
+             if (JS_IsException(val))
+                 goto exception;
+             present = true;
++        } else if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
++                   JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY &&
++                   JS_VALUE_GET_OBJ(obj)->fast_array &&
++                   k < JS_VALUE_GET_OBJ(obj)->u.array.count) {
++            val = js_dup(JS_VALUE_GET_OBJ(obj)->u.array.u.values[k]);
++            present = true;
+         } else {
+             present = JS_TryGetPropertyInt64(ctx, obj, k, &val);
+             if (present < 0)
+@@ -43602,7 +44360,11 @@
+             args[0] = val;
+             args[1] = index_val;
+             args[2] = obj;
+-            res = JS_Call(ctx, func, this_arg, 3, args);
++            res = JS_UNINITIALIZED;
++            if (fast_rec)
++                res = fast_rec->fast(ctx, this_arg, 3, args, vc(fast_rec->data));
++            if (JS_IsUninitialized(res))
++                res = JS_Call(ctx, func, this_arg, 3, args);
+             JS_FreeValue(ctx, index_val);
+             if (JS_IsException(res))
+                 goto exception;
+@@ -43730,6 +44492,17 @@
+             }
+         }
+     }
++    /* tsaot: as in js_array_every. */
++    JSCFunctionDataRecord *fast_rec = NULL;
++    if (!(special & special_TA) && js_is_c_function_data(func)) {
++        fast_rec = JS_VALUE_GET_OBJ(func)->u.c_function_data_record;
++        if (!fast_rec->fast) {
++            fast_rec = NULL;
++        } else if (js_check_stack_overflow(ctx->rt, 0)) {
++            JS_ThrowStackOverflow(ctx);
++            goto exception;
++        }
++    }
+     for (; k < len; k++) {
+         if (js_poll_interrupts(ctx))
+             goto exception;
+@@ -43739,6 +44512,12 @@
+             if (JS_IsException(val))
+                 goto exception;
+             present = true;
++        } else if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
++                   JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY &&
++                   JS_VALUE_GET_OBJ(obj)->fast_array &&
++                   k1 < JS_VALUE_GET_OBJ(obj)->u.array.count) {
++            val = js_dup(JS_VALUE_GET_OBJ(obj)->u.array.u.values[k1]);
++            present = true;
+         } else {
+             present = JS_TryGetPropertyInt64(ctx, obj, k1, &val);
+             if (present < 0)
+@@ -43750,7 +44529,11 @@
+             args[1] = val;
+             args[2] = index_val;
+             args[3] = obj;
+-            acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
++            acc1 = JS_UNINITIALIZED;
++            if (fast_rec)
++                acc1 = fast_rec->fast(ctx, JS_UNDEFINED, 4, args, vc(fast_rec->data));
++            if (JS_IsUninitialized(acc1))
++                acc1 = JS_Call(ctx, func, JS_UNDEFINED, 4, args);
+             JS_FreeValue(ctx, index_val);
+             JS_FreeValue(ctx, val);
+             val = JS_UNDEFINED;
+@@ -44171,6 +44954,30 @@
      return JS_EXCEPTION;
  }
  
@@ -1487,7 +1576,7 @@
  static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int unshift)
  {
-@@ -44978,6 +45742,15 @@
+@@ -44978,6 +45785,15 @@
      return JS_EXCEPTION;
  }
  
@@ -1503,7 +1592,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -47273,11 +48046,10 @@
+@@ -47273,11 +48089,10 @@
                  return i;
          }
      } else {
@@ -1519,7 +1608,7 @@
          }
      }
      return -1;
-@@ -47431,7 +48203,11 @@
+@@ -47431,7 +48246,11 @@
          inc = 1;
      }
      ret = -1;
@@ -1532,7 +1621,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -56073,6 +56849,48 @@
+@@ -56073,6 +56892,48 @@
      return result_promise;
  }
  
@@ -1581,7 +1670,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +56899,24 @@
+@@ -56081,14 +56942,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -1611,7 +1700,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +56934,454 @@
+@@ -56106,6 +56977,454 @@
      return result_promise;
  }
  
@@ -2066,7 +2155,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +57755,25 @@
+@@ -56479,6 +57798,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -2092,7 +2181,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +57793,8 @@
+@@ -56498,23 +57836,8 @@
          rd_array[i] = rd;
      }
  
