@@ -243,6 +243,33 @@ pub enum Hint {
     ArrayOf(usize),
 }
 
+/// The array methods with native loops (`ExprKind::ArrayLoop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopKind {
+    ForEach,
+    Map,
+    Filter,
+    Some,
+    Every,
+    Find,
+    FindIndex,
+}
+
+impl LoopKind {
+    pub fn named(name: &str) -> Option<LoopKind> {
+        Some(match name {
+            "forEach" => LoopKind::ForEach,
+            "map" => LoopKind::Map,
+            "filter" => LoopKind::Filter,
+            "some" => LoopKind::Some,
+            "every" => LoopKind::Every,
+            "find" => LoopKind::Find,
+            "findIndex" => LoopKind::FindIndex,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Func {
     /// JS name of the function (`.name` of its function object).
@@ -546,6 +573,34 @@ pub enum ExprKind {
         func: usize,
         body: Vec<Stmt>,
         locals: Vec<LocalId>,
+    },
+    /// `recv.method(callback)`, `callback` an arrow function (the `Closure`
+    /// of global function `func`) whose body is attached (see
+    /// `inline_callbacks`): when `recv` is an array without holes and its
+    /// `method` is the original builtin (`kind`), a native loop runs `body`
+    /// for each element, over `locals` (the callback's, parameters first;
+    /// its captured variables are the caller's own locals); otherwise the
+    /// method is called with the callback. `Any`.
+    ArrayLoop {
+        kind: LoopKind,
+        recv: Box<Expr>,
+        method: AtomId,
+        callback: Box<Expr>,
+        func: usize,
+        body: Vec<Stmt>,
+        locals: Vec<LocalId>,
+    },
+    /// `recv.method(callback)`, `callback` an arrow function without
+    /// captures (the `Closure` of global function `func`) comparing two
+    /// `Any`s or two `F64`s into an `F64` or `Any`: when `method` is the
+    /// original `sort`, the engine sorts the array (`JS_SortNative`)
+    /// calling the native function directly; else (or if the engine
+    /// declines) the method is called with the callback. `Any`.
+    ArraySort {
+        recv: Box<Expr>,
+        method: AtomId,
+        callback: Box<Expr>,
+        func: usize,
     },
     /// An object of `aot type` `layout` from a literal with the fields in
     /// `mask`: (field, value) in source order. `Ty::Struct(layout)`.
@@ -871,6 +926,15 @@ macro_rules! visitor {
                 Predicted { expr, body, .. } => {
                     $name(expr, f);
                     $stmts(body, f);
+                }
+                ArrayLoop { recv, callback, body, .. } => {
+                    $name(recv, f);
+                    $name(callback, f);
+                    $stmts(body, f);
+                }
+                ArraySort { recv, callback, .. } => {
+                    $name(recv, f);
+                    $name(callback, f);
                 }
                 CallChecked { callee, args, .. } => {
                     $name(callee, f);
@@ -1823,6 +1887,37 @@ fn shift_locals(e: &mut Expr, base: LocalId) {
         ExprKind::Closure(_, caps) => caps.iter_mut().for_each(|l| *l += base),
         ExprKind::Inline { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
         ExprKind::Predicted { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
+        ExprKind::ArrayLoop { locals, .. } => locals.iter_mut().for_each(|l| *l += base),
+        _ => {}
+    }
+}
+
+/// Renumber the locals of `e` (not its subexpressions) by `map`.
+fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
+    let m = |l: &mut LocalId| *l = map(*l);
+    match &mut e.kind {
+        ExprKind::Local(l)
+        | ExprKind::SetLocal(l, _)
+        | ExprKind::InitLocal(l, _)
+        | ExprKind::Update { local: l, .. }
+        | ExprKind::ForInGet(l, _, _)
+        | ExprKind::ArrayPush(l, _)
+        | ExprKind::AsyncIterResult(_, l)
+        | ExprKind::IterCloseQuiet(l) => m(l),
+        ExprKind::IterOpen(_, l, n, _) | ExprKind::IterClose(l, n) => {
+            m(l);
+            m(n);
+        }
+        ExprKind::IterStep(l, n) => {
+            m(l);
+            if let Some(n) = n {
+                m(n);
+            }
+        }
+        ExprKind::Closure(_, caps) => caps.iter_mut().for_each(m),
+        ExprKind::Inline { locals, .. } | ExprKind::Predicted { locals, .. } | ExprKind::ArrayLoop { locals, .. } => {
+            locals.iter_mut().for_each(m)
+        }
         _ => {}
     }
 }
@@ -2172,10 +2267,12 @@ pub fn predict_calls(m: &mut Module) {
             let mut pending: HashMap<LocalId, usize> = HashMap::new();
             let mut wrapped: HashSet<*const Expr> = HashSet::new();
             visit_stmts_mut(&mut body, &mut |e| {
-                if let ExprKind::Predicted { body, locals, .. } = &mut e.kind {
+                if let ExprKind::Predicted { expr, body, locals, .. } = &mut e.kind {
                     if !body.is_empty() {
                         stash.insert(locals[0], std::mem::take(body));
                     }
+                    // (Its call is predicted already.)
+                    wrapped.insert(&**expr as *const Expr);
                     return;
                 }
                 if wrapped.contains(&(e as *const Expr)) {
@@ -2216,6 +2313,138 @@ pub fn predict_calls(m: &mut Module) {
             f.local_names.extend(added.iter().map(|_| None));
             f.locals.extend(added);
         }
+    }
+}
+
+/// IR nodes in a callback body that `inline_callbacks` inlines.
+const CALLBACK_SIZE: usize = 160;
+
+/// Whether closure `f` can be a native loop's body (`inline_callbacks`):
+/// an arrow function without `this`, nested closures, boxes of its own,
+/// loops or `try`, with at most 3 parameters typed as its loop passes them
+/// (an element: `Any` or `F64`; its index: `Any` or `F64`; the array: `Any`).
+fn callback_ok(f: &Func) -> bool {
+    fn stmts_ok(stmts: &[Stmt]) -> bool {
+        stmts.iter().all(|s| match s {
+            Stmt::Expr(_) | Stmt::Return(_) | Stmt::Throw(_) => true,
+            Stmt::If(_, a, b) => stmts_ok(a) && stmts_ok(b),
+            Stmt::Block(b) => stmts_ok(b),
+            _ => false,
+        })
+    }
+    if !callback_plain(f) {
+        return false;
+    }
+    let typed = [&[Ty::Any, Ty::F64][..], &[Ty::Any, Ty::F64], &[Ty::Any]];
+    if f.params.len() > 3 || f.params.iter().zip(typed).any(|(t, ok)| !ok.contains(t)) {
+        return false;
+    }
+    if (0..f.locals.len()).any(|l| f.boxed[l] && !f.captures.contains(&l)) || !stmts_ok(&f.body) {
+        return false;
+    }
+    let mut size = 0;
+    let mut ok = true;
+    visit_stmts(&f.body, &mut |e| {
+        size += 1;
+        match &e.kind {
+            ExprKind::Closure(..) | ExprKind::This => ok = false,
+            ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } => ok &= stmts_ok(body),
+            _ => {}
+        }
+    });
+    ok && size <= CALLBACK_SIZE
+}
+
+/// A function the native loops can call or inline: an arrow function
+/// (no `this`), neither async nor a generator, without a rest parameter.
+fn callback_plain(f: &Func) -> bool {
+    f.is_closure && !f.has_this && !f.is_async && !f.is_generator && !f.rest && f.ret_slot.is_none()
+}
+
+/// Whether a closure (its parameter types, return type, and whether it is
+/// `callback_plain` without captures) can be `JS_SortNative`'s comparator.
+fn comparator_ok((params, ret, plain): &(Vec<Ty>, Ty, bool)) -> bool {
+    *plain
+        && matches!(params.as_slice(), [Ty::Any, Ty::Any] | [Ty::F64, Ty::F64])
+        && matches!(ret, Ty::F64 | Ty::Any)
+}
+
+/// Native loops for array callbacks, as JIT compilers inline a builtin's
+/// loop and its callback: `xs.map((x) => ...)` (`forEach`, `map`, `filter`,
+/// `some`, `every`, `find`, `findIndex`) with an arrow function that
+/// `callback_ok` accepts gets the function's body attached
+/// (`ExprKind::ArrayLoop`), its locals appended to the caller's; and
+/// `xs.sort((a, b) => ...)` calls the comparator natively
+/// (`ExprKind::ArraySort`).
+pub fn inline_callbacks(m: &mut Module) {
+    let nfuncs = m.funcs.len();
+    let total = nfuncs + m.closures.len();
+    let templates: Vec<Option<Func>> = m.closures.iter().map(|c| callback_ok(c).then(|| c.clone())).collect();
+    let names: Vec<Option<LoopKind>> = m.atoms.iter().map(|a| LoopKind::named(a)).collect();
+    let sort_atom = m.atoms.iter().position(|a| a == "sort");
+    let comparators: Vec<(Vec<Ty>, Ty, bool)> =
+        m.closures.iter().map(|c| (c.params.clone(), c.ret, callback_plain(c) && c.captures.is_empty())).collect();
+    for g in 0..total {
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        let mut body = std::mem::take(&mut f.body);
+        let base0 = f.locals.len();
+        let mut budget = INLINE_CALLER_LIMIT.saturating_sub(ir_size(&body));
+        let mut added: Vec<Ty> = Vec::new();
+        // Calls that predictions wrap stay as they are.
+        let mut wrapped: HashSet<*const Expr> = HashSet::new();
+        visit_stmts_mut(&mut body, &mut |e| {
+            if let ExprKind::Predicted { expr, .. } = &e.kind {
+                wrapped.insert(&**expr as *const Expr);
+                return;
+            }
+            if wrapped.contains(&(e as *const Expr)) {
+                return;
+            }
+            let ExprKind::CallMethod(_, Key::Atom(a), args) = &e.kind else { return };
+            let [Expr { kind: ExprKind::Closure(cid, caps), .. }] = args.as_slice() else { return };
+            if sort_atom == Some(*a) && caps.is_empty() && comparator_ok(&comparators[*cid]) {
+                let func = nfuncs + *cid;
+                let ty = e.ty;
+                let ExprKind::CallMethod(recv, Key::Atom(method), mut args) =
+                    std::mem::replace(&mut e.kind, ExprKind::Undefined)
+                else {
+                    unreachable!()
+                };
+                let callback = Box::new(args.pop().unwrap());
+                *e = Expr { ty, kind: ExprKind::ArraySort { recv, method, callback, func } };
+                return;
+            }
+            let Some(kind) = names[*a] else { return };
+            let Some(t) = templates[*cid].as_ref() else { return };
+            let size = ir_size(&t.body);
+            if size > budget {
+                return;
+            }
+            budget -= size;
+            let base = base0 + added.len();
+            added.extend(&t.locals);
+            let map = |l: LocalId| match t.captures.iter().position(|&c| c == l) {
+                Some(j) => caps[j],
+                None => base + l,
+            };
+            let mut inner = t.body.clone();
+            visit_stmts_mut(&mut inner, &mut |x| remap_locals(x, &map));
+            let locals: Vec<LocalId> = (0..t.locals.len()).filter(|l| !t.captures.contains(l)).map(|l| base + l).collect();
+            let func = nfuncs + *cid;
+            let ty = e.ty;
+            let ExprKind::CallMethod(recv, Key::Atom(method), mut args) =
+                std::mem::replace(&mut e.kind, ExprKind::Undefined)
+            else {
+                unreachable!()
+            };
+            let callback = Box::new(args.pop().unwrap());
+            *e = Expr { ty, kind: ExprKind::ArrayLoop { kind, recv, method, callback, func, body: inner, locals } };
+        });
+        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+        f.body = body;
+        f.boxed.extend(added.iter().map(|_| false));
+        f.local_names.extend(added.iter().map(|_| None));
+        f.locals.extend(added);
     }
 }
 

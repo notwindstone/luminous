@@ -20,8 +20,8 @@ use crate::mir::{
     StackSlotData, StackSlotKind, Type, Value, Variable,
 };
 use tsaot_front::ir::{
-    self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, MAYBE_F64_UNDEFINED,
-    MathFn, Stmt, Ty, UnOp,
+    self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, LoopKind,
+    MAYBE_F64_UNDEFINED, MathFn, Stmt, Ty, UnOp,
 };
 
 use crate::jsvalue::*;
@@ -204,6 +204,11 @@ impl Method {
 const PIN_STRING_PROTO: i32 = 24;
 const PIN_CHAR_CODE_AT: i32 = 25;
 const PIN_ARRAY_PUSH: i32 = 26;
+/// `Array.prototype.forEach`, `map`, `filter`, `some`, `every`, `find`,
+/// `findIndex` (in `LoopKind` order).
+const PIN_ARRAY_LOOPS: i32 = 27;
+/// `Array.prototype.sort`.
+const PIN_ARRAY_SORT: i32 = 34;
 /// `TSAOT_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -1957,6 +1962,10 @@ impl Lower {
                 }
                 self.expr(expr)
             }
+            ExprKind::ArrayLoop { kind, recv, method, callback, func, body, locals } => {
+                self.array_loop(*kind, recv, *method, callback, *func, body, locals)
+            }
+            ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
             ExprKind::NumArith(op, x, y) => {
                 let a = self.expr(x);
                 self.hold(a);
@@ -3469,6 +3478,340 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
         self.b.switch_to_block(join);
         self.check_value(rt);
+        V::Any(rp, rt)
+    }
+
+    /// `recv.method(callback)` as a native loop over the elements of an
+    /// array without holes whose `method` is the original builtin `kind`,
+    /// with the callback's `body` inline (see `ExprKind::ArrayLoop`); else
+    /// a call. The loop reads each element afresh (the callback may change
+    /// the array): past the fast elements, as the builtin does.
+    #[allow(clippy::too_many_arguments)]
+    fn array_loop(
+        &mut self,
+        kind: LoopKind,
+        recv: &Expr,
+        method: ir::AtomId,
+        callback: &Expr,
+        func: usize,
+        body: &[Stmt],
+        locals: &[ir::LocalId],
+    ) -> V {
+        let (obj, owned) = self.operand(recv, &[callback]);
+        let (op_, ot) = obj.any();
+        let (mp, mt) = self.method_get(op_, ot, method);
+        self.check_value(mt);
+        let f = V::Any(mp, mt);
+        self.hold(f);
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        // The original builtin, an array, no holes.
+        let is_fn = self.b.ins().icmp_imm_s(IntCC::Equal, mt, TAG_OBJECT);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, (PIN_ARRAY_LOOPS + kind as i32) * 8);
+        let same = self.b.ins().icmp(IntCC::Equal, mp, orig);
+        let ok = self.b.ins().band(is_fn, same);
+        let count = self.array_part(op_, ot, ok, slow);
+        let length = self.array_length(op_);
+        let dense = self.b.ins().icmp(IntCC::Equal, count, length);
+        let fast = self.b.create_block();
+        self.b.ins().brif(dense, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let len = count;
+        // The result array (`map`: with room for every element).
+        let out = match kind {
+            LoopKind::Map | LoopKind::Filter => {
+                let n = if kind == LoopKind::Map { len } else { self.b.ins().iconst(I64, -1) };
+                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, op_, ot, n]);
+                self.check_value(r[1]);
+                let a = V::Any(r[0], r[1]);
+                self.hold(a);
+                Some(a)
+            }
+            _ => None,
+        };
+        let head = self.b.create_block();
+        let k = self.b.append_block_param(head, I64);
+        let n = self.b.append_block_param(head, I64);
+        let done = self.b.create_block();
+        let dp = self.b.append_block_param(done, I64);
+        let dt = self.b.append_block_param(done, I64);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+        self.b.switch_to_block(head);
+        let next = self.b.create_block();
+        let nk = self.b.append_block_param(next, I64);
+        let nn = self.b.append_block_param(next, I64);
+        let k1 = self.b.ins().iadd_imm_s(k, 1);
+        // Past the end: the result without a match.
+        let (ep, et) = match (kind, out) {
+            (LoopKind::Map | LoopKind::Filter, Some(a)) => a.any(),
+            (LoopKind::Some, _) => (zero, self.b.ins().iconst(I64, TAG_BOOL)),
+            (LoopKind::Every, _) => (self.b.ins().iconst(I64, 1), self.b.ins().iconst(I64, TAG_BOOL)),
+            (LoopKind::FindIndex, _) => (self.b.ins().iconst(I64, -1i32 as u32 as i64), self.b.ins().iconst(I64, TAG_INT)),
+            _ => (zero, self.b.ins().iconst(I64, TAG_UNDEFINED)),
+        };
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, k, len);
+        let step = self.b.create_block();
+        self.b.ins().brif(more, step, &[], done, &[BlockArg::Value(ep), BlockArg::Value(et)]);
+        self.b.switch_to_block(step);
+        // The element: in place while the array is fast, else read.
+        let elem = self.b.create_block();
+        let ep_ = self.b.append_block_param(elem, I64);
+        let et_ = self.b.append_block_param(elem, I64);
+        let now = self.b.ins().uload32(M_HEADER, op_, layout::OBJ_ARRAY_COUNT);
+        let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, k, now);
+        let hit = self.b.create_block();
+        let read = self.b.create_block();
+        self.b.set_cold_block(read);
+        self.b.ins().brif(inb, hit, &[], read, &[]);
+        self.b.switch_to_block(hit);
+        let at = self.array_slot(op_, k);
+        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
+        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        self.dup((vp, vt));
+        self.b.ins().jump(elem, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.b.switch_to_block(read);
+        let present = self.done_slot();
+        let r = self.helper("JS_TryGetElement", &[ctx, op_, ot, k, present]);
+        self.check_value(r[1]);
+        let has = self.b.ins().load(I32, M_SLOT, present, 0);
+        let absent = self.b.ins().icmp_imm_s(IntCC::Equal, has, 0);
+        let got = self.b.create_block();
+        // (A hole: skipped.)
+        self.b.ins().brif(absent, next, &[BlockArg::Value(k1), BlockArg::Value(n)], got, &[]);
+        self.b.switch_to_block(got);
+        self.b.ins().jump(elem, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(elem);
+        let v = V::Any(ep_, et_);
+        self.hold(v);
+        // The callback's result, boxed: its body inline when the element
+        // has its parameter's type, else a call of the callback.
+        let params = self.env.params[func].clone();
+        let ret = self.env.rets[func];
+        let res = self.b.create_block();
+        let resp = self.b.append_block_param(res, I64);
+        let rest = self.b.append_block_param(res, I64);
+        let inline = self.b.create_block();
+        let typed = params.first() == Some(&Ty::F64);
+        if typed {
+            let call = self.b.create_block();
+            self.b.set_cold_block(call);
+            let num = self.is_number(et_);
+            self.b.ins().brif(num, inline, &[], call, &[]);
+            self.b.switch_to_block(call);
+            let cb = self.expr(callback);
+            self.hold(cb);
+            let kd = self.b.ins().fcvt_from_sint(F64, k);
+            let kv = self.box_number(kd);
+            let (cp, ct) = cb.any();
+            let undef = self.konst(0, TAG_UNDEFINED).any();
+            let vals = [(cp, ct), undef, (ep_, et_), kv, (op_, ot)];
+            let slot = self.values_slot(&vals);
+            let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+            let argc = self.b.ins().iconst(I32, 3);
+            let (gp, gt) = self.call_linked((cp, ct), undef, 3, argv, false, |l| {
+                let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                (r[0], r[1])
+            });
+            self.check_value(gt);
+            self.release(cb);
+            self.free_v(cb);
+            self.b.ins().jump(res, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        } else {
+            self.b.ins().jump(inline, &[]);
+        }
+        self.b.switch_to_block(inline);
+        for (i, &pt) in params.iter().enumerate() {
+            let l = locals[i];
+            let a = match (i, pt) {
+                (0, Ty::F64) => V::Num(self.number_of((ep_, et_))),
+                (0, _) => {
+                    self.dup((ep_, et_));
+                    V::Any(ep_, et_)
+                }
+                (1, Ty::F64) => V::Num(self.b.ins().fcvt_from_sint(F64, k)),
+                (1, _) => {
+                    let i = self.b.ins().ireduce(I32, k);
+                    let i = self.b.ins().sextend(I64, i);
+                    V::Any(i, self.b.ins().iconst(I64, TAG_INT))
+                }
+                _ => {
+                    self.dup((op_, ot));
+                    V::Any(op_, ot)
+                }
+            };
+            // The local may be `Any` where its parameter is not.
+            let a = if is_js(self.locals[l]) && !matches!(a, V::Any(..)) {
+                let (p, t) = self.boxed(a);
+                V::Any(p, t)
+            } else {
+                a
+            };
+            self.init_local(l, a);
+        }
+        let r = self.inline_body(body, locals, ret);
+        let (bp, bt) = self.boxed(r);
+        self.b.ins().jump(res, &[BlockArg::Value(bp), BlockArg::Value(bt)]);
+        self.b.switch_to_block(res);
+        let result = (resp, rest);
+        match kind {
+            LoopKind::ForEach => {
+                self.free(result);
+                self.release(v);
+                self.free_v(v);
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+            }
+            LoopKind::Map => {
+                let (ap, at) = out.unwrap().any();
+                let r = self.helper("JS_DefineElement", &[ctx, ap, at, k, resp, rest]);
+                self.release(v);
+                self.free_v(v);
+                self.check_int(r[0]);
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+            }
+            LoopKind::Filter => {
+                let hit = self.truthy_any(result);
+                self.free(result);
+                let keep = self.b.create_block();
+                let drop = self.b.create_block();
+                self.b.ins().brif(hit, keep, &[], drop, &[]);
+                self.b.switch_to_block(drop);
+                self.free((ep_, et_));
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+                self.b.switch_to_block(keep);
+                let (ap, at) = out.unwrap().any();
+                // (The definition takes the element.)
+                self.release(v);
+                let r = self.helper("JS_DefineElement", &[ctx, ap, at, n, ep_, et_]);
+                self.check_int(r[0]);
+                let n1 = self.b.ins().iadd_imm_s(n, 1);
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
+            }
+            LoopKind::Some | LoopKind::Every | LoopKind::Find | LoopKind::FindIndex => {
+                let hit = self.truthy_any(result);
+                self.free(result);
+                let stop = if kind == LoopKind::Every { self.b.ins().bxor_imm_u(hit, 1) } else { hit };
+                let found = self.b.create_block();
+                let go_on = self.b.create_block();
+                self.b.ins().brif(stop, found, &[], go_on, &[]);
+                self.b.switch_to_block(go_on);
+                self.free((ep_, et_));
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+                self.b.switch_to_block(found);
+                let (fp_, ft_) = match kind {
+                    LoopKind::Find => (ep_, et_),
+                    _ => {
+                        self.free((ep_, et_));
+                        match kind {
+                            LoopKind::Some => (self.b.ins().iconst(I64, 1), self.b.ins().iconst(I64, TAG_BOOL)),
+                            LoopKind::Every => (zero, self.b.ins().iconst(I64, TAG_BOOL)),
+                            _ => {
+                                let i = self.b.ins().ireduce(I32, k);
+                                let i = self.b.ins().sextend(I64, i);
+                                (i, self.b.ins().iconst(I64, TAG_INT))
+                            }
+                        }
+                    }
+                };
+                self.b.ins().jump(done, &[BlockArg::Value(fp_), BlockArg::Value(ft_)]);
+                self.release(v);
+            }
+        }
+        self.b.switch_to_block(next);
+        self.b.ins().jump(head, &[BlockArg::Value(nk), BlockArg::Value(nn)]);
+        self.b.switch_to_block(done);
+        if let Some(a) = out {
+            // (The result: the array, now the expression's.)
+            self.release(a);
+        }
+        self.b.ins().jump(join, &[BlockArg::Value(dp), BlockArg::Value(dt)]);
+        // Otherwise a call, with the callback.
+        self.b.switch_to_block(slow);
+        let cb = self.expr(callback);
+        self.hold(cb);
+        let (cp, ct) = cb.any();
+        let vals = [(mp, mt), (op_, ot), (cp, ct)];
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        self.check_value(gt);
+        self.release(cb);
+        self.free_v(cb);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        self.release(f);
+        self.free_v(f);
+        self.drop_operand(obj, owned);
+        V::Any(rp, rt)
+    }
+
+    /// `recv.method(callback)` where `method` may be the original `sort` and
+    /// the callback a native comparator: the engine sorts calling it
+    /// directly (`JS_SortNative`); else a call.
+    fn array_sort(&mut self, recv: &Expr, method: ir::AtomId, callback: &Expr, func: usize) -> V {
+        let (obj, owned) = self.operand(recv, &[callback]);
+        let (op_, ot) = obj.any();
+        let (mp, mt) = self.method_get(op_, ot, method);
+        self.check_value(mt);
+        let f = V::Any(mp, mt);
+        self.hold(f);
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let is_fn = self.b.ins().icmp_imm_s(IntCC::Equal, mt, TAG_OBJECT);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, PIN_ARRAY_SORT * 8);
+        let same = self.b.ins().icmp(IntCC::Equal, mp, orig);
+        let ok = self.b.ins().band(is_fn, same);
+        let fast = self.b.create_block();
+        self.b.ins().brif(ok, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        let numbers = self.env.params[func].first() == Some(&Ty::F64);
+        let boxed_ret = self.env.rets[func] != Ty::F64;
+        let mode = self.b.ins().iconst(I32, numbers as i64 | (boxed_ret as i64) << 1);
+        let cmp = self.b.ins().func_addr(self.ptr, self.env.funcs[func]);
+        let flag = self.b.ins().symbol_value(self.ptr, self.env.unwinding);
+        let r = self.helper("JS_SortNative", &[ctx, op_, ot, cmp, mode, flag])[0];
+        self.check_int(r);
+        let sorted = self.b.create_block();
+        let done = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
+        self.b.ins().brif(done, sorted, &[], slow, &[]);
+        self.b.switch_to_block(sorted);
+        // (`sort` returns the array.)
+        self.dup((op_, ot));
+        self.b.ins().jump(join, &[BlockArg::Value(op_), BlockArg::Value(ot)]);
+        self.b.switch_to_block(slow);
+        let cb = self.expr(callback);
+        self.hold(cb);
+        let (cp, ct) = cb.any();
+        let vals = [(mp, mt), (op_, ot), (cp, ct)];
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        self.check_value(gt);
+        self.release(cb);
+        self.free_v(cb);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        self.release(f);
+        self.free_v(f);
+        self.drop_operand(obj, owned);
         V::Any(rp, rt)
     }
 
@@ -5974,11 +6317,12 @@ fn int_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
 }
 
 /// The parameters of the bodies predicted calls inline (`Pred`), which
-/// `inline_method` binds to the arguments, not an assignment of the IR.
+/// `inline_method` binds to the arguments, and of native loops' callbacks
+/// (`array_loop`): not assignments of the IR.
 fn predicted_params(f: &ir::Func, params: &[Vec<Ty>]) -> Vec<ir::LocalId> {
     let mut out = Vec::new();
     ir::visit_stmts(&f.body, &mut |e| {
-        if let ExprKind::Predicted { func, locals, .. } = &e.kind {
+        if let ExprKind::Predicted { func, locals, .. } | ExprKind::ArrayLoop { func, locals, .. } = &e.kind {
             out.extend(locals.iter().take(params[*func].len()));
         }
     });

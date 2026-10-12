@@ -328,6 +328,7 @@ pub fn check<'a>(
             ir::infer_hints(&mut module);
             ir::inline_calls(&mut module);
             ir::predict_calls(&mut module);
+            ir::inline_callbacks(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }

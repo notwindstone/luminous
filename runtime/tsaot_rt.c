@@ -593,7 +593,9 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             Object.getPrototypeOf(function* () {}).prototype.next,\n"
         "             Object.getPrototypeOf(async function* () {}),\n"
         "             g.Promise, g.Promise.resolve, g.String.prototype, g.String.prototype.charCodeAt,\n"
-        "             g.Array.prototype.push);\n"
+        "             g.Array.prototype.push, g.Array.prototype.forEach, g.Array.prototype.map,\n"
+        "             g.Array.prototype.filter, g.Array.prototype.some, g.Array.prototype.every,\n"
+        "             g.Array.prototype.find, g.Array.prototype.findIndex, g.Array.prototype.sort);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";

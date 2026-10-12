@@ -177,6 +177,10 @@ fast paths that keep the engine's semantics:
   `sort` comparators, `map` callbacks) enters native functions' fast
   entries first;
 - `JS_ArrayPushFast`: `push`'s own fast path, for native code;
+- for native array loops: `JS_ArraySpeciesCreateRoom` (a `map` result with
+  room for every element), `JS_TryGetElement`, `JS_DefineElement` (appends
+  in place), and `JS_SortNative`, a stable merge sort that calls a native
+  comparator directly through its native signature;
 - faster engine internals that every program benefits from, interpreted
   or not: 64KB allocator arenas handed out by a bump index, with one empty
   arena kept per size class (allocation-heavy code used to create and free
@@ -184,14 +188,20 @@ fast paths that keep the engine's semantics:
   size class (a free and the next allocation are a push and a pop); plain
   objects made from an allocation site's shape in one short function, and
   freed (with the plain objects only they referenced) in a loop rather than
-  through the collector's queue; plain objects that keep their
-  property array in their own allocation until it grows; defining the next
-  element of a fast array (`map`, `filter`, …) appends it; `map`,
+  through the collector's queue; arrays freed the same way with their
+  plain elements; an empty size-class cache refilled 32 blocks at a time,
+  in address order; strings allocated from the cache inline; plain objects
+  that keep their property array in their own allocation until it grows;
+  defining the next element of a fast array (`map`, `filter`, `split`,
+  `Array.from`, …) appends it, and a growing array makes room for 8
+  elements at least; `map`,
   `filter`, `forEach`, `some`, `every`, `reduce` and `sort` read the
   elements of fast arrays in place and call a native callback's fast entry
   directly; forward `indexOf` searches by its first character with
-  `memchr`; the cycle collector first runs at 4MB and then whenever the
-  heap has doubled (rather than from 256KB, at every 50% growth);
+  `memchr`; `parseInt`, `Number(s)` and `+s` read small decimal integers
+  directly; the cycle collector first runs at 4MB and then whenever the
+  heap has doubled, or quadrupled after a collection that freed little
+  (rather than from 256KB, at every 50% growth);
   `x ** 2` is the correctly rounded square (as native code computes it).
 
 ## Backends
@@ -328,6 +338,15 @@ The differential tests run every case with both.
   it at the call instead of going through the callee's JS entry. Where the
   arguments cannot run code, the method is read without taking a
   reference.
+- **Array callbacks as native loops**: `xs.forEach(cb)`, `map`, `filter`,
+  `some`, `every`, `find` and `findIndex` with an arrow function written at
+  the call become a loop with the arrow's body inline (its captured
+  variables are the caller's own), as JIT compilers inline the builtin and
+  its callback; it runs while `xs` is an array without holes and the
+  method is the original builtin, reading each element afresh (the
+  callback may change the array), and calls the builtin otherwise.
+  `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
+  engine sort calling the compiled comparator directly.
 - **Leaf functions** that can neither throw nor call (only unboxed numbers
   and booleans) skip the stack check, and their callers the exception
   check after the call.

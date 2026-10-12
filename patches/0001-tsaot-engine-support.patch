@@ -173,13 +173,32 @@
  
  JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
  JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
-@@ -1342,6 +1494,29 @@
+@@ -1342,6 +1494,48 @@
  JS_EXTERN JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                                        int length, int magic, int data_len,
                                        JSValueConst *data);
 +/* `arr.push(val)` (val borrowed) where it takes Array.prototype.push's fast
 +   path: the new length, or JS_UNINITIALIZED where it does not (call push). */
 +JS_EXTERN JSValue JS_ArrayPushFast(JSContext *ctx, JSValueConst arr, JSValueConst val);
++/* For native `map` (len >= 0) and `filter` (len < 0) loops over `obj`: the
++   result array, as ArraySpeciesCreate makes it, with room for len elements. */
++JS_EXTERN JSValue JS_ArraySpeciesCreateRoom(JSContext *ctx, JSValueConst obj, int64_t len);
++/* Element `idx` of `obj` if it has one (*present = 1), else undefined
++   (*present = 0); JS_EXCEPTION on an exception. */
++JS_EXTERN JSValue JS_TryGetElement(JSContext *ctx, JSValueConst obj, int64_t idx, int *present);
++/* Define element `idx` of `arr` as `val` (taken), enumerable, writable and
++   configurable, throwing on failure (CreateDataPropertyOrThrow), as native
++   `map` and `filter` loops add to their result: in place when it is the
++   next element of a fast array with room for it. Negative on an exception. */
++JS_EXTERN int JS_DefineElement(JSContext *ctx, JSValueConst arr, int64_t idx, JSValue val);
++/* `arr.sort(cmp)` for a fast array without holes, with `cmp` a native
++   comparator called directly: `(ctx, NULL, a, b)` with a, b JSValues
++   (taken) (`mode` 0, 2) or doubles (1, 3: declined unless every element is
++   a number), returning a double (0, 1) or a JSValue (2, 3). An exception
++   in it sets `*unwinding`. 1: sorted; 0: declined (nothing done); -1: an
++   exception. */
++JS_EXTERN int JS_SortNative(JSContext *ctx, JSValueConst arr, void *cmp, int mode,
++                            const uint8_t *unwinding);
 +/* Call `func_obj`, a builtin (C function: JS_LAYOUT_CLASS_C_FUNCTION), as
 +   JS_Call would, without the interpreter's frame. */
 +JS_EXTERN JSValue JS_CallBuiltin(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
@@ -235,7 +254,7 @@
  #define JS_ARENA_BLOCK_SIZE_COUNT  31
  #define JS_ARENA_MAX_SMALL_SIZE    512
  #define JS_ARENA_FREE_NIL          0xffff
-@@ -304,12 +308,29 @@
+@@ -304,12 +308,31 @@
      uint16_t n_used_blocks;
      uint16_t n_blocks;
      uint16_t first_free_block;    /* JS_ARENA_FREE_NIL if none */
@@ -246,7 +265,9 @@
 +/* tsaot: blocks freed recently, per size class, kept out of their arena
 +   (which still counts them as used): the usual free / allocate pairs are a
 +   push and a pop. Up to this many bytes per size class. */
-+#define JS_ARENA_CACHE_BYTES (256 * 1024)
++#define JS_ARENA_CACHE_BYTES (1024 * 1024)
++/* Blocks taken from an arena at once when the cache is empty. */
++#define JS_ARENA_REFILL 32
 +
 +typedef struct JSArenaCache {
 +    void *head;      /* user data of a free block, whose first word links the next */
@@ -265,7 +286,7 @@
      _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
  } JSArenaState;
  
-@@ -922,6 +943,10 @@
+@@ -922,6 +945,10 @@
      bool is_array;
      uint32_t array_length;
      uint32_t idx;
@@ -276,7 +297,7 @@
  } JSForInIterator;
  
  typedef struct JSRegExp {
-@@ -1207,6 +1232,29 @@
+@@ -1207,6 +1234,29 @@
      /* byte sizes: 40/48/72 */
  };
  
@@ -306,19 +327,23 @@
  typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
-@@ -1692,8 +1740,9 @@
+@@ -1691,9 +1741,13 @@
+             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
          }
  #endif
++        size_t before = rt->malloc_state.malloc_size, after;
          JS_RunGC(rt);
 -        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
 -            (rt->malloc_state.malloc_size >> 1);
 +        /* tsaot: the next collection when the heap has doubled (rather
-+           than grown by half): fewer scans of large live heaps. */
-+        rt->malloc_gc_threshold = rt->malloc_state.malloc_size * 2;
++           than grown by half), or quadrupled after one that freed under an
++           eighth of it: fewer scans of large live heaps. */
++        after = rt->malloc_state.malloc_size;
++        rt->malloc_gc_threshold = after * (before - after < before / 8 ? 4 : 2);
      }
  }
  
-@@ -1736,7 +1785,13 @@
+@@ -1736,7 +1790,13 @@
      for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
          init_list_head(&s->arena_list[i]);
          init_list_head(&s->free_arena_list[i]);
@@ -332,7 +357,7 @@
  }
  
  static inline void *arena_get_block(JSArena *ar, unsigned int idx,
-@@ -1747,9 +1802,8 @@
+@@ -1747,9 +1807,8 @@
  
  static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
  {
@@ -343,7 +368,7 @@
  
      block_size = arena_block_sizes[block_size_idx];
      n_blocks = (JS_ARENA_SIZE - sizeof(JSArena)) / block_size;
-@@ -1760,15 +1814,8 @@
+@@ -1760,15 +1819,8 @@
      ar->block_size_idx = block_size_idx;
      ar->n_blocks = n_blocks;
      ar->n_used_blocks = 0;
@@ -361,7 +386,7 @@
      list_add(&ar->link, &rt->arena_state.arena_list[block_size_idx]);
      list_add(&ar->free_link, &rt->arena_state.free_arena_list[block_size_idx]);
      return ar;
-@@ -1813,7 +1860,16 @@
+@@ -1813,7 +1865,16 @@
          JSArena *ar;
          struct list_head *el, *head;
  
@@ -379,29 +404,61 @@
          block_size = arena_block_sizes[block_size_idx];
          head = &rt->arena_state.free_arena_list[block_size_idx];
          el = head->next;
-@@ -1823,10 +1879,19 @@
+@@ -1823,15 +1884,45 @@
                  return NULL;
          } else {
              ar = list_entry(el, JSArena, free_link);
 +            if (unlikely(ar == rt->arena_state.spare[block_size_idx]))
 +                rt->arena_state.spare[block_size_idx] = NULL;
++        }
++        {
++            /* tsaot: this block, and up to JS_ARENA_REFILL - 1 more for
++               the (empty) cache: allocation bursts take blocks in batches. */
++            void *first = NULL, *batch[JS_ARENA_REFILL];
++            int k, take = ar->n_blocks - ar->n_used_blocks;
++            if (take > JS_ARENA_REFILL)
++                take = JS_ARENA_REFILL;
++            for (k = 0; k < take; k++) {
++                block_idx = ar->first_free_block;
++                if (block_idx != JS_ARENA_FREE_NIL) {
++                    b = arena_get_block(ar, block_idx, block_size);
++                    ar->first_free_block = b->u.free_next;
++                } else {
++                    /* (Not full, nothing freed: some blocks were never used.) */
++                    block_idx = ar->n_bumped++;
++                    b = arena_get_block(ar, block_idx, block_size);
++                    b->block_size_idx = block_size_idx;
++                }
++                b->u.block_idx = block_idx;
++                if (k == 0) {
++                    first = b->user_data;
++                } else {
++                    batch[k] = b->user_data;
++                }
++            }
++            /* (Handed out in address order, for bump-allocated blocks.) */
++            for (k = take - 1; k > 0; k--) {
++                *(void **)batch[k] = c->head;
++                c->head = batch[k];
++                c->count++;
++            }
++            ar->n_used_blocks += take;
++            if (unlikely(ar->n_used_blocks == ar->n_blocks))
++                list_del(&ar->free_link);
++            return first;
          }
-         block_idx = ar->first_free_block;
+-        block_idx = ar->first_free_block;
 -        b = arena_get_block(ar, block_idx, block_size);
 -        ar->first_free_block = b->u.free_next;
-+        if (block_idx != JS_ARENA_FREE_NIL) {
-+            b = arena_get_block(ar, block_idx, block_size);
-+            ar->first_free_block = b->u.free_next;
-+        } else {
-+            /* (Not full, nothing freed: some blocks were never used.) */
-+            block_idx = ar->n_bumped++;
-+            b = arena_get_block(ar, block_idx, block_size);
-+            b->block_size_idx = block_size_idx;
-+        }
-         b->u.block_idx = block_idx;
-         ar->n_used_blocks++;
-         if (unlikely(ar->n_used_blocks == ar->n_blocks))
-@@ -1854,6 +1919,13 @@
+-        b->u.block_idx = block_idx;
+-        ar->n_used_blocks++;
+-        if (unlikely(ar->n_used_blocks == ar->n_blocks))
+-            list_del(&ar->free_link);
+-        return b->user_data;
+     } else {
+         return arena_malloc_large(rt, size);
+     }
+@@ -1854,6 +1945,13 @@
      } else {
          unsigned int block_idx = b->u.block_idx;
          unsigned int block_size_idx = b->block_size_idx;
@@ -415,7 +472,7 @@
          unsigned int block_size = arena_block_sizes[block_size_idx];
          JSArena *ar = (JSArena *)((uint8_t *)b -
                                    (size_t)block_size * block_idx -
-@@ -1865,9 +1937,17 @@
+@@ -1865,9 +1963,17 @@
                       &rt->arena_state.free_arena_list[block_size_idx]);
          ar->n_used_blocks--;
          if (unlikely(ar->n_used_blocks == 0)) {
@@ -436,7 +493,7 @@
          }
      }
  }
-@@ -1972,6 +2052,9 @@
+@@ -1972,6 +2078,9 @@
          }
          init_list_head(&s->arena_list[i]);
          init_list_head(&s->free_arena_list[i]);
@@ -446,20 +503,36 @@
      }
  }
  
-@@ -2001,6 +2084,54 @@
+@@ -2001,6 +2110,70 @@
      return ptr;
  }
  
-+/* (Inlined into object allocation and freeing.) */
++/* (Inlined into object and string allocation and freeing.) */
 +static inline __attribute__((always_inline)) void *js_malloc_rt_inline(JSRuntime *rt, size_t size)
 +{
 +    void *ptr;
 +    JSMallocState *s;
++    size_t total;
 +
 +    s = &rt->malloc_state;
 +    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
 +    if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
 +        return NULL;
++    /* A cached block of the size class, when there is one. */
++    total = ((size + JS_ARENA_ALIGN - 1) & ~(size_t)(JS_ARENA_ALIGN - 1)) +
++        sizeof(JSMallocBlockHeader);
++    if (likely(!JS_ARENA_LARGE_BLOCKS_ONLY && total <= JS_ARENA_MAX_SMALL_SIZE && size != 0)) {
++        unsigned int idx = rt->arena_state.size_index[total / 8];
++        JSArenaCache *c = &rt->arena_state.cache[idx];
++        ptr = c->head;
++        if (likely(ptr != NULL)) {
++            c->head = *(void **)ptr;
++            c->count--;
++            s->malloc_count++;
++            s->malloc_size += arena_block_sizes[idx] - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
++            return ptr;
++        }
++    }
 +
 +    ptr = js_arena_malloc(rt, size);
 +    if (!ptr)
@@ -501,7 +574,7 @@
  void *js_malloc_rt(JSRuntime *rt, size_t size)
  {
      void *ptr;
-@@ -2330,7 +2461,8 @@
+@@ -2330,7 +2503,8 @@
      ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
      rt->malloc_state = ms;
      js_arena_init(rt);
@@ -511,7 +584,21 @@
  
      init_list_head(&rt->context_list);
      init_list_head(&rt->gc_obj_list);
-@@ -5842,6 +5974,27 @@
+@@ -2567,10 +2741,12 @@
+ }
+ 
+ /* Note: the string contents are uninitialized */
++static inline void *js_malloc_rt_inline(JSRuntime *rt, size_t size);
++
+ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char)
+ {
+     JSString *str;
+-    str = js_malloc_rt(rt, sizeof(JSString) + (max_len << is_wide_char) + 1 - is_wide_char);
++    str = js_malloc_rt_inline(rt, sizeof(JSString) + (max_len << is_wide_char) + 1 - is_wide_char);
+     if (unlikely(!str))
+         return NULL;
+     JS_REF_COUNT(str) = 1;
+@@ -5842,6 +6018,27 @@
  }
  
  /* make space to hold at least 'count' properties */
@@ -539,7 +626,7 @@
  static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                                         JSObject *p, uint32_t count)
  {
-@@ -5857,7 +6010,7 @@
+@@ -5857,7 +6054,7 @@
         in case of memory allocation failure */
      if (p) {
          JSProperty *new_prop;
@@ -548,7 +635,7 @@
          if (unlikely(!new_prop))
              return -1;
          p->prop = new_prop;
-@@ -5985,7 +6138,7 @@
+@@ -5985,7 +6182,7 @@
      js_free(ctx, get_alloc_from_shape(old_sh));
  
      /* reduce the size of the object properties */
@@ -557,7 +644,7 @@
      if (new_prop)
          p->prop = new_prop;
      return 0;
-@@ -6140,9 +6293,11 @@
+@@ -6140,9 +6337,11 @@
      int i;
  
      js_trigger_gc(ctx->rt, sizeof(JSObject) + sizeof(JSProperty) * sh->prop_size);
@@ -571,7 +658,7 @@
      p->class_id = class_id;
      p->extensible = true;
      p->free_mark = 0;
-@@ -6156,7 +6311,10 @@
+@@ -6156,7 +6355,10 @@
      p->first_weak_ref = NULL;
      p->u.opaque = NULL;
      p->shape = sh;
@@ -583,7 +670,7 @@
      if (unlikely(!p->prop)) {
          js_free(ctx, p);
      fail:
-@@ -6560,12 +6718,20 @@
+@@ -6560,12 +6762,20 @@
  
  typedef struct JSCFunctionDataRecord {
      JSCFunctionData *func;
@@ -604,7 +691,7 @@
  static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
  {
      JSCFunctionDataRecord *s = JS_GetOpaque(val, JS_CLASS_C_FUNCTION_DATA);
-@@ -6608,6 +6774,11 @@
+@@ -6608,6 +6818,11 @@
      s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
      if (!s)
          return JS_EXCEPTION; // can't really happen
@@ -616,7 +703,7 @@
      arg_buf = argv;
      arg_count = s->length;
      if (unlikely(argc < arg_count)) {
-@@ -6653,6 +6824,8 @@
+@@ -6653,6 +6868,8 @@
          return JS_EXCEPTION;
      }
      s->func = func;
@@ -625,7 +712,7 @@
      s->length = length;
      s->data_len = data_len;
      s->magic = magic;
-@@ -6672,6 +6845,73 @@
+@@ -6672,6 +6889,73 @@
      return func_obj;
  }
  
@@ -699,23 +786,10 @@
  JSValue JS_NewCFunctionData(JSContext *ctx, JSCFunctionData *func,
                              int length, int magic, int data_len,
                              JSValueConst *data)
-@@ -7036,6 +7276,8 @@
-     JSObject *p = JS_VALUE_GET_OBJ(val);
-     JSForInIterator *it = p->u.for_in_iterator;
-     JS_FreeValueRT(rt, it->obj);
-+    if (it->shape)
-+        js_free_shape(rt, it->shape);
-     js_free_rt(rt, it);
+@@ -6898,11 +7182,75 @@
+     }
  }
  
-@@ -7045,6 +7287,62 @@
-     JSObject *p = JS_VALUE_GET_OBJ(val);
-     JSForInIterator *it = p->u.for_in_iterator;
-     JS_MarkValue(rt, it->obj, mark_func);
-+    if (it->shape)
-+        mark_func(rt, &it->shape->header);
-+}
-+
 +static void js_free_value_rt(JSRuntime *rt, JSValue v);
 +
 +/* tsaot: a plain object: no finalizer, weak references or separate
@@ -725,57 +799,92 @@
 +    return p->class_id == JS_CLASS_OBJECT && js_inline_props(p) && !p->first_weak_ref;
 +}
 +
-+/* Free plain object `p` (unreferenced, out of the GC object list) and the
-+   plain objects only it kept alive, in a loop; the other values it held are
-+   released as usual (queued: the GC phase is not JS_GC_PHASE_NONE). Not
-+   during cycle removal. */
-+static void free_plain_objects(JSRuntime *rt, JSObject *p)
++/* Release `v` while objects are freed (JS_GC_PHASE_DECREF): a plain
++   object it held the last reference to, out of the GC object list, joins
++   `*pending` (linked through header.link.next) for free_plain_objects. */
++static inline void js_release_value(JSRuntime *rt, JSValue v, JSObject **pending)
 +{
-+    /* Objects left to free, linked through header.link.next. */
-+    JSObject *pending = NULL;
-+    for (;;) {
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
++        JSObject *c = JS_VALUE_GET_OBJ(v);
++        if (--JS_REF_COUNT(c) <= 0) {
++            if (js_plain_object(c)) {
++                list_del(&c->header.link);
++                c->header.link.next = (struct list_head *)*pending;
++                *pending = c;
++            } else {
++                js_free_value_rt(rt, v);
++            }
++        }
++    } else {
++        JS_FreeValueRT(rt, v);
++    }
++}
++
++/* Free the plain objects of `pending` (unreferenced, out of the GC object
++   list, linked through header.link.next) and the plain objects only they
++   kept alive, in a loop; the other values they held are released as usual
++   (queued: the GC phase is JS_GC_PHASE_DECREF). */
++static void free_plain_objects(JSRuntime *rt, JSObject *pending)
++{
++    while (pending) {
++        JSObject *p = pending;
 +        JSShape *sh = p->shape;
 +        JSShapeProperty *pr = get_shape_prop(sh);
 +        JSProperty *q = p->prop;
 +        int i, n = sh->prop_count;
++        pending = (JSObject *)p->header.link.next;
 +        p->free_mark = 1;
 +        for (i = 0; i < n; i++, pr++, q++) {
-+            JSValue v;
-+            if (unlikely(pr->flags & JS_PROP_TMASK)) {
++            if (unlikely(pr->flags & JS_PROP_TMASK))
 +                free_property(rt, q, pr->flags);
-+                continue;
-+            }
-+            v = q->u.value;
-+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
-+                JSObject *c = JS_VALUE_GET_OBJ(v);
-+                if (--JS_REF_COUNT(c) <= 0) {
-+                    if (js_plain_object(c)) {
-+                        list_del(&c->header.link);
-+                        c->header.link.next = (struct list_head *)pending;
-+                        pending = c;
-+                    } else {
-+                        js_free_value_rt(rt, v);
-+                    }
-+                }
-+            } else {
-+                JS_FreeValueRT(rt, v);
-+            }
++            else
++                js_release_value(rt, q->u.value, &pending);
 +        }
 +        js_free_shape(rt, sh);
 +        js_free_rt_inline(rt, p);
-+        if (!pending)
-+            break;
-+        p = pending;
-+        pending = (JSObject *)p->header.link.next;
 +    }
++}
++
+ static void js_array_finalizer(JSRuntime *rt, JSValueConst val)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     uint32_t i;
+ 
++    if (rt->gc_phase == JS_GC_PHASE_DECREF) {
++        /* tsaot: plain objects freed in a loop (see free_plain_objects). */
++        JSObject *pending = NULL;
++        for(i = 0; i < p->u.array.count; i++)
++            js_release_value(rt, p->u.array.u.values[i], &pending);
++        js_free_rt(rt, p->u.array.u.values);
++        free_plain_objects(rt, pending);
++        return;
++    }
+     for(i = 0; i < p->u.array.count; i++) {
+         JS_FreeValueRT(rt, p->u.array.u.values[i]);
+     }
+@@ -7036,6 +7384,8 @@
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
+     JS_FreeValueRT(rt, it->obj);
++    if (it->shape)
++        js_free_shape(rt, it->shape);
+     js_free_rt(rt, it);
+ }
+ 
+@@ -7045,6 +7395,8 @@
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSForInIterator *it = p->u.for_in_iterator;
+     JS_MarkValue(rt, it->obj, mark_func);
++    if (it->shape)
++        mark_func(rt, &it->shape->header);
  }
  
  static void free_object(JSRuntime *rt, JSObject *p)
-@@ -7054,6 +7352,11 @@
+@@ -7054,6 +7406,11 @@
      JSShape *sh;
      JSShapeProperty *pr;
  
-+    if (likely(js_plain_object(p) && rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES)) {
++    if (likely(js_plain_object(p) && rt->gc_phase == JS_GC_PHASE_DECREF)) {
 +        list_del(&p->header.link);
 +        free_plain_objects(rt, p);
 +        return;
@@ -783,7 +892,7 @@
      p->free_mark = 1; /* used to tell the object is invalid when
                           freeing cycles */
      /* free all the fields */
-@@ -7063,7 +7366,8 @@
+@@ -7063,7 +7420,8 @@
          free_property(rt, &p->prop[i], pr->flags);
          pr++;
      }
@@ -793,7 +902,7 @@
      /* as an optimization we destroy the shape immediately without
         putting it in gc_zero_ref_count_list */
      js_free_shape(rt, sh);
-@@ -7090,7 +7394,7 @@
+@@ -7090,7 +7448,7 @@
      if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(p) != 0) {
          list_add_tail(&p->header.link, &rt->gc_zero_ref_count_list);
      } else {
@@ -802,7 +911,7 @@
      }
  }
  
-@@ -7162,12 +7466,22 @@
+@@ -7162,12 +7520,22 @@
      case JS_TAG_FUNCTION_BYTECODE:
          {
              JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
@@ -812,7 +921,7 @@
 +                   usual, then freed). */
 +                rt->gc_phase = JS_GC_PHASE_DECREF;
 +                if (tag == JS_TAG_OBJECT && js_plain_object((JSObject *)p)) {
-+                    list_del(&p->link);
++                    list_del(&p->link); /* (link.next: NULL) */
 +                    free_plain_objects(rt, (JSObject *)p);
 +                } else {
 +                    free_gc_object(rt, p);
@@ -829,7 +938,7 @@
              }
          }
          break;
-@@ -10173,8 +10487,7 @@
+@@ -10173,8 +10541,7 @@
              /*  the property array may need to be resized */
              if (new_sh->prop_size != sh->prop_size) {
                  JSProperty *new_prop;
@@ -839,7 +948,17 @@
                  if (!new_prop)
                      return NULL;
                  p->prop = new_prop;
-@@ -10827,6 +11140,20 @@
+@@ -10465,7 +10832,8 @@
+         JS_ThrowOutOfMemory(ctx);
+         return -1;
+     }
+-    new_size = max_uint32(new_len, new_size);
++    /* tsaot: room for 8 elements at least (small arrays grew 1, 2, 3...) */
++    new_size = max_uint32(new_len, max_uint32(new_size, 8));
+     new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
+     if (!new_array_prop)
+         return -1;
+@@ -10827,6 +11195,20 @@
  }
  
  /* flags can be JS_PROP_THROW or JS_PROP_THROW_STRICT */
@@ -860,7 +979,7 @@
  int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                          JSValue prop, JSValue val, int flags)
  {
-@@ -11558,9 +11885,27 @@
+@@ -11558,9 +11940,27 @@
      return ret;
  }
  
@@ -888,7 +1007,7 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_uint32(idx),
                                         val, flags);
  }
-@@ -11568,6 +11913,9 @@
+@@ -11568,6 +11968,9 @@
  int JS_DefinePropertyValueInt64(JSContext *ctx, JSValueConst this_obj,
                                  int64_t idx, JSValue val, int flags)
  {
@@ -898,7 +1017,17 @@
      return JS_DefinePropertyValueValue(ctx, this_obj, js_int64(idx),
                                         val, flags);
  }
-@@ -11616,6 +11964,9 @@
+@@ -11605,7 +12008,8 @@
+ static int JS_CreateDataPropertyUint32(JSContext *ctx, JSValueConst this_obj,
+                                        int64_t idx, JSValue val, int flags)
+ {
+-    return JS_DefinePropertyValueValue(ctx, this_obj, js_int64(idx),
++    /* tsaot: (the next element of a fast array: appended) */
++    return JS_DefinePropertyValueInt64(ctx, this_obj, idx,
+                                        val, flags | JS_PROP_CONFIGURABLE |
+                                        JS_PROP_ENUMERABLE | JS_PROP_WRITABLE);
+ }
+@@ -11616,6 +12020,9 @@
  {
      JSAtom atom;
      int ret;
@@ -908,7 +1037,84 @@
      atom = JS_ValueToAtom(ctx, js_int64(idx));
      if (unlikely(atom == JS_ATOM_NULL))
          return -1;
-@@ -15015,11 +15366,29 @@
+@@ -13955,6 +14362,43 @@
+     TON_FLAG_NUMERIC,
+ } JSToNumberHintEnum;
+ 
++/* tsaot: a decimal integer of 1 to 9 digits after an optional sign at
++   the start of 8-bit string `s` (at its end too if `whole`), not -0: its
++   value; else false (the caller converts as usual). */
++static bool js_string_small_int(JSValueConst s, bool whole, bool hex_prefix, int32_t *pres)
++{
++    JSString *p;
++    const uint8_t *c;
++    uint32_t i = 0, start, n, v = 0;
++    bool neg = false;
++
++    if (JS_VALUE_GET_TAG(s) != JS_TAG_STRING)
++        return false;
++    p = JS_VALUE_GET_STRING(s);
++    if (p->is_wide_char)
++        return false;
++    n = p->len;
++    c = strv(p);
++    if (n > 0 && (c[0] == '-' || c[0] == '+')) {
++        neg = c[0] == '-';
++        i = 1;
++    }
++    start = i;
++    while (i < n && i - start < 10 && c[i] >= '0' && c[i] <= '9')
++        v = v * 10 + (c[i++] - '0');
++    if (i == start || i - start > 9 || (neg && v == 0))
++        return false;
++    if (i < n) {
++        if (whole || (c[i] >= '0' && c[i] <= '9'))
++            return false;
++        /* ("0x..." with no radix: hexadecimal) */
++        if (hex_prefix && i == start + 1 && c[start] == '0' && (c[i] | 0x20) == 'x')
++            return false;
++    }
++    *pres = neg ? -(int32_t)v : (int32_t)v;
++    return true;
++}
++
+ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
+                                    JSToNumberHintEnum flag)
+ {
+@@ -13995,7 +14439,13 @@
+             const char *str;
+             const char *p;
+             size_t len;
++            int32_t v;
+ 
++            /* tsaot: a small decimal integer, directly */
++            if (js_string_small_int(val, true, false, &v)) {
++                JS_FreeValue(ctx, val);
++                return js_int32(v);
++            }
+             str = JS_ToCStringLen(ctx, &len, val);
+             JS_FreeValue(ctx, val);
+             if (!str)
+@@ -14662,6 +15112,9 @@
+ 
+ JSValue JS_ToString(JSContext *ctx, JSValueConst val)
+ {
++    /* tsaot: (strings first) */
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
++        return js_dup(val);
+     return JS_ToStringInternal(ctx, val, /*flags*/0);
+ }
+ 
+@@ -14695,6 +15148,8 @@
+ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
+ {
+     uint32_t tag = JS_VALUE_GET_TAG(val);
++    if (tag == JS_TAG_STRING)
++        return js_dup(val);
+     if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
+         return JS_ThrowTypeError(ctx, "null or undefined are forbidden");
+     return JS_ToString(ctx, val);
+@@ -15015,11 +15470,29 @@
      }
  }
  
@@ -939,7 +1145,7 @@
      }
      return false;
  }
-@@ -15033,7 +15402,7 @@
+@@ -15033,7 +15506,7 @@
          if (unlikely(p->class_id == JS_CLASS_PROXY))
              return js_proxy_isArray(ctx, val);
          else
@@ -948,7 +1154,7 @@
      } else {
          return false;
      }
-@@ -15046,6 +15415,10 @@
+@@ -15046,6 +15519,10 @@
      if (unlikely(!isfinite(b)) && fabs(a) == 1) {
          /* not compatible with IEEE 754 */
          d = NAN;
@@ -959,7 +1165,7 @@
      } else {
          JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
          d = pow(a, b);
-@@ -16550,6 +16923,165 @@
+@@ -16550,6 +17027,165 @@
      return atom;
  }
  
@@ -1125,7 +1331,7 @@
  static __exception int js_operator_delete(JSContext *ctx, JSValue *sp)
  {
      JSValue op1, op2;
-@@ -16757,6 +17289,13 @@
+@@ -16757,6 +17393,13 @@
      return JS_EXCEPTION;
  }
  
@@ -1139,7 +1345,7 @@
  static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
  {
      JSObject *p;
-@@ -16785,6 +17324,8 @@
+@@ -16785,6 +17428,8 @@
      it->is_array = false;
      it->obj = obj;
      it->idx = 0;
@@ -1148,7 +1354,7 @@
      p = JS_VALUE_GET_OBJ(enum_obj);
      p->u.for_in_iterator = it;
  
-@@ -16906,7 +17447,20 @@
+@@ -16906,7 +17551,20 @@
      it = p->u.for_in_iterator;
  
      for(;;) {
@@ -1170,7 +1376,7 @@
              if (it->idx >= it->array_length)
                  goto done;
              prop = __JS_AtomFromUInt32(it->idx);
-@@ -18047,6 +18601,92 @@
+@@ -18047,6 +18705,92 @@
      return can_store_error_stack(exc) || can_add_backtrace(exc);
  }
  
@@ -1263,7 +1469,7 @@
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
  static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSValueConst this_obj, JSValueConst new_target,
-@@ -18548,9 +19188,12 @@
+@@ -18548,9 +19292,12 @@
              has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1276,7 +1482,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call)
-@@ -18585,9 +19228,12 @@
+@@ -18585,9 +19332,12 @@
                  pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
@@ -1289,7 +1495,7 @@
                  if (unlikely(JS_IsException(ret_val)))
                      goto exception;
                  if (opcode == OP_tail_call_method)
-@@ -18598,6 +19244,21 @@
+@@ -18598,6 +19348,21 @@
                  *sp++ = ret_val;
              }
              BREAK;
@@ -1311,7 +1517,7 @@
          CASE(OP_array_from):
              {
                  call_argc = get_u16(pc);
-@@ -20983,18 +21644,18 @@
+@@ -20983,18 +21748,18 @@
      return ret_val;
  }
  
@@ -1334,7 +1540,7 @@
      JS_FreeValue(ctx, func_obj);
      return res;
  }
-@@ -21274,13 +21935,21 @@
+@@ -21274,13 +22039,21 @@
  typedef struct JSGeneratorData {
      JSGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
@@ -1357,7 +1563,7 @@
      s->state = JS_GENERATOR_STATE_COMPLETED;
  }
  
-@@ -21307,7 +21976,10 @@
+@@ -21307,7 +22080,10 @@
  
      if (!s || s->state == JS_GENERATOR_STATE_COMPLETED)
          return;
@@ -1369,7 +1575,7 @@
  }
  
  /* XXX: use enum */
-@@ -21315,6 +21987,56 @@
+@@ -21315,6 +22091,56 @@
  #define GEN_MAGIC_RETURN 1
  #define GEN_MAGIC_THROW  2
  
@@ -1426,7 +1632,7 @@
  static JSValue js_generator_next(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv,
                                   int *pdone, int magic)
-@@ -21326,6 +22048,8 @@
+@@ -21326,6 +22152,8 @@
      *pdone = true;
      if (!s)
          return JS_ThrowTypeError(ctx, "not a generator");
@@ -1435,7 +1641,7 @@
      sf = &s->func_state.frame;
      switch(s->state) {
      default:
-@@ -21440,6 +22164,61 @@
+@@ -21440,6 +22268,61 @@
      return JS_EXCEPTION;
  }
  
@@ -1497,7 +1703,7 @@
  /* AsyncFunction */
  
  static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
-@@ -21672,6 +22451,12 @@
+@@ -21672,6 +22555,12 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
@@ -1510,7 +1716,7 @@
  } JSAsyncGeneratorData;
  
  static void js_async_generator_free(JSRuntime *rt,
-@@ -21688,8 +22473,11 @@
+@@ -21688,8 +22577,11 @@
          JS_FreeValueRT(rt, req->resolving_funcs[1]);
          js_free_rt(rt, req);
      }
@@ -1524,7 +1730,7 @@
          async_func_free(rt, &s->func_state);
      }
      js_free_rt(rt, s);
-@@ -21718,8 +22506,11 @@
+@@ -21718,8 +22610,11 @@
              JS_MarkValue(rt, req->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, req->resolving_funcs[1], mark_func);
          }
@@ -1538,7 +1744,7 @@
              async_func_mark(rt, &s->func_state, mark_func);
          }
      }
-@@ -21832,7 +22623,12 @@
+@@ -21832,7 +22727,12 @@
  {
      if (s->state != JS_ASYNC_GENERATOR_STATE_COMPLETED) {
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
@@ -1552,7 +1758,7 @@
      }
  }
  
-@@ -21874,6 +22670,55 @@
+@@ -21874,6 +22774,55 @@
      return res;
  }
  
@@ -1608,7 +1814,7 @@
  static void js_async_generator_resume_next(JSContext *ctx,
                                             JSAsyncGeneratorData *s)
  {
-@@ -21910,6 +22755,12 @@
+@@ -21910,6 +22859,12 @@
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD:
          case JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD_STAR:
              value = js_dup(next->result);
@@ -1621,7 +1827,7 @@
              if (next->completion_type == GEN_MAGIC_THROW &&
                  s->state == JS_ASYNC_GENERATOR_STATE_SUSPENDED_YIELD) {
                  JS_Throw(ctx, value);
-@@ -21922,10 +22773,20 @@
+@@ -21922,10 +22877,20 @@
                      js_int32(next->completion_type);
                  s->func_state.frame.cur_sp++;
              exec_no_arg:
@@ -1643,7 +1849,7 @@
              func_ret = async_func_resume(ctx, &s->func_state);
              if (JS_IsException(func_ret)) {
                  value = JS_GetException(ctx);
-@@ -21999,6 +22860,12 @@
+@@ -21999,6 +22964,12 @@
          }
      } else if (s->state == JS_ASYNC_GENERATOR_STATE_EXECUTING) {
          /* restart function execution after await() */
@@ -1656,7 +1862,7 @@
          s->func_state.throw_flag = is_reject;
          if (is_reject) {
              JS_Throw(ctx, js_dup(arg));
-@@ -22095,6 +22962,37 @@
+@@ -22095,6 +23066,37 @@
      return JS_EXCEPTION;
  }
  
@@ -1694,7 +1900,24 @@
  /* JS parser */
  
  enum {
-@@ -43584,6 +44482,18 @@
+@@ -43563,6 +44565,16 @@
+         ret = JS_ArraySpeciesCreate(ctx, obj, js_int64(len));
+         if (JS_IsException(ret))
+             goto exception;
++        /* tsaot: the result of mapping a dense array gets room for all
++           its elements at once (appended in place below). */
++        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
++            JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY &&
++            JS_VALUE_GET_OBJ(obj)->fast_array &&
++            JS_VALUE_GET_OBJ(obj)->u.array.count == len) {
++            JSObject *rp = js_appendable(ret, 0, JS_PROP_C_W_E);
++            if (rp && len > rp->u.array.u1.size && expand_fast_array(ctx, rp, len))
++                goto exception;
++        }
+         break;
+     case special_filter:
+         ret = JS_ArraySpeciesCreate(ctx, obj, js_int32(0));
+@@ -43584,6 +44596,18 @@
      }
      n = 0;
  
@@ -1713,7 +1936,7 @@
      for(k = 0; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43592,6 +44502,12 @@
+@@ -43592,6 +44616,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -1726,7 +1949,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k, &val);
              if (present < 0)
-@@ -43602,7 +44518,11 @@
+@@ -43602,7 +44632,11 @@
              args[0] = val;
              args[1] = index_val;
              args[2] = obj;
@@ -1739,7 +1962,25 @@
              JS_FreeValue(ctx, index_val);
              if (JS_IsException(res))
                  goto exception;
-@@ -43730,6 +44650,17 @@
+@@ -43622,6 +44656,17 @@
+                 }
+                 break;
+             case special_map:
++                {
++                    /* tsaot: appended in place (inside the length) */
++                    JSObject *rp = js_appendable(ret, k, JS_PROP_C_W_E);
++                    if (rp && k < rp->u.array.u1.size &&
++                        JS_VALUE_GET_TAG(rp->prop[0].u.value) == JS_TAG_INT &&
++                        k < JS_VALUE_GET_INT(rp->prop[0].u.value)) {
++                        rp->u.array.u.values[k] = res;
++                        rp->u.array.count = k + 1;
++                        break;
++                    }
++                }
+                 if (JS_DefinePropertyValueInt64(ctx, ret, k, res,
+                                                 JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                     goto exception;
+@@ -43730,6 +44775,17 @@
              }
          }
      }
@@ -1757,7 +1998,7 @@
      for (; k < len; k++) {
          if (js_poll_interrupts(ctx))
              goto exception;
-@@ -43739,6 +44670,12 @@
+@@ -43739,6 +44795,12 @@
              if (JS_IsException(val))
                  goto exception;
              present = true;
@@ -1770,7 +2011,7 @@
          } else {
              present = JS_TryGetPropertyInt64(ctx, obj, k1, &val);
              if (present < 0)
-@@ -43750,7 +44687,11 @@
+@@ -43750,7 +44812,11 @@
              args[1] = val;
              args[2] = index_val;
              args[3] = obj;
@@ -1783,7 +2024,7 @@
              JS_FreeValue(ctx, index_val);
              JS_FreeValue(ctx, val);
              val = JS_UNDEFINED;
-@@ -44171,6 +45112,30 @@
+@@ -44171,6 +45237,72 @@
      return JS_EXCEPTION;
  }
  
@@ -1811,10 +2052,52 @@
 +    return js_int32(len + 1);
 +}
 +
++JSValue JS_ArraySpeciesCreateRoom(JSContext *ctx, JSValueConst obj, int64_t len)
++{
++    JSValue ret = JS_ArraySpeciesCreate(ctx, obj, js_int64(len < 0 ? 0 : len));
++    if (len > 0 && !JS_IsException(ret)) {
++        JSObject *rp = js_appendable(ret, 0, JS_PROP_C_W_E);
++        if (rp && len > rp->u.array.u1.size && len < INT32_MAX &&
++            expand_fast_array(ctx, rp, len)) {
++            JS_FreeValue(ctx, ret);
++            return JS_EXCEPTION;
++        }
++    }
++    return ret;
++}
++
++int JS_DefineElement(JSContext *ctx, JSValueConst arr, int64_t idx, JSValue val)
++{
++    JSObject *p = js_appendable(arr, idx, JS_PROP_C_W_E);
++    if (likely(p && idx < p->u.array.u1.size &&
++               JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
++        if (idx >= JS_VALUE_GET_INT(p->prop[0].u.value)) {
++            if (unlikely(!(get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE)))
++                goto slow;
++            p->prop[0].u.value = js_int32(idx + 1);
++        }
++        p->u.array.u.values[idx] = val;
++        p->u.array.count = idx + 1;
++        return true;
++    }
++ slow:
++    return JS_DefinePropertyValueInt64(ctx, arr, idx, val, JS_PROP_C_W_E | JS_PROP_THROW);
++}
++
++JSValue JS_TryGetElement(JSContext *ctx, JSValueConst obj, int64_t idx, int *present)
++{
++    JSValue val;
++    int r = JS_TryGetPropertyInt64(ctx, obj, idx, &val);
++    *present = r > 0;
++    if (r < 0)
++        return JS_EXCEPTION;
++    return val;
++}
++
  static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int unshift)
  {
-@@ -44694,8 +45659,29 @@
+@@ -44694,8 +45826,29 @@
      int exception;
      int has_method;
      JSValueConst method;
@@ -1844,7 +2127,7 @@
  static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
      struct array_sort_context *psc = opaque;
      JSContext *ctx = psc->ctx;
-@@ -44711,7 +45697,11 @@
+@@ -44711,7 +45864,11 @@
      if (psc->has_method) {
          argv[0] = ap->val;
          argv[1] = bp->val;
@@ -1857,7 +2140,175 @@
          if (JS_IsException(res))
              goto exception;
          if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-@@ -44795,6 +45785,8 @@
+@@ -44751,6 +45908,167 @@
+     return 0;
+ }
+ 
++/* tsaot: `arr.sort(cmp)` with `cmp` a natively compiled comparator,
++   called directly (see JS_SortNative). */
++typedef double JSNativeCmpAny(JSContext *ctx, void *data, JSValue a, JSValue b);
++typedef double JSNativeCmpNum(JSContext *ctx, void *data, double a, double b);
++typedef JSValue JSNativeCmpAnyV(JSContext *ctx, void *data, JSValue a, JSValue b);
++typedef JSValue JSNativeCmpNumV(JSContext *ctx, void *data, double a, double b);
++
++typedef struct JSNativeSort {
++    JSContext *ctx;
++    void *cmp;
++    int mode;
++    const uint8_t *unwinding;
++    bool failed;
++} JSNativeSort;
++
++static inline double js_native_number(JSValueConst v)
++{
++    return JS_VALUE_GET_TAG(v) == JS_TAG_INT ? JS_VALUE_GET_INT(v) : JS_VALUE_GET_FLOAT64(v);
++}
++
++/* The comparator's result for (a, b) as a number (NaN: 0); `failed` on an
++   exception. */
++static double js_native_compare(JSNativeSort *s, JSValueConst a, JSValueConst b)
++{
++    JSContext *ctx = s->ctx;
++    double r = 0;
++    JSValue v = JS_UNDEFINED;
++    switch (s->mode) {
++    case 0:
++        r = ((JSNativeCmpAny *)s->cmp)(ctx, NULL, js_dup(a), js_dup(b));
++        break;
++    case 1:
++        r = ((JSNativeCmpNum *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
++        break;
++    case 2:
++        v = ((JSNativeCmpAnyV *)s->cmp)(ctx, NULL, js_dup(a), js_dup(b));
++        break;
++    default:
++        v = ((JSNativeCmpNumV *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
++        break;
++    }
++    if (unlikely(*s->unwinding)) {
++        s->failed = true;
++        return 0;
++    }
++    if (s->mode & 2) {
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
++            r = JS_VALUE_GET_INT(v);
++        } else if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) {
++            r = JS_VALUE_GET_FLOAT64(v);
++        } else if (JS_ToFloat64Free(ctx, &r, v)) {
++            s->failed = true;
++            return 0;
++        }
++    }
++    return isnan(r) ? 0 : r;
++}
++
++/* Stable merge sort of a[0..n) (tmp: room for n / 2 + 1 values). */
++static void js_native_merge_sort(JSNativeSort *s, JSValue *a, JSValue *tmp, size_t n)
++{
++    size_t i, j, k, m;
++    if (n <= 8) {
++        for (i = 1; i < n && !s->failed; i++) {
++            JSValue x = a[i];
++            for (j = i; j > 0; j--) {
++                if (js_native_compare(s, a[j - 1], x) <= 0 || s->failed)
++                    break;
++                a[j] = a[j - 1];
++            }
++            a[j] = x;
++        }
++        return;
++    }
++    m = n / 2;
++    js_native_merge_sort(s, a, tmp, m);
++    if (!s->failed)
++        js_native_merge_sort(s, a + m, tmp, n - m);
++    if (s->failed || js_native_compare(s, a[m - 1], a[m]) <= 0 || s->failed)
++        return;
++    memcpy(tmp, a, m * sizeof(JSValue));
++    i = 0; j = m; k = 0;
++    while (i < m && j < n) {
++        double c = js_native_compare(s, tmp[i], a[j]);
++        if (s->failed) {
++            /* (Every value back in the array, in some order.) */
++            memcpy(a + k, tmp + i, (m - i) * sizeof(JSValue));
++            return;
++        }
++        if (c <= 0)
++            a[k++] = tmp[i++];
++        else
++            a[k++] = a[j++];
++    }
++    while (i < m)
++        a[k++] = tmp[i++];
++}
++
++int JS_SortNative(JSContext *ctx, JSValueConst arr, void *cmp, int mode, const uint8_t *unwinding)
++{
++    JSObject *p;
++    JSValue *tab;
++    uint32_t len, i, n = 0;
++    JSNativeSort s = { ctx, cmp, mode, unwinding, false };
++
++    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(arr);
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array ||
++        JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
++        JS_VALUE_GET_INT(p->prop[0].u.value) != p->u.array.count)
++        return 0;
++    len = p->u.array.count;
++    if (mode & 1) {
++        for (i = 0; i < len; i++) {
++            int tag = JS_VALUE_GET_TAG(p->u.array.u.values[i]);
++            if (tag != JS_TAG_INT && tag != JS_TAG_FLOAT64)
++                return 0;
++        }
++    }
++    if (len < 2)
++        return 1;
++    /* The elements (undefined last, unsorted) on the side: the comparator
++       may change the array. */
++    tab = js_malloc(ctx, sizeof(JSValue) * (len + len / 2 + 1));
++    if (!tab)
++        return -1;
++    for (i = 0; i < len; i++) {
++        JSValue v = p->u.array.u.values[i];
++        if (!JS_IsUndefined(v))
++            tab[n++] = js_dup(v);
++    }
++    js_native_merge_sort(&s, tab, tab + len, n);
++    if (s.failed) {
++        for (i = 0; i < n; i++)
++            JS_FreeValue(ctx, tab[i]);
++        js_free(ctx, tab);
++        return -1;
++    }
++    for (i = n; i < len; i++)
++        tab[i] = JS_UNDEFINED;
++    if (p->class_id == JS_CLASS_ARRAY && p->fast_array && p->u.array.count == len) {
++        for (i = 0; i < len; i++) {
++            JSValue old = p->u.array.u.values[i];
++            p->u.array.u.values[i] = tab[i];
++            JS_FreeValue(ctx, old);
++        }
++    } else {
++        for (i = 0; i < len; i++) {
++            if (JS_SetPropertyInt64(ctx, arr, i, tab[i]) < 0) {
++                for (i++; i < len; i++)
++                    JS_FreeValue(ctx, tab[i]);
++                js_free(ctx, tab);
++                return -1;
++            }
++        }
++    }
++    js_free(ctx, tab);
++    return 1;
++}
++
+ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+ {
+@@ -44795,6 +46113,8 @@
          array[pos].pos = i;
          pos++;
      }
@@ -1866,7 +2317,7 @@
      rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
      if (asc.exception)
          goto exception;
-@@ -44978,6 +45970,15 @@
+@@ -44978,6 +46298,15 @@
      return JS_EXCEPTION;
  }
  
@@ -1882,7 +2333,22 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -47273,11 +48274,10 @@
+@@ -46732,6 +48061,14 @@
+     int32_t radix;
+     JSValue ret;
+ 
++    /* tsaot: small decimal integers (radix 10, or none), directly */
++    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING) {
++        int32_t v;
++        bool none = JS_IsUndefined(argv[1]);
++        if ((none || (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_INT && JS_VALUE_GET_INT(argv[1]) == 10)) &&
++            js_string_small_int(argv[0], false, none, &v))
++            return js_int32(v);
++    }
+     str = JS_ToCString(ctx, argv[0]);
+     if (!str)
+         return JS_EXCEPTION;
+@@ -47273,11 +48610,10 @@
                  return i;
          }
      } else {
@@ -1898,7 +2364,7 @@
          }
      }
      return -1;
-@@ -47431,7 +48431,11 @@
+@@ -47431,7 +48767,11 @@
          inc = 1;
      }
      ret = -1;
@@ -1911,7 +2377,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -56073,6 +57077,48 @@
+@@ -56073,6 +57413,48 @@
      return result_promise;
  }
  
@@ -1960,7 +2426,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +57127,24 @@
+@@ -56081,14 +57463,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -1990,7 +2456,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +57162,498 @@
+@@ -56106,6 +57498,498 @@
      return result_promise;
  }
  
@@ -2489,7 +2955,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +58027,25 @@
+@@ -56479,6 +58363,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -2515,7 +2981,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +58065,8 @@
+@@ -56498,23 +58401,8 @@
          rd_array[i] = rd;
      }
  
