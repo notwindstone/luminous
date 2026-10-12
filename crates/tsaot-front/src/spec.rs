@@ -707,6 +707,25 @@ impl Region {
             if cx.f.boxed[p] || stmts_assign(body, p) {
                 return None;
             }
+            // A scalar-replaced object passed on: what makes it, then
+            // (`Lazy`) the object, which an inline body does not take (its
+            // parameter is `undefined`; it reads the fields' locals).
+            let lazy = match &a.kind {
+                Lazy(_) => Some(&[][..]),
+                Seq(xs) if matches!(xs.last().map(|x| &x.kind), Some(Lazy(_))) => Some(&xs[..xs.len() - 1]),
+                _ => None,
+            };
+            if let Some(pre) = lazy {
+                if object_param(body, p) || cx.f.locals[p] != Ty::Any {
+                    return None;
+                }
+                for x in pre {
+                    out.push(self.effect(x, cx)?);
+                }
+                let init = Expr::new(Ty::Any, InitLocal(p, bx(Expr::new(Ty::Any, Undefined))));
+                out.push(self.effect(&init, cx)?);
+                continue;
+            }
             if object_param(body, p) {
                 if !matches!(a.kind, This | Local(_) | ShapeGet { .. }) {
                     return None;
