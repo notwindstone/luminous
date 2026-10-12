@@ -180,7 +180,11 @@ fast paths that keep the engine's semantics:
 - faster engine internals that every program benefits from, interpreted
   or not: 64KB allocator arenas handed out by a bump index, with one empty
   arena kept per size class (allocation-heavy code used to create and free
-  an arena every few dozen objects); plain objects that keep their
+  an arena every few dozen objects), and recently freed blocks cached per
+  size class (a free and the next allocation are a push and a pop); plain
+  objects made from an allocation site's shape in one short function, and
+  freed (with the plain objects only they referenced) in a loop rather than
+  through the collector's queue; plain objects that keep their
   property array in their own allocation until it grows; defining the next
   element of a fast array (`map`, `filter`, …) appends it; `map`,
   `filter`, `forEach`, `some`, `every`, `reduce` and `sort` read the
