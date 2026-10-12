@@ -388,8 +388,15 @@ The differential tests run every case with both.
   `s.charCodeAt(i)` / `s.length` of strings in locals: the guard then also
   checks that those are flat strings and that `charCodeAt` is the builtin,
   so a scanning loop such as `while (i < n && isDigit(s.charCodeAt(i)))
-  i++` runs as integer code. A run that stores no field needs enough
-  arithmetic (or a loop) to be worth its guard.
+  i++` runs as integer code. Methods take part: `this` is guarded as
+  locals are, objects held by guarded objects' fields (`this.center`)
+  are guarded too, a predicted call of a class's method runs its body in
+  the region (the guard checks that the receiver's prototype is the
+  class's and still has the method, and that the class binding is
+  initialized), and the vectors such methods return (scalar-replaced, see
+  below) keep their fields in float locals, so `origin.sub(this.center)
+  .dot(dir)` is float code throughout. A run that stores no field needs
+  enough arithmetic (or a loop) to be worth its guard.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline,
   `arr.push(x)` appends inline to an extensible fast array of a fresh

@@ -664,6 +664,16 @@ pub enum ExprKind {
         /// `String.prototype.charCodeAt` must be the builtin.
         strs: Vec<LocalId>,
         char_code_at: bool,
+        /// Objects held by fields of guarded objects, in order: `(obj, of,
+        /// slot, record)`, the object in field `slot` of `of`, of `record`
+        /// (`obj` names it in the region; it is guarded as `objs` are).
+        derived: Vec<(LocalId, LocalId, u32, usize)>,
+        /// Method calls the region runs inline: `(obj, class, method,
+        /// func)`, the prototype of `obj`'s shape (if any) is `class`'s,
+        /// whose own data property `method` is native function `func`.
+        methods: Vec<(Option<LocalId>, usize, AtomId, usize)>,
+        /// Cells (class bindings) that must be initialized.
+        cells: Vec<CellId>,
     },
     /// In a speculative region: `s.charCodeAt(idx)` for the flat string in
     /// local `s` (the builtin, checked by the guard), `idx` a number. `F64`.
@@ -1371,9 +1381,18 @@ fn stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
     }
 }
 
+/// What `SpecGuard`, `SlotLoad` and `SlotStore` name for the function's
+/// `this` (a method's receiver, or a predicted call's in its body).
+pub const THIS_LOCAL: LocalId = usize::MAX;
+
 /// Calls `f` on the locals expression `e` names itself (not through its
 /// subexpressions), and on those the statements of a body it holds name.
 fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
+    let f = &mut |l: LocalId| {
+        if l != THIS_LOCAL {
+            f(l)
+        }
+    };
     use ExprKind::*;
     match &e.kind {
         Local(l)
@@ -1401,8 +1420,13 @@ fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             locals.iter().for_each(|&l| f(l));
             stmt_locals(body, f);
         }
-        SpecGuard { objs, fields, nums, strs, .. } => {
+        SpecGuard { objs, fields, nums, strs, derived, methods, .. } => {
             objs.iter().for_each(|&(l, _)| f(l));
+            derived.iter().for_each(|&(l, of, _, _)| {
+                f(l);
+                f(of);
+            });
+            methods.iter().for_each(|&(l, ..)| l.iter().for_each(|&l| f(l)));
             fields.iter().for_each(|&(l, _)| f(l));
             nums.iter().for_each(|&(a, b)| {
                 f(a);

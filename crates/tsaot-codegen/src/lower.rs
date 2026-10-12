@@ -967,8 +967,25 @@ impl Lower {
             Stmt::Await { value, target } => self.await_stmt(value, *target),
             Stmt::Yield { value, kind, target } => self.yield_stmt(value, *kind, *target),
             Stmt::Block(b) => self.stmts(b),
-            Stmt::If(Expr { kind: ExprKind::SpecGuard { objs, distinct, fields, nums, strs, char_code_at }, .. }, fast, slow) => {
-                let guard = SpecGuard { objs, distinct: *distinct, fields, nums, strs, char_code_at: *char_code_at };
+            Stmt::If(
+                Expr {
+                    kind: ExprKind::SpecGuard { objs, distinct, fields, nums, strs, char_code_at, derived, methods, cells },
+                    ..
+                },
+                fast,
+                slow,
+            ) => {
+                let guard = SpecGuard {
+                    objs,
+                    distinct: *distinct,
+                    fields,
+                    nums,
+                    strs,
+                    char_code_at: *char_code_at,
+                    derived,
+                    methods,
+                    cells,
+                };
                 self.spec_region(&guard, fast, slow)
             }
             Stmt::If(c, then, els) => {
@@ -2569,8 +2586,8 @@ impl Lower {
             }
             ExprKind::SlotStore { obj, slot, value, arith } => {
                 let d = self.expr(value).num();
-                let (p, _) = self.use_local(*obj).any();
-                let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+                // (The guard's: nothing in the region moves the properties.)
+                let props = self.spec_src[obj];
                 // A number replaces a number: nothing to free. Where only
                 // floats were read, the result is a float, as the
                 // interpreter's float arithmetic makes it.
@@ -4192,20 +4209,48 @@ impl Lower {
         }
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs = Vec::new();
+        // Class bindings read by the region (whose TDZ checks it skips).
+        for &k in g.cells {
+            let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
+            let t = self.b.ins().load(I64, M_SLOT, base, (k * SIZE) as i32 + TAG_OFFSET);
+            let set = self.b.ins().icmp_imm_s(IntCC::NotEqual, t, TAG_UNINITIALIZED);
+            let next = self.b.create_block();
+            self.b.ins().brif(set, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
+        // The objects, then those their fields hold: of their records.
         for &(o, r) in objs {
-            let (p, t) = self.use_local(o).any();
-            let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
-            let next = self.b.create_block();
-            self.b.ins().brif(is_obj, next, &[], slow_b, &[]);
-            self.b.switch_to_block(next);
-            let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
-            let want = self.b.ins().load(I64, M_IC, table, (r * 8) as i32);
-            let same = self.b.ins().icmp(IntCC::Equal, shape, want);
-            let next = self.b.create_block();
-            self.b.ins().brif(same, next, &[], slow_b, &[]);
-            self.b.switch_to_block(next);
-            let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+            let (p, t) = if o == ir::THIS_LOCAL { self.this.expect("`this` in a region") } else { self.use_local(o).any() };
+            let props = self.guard_record((p, t), r, table, slow_b);
             ptrs.push((o, p, props));
+        }
+        for &(o, of, slot, r) in g.derived {
+            let props = ptrs.iter().find(|x| x.0 == of).expect("guarded holder").2;
+            let off = (slot as usize * SIZE) as i32;
+            let p = self.b.ins().load(I64, M_SLOT, props, off);
+            let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
+            let props = self.guard_record((p, t), r, table, slow_b);
+            ptrs.push((o, p, props));
+        }
+        // Methods run inline: the receiver's prototype is the class's, which
+        // still has the method.
+        for &(o, class, method, func) in g.methods {
+            if let Some(o) = o {
+                let p = ptrs.iter().find(|x| x.0 == o).expect("guarded receiver").1;
+                let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+                let proto = self.b.ins().load(I64, M_HEADER, shape, layout::SHAPE_PROTO);
+                let (hp, ht) = self.table_value(self.env.homes, 2 * class);
+                let same = self.b.ins().icmp(IntCC::Equal, proto, hp);
+                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ht, TAG_OBJECT);
+                let ok = self.b.ins().band(same, is_obj);
+                let next = self.b.create_block();
+                self.b.ins().brif(ok, next, &[], slow_b, &[]);
+                self.b.switch_to_block(next);
+            }
+            let ok = self.proto_method_is(class, method, func);
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
         }
         if distinct {
             let mut same = self.b.ins().iconst(I8, 0);
@@ -4293,6 +4338,23 @@ impl Lower {
             self.b.ins().jump(join, &[]);
         }
         self.b.switch_to_block(join);
+    }
+
+    /// A region guard's check that `(p, t)` is an object of `record`'s
+    /// shape (`table`: the records' shapes), else to `slow`: its property
+    /// array.
+    fn guard_record(&mut self, (p, t): (Value, Value), record: usize, table: Value, slow: Block) -> Value {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let next = self.b.create_block();
+        self.b.ins().brif(is_obj, next, &[], slow, &[]);
+        self.b.switch_to_block(next);
+        let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, want);
+        let next = self.b.create_block();
+        self.b.ins().brif(same, next, &[], slow, &[]);
+        self.b.switch_to_block(next);
+        self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP)
     }
 
     /// `charCodeAt` of flat string `p` at position `d` (a number): the code
@@ -7728,4 +7790,7 @@ struct SpecGuard<'a> {
     nums: &'a [(ir::LocalId, ir::LocalId)],
     strs: &'a [ir::LocalId],
     char_code_at: bool,
+    derived: &'a [(ir::LocalId, ir::LocalId, u32, usize)],
+    methods: &'a [(Option<ir::LocalId>, usize, ir::AtomId, usize)],
+    cells: &'a [ir::CellId],
 }

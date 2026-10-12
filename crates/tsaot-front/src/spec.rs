@@ -15,6 +15,13 @@
 //! When the guard fails, the statements run as they are. Nothing in the
 //! copy can run code, throw or allocate, so what the guard checked holds
 //! throughout, and when the stores happen cannot be observed.
+//!
+//! Methods take part: `this` is an object as locals are, a predicted call
+//! of a class's method (`Predicted`) runs its body in the copy (the guard
+//! checks that the receiver's prototype is the class's, still with that
+//! method), objects held by guarded objects' fields are guarded too, and
+//! the scalar-replaced objects of `virtualize_instances` (`undefined`, a
+//! flag, and a local per field) keep their fields in `F64` locals.
 
 use crate::ir::*;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +39,12 @@ const MIN_PURE_WORK: usize = 6;
 pub fn speculate_numbers(m: &mut Module) {
     let nums: Vec<Vec<bool>> = m.records.iter().map(|r| r.nums.clone()).collect();
     let rets: Vec<Ty> = m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect();
+    let methods = Methods {
+        class: m.funcs.iter().chain(&m.closures).map(|f| f.class).collect(),
+        params: m.funcs.iter().chain(&m.closures).map(|f| f.params.len()).collect(),
+        records: m.class_records.clone(),
+        fields: m.records.iter().map(|r| r.fields.clone()).collect(),
+    };
     // Native functions a region may call: they can neither throw nor call.
     let leaves: Vec<Option<(Vec<Ty>, Ty)>> =
         m.funcs.iter().map(|f| nothrow_leaf(f).then(|| (f.params.clone(), f.ret))).collect();
@@ -43,13 +56,35 @@ pub fn speculate_numbers(m: &mut Module) {
         let refs = mentions(&f.body, f.locals.len());
         let mut body = std::mem::take(&mut f.body);
         let ret = f.ret;
-        let mut cx = Cx { f, nums: &nums, refs, atoms: &atoms, leaves: &leaves, next_loop: FIRST_COPY_LOOP };
+        let this = f.has_this;
+        let mut cx = Cx {
+            f,
+            nums: &nums,
+            refs,
+            atoms: &atoms,
+            leaves: &leaves,
+            methods: &methods,
+            this,
+            next_loop: FIRST_COPY_LOOP,
+        };
         cx.list(&mut body, Some(ret));
         // The statement lists inside expressions (inlined bodies, whose
-        // `return`s give the expression's value).
+        // `return`s give the expression's value; a predicted call's `this`
+        // is its receiver).
         visit_stmts_mut(&mut body, &mut |e| match &mut e.kind {
-            ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } => cx.list(body, Some(e.ty)),
-            ExprKind::ArrayLoop { body, func, .. } => cx.list(body, rets.get(*func).copied()),
+            ExprKind::Inline { body, .. } => {
+                cx.this = false;
+                cx.list(body, Some(e.ty));
+            }
+            // (Its `return`s give the callee's value, boxed after it.)
+            ExprKind::Predicted { body, func, .. } => {
+                cx.this = true;
+                cx.list(body, rets.get(*func).copied());
+            }
+            ExprKind::ArrayLoop { body, func, .. } => {
+                cx.this = false;
+                cx.list(body, rets.get(*func).copied())
+            }
             _ => {}
         });
         cx.f.body = body;
@@ -130,10 +165,25 @@ fn stmt_mentions(stmts: &[Stmt], add: &mut impl FnMut(LocalId)) {
     }
 }
 
+/// What predicted method calls need to know of the module.
+struct Methods {
+    /// Per function (module functions, then closures): its class, and
+    /// whether it is static; its number of parameters.
+    class: Vec<Option<(usize, bool)>>,
+    params: Vec<usize>,
+    /// Per class, its instances' record; per record, its fields.
+    records: Vec<Option<usize>>,
+    fields: Vec<Vec<AtomId>>,
+}
+
 struct Cx<'a> {
     f: &'a mut Func,
     nums: &'a [Vec<bool>],
     atoms: &'a [String],
+    methods: &'a Methods,
+    /// Whether the statements being made into regions may read `this`
+    /// (a method's, or a predicted call's receiver in its body).
+    this: bool,
     /// Per module function: its parameter and return types if it is a
     /// leaf (see `nothrow_leaf`).
     leaves: &'a [Option<(Vec<Ty>, Ty)>],
@@ -167,6 +217,25 @@ struct Region {
     char_code_at: bool,
     /// The loops in it, and their ids in the copy.
     loops: HashMap<LoopId, LoopId>,
+    /// Objects held by fields of guarded objects: `(name, of, slot,
+    /// record)` (see `SpecGuard`); method calls run inline; class bindings
+    /// read.
+    derived: Vec<(LocalId, LocalId, u32, usize)>,
+    methods: Vec<(Option<LocalId>, usize, AtomId, usize)>,
+    cells: Vec<CellId>,
+    /// `Bool` locals with a value known here (the flags of scalar-replaced
+    /// objects).
+    consts: HashMap<LocalId, bool>,
+    /// JS-valued locals holding `undefined` here (a scalar-replaced
+    /// object's own local, and its fields' before they are set).
+    undef: HashSet<LocalId>,
+    /// The receivers of the predicted calls running inline (innermost
+    /// last): what `this` is in their bodies.
+    receivers: Vec<LocalId>,
+    /// Parameters of those calls (and locals of inlined bodies) used as
+    /// objects: their arguments (initializers), and the receivers where
+    /// those are read.
+    aliases: HashMap<LocalId, (Expr, Vec<LocalId>)>,
     /// Whether every path so far has left (returned, or jumped).
     returned: bool,
     accesses: usize,
@@ -279,12 +348,15 @@ impl Cx<'_> {
         init.extend(fast);
         let written = r.fields.iter().any(|f| f.2.is_some());
         let guard = ExprKind::SpecGuard {
-            distinct: written && r.objs.len() > 1,
+            distinct: written && r.objs.len() + r.derived.len() > 1,
             objs: r.objs,
             fields: r.fields.iter().map(|&(o, s, _)| (o, s)).collect(),
             nums: r.nums,
             strs: r.strs,
             char_code_at: r.char_code_at,
+            derived: r.derived,
+            methods: r.methods,
+            cells: r.cells,
         };
         list.push(Stmt::If(Expr::new(Ty::Bool, guard), init, run));
     }
@@ -338,8 +410,12 @@ impl Region {
         for l in self.assigned.clone() {
             let loaded = self.nums.iter().any(|&(m, _)| m == l);
             if loaded || cx.refs[l] > inside[l] {
-                let c = self.valid(l);
-                let v = Expr::new(Ty::Any, ExprKind::Box(bx(f64(ExprKind::Local(c)))));
+                let v = if self.undef.contains(&l) {
+                    Expr::new(Ty::Any, ExprKind::Undefined)
+                } else {
+                    let c = self.valid(l);
+                    Expr::new(Ty::Any, ExprKind::Box(bx(f64(ExprKind::Local(c)))))
+                };
                 out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(l, bx(v)))));
             }
         }
@@ -368,10 +444,19 @@ impl Region {
             Stmt::Expr(e) => Some(Stmt::Expr(self.effect(e, cx)?)),
             Stmt::Block(b) => Some(Stmt::Block(self.stmts(b, cx)?)),
             Stmt::If(c, a, b) => {
+                if let Some(v) = self.known(c, cx) {
+                    // (A test the guard or the region decides.)
+                    return Some(Stmt::Block(self.stmts(if v { a } else { b }, cx)?));
+                }
                 let c = self.cond(c, cx)?;
-                let before = (self.defined.clone(), self.returned);
+                let before = (self.defined.clone(), self.returned, self.consts.clone(), self.undef.clone());
                 let a = self.stmts(a, cx)?;
-                let after_a = (std::mem::replace(&mut self.defined, before.0.clone()), self.returned);
+                let after_a = (
+                    std::mem::replace(&mut self.defined, before.0.clone()),
+                    self.returned,
+                    std::mem::replace(&mut self.consts, before.2.clone()),
+                    std::mem::replace(&mut self.undef, before.3.clone()),
+                );
                 self.returned = before.1;
                 let b = self.stmts(b, cx)?;
                 match (after_a.1, self.returned) {
@@ -379,9 +464,17 @@ impl Region {
                     (true, false) => {}
                     (false, true) => {
                         self.defined = after_a.0;
+                        self.consts = after_a.2;
+                        self.undef = after_a.3;
                         self.returned = false;
                     }
-                    (false, false) => self.defined.retain(|l| after_a.0.contains(l)),
+                    (false, false) => {
+                        self.defined.retain(|l| after_a.0.contains(l));
+                        self.consts.retain(|l, v| after_a.2.get(l) == Some(v));
+                        if self.undef != after_a.3 {
+                            return None;
+                        }
+                    }
                 }
                 Some(Stmt::If(c, a, b))
             }
@@ -391,6 +484,8 @@ impl Region {
                 self.loops.insert(*id, fresh);
                 // (What the loop assigns is not sure after it.)
                 let defined = self.defined.clone();
+                let undef = self.undef.clone();
+                self.consts.clear();
                 let test = match test {
                     Some(t) => Some(self.cond(t, cx)?),
                     None => None,
@@ -402,6 +497,10 @@ impl Region {
                     None => None,
                 };
                 self.defined = defined;
+                self.consts.clear();
+                if self.undef != undef {
+                    return None;
+                }
                 Some(Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() })
             }
             Stmt::Break(id) | Stmt::Continue(id) => {
@@ -456,7 +555,180 @@ impl Region {
 
     /// The copy of an expression evaluated for its effects.
     fn effect(&mut self, e: &Expr, cx: &mut Cx) -> Option<Expr> {
-        if e.ty == Ty::Bool { self.cond(e, cx) } else { self.num(e, cx) }
+        if e.ty == Ty::Bool {
+            return self.cond(e, cx);
+        }
+        if let ExprKind::Seq(xs) = &e.kind {
+            let out = xs.iter().map(|x| self.effect(x, cx)).collect::<Option<Vec<_>>>()?;
+            let ty = out.last().map_or(Ty::F64, |x| x.ty);
+            return Some(Expr::new(ty, ExprKind::Seq(out)));
+        }
+        let saved = self.clone();
+        let n = cx.f.locals.len();
+        if let Some(x) = self.num(e, cx) {
+            return Some(x);
+        }
+        *self = saved;
+        cx.truncate_locals(n);
+        use ExprKind::*;
+        match &e.kind {
+            // `undefined` in a JS-valued local (a scalar-replaced object's).
+            SetLocal(l, x) | InitLocal(l, x)
+                if !cx.f.boxed[*l] && cx.f.locals[*l] == Ty::Any && !self.is_obj(*l) && !self.strs.contains(l) =>
+            {
+                let v = self.void(x, cx)?;
+                if !self.assigned.contains(l) {
+                    self.assigned.push(*l);
+                }
+                self.defined.insert(*l);
+                self.undef.insert(*l);
+                Some(v)
+            }
+            _ => self.void(e, cx),
+        }
+    }
+
+    /// The expressions of an inlined body but the declarations of its
+    /// locals used as objects, which name their object instead (their
+    /// initializer: `this`, a local or a field, read where used).
+    fn bind_objects<'e>(&mut self, body: &[Stmt], exprs: Vec<&'e Expr>, cx: &Cx) -> Option<Vec<&'e Expr>> {
+        let mut out = Vec::new();
+        for x in exprs {
+            if let ExprKind::InitLocal(l, init) = &x.kind
+                && !cx.f.boxed[*l]
+                && cx.f.locals[*l] == Ty::Any
+                && matches!(init.kind, ExprKind::This | ExprKind::Local(_) | ExprKind::ShapeGet { .. })
+                && object_param(body, *l)
+                && !stmts_assign(body, *l)
+            {
+                self.aliases.insert(*l, ((**init).clone(), self.receivers.clone()));
+                continue;
+            }
+            out.push(x);
+        }
+        Some(out)
+    }
+
+    /// Whether `l` names an object of the region.
+    fn is_obj(&self, l: LocalId) -> bool {
+        self.objs.iter().any(|&(o, _)| o == l) || self.aliases.contains_key(&l)
+    }
+
+    /// The copy (for its effects) of an expression whose value is
+    /// `undefined`.
+    fn void(&mut self, e: &Expr, cx: &mut Cx) -> Option<Expr> {
+        use ExprKind::*;
+        match &e.kind {
+            Undefined => Some(Expr::num(0.0)),
+            // A class binding's TDZ check: the guard's.
+            Void(x) if matches!(x.kind, Cell(_)) => {
+                let Cell(k) = x.kind else { unreachable!() };
+                if !self.cells.contains(&k) {
+                    self.cells.push(k);
+                }
+                Some(Expr::num(0.0))
+            }
+            Void(x) => self.effect(x, cx),
+            Seq(xs) => {
+                let (last, rest) = xs.split_last()?;
+                let mut out = rest.iter().map(|x| self.effect(x, cx)).collect::<Option<Vec<_>>>()?;
+                out.push(self.void(last, cx)?);
+                Some(f64(Seq(out)))
+            }
+            Cond(c, a, b) => {
+                let v = self.known(c, cx)?;
+                self.void(if v { a } else { b }, cx)
+            }
+            Inline { body, .. } => {
+                let (exprs, v) = inline_parts(body)?;
+                let exprs = self.bind_objects(body, exprs, cx)?;
+                let mut out = exprs.iter().map(|x| self.effect(x, cx)).collect::<Option<Vec<_>>>()?;
+                out.push(self.void(v, cx)?);
+                Some(f64(Seq(out)))
+            }
+            Predicted { .. } => self.predicted(e, false, cx),
+            _ => None,
+        }
+    }
+
+    /// Whether `c` is decided here: by constants, the flags of
+    /// scalar-replaced objects, or checks the guard makes (a prototype
+    /// still with a method).
+    fn known(&mut self, c: &Expr, cx: &Cx) -> Option<bool> {
+        use ExprKind::*;
+        let n = self.methods.len();
+        let r = match &c.kind {
+            Bool(b) => Some(*b),
+            Local(l) if !cx.f.boxed[*l] => self.consts.get(l).copied(),
+            ProtoMethodIs { class, method, func } => {
+                let k = (None, *class, *method, *func);
+                if !self.methods.contains(&k) {
+                    self.methods.push(k);
+                }
+                Some(true)
+            }
+            Cond(x, a, b) => match self.known(x, cx) {
+                Some(v) => self.known(if v { a } else { b }, cx),
+                None => None,
+            },
+            Unary(UnOp::Not, x) => self.known(x, cx).map(|v| !v),
+            _ => None,
+        };
+        if r.is_none() {
+            self.methods.truncate(n);
+        }
+        r
+    }
+
+    /// The copy of a predicted call of a class's method, its body inline
+    /// with `this` the receiver: a number (or, unless `num`, `undefined`).
+    fn predicted(&mut self, e: &Expr, num: bool, cx: &mut Cx) -> Option<Expr> {
+        use ExprKind::*;
+        let Predicted { expr, func, body, locals } = &e.kind else { return None };
+        let CallMethod(recv, Key::Atom(method), args) = &expr.kind else { return None };
+        let ms = cx.methods;
+        let (class, false) = (*ms.class.get(*func)?)? else { return None };
+        let record = (*ms.records.get(class)?)?;
+        let nparams = ms.params[*func];
+        if ms.fields[record].contains(method) || args.len() != nparams || locals.len() < nparams {
+            return None;
+        }
+        let o = self.obj(recv, record, cx)?;
+        let k = (Some(o), class, *method, *func);
+        if !self.methods.contains(&k) {
+            self.methods.push(k);
+        }
+        let (exprs, v) = inline_parts(body)?;
+        let exprs = self.bind_objects(body, exprs, cx)?;
+        let mut out = Vec::new();
+        // Parameters: those used as objects name their argument; the
+        // others get its value.
+        for (a, &p) in args.iter().zip(locals) {
+            if cx.f.boxed[p] || stmts_assign(body, p) {
+                return None;
+            }
+            if object_param(body, p) {
+                if !matches!(a.kind, This | Local(_) | ShapeGet { .. }) {
+                    return None;
+                }
+                self.aliases.insert(p, (a.clone(), self.receivers.clone()));
+            } else {
+                let init = Expr::new(cx.f.locals[p], InitLocal(p, bx(a.clone())));
+                out.push(self.num(&init, cx)?);
+            }
+        }
+        self.receivers.push(o);
+        let body = (|| {
+            for x in exprs {
+                out.push(self.effect(x, cx)?);
+            }
+            out.push(if num { self.num(v, cx)? } else { self.void(v, cx)? });
+            Some(())
+        })();
+        self.receivers.pop();
+        body?;
+        let ty = if num { out.last().map_or(Ty::F64, |x| x.ty) } else { Ty::F64 };
+        Some(Expr::new(ty, Seq(out)))
     }
 
     /// The copy of a call of a leaf function, if its arguments have copies
@@ -532,17 +804,56 @@ impl Region {
 
     /// The local holding the object of a field access, if it can be
     /// guarded (as an object of `record`).
-    fn obj(&mut self, obj: &Expr, record: usize, cx: &Cx) -> Option<LocalId> {
-        let ExprKind::Local(o) = obj.kind else { return None };
-        let ok = cx.f.locals[o] == Ty::Any
-            && !cx.f.boxed[o]
-            && !self.copies.contains_key(&o)
-            && !self.strs.contains(&o)
-            && self.objs.iter().all(|&(p, r)| p != o || r == record);
-        if ok && !self.objs.iter().any(|&(p, _)| p == o) {
+    fn obj(&mut self, obj: &Expr, record: usize, cx: &mut Cx) -> Option<LocalId> {
+        let o = match &obj.kind {
+            ExprKind::This => match self.receivers.last() {
+                Some(&o) => o,
+                None if cx.this => THIS_LOCAL,
+                None => return None,
+            },
+            ExprKind::Local(l) if self.aliases.contains_key(l) => {
+                let (a, receivers) = self.aliases[l].clone();
+                let inner = std::mem::replace(&mut self.receivers, receivers);
+                let o = self.obj(&a, record, cx);
+                self.receivers = inner;
+                return o;
+            }
+            &ExprKind::Local(o) => {
+                let ok = cx.f.locals[o] == Ty::Any
+                    && !cx.f.boxed[o]
+                    && !self.copies.contains_key(&o)
+                    && !self.strs.contains(&o)
+                    && !self.undef.contains(&o);
+                if !ok {
+                    return None;
+                }
+                o
+            }
+            // An object a guarded object's field holds (the region writes
+            // no such field).
+            ExprKind::ShapeGet { obj: of, record: r, slot, .. } if !cx.nums[*r][*slot as usize] => {
+                let of = self.obj(of, *r, cx)?;
+                return match self.derived.iter().find(|d| d.1 == of && d.2 == *slot) {
+                    Some(d) => (d.3 == record).then_some(d.0),
+                    None => {
+                        let d = cx.new_local();
+                        self.derived.push((d, of, *slot, record));
+                        Some(d)
+                    }
+                };
+            }
+            _ => return None,
+        };
+        if let Some(d) = self.derived.iter().find(|d| d.0 == o) {
+            return (d.3 == record).then_some(o);
+        }
+        if !self.objs.iter().all(|&(p, r)| p != o || r == record) {
+            return None;
+        }
+        if !self.objs.iter().any(|&(p, _)| p == o) {
             self.objs.push((o, record));
         }
-        ok.then_some(o)
+        Some(o)
     }
 
     /// A field of a guarded object: its `F64` local once written (by
@@ -570,8 +881,14 @@ impl Region {
     /// not sure after it.
     fn maybe<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
         let defined = self.defined.clone();
+        let consts = self.consts.clone();
+        let undef = self.undef.clone();
         let r = f(self);
         self.defined = defined;
+        self.consts.retain(|l, v| consts.get(l) == Some(v));
+        if self.undef != undef {
+            return None;
+        }
         r
     }
 
@@ -581,6 +898,9 @@ impl Region {
         use ExprKind::*;
         if e.ty != Ty::Bool {
             return None;
+        }
+        if let Some(v) = self.known(e, cx) {
+            return Some(bool(Bool(v)));
         }
         Some(match &e.kind {
             Bool(_) => e.clone(),
@@ -609,7 +929,12 @@ impl Region {
                 bool(Cond(bx(c), bx(a), bx(b)))
             }
             SetLocal(l, x) | InitLocal(l, x) if !cx.f.boxed[*l] && cx.f.locals[*l] == Ty::Bool => {
-                let v = bx(self.cond(x, cx)?);
+                let v = self.cond(x, cx)?;
+                match v.kind {
+                    Bool(b) => self.consts.insert(*l, b),
+                    _ => self.consts.remove(l),
+                };
+                let v = bx(v);
                 bool(if matches!(e.kind, InitLocal(..)) { InitLocal(*l, v) } else { SetLocal(*l, v) })
             }
             _ => return None,
@@ -624,11 +949,33 @@ impl Region {
             Num(_) => e.clone(),
             Local(l) if !cx.f.boxed[*l] => match cx.f.locals[*l] {
                 Ty::F64 | Ty::I32 => e.clone(),
-                Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) && !self.strs.contains(l) => {
+                Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) => {
                     f64(Local(self.copy(*l, true, cx)))
                 }
                 _ => return None,
             },
+            Seq(xs) => {
+                let (last, rest) = xs.split_last()?;
+                let mut out = rest.iter().map(|x| self.effect(x, cx)).collect::<Option<Vec<_>>>()?;
+                let v = self.num(last, cx)?;
+                let ty = v.ty;
+                out.push(v);
+                Expr::new(ty, Seq(out))
+            }
+            Inline { body, .. } => {
+                let (exprs, v) = inline_parts(body)?;
+                let exprs = self.bind_objects(body, exprs, cx)?;
+                let mut out = exprs.iter().map(|x| self.effect(x, cx)).collect::<Option<Vec<_>>>()?;
+                let v = self.num(v, cx)?;
+                let ty = v.ty;
+                out.push(v);
+                Expr::new(ty, Seq(out))
+            }
+            Predicted { .. } => self.predicted(e, true, cx)?,
+            Cond(c, a, b) if e.ty != Ty::Bool && self.known(c, cx).is_some() => {
+                let v = self.known(c, cx).expect("decided");
+                self.num(if v { a } else { b }, cx)?
+            }
             Update { local, .. } if cx.f.locals[*local] == Ty::F64 && !cx.f.boxed[*local] => e.clone(),
             Box(x) if matches!(x.ty, Ty::F64 | Ty::I32) => self.num(x, cx)?,
             Unary(UnOp::Neg, x) if e.ty == Ty::F64 => f64(Unary(UnOp::Neg, bx(self.num(x, cx)?))),
@@ -710,13 +1057,14 @@ impl Region {
                         let v = bx(self.num(x, cx)?);
                         f64(if init { InitLocal(*l, v) } else { SetLocal(*l, v) })
                     }
-                    Ty::Any if !self.objs.iter().any(|&(o, _)| o == *l) && !self.strs.contains(l) => {
+                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) => {
                         let v = self.num(x, cx)?;
                         let c = self.copy(*l, false, cx);
                         if !self.assigned.contains(l) {
                             self.assigned.push(*l);
                         }
                         self.defined.insert(*l);
+                        self.undef.remove(l);
                         f64(SetLocal(c, bx(v)))
                     }
                     _ => return None,
@@ -731,4 +1079,53 @@ impl Region {
 /// `I32`s).
 fn arith_op(op: BinOp) -> bool {
     matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Pow)
+}
+
+/// An inlined body that only evaluates expressions, then returns a value:
+/// those expressions and the value.
+fn inline_parts(body: &[Stmt]) -> Option<(Vec<&Expr>, &Expr)> {
+    fn flat<'a>(b: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
+        for s in b {
+            match s {
+                Stmt::Block(x) => flat(x, out),
+                _ => out.push(s),
+            }
+        }
+    }
+    let mut all = Vec::new();
+    flat(body, &mut all);
+    let (last, rest) = all.split_last()?;
+    let Stmt::Return(Some(v)) = last else { return None };
+    let exprs = rest
+        .iter()
+        .map(|s| match s {
+            Stmt::Expr(e) => Some(e),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((exprs, v))
+}
+
+/// Whether `stmts` assign local `l`.
+fn stmts_assign(stmts: &[Stmt], l: LocalId) -> bool {
+    let mut found = false;
+    visit_stmts(stmts, &mut |e| {
+        found |= matches!(e.kind, ExprKind::SetLocal(m, _) | ExprKind::Update { local: m, .. } if m == l)
+    });
+    found
+}
+
+/// Whether parameter `p` is used as an object in `body` (whose fields are
+/// read, or whose methods are called).
+fn object_param(body: &[Stmt], p: LocalId) -> bool {
+    let is_p = |x: &Expr| matches!(x.kind, ExprKind::Local(l) if l == p);
+    let mut found = false;
+    visit_stmts(body, &mut |e| {
+        found |= match &e.kind {
+            ExprKind::ShapeGet { obj, .. } | ExprKind::ShapeSet { obj, .. } => is_p(obj),
+            ExprKind::CallMethod(o, ..) | ExprKind::GetProp(o, _) => is_p(o),
+            _ => false,
+        }
+    });
+    found
 }
