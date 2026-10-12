@@ -392,7 +392,9 @@ The differential tests run every case with both.
   arithmetic (or a loop) to be worth its guard.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline,
-  `arr.push(x)` takes the engine's fast path, and `s.slice`, `substring`,
+  `arr.push(x)` appends inline to an extensible fast array of a fresh
+  array's shape with room for it (else takes the engine's fast path),
+  and `s.slice`, `substring`,
   `indexOf`, `includes`, `startsWith` and `endsWith` on a string call the
   engine's implementation directly (no call frame; int32 bounds taken
   as they are) while they are the original builtins (checked at each
@@ -408,7 +410,8 @@ The differential tests run every case with both.
   variables are the caller's own), as JIT compilers inline the builtin and
   its callback; it runs while `xs` is an array without holes and the
   method is the original builtin, reading each element afresh (the
-  callback may change the array), and calls the builtin otherwise.
+  callback may change the array), and calls the builtin otherwise. The
+  results of `map` and `filter` are appended to inline.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
   engine sort calling the compiled comparator directly.
 - **Leaf functions** that can neither throw nor call (only unboxed numbers

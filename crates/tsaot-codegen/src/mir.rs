@@ -986,6 +986,9 @@ impl Ins<'_> {
     pub fn istore16(self, flags: MemFlags, val: Value, addr: Value, off: i32) -> Inst {
         self.b.push(InstData::Store { mem: Type::I16, flags, val, addr, off }, &[])
     }
+    pub fn istore32(self, flags: MemFlags, val: Value, addr: Value, off: i32) -> Inst {
+        self.b.push(InstData::Store { mem: Type::I32, flags, val, addr, off }, &[])
+    }
 
     pub fn stack_addr(self, _ptr: Type, slot: StackSlot, off: i32) -> Value {
         self.b.push1(InstData::StackAddr { slot, off }, Type::I64)

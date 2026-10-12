@@ -212,6 +212,9 @@ impl Method {
 }
 
 /// Indices in `tsaot_shapes` (see `tsaot_rt.h`).
+/// The shape of a fresh array (`[]`): `length` writable, own properties
+/// none else, the original prototype.
+const SHAPE_ARRAY: i32 = 12;
 const PIN_STRING_PROTO: i32 = 24;
 const PIN_CHAR_CODE_AT: i32 = 25;
 const PIN_ARRAY_PUSH: i32 = 26;
@@ -3832,10 +3835,17 @@ impl Lower {
             self.b.ins().jump(inline, &[]);
         }
         self.b.switch_to_block(inline);
+        // `forEach` and `map` need the element no more once the body has
+        // it: its parameter takes the loop's reference.
+        let moved = !typed && matches!(kind, LoopKind::ForEach | LoopKind::Map) && !params.is_empty();
         for (i, &pt) in params.iter().enumerate() {
             let l = locals[i];
             let a = match (i, pt) {
                 (0, Ty::F64) => V::Num(self.number_of((ep_, et_))),
+                (0, _) if moved => {
+                    self.release(v);
+                    V::Any(ep_, et_)
+                }
                 (0, _) => {
                     self.dup((ep_, et_));
                     V::Any(ep_, et_)
@@ -3868,15 +3878,24 @@ impl Lower {
         match kind {
             LoopKind::ForEach => {
                 self.free(result);
-                self.release(v);
-                self.free_v(v);
+                if !moved {
+                    self.release(v);
+                    self.free_v(v);
+                }
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
             }
             LoopKind::Map => {
                 let (ap, at) = out.unwrap().any();
+                if !moved {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                let define = self.b.create_block();
+                self.b.set_cold_block(define);
+                self.append_inline((ap, at), Some(k), (resp, rest), true, define);
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+                self.b.switch_to_block(define);
                 let r = self.helper("JS_DefineElement", &[ctx, ap, at, k, resp, rest]);
-                self.release(v);
-                self.free_v(v);
                 self.check_int(r[0]);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
             }
@@ -3893,9 +3912,14 @@ impl Lower {
                 let (ap, at) = out.unwrap().any();
                 // (The definition takes the element.)
                 self.release(v);
+                let n1 = self.b.ins().iadd_imm_s(n, 1);
+                let define = self.b.create_block();
+                self.b.set_cold_block(define);
+                self.append_inline((ap, at), Some(n), (ep_, et_), true, define);
+                self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
+                self.b.switch_to_block(define);
                 let r = self.helper("JS_DefineElement", &[ctx, ap, at, n, ep_, et_]);
                 self.check_int(r[0]);
-                let n1 = self.b.ins().iadd_imm_s(n, 1);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
             }
             LoopKind::Some | LoopKind::Every | LoopKind::Find | LoopKind::FindIndex => {
@@ -4720,6 +4744,18 @@ impl Lower {
         self.b.ins().brif(ok, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let ctx = self.ctx;
+        // Inline while the array prototypes have no index properties (as
+        // the engine's fast path), else through that.
+        let engine = self.b.create_block();
+        let inline = self.b.create_block();
+        let std = self.b.ins().uload8(I32, M_FLAG, ctx, layout::CTX_STD_ARRAY_PROTO);
+        let std = self.b.ins().icmp_imm_s(IntCC::NotEqual, std, 0);
+        self.b.ins().brif(std, inline, &[], engine, &[]);
+        self.b.switch_to_block(inline);
+        let n = self.append_inline((sp, st), None, (ap, at), false, engine);
+        let int = self.b.ins().iconst(I64, TAG_INT);
+        self.b.ins().jump(join, &[BlockArg::Value(n), BlockArg::Value(int)]);
+        self.b.switch_to_block(engine);
         let r = self.helper("JS_ArrayPushFast", &[ctx, sp, st, ap, at]);
         let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_UNINITIALIZED);
         let done = self.b.create_block();
@@ -6503,6 +6539,69 @@ impl Lower {
         let p = self.b.ins().load(I64, M_TABLE, base, at);
         let t = self.b.ins().load(I64, M_TABLE, base, at + TAG_OFFSET);
         (p, t)
+    }
+
+    /// Append `(vp, vt)` (taken if `take`, else a new reference) to
+    /// `(ap, at)` inline, as the engine's fast path does, when it is an
+    /// extensible fast array with a fresh array's shape (so its `length` is
+    /// writable) and room for one more element, at `idx` if that is its
+    /// element count (`None`: at its count, which must be its `length`, as
+    /// `push` appends): the element count and `length` grow. Returns the
+    /// new count; else branches to `slow` (the value not taken).
+    fn append_inline(
+        &mut self,
+        (ap, at): (Value, Value),
+        idx: Option<Value>,
+        (vp, vt): (Value, Value),
+        take: bool,
+        slow: Block,
+    ) -> Value {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, at, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], slow, &[]);
+        self.b.switch_to_block(obj);
+        let shape = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_SHAPE);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let fresh = self.b.ins().load(I64, M_CONST, table, SHAPE_ARRAY * 8);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, fresh);
+        let word = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_FLAGS);
+        let bits = self.b.ins().band_imm_u(word, layout::OBJ_APPEND_MASK);
+        let fast = self.b.ins().icmp_imm_s(IntCC::Equal, bits, layout::OBJ_APPEND_FLAGS);
+        let ok = self.b.ins().band(same, fast);
+        let array = self.b.create_block();
+        self.b.ins().brif(ok, array, &[], slow, &[]);
+        self.b.switch_to_block(array);
+        let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
+        let size = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_SIZE);
+        let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
+        let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
+        let len = self.b.ins().uload32(M_SLOT, prop, 0);
+        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
+        let (k, at_count) = match idx {
+            Some(k) => (k, self.b.ins().icmp(IntCC::Equal, k, count)),
+            None => (count, self.b.ins().icmp(IntCC::Equal, len, count)),
+        };
+        // (Room, and a length that stays an int32.)
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThan, k, size);
+        let small = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, k, i32::MAX as i64);
+        let ok = self.b.ins().band(is_int, at_count);
+        let ok = self.b.ins().band(ok, room);
+        let ok = self.b.ins().band(ok, small);
+        let store = self.b.create_block();
+        self.b.ins().brif(ok, store, &[], slow, &[]);
+        self.b.switch_to_block(store);
+        if !take {
+            self.dup((vp, vt));
+        }
+        let k1 = self.b.ins().iadd_imm_s(k, 1);
+        let grow = self.b.ins().icmp(IntCC::UnsignedLessThan, len, k1);
+        let new_len = self.b.ins().select(grow, k1, len);
+        self.b.ins().store(M_SLOT, new_len, prop, 0);
+        let at = self.array_slot(ap, k);
+        self.b.ins().store(M_SLOT, vp, at, 0);
+        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
+        k1
     }
 
     /// Address of fast array element `idx`.

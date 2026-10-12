@@ -112,6 +112,11 @@ pub mod layout {
     pub const OBJ_WEAK_REF: i32 = 40;
     pub const OBJ_OPAQUE_WORD: i32 = 48;
     pub const OBJ_SIZE: i32 = 72;
+    // Appending to a fast array inline.
+    pub const OBJ_ARRAY_SIZE: i32 = 48;
+    pub const OBJ_APPEND_MASK: i64 = 0xffff_0012;
+    pub const OBJ_APPEND_FLAGS: i64 = 0x2_0012;
+    pub const CTX_STD_ARRAY_PROTO: i32 = 48;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -151,6 +156,10 @@ pub mod layout {
         ("OBJ_WEAK_REF", OBJ_WEAK_REF as i64),
         ("OBJ_OPAQUE_WORD", OBJ_OPAQUE_WORD as i64),
         ("OBJ_SIZE", OBJ_SIZE as i64),
+        ("OBJ_ARRAY_SIZE", OBJ_ARRAY_SIZE as i64),
+        ("OBJ_APPEND_MASK", OBJ_APPEND_MASK),
+        ("OBJ_APPEND_FLAGS", OBJ_APPEND_FLAGS),
+        ("CTX_STD_ARRAY_PROTO", CTX_STD_ARRAY_PROTO as i64),
     ];
 }
 
