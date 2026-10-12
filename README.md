@@ -217,7 +217,7 @@ engine's semantics:
   argument skip the conversions; 8-bit strings of up to 16 characters
   compared for equality (`===`, `Map` keys) with a few word loads; `parseInt`, `Number(s)` and `+s` read small decimal integers
   directly; the cycle collector first runs at 4MB and then whenever the
-  heap has doubled, or quadrupled after a collection that freed little
+  heap has doubled, or grown eightfold after a collection that freed little
   (rather than from 256KB, at every 50% growth);
   `x ** 2` is the correctly rounded square (as native code computes it).
 

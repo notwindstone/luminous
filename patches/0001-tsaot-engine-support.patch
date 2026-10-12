@@ -435,10 +435,10 @@
 -        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
 -            (rt->malloc_state.malloc_size >> 1);
 +        /* tsaot: the next collection when the heap has doubled (rather
-+           than grown by half), or quadrupled after one that freed under an
-+           eighth of it: fewer scans of large live heaps. */
++           than grown by half), or grown eightfold after one that freed
++           under an eighth of it: fewer scans of large live heaps. */
 +        after = rt->malloc_state.malloc_size;
-+        rt->malloc_gc_threshold = after * (before - after < before / 8 ? 4 : 2);
++        rt->malloc_gc_threshold = after * (before - after < before / 8 ? 8 : 2);
      }
  }
  
