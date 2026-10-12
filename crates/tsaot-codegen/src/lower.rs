@@ -2395,6 +2395,29 @@ impl Lower {
                 let (p, t) = self.unary_any(*op, v);
                 V::Any(p, t)
             }
+            ExprKind::AnyBinary(AnyBinOp::Add, ..) if concat_parts(e).is_some() => {
+                // A template literal: its strings, concatenated by one call
+                // that copies each once.
+                let parts = concat_parts(e).unwrap();
+                let vals: Vec<V> = parts
+                    .iter()
+                    .map(|x| {
+                        let v = self.expr(x);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                for &v in vals.iter().rev() {
+                    self.release(v);
+                }
+                let anys: Vec<(Value, Value)> = vals.iter().map(|v| v.any()).collect();
+                let slot = self.values_slot(&anys);
+                let n = self.b.ins().iconst(I32, anys.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("JS_ConcatStrings", &[ctx, slot, n]);
+                self.check_value(r[1]);
+                V::Any(r[0], r[1])
+            }
             ExprKind::AnyBinary(op, x, y) => {
                 let a = self.expr(x);
                 self.hold(a);
@@ -7833,4 +7856,20 @@ struct SpecGuard<'a> {
     derived: &'a [(ir::LocalId, ir::LocalId, u32, usize)],
     methods: &'a [(Option<ir::LocalId>, usize, ir::AtomId, usize)],
     cells: &'a [ir::CellId],
+}
+
+/// The parts of a template literal's concatenation (`a${x}b` is checked as
+/// "a" + ToString(x) + "b"): strings and string conversions, added left to
+/// right. `+` of other values converts them otherwise.
+fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
+    let mut parts = Vec::new();
+    let mut e = e;
+    while let ExprKind::AnyBinary(AnyBinOp::Add, l, r) = &e.kind {
+        parts.push(&**r);
+        e = l;
+    }
+    parts.push(e);
+    parts.reverse();
+    let string = |x: &&Expr| matches!(x.kind, ExprKind::Str(_) | ExprKind::AnyUnary(AnyUnOp::ToStr, _));
+    (parts.len() >= 2 && parts.iter().all(string)).then_some(parts)
 }

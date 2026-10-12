@@ -292,7 +292,9 @@ The differential tests run every case with both.
 - **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
 - **JS values**: `let` / `const` / `var` holding anything, plus:
-  - string, template, object and array literals;
+  - string, template, object and array literals (a template's parts are
+    concatenated by one engine call that copies each once, rather than
+    one `+` at a time);
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
     check (one comparison: other kinds of entries keep their shape in a

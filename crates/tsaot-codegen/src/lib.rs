@@ -335,6 +335,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_record_learn", &[P, W, W, Int], &[]),
         ("tsaot_char_code_at_ok", &[P], &[Int]),
         ("JS_CallStringFn", &[P, W, W, Int, Int, P], &[W, W]),
+        ("JS_ConcatStrings", &[P, P, Int], &[W, W]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
         ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
