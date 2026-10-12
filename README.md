@@ -423,7 +423,10 @@ The differential tests run every case with both.
   callback may change the array), and calls the builtin otherwise. The
   results of `map` and `filter` are appended to inline.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
-  engine sort calling the compiled comparator directly.
+  engine sort calling the compiled comparator directly: a merge sort per
+  comparator signature with the call inlined, and a copy of the
+  comparator that borrows the elements the sort holds (no reference
+  taken or released per comparison).
 - **Leaf functions** that can neither throw nor call (only unboxed numbers
   and booleans) skip the stack check, and their callers the exception
   check after the call.

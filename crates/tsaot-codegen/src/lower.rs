@@ -231,6 +231,8 @@ const IC_STRING: i64 = 8;
 pub(crate) struct Env {
     pub helpers: HashMap<&'static str, FuncRef>,
     pub funcs: Vec<FuncRef>,
+    /// The copies of native `sort` comparators with borrowed parameters.
+    pub sort_cmps: HashMap<usize, FuncRef>,
     pub stack_limit: GlobalValue,
     pub unwinding: GlobalValue,
     pub cells: GlobalValue,
@@ -350,6 +352,9 @@ pub(crate) struct Lower {
     async_gen: bool,
     /// See `ir::Func::ret_slot`.
     ret_slot: Option<ir::LocalId>,
+    /// Parameters held by the caller (not released here; see
+    /// `borrow_params`).
+    borrowed: HashSet<ir::LocalId>,
     /// How many times the function names each local (`ir::local_uses`),
     /// and its number of parameters.
     local_uses: Vec<usize>,
@@ -481,6 +486,7 @@ impl Lower {
             async_cx: None,
             async_gen: false,
             ret_slot: f.ret_slot,
+            borrowed: HashSet::new(),
             local_uses: ir::local_uses(&f.body, f.locals.len()),
             n_params: f.params.len(),
             int_of: HashMap::new(),
@@ -710,8 +716,37 @@ impl Lower {
         }
     }
 
+    /// The JS-valued parameters arrive borrowed: the caller holds them while
+    /// the function runs (a native `sort` calls its comparator so, on the
+    /// elements it holds). Those the body never assigns are not released;
+    /// the others take a reference of their own.
+    pub(crate) fn borrow_params(&mut self, f: &ir::Func) {
+        for l in 0..f.params.len() {
+            if !is_js(self.locals[l]) {
+                continue;
+            }
+            let LVar::Two(..) = self.vars[l] else { unreachable!("parameters are not boxed") };
+            let mut assigned = false;
+            ir::visit_stmts(&f.body, &mut |e| {
+                assigned |= matches!(
+                    e.kind,
+                    ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } if m == l
+                )
+            });
+            if assigned {
+                let v = self.use_local(l).any();
+                self.dup(v);
+            } else {
+                self.borrowed.insert(l);
+            }
+        }
+    }
+
     fn free_all_locals(&mut self) {
         for l in 0..self.locals.len() {
+            if self.borrowed.contains(&l) {
+                continue;
+            }
             match self.vars[l] {
                 LVar::Boxed { obj: (op, ot), owned: true, .. } => {
                     let obj = (self.b.use_var(op), self.b.use_var(ot));
@@ -4027,8 +4062,13 @@ impl Lower {
         self.b.switch_to_block(fast);
         let numbers = self.env.params[func].first() == Some(&Ty::F64);
         let boxed_ret = self.env.rets[func] != Ty::F64;
-        let mode = self.b.ins().iconst(I32, numbers as i64 | (boxed_ret as i64) << 1);
-        let cmp = self.b.ins().func_addr(self.ptr, self.env.funcs[func]);
+        // (Mode 4: the comparator borrows the elements.)
+        let (cmp, borrowed) = match self.env.sort_cmps.get(&func) {
+            Some(&c) => (c, true),
+            None => (self.env.funcs[func], false),
+        };
+        let mode = self.b.ins().iconst(I32, numbers as i64 | (boxed_ret as i64) << 1 | (borrowed as i64) << 2);
+        let cmp = self.b.ins().func_addr(self.ptr, cmp);
         let flag = self.b.ins().symbol_value(self.ptr, self.env.unwinding);
         let r = self.helper("JS_SortNative", &[ctx, op_, ot, cmp, mode, flag])[0];
         self.check_int(r);

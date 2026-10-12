@@ -2315,7 +2315,7 @@
          if (JS_IsException(res))
              goto exception;
          if (JS_VALUE_GET_TAG(res) == JS_TAG_INT) {
-@@ -44751,6 +45969,187 @@
+@@ -44751,6 +45969,193 @@
      return 0;
  }
  
@@ -2332,6 +2332,8 @@
 +    int mode;
 +    const uint8_t *unwinding;
 +    bool failed;
++    /* (Mode 4: the comparator borrows its arguments, which the sort holds.) */
++    bool borrowed;
 +} JSNativeSort;
 +
 +static inline double js_native_number(JSValueConst v)
@@ -2348,15 +2350,19 @@
 +    JSContext *ctx = s->ctx;
 +    double r = 0;
 +    JSValue v = JS_UNDEFINED;
++    if (!(mode & 1) && !s->borrowed) {
++        js_dup(a);
++        js_dup(b);
++    }
 +    switch (mode) {
 +    case 0:
-+        r = ((JSNativeCmpAny *)s->cmp)(ctx, NULL, js_dup(a), js_dup(b));
++        r = ((JSNativeCmpAny *)s->cmp)(ctx, NULL, a, b);
 +        break;
 +    case 1:
 +        r = ((JSNativeCmpNum *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
 +        break;
 +    case 2:
-+        v = ((JSNativeCmpAnyV *)s->cmp)(ctx, NULL, js_dup(a), js_dup(b));
++        v = ((JSNativeCmpAnyV *)s->cmp)(ctx, NULL, a, b);
 +        break;
 +    default:
 +        v = ((JSNativeCmpNumV *)s->cmp)(ctx, NULL, js_native_number(a), js_native_number(b));
@@ -2429,7 +2435,7 @@
 +
 +static void js_native_merge_sort(JSNativeSort *s, JSValue *a, JSValue *tmp, size_t n)
 +{
-+    switch (s->mode) {
++    switch (s->mode & 3) {
 +    case 0: js_native_merge_sort_0(s, a, tmp, n); break;
 +    case 1: js_native_merge_sort_1(s, a, tmp, n); break;
 +    case 2: js_native_merge_sort_2(s, a, tmp, n); break;
@@ -2442,7 +2448,7 @@
 +    JSObject *p;
 +    JSValue *tab;
 +    uint32_t len, i, n = 0;
-+    JSNativeSort s = { ctx, cmp, mode, unwinding, false };
++    JSNativeSort s = { ctx, cmp, mode & 3, unwinding, false, (mode & 4) != 0 };
 +
 +    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
 +        return 0;
@@ -2503,7 +2509,7 @@
  static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
  {
-@@ -44795,6 +46194,8 @@
+@@ -44795,6 +46200,8 @@
          array[pos].pos = i;
          pos++;
      }
@@ -2512,7 +2518,7 @@
      rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
      if (asc.exception)
          goto exception;
-@@ -44978,6 +46379,15 @@
+@@ -44978,6 +46385,15 @@
      return JS_EXCEPTION;
  }
  
@@ -2528,7 +2534,7 @@
  static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv,
                                        int *pdone, int magic)
-@@ -46732,6 +48142,14 @@
+@@ -46732,6 +48148,14 @@
      int32_t radix;
      JSValue ret;
  
@@ -2543,7 +2549,7 @@
      str = JS_ToCString(ctx, argv[0]);
      if (!str)
          return JS_EXCEPTION;
-@@ -47273,11 +48691,10 @@
+@@ -47273,11 +48697,10 @@
                  return i;
          }
      } else {
@@ -2559,7 +2565,7 @@
          }
      }
      return -1;
-@@ -47431,7 +48848,11 @@
+@@ -47431,7 +48854,11 @@
          inc = 1;
      }
      ret = -1;
@@ -2572,7 +2578,7 @@
          for (i = start;; i += inc) {
              if (!string_cmp(p, p1, i, 0, v_len)) {
                  ret = i;
-@@ -47998,6 +49419,45 @@
+@@ -47998,6 +49425,45 @@
      return ret;
  }
  
@@ -2618,7 +2624,7 @@
  static JSValue js_string_pad(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int padEnd)
  {
-@@ -56073,6 +57533,48 @@
+@@ -56073,6 +57539,48 @@
      return result_promise;
  }
  
@@ -2667,7 +2673,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +57583,24 @@
+@@ -56081,14 +57589,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -2697,7 +2703,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +57618,530 @@
+@@ -56106,6 +57624,530 @@
      return result_promise;
  }
  
@@ -3228,7 +3234,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +58515,25 @@
+@@ -56479,6 +58521,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -3254,7 +3260,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +58553,8 @@
+@@ -56498,23 +58559,8 @@
          rd_array[i] = rd;
      }
  

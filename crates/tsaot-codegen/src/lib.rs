@@ -213,6 +213,12 @@ pub fn lower_module(m: &ir::Module) -> Result<mir::Module> {
         cg.define(i, f).with_context(|| format!("compiling `{}`", f.name))?;
         cg.define_fast(i, f).with_context(|| format!("compiling the entry of `{}`", f.name))?;
     }
+    let mut cmps: Vec<(usize, FuncId)> = cg.sort_cmps.iter().map(|(&i, &id)| (i, id)).collect();
+    cmps.sort();
+    for (i, id) in cmps {
+        let f = m.funcs.iter().chain(&m.closures).nth(i).expect("comparator");
+        cg.define_as(id, i, f, true).with_context(|| format!("compiling the comparator `{}`", f.name))?;
+    }
     cg.define_ics();
     Ok(cg.module)
 }
@@ -363,6 +369,9 @@ enum Arg {
 struct Codegen {
     module: mir::Module,
     funcs: Vec<FuncId>,
+    /// Native `sort` comparators (by function): a copy whose JS-valued
+    /// parameters are borrowed (`tsaot_cmp_<i>`).
+    sort_cmps: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
     data: [DataId; 12],
@@ -394,6 +403,20 @@ impl Codegen {
             // referenced by the C glue; the others only by native code.
             let linkage = if f.is_async || f.is_generator { Linkage::Export } else { Linkage::Local };
             funcs.push(module.declare_function(&symbol_name(i), linkage, &native_signature(f)));
+        }
+        let mut sort_cmps = HashMap::new();
+        for f in m.funcs.iter().chain(&m.closures) {
+            ir::visit_stmts(&f.body, &mut |e| {
+                if let ir::ExprKind::ArraySort { func, .. } = e.kind
+                    && !sort_cmps.contains_key(&func)
+                    && let Some(g) = m.funcs.iter().chain(&m.closures).nth(func)
+                    && !g.is_async
+                    && !g.is_generator
+                {
+                    let id = module.declare_function(&format!("tsaot_cmp_{func}"), Linkage::Local, &native_signature(g));
+                    sort_cmps.insert(func, id);
+                }
+            });
         }
         let fast_sig = fast_signature();
         let mut fast_funcs = Vec::new();
@@ -491,6 +514,7 @@ impl Codegen {
             ),
             module,
             funcs,
+            sort_cmps,
             fast_funcs,
             helpers,
             data: data.try_into().unwrap(),
@@ -518,6 +542,7 @@ impl Codegen {
         Env {
             helpers: self.helpers.clone(),
             funcs: self.funcs.clone(),
+            sort_cmps: self.sort_cmps.clone(),
             stack_limit,
             unwinding,
             cells,
@@ -559,6 +584,13 @@ impl Codegen {
         if f.is_async || f.is_generator {
             return self.define_step(index, f);
         }
+        self.define_as(self.funcs[index], index, f, false)
+    }
+
+    /// Defines native function `index` as `id`; with `borrowed`, its
+    /// JS-valued parameters that it never assigns are borrowed (a native
+    /// `sort`'s comparator: the engine holds the elements).
+    fn define_as(&mut self, id: FuncId, index: usize, f: &ir::Func, borrowed: bool) -> Result<()> {
         let ptr = I64;
         let env = self.env();
         let mut b = self.module.builder(native_signature(f));
@@ -583,12 +615,15 @@ impl Codegen {
         let leaf = self.nothrow.get(index).copied().unwrap_or(false);
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
         l.this = this;
+        if borrowed {
+            l.borrow_params(f);
+        }
         // (A leaf adds one frame: the caller's check covers it.)
         if !leaf {
             l.stack_check();
         }
         let b = l.body(&f.body);
-        self.module.define_function(self.funcs[index], b.finish());
+        self.module.define_function(id, b.finish());
         Ok(())
     }
 
