@@ -188,6 +188,10 @@ pub(crate) enum Method {
     CharCodeAt,
     /// `Array.prototype.push` (one argument).
     ArrayPush,
+    /// `String.prototype.slice`, `substring`, `indexOf`, `includes`,
+    /// `startsWith`, `endsWith` (in this order; `JS_CallStringFn`), with
+    /// at most two arguments.
+    StringFn(i32),
 }
 
 impl Method {
@@ -195,6 +199,12 @@ impl Method {
         match name {
             "charCodeAt" => Some(Method::CharCodeAt),
             "push" => Some(Method::ArrayPush),
+            "slice" => Some(Method::StringFn(0)),
+            "substring" => Some(Method::StringFn(1)),
+            "indexOf" => Some(Method::StringFn(2)),
+            "includes" => Some(Method::StringFn(3)),
+            "startsWith" => Some(Method::StringFn(4)),
+            "endsWith" => Some(Method::StringFn(5)),
             _ => None,
         }
     }
@@ -209,6 +219,8 @@ const PIN_ARRAY_PUSH: i32 = 26;
 const PIN_ARRAY_LOOPS: i32 = 27;
 /// `Array.prototype.sort`.
 const PIN_ARRAY_SORT: i32 = 34;
+/// The methods of `Method::StringFn`.
+const PIN_STRING_FNS: i32 = 35;
 /// `TSAOT_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -2815,15 +2827,21 @@ impl Lower {
                 // it only when it is not the builtin: read without a new
                 // reference while nothing can run before that (the arguments
                 // are pure).
+                let fits = |m: Method| match m {
+                    Method::ArrayPush => args.len() == 1,
+                    Method::StringFn(_) => args.len() <= 2,
+                    Method::CharCodeAt => true,
+                };
                 if let (Some(method), Key::Atom(a)) = (method, key)
                     && args.iter().all(|x| self.pure_arg(x))
-                    && (method != Method::ArrayPush || args.len() == 1)
+                    && fits(method)
                 {
                     let (mp, mt, f_owned) = self.prop_get_inner(op_, ot, None, *a, None, true, true);
                     let fv = V::Any(mp, mt);
                     let r = match method {
                         Method::CharCodeAt => self.char_code_at(fv, f_owned, obj, args),
                         Method::ArrayPush => self.array_push(fv, f_owned, obj, &args[0]),
+                        Method::StringFn(k) => self.string_fn(k, fv, f_owned, obj, args),
                     };
                     self.drop_operand(obj, owned);
                     return r;
@@ -2844,7 +2862,8 @@ impl Lower {
                 let r = match method {
                     Some(Method::CharCodeAt) => self.char_code_at(fv, None, obj, args),
                     Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, None, obj, &args[0]),
-                    Some(Method::ArrayPush) | None => self.call_values(fv, obj, args, pred),
+                    Some(Method::StringFn(k)) if args.len() <= 2 => self.string_fn(k, fv, None, obj, args),
+                    Some(Method::ArrayPush | Method::StringFn(_)) | None => self.call_values(fv, obj, args, pred),
                 };
                 self.drop_operand(obj, owned);
                 r
@@ -4419,7 +4438,7 @@ impl Lower {
         if borrowed {
             self.free((fp, ft));
         }
-        self.check_value(gt);
+        self.check_value_method(gt, f, f_owned);
         self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {
@@ -4428,6 +4447,100 @@ impl Lower {
         }
         self.drop_method(f, f_owned);
         V::Any(rp, rt)
+    }
+
+    /// `this.<method>(args)` for a `Method::StringFn` method `k`, with `f`
+    /// (held) the method read: when it is the original builtin and `this` a
+    /// string, the engine's entry runs it without a call frame
+    /// (`JS_CallStringFn`); else it is called. Frees `f`.
+    /// `f_owned`: as for `char_code_at`.
+    fn string_fn(&mut self, k: i32, f: V, f_owned: Option<Value>, this: V, args: &[Expr]) -> V {
+        let held: Vec<V> = args
+            .iter()
+            .map(|a| {
+                let v = self.expr(a);
+                self.hold(v);
+                v
+            })
+            .collect();
+        let (fp, ft) = f.any();
+        let (sp, st) = this.any();
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAG_STRING);
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, (PIN_STRING_FNS + k) * 8);
+        let same = self.b.ins().icmp(IntCC::Equal, fp, orig);
+        let ok = self.b.ins().band(is_str, is_obj);
+        let ok = self.b.ins().band(ok, same);
+        let direct = self.b.create_block();
+        self.b.ins().brif(ok, direct, &[], slow, &[]);
+        self.b.switch_to_block(direct);
+        let undef = self.konst(0, TAG_UNDEFINED).any();
+        let mut vals: Vec<(Value, Value)> = held.iter().map(|&v| self.boxed(v)).collect();
+        vals.resize(2, undef);
+        let (_, argv) = self.values_slot_raw(&vals);
+        let ctx = self.ctx;
+        let which = self.b.ins().iconst(I32, k as i64);
+        let argc = self.b.ins().iconst(I32, held.len() as i64);
+        let r = self.helper("JS_CallStringFn", &[ctx, sp, st, which, argc, argv]);
+        self.check_value_method(r[1], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(slow);
+        let mut vals = vec![(fp, ft), (sp, st)];
+        for &v in &held {
+            let b = self.boxed(v);
+            vals.push(b);
+        }
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, held.len() as i64);
+        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        // (A borrowed method is held while it runs.)
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup((fp, ft));
+        }
+        let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        if borrowed {
+            self.free((fp, ft));
+        }
+        self.check_value_method(gt, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        for v in held.into_iter().rev() {
+            self.release(v);
+            self.free_v(v);
+        }
+        self.drop_method(f, f_owned);
+        V::Any(rp, rt)
+    }
+
+    /// `check_value` in a builtin's fast path whose method read `f` is
+    /// released after it (`drop_method`): an exception releases it first
+    /// when the read made a new reference (a held one is freed with the
+    /// other held values).
+    fn check_value_method(&mut self, t: Value, f: V, f_owned: Option<Value>) {
+        if let Some(flag) = f_owned {
+            let exc = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_EXCEPTION);
+            let both = self.b.ins().band(exc, flag);
+            let yes = self.b.create_block();
+            let join = self.b.create_block();
+            self.b.set_cold_block(yes);
+            self.b.ins().brif(both, yes, &[], join, &[]);
+            self.b.switch_to_block(yes);
+            self.free(f.any());
+            self.b.ins().jump(join, &[]);
+            self.b.switch_to_block(join);
+        }
+        self.check_value(t);
     }
 
     /// Release the method read for a builtin's fast path: held (`None`), or
@@ -4488,7 +4601,7 @@ impl Lower {
         let done = self.b.create_block();
         self.b.ins().brif(declined, slow, &[], done, &[]);
         self.b.switch_to_block(done);
-        self.check_value(r[1]);
+        self.check_value_method(r[1], f, f_owned);
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
         self.b.switch_to_block(slow);
         let vals = [(fp, ft), (sp, st), (ap, at)];
@@ -4506,7 +4619,7 @@ impl Lower {
         if borrowed {
             self.free((fp, ft));
         }
-        self.check_value(gt);
+        self.check_value_method(gt, f, f_owned);
         self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {

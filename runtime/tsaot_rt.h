@@ -85,7 +85,10 @@ int tsaot_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
  * (native loops). */
 #define TSAOT_PIN_ARRAY_LOOPS 27
 #define TSAOT_PIN_ARRAY_SORT 34
-#define TSAOT_PINS 35
+/* String.prototype.slice, substring, indexOf, includes, startsWith,
+ * endsWith (JS_CallStringFn). */
+#define TSAOT_PIN_STRING_FNS 35
+#define TSAOT_PINS 41
 int tsaot_is_promise_resolve(JSValue promise, JSValue resolve);
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);

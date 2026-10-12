@@ -379,9 +379,12 @@ The differential tests run every case with both.
   i++` runs as integer code. A run that stores no field needs enough
   arithmetic (or a loop) to be worth its guard.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
-  through their inline caches; `s.charCodeAt(i)` runs inline and
-  `arr.push(x)` takes the engine's fast path while they are the original
-  builtins (checked at each call); `===`, `!==` and `switch` against
+  through their inline caches; `s.charCodeAt(i)` runs inline,
+  `arr.push(x)` takes the engine's fast path, and `s.slice`, `substring`,
+  `indexOf`, `includes`, `startsWith` and `endsWith` on a string call the
+  engine's implementation directly (no call frame; int32 bounds taken
+  as they are) while they are the original builtins (checked at each
+  call); `===`, `!==` and `switch` against
   string constants compare pointers, then lengths, before characters; a
   direct call with a JS value for a `number` or `boolean` parameter checks
   it at the call instead of going through the callee's JS entry. Where the

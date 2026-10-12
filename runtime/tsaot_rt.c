@@ -612,7 +612,9 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             g.Promise, g.Promise.resolve, g.String.prototype, g.String.prototype.charCodeAt,\n"
         "             g.Array.prototype.push, g.Array.prototype.forEach, g.Array.prototype.map,\n"
         "             g.Array.prototype.filter, g.Array.prototype.some, g.Array.prototype.every,\n"
-        "             g.Array.prototype.find, g.Array.prototype.findIndex, g.Array.prototype.sort);\n"
+        "             g.Array.prototype.find, g.Array.prototype.findIndex, g.Array.prototype.sort,\n"
+        "             g.String.prototype.slice, g.String.prototype.substring, g.String.prototype.indexOf,\n"
+        "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
