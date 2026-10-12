@@ -1419,7 +1419,7 @@ pub const THIS_LOCAL: LocalId = usize::MAX;
 
 /// Calls `f` on the locals expression `e` names itself (not through its
 /// subexpressions), and on those the statements of a body it holds name.
-fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
+pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
     let f = &mut |l: LocalId| {
         if l != THIS_LOCAL {
             f(l)

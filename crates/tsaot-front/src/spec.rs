@@ -518,7 +518,9 @@ impl Region {
         for l in self.assigned.clone() {
             let loaded = self.nums.iter().any(|&(m, _)| m == l);
             if loaded || cx.refs[l] > inside[l] {
-                let v = if self.undef.contains(&l) {
+                // (No copy: a local an iteration declared, set to
+                // `undefined`, and the loop is done.)
+                let v = if self.undef.contains(&l) || !self.copies.contains_key(&l) {
                     Expr::new(Ty::Any, ExprKind::Undefined)
                 } else {
                     let c = self.valid(l);
@@ -547,7 +549,7 @@ impl Region {
             if dead.contains(&l) {
                 continue;
             }
-            let v = if self.undef.contains(&l) {
+            let v = if self.undef.contains(&l) || !self.copies.contains_key(&l) {
                 Expr::new(Ty::Any, ExprKind::Undefined)
             } else {
                 let c = self.valid(l);
@@ -665,6 +667,7 @@ impl Region {
                 Some(Stmt::If(c, a, b))
             }
             Stmt::Loop { id, test, post_test, body, update, per_iteration } if per_iteration.is_empty() => {
+                let body_src: &[Stmt] = body;
                 let fresh = cx.next_loop;
                 cx.next_loop += 1;
                 self.loops.insert(*id, fresh);
@@ -685,7 +688,7 @@ impl Region {
                             assigned.insert(l);
                         }
                     });
-                    let iteration = iteration_locals(body, &cx.uses, |_| true).into_iter().collect();
+                    let iteration = scoped_locals(body, &cx.uses);
                     self.elem_loop = Some(ElemLoop { assigned, in_body: false, iteration });
                 }
                 self.depth += 1;
@@ -712,7 +715,11 @@ impl Region {
                 self.depth -= 1;
                 self.defined = defined;
                 self.consts.clear();
-                if self.undef != undef {
+                // (Locals each iteration declares, its own or those of the
+                // bodies it runs inline, are set before they are read.)
+                let fresh_locals = scoped_locals(body_src, &cx.uses);
+                self.undef.retain(|l| !fresh_locals.contains(l));
+                if self.undef.iter().any(|l| !undef.contains(l)) || undef.iter().any(|l| !fresh_locals.contains(l) && !self.undef.contains(l)) {
                     return None;
                 }
                 if top && !self.elems.is_empty() {
@@ -1514,6 +1521,33 @@ fn inline_parts(body: &[Stmt]) -> Option<(Vec<&Expr>, &Expr)> {
         })
         .collect::<Option<Vec<_>>>()?;
     Some((exprs, v))
+}
+
+/// The locals a loop body declares afresh in each iteration: those its
+/// body names first by declaring them (`InitLocal`, as `let`, `const`, the
+/// fields of scalar-replaced objects and inlined bodies' locals are), that
+/// nothing outside the body names (`uses`: the function's counts). Their
+/// values are dead where an iteration starts.
+fn scoped_locals(body: &[Stmt], uses: &[usize]) -> HashSet<LocalId> {
+    let inside = local_uses(body, uses.len());
+    let mut seen: HashSet<LocalId> = HashSet::new();
+    let mut out = HashSet::new();
+    visit_stmts(body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, x) => {
+            let mut own = false;
+            visit(x, &mut |y| expr_locals(y, &mut |m| own |= m == *l));
+            if !seen.contains(l) && !own && inside[*l] == uses[*l] {
+                out.insert(*l);
+            }
+            seen.insert(*l);
+        }
+        // (The locals an inlined body declares, not named yet.)
+        ExprKind::Inline { .. } | ExprKind::Predicted { .. } => {}
+        _ => expr_locals(e, &mut |m| {
+            seen.insert(m);
+        }),
+    });
+    out
 }
 
 /// Whether `stmts` assign local `l`.

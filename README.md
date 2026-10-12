@@ -430,7 +430,11 @@ The differential tests run every case with both.
   where some hold int32s. Where an element is not what
   the region needs (another shape, a string field, a hole, the same object
   as another), the region stores what it changed and the original loop
-  goes on from that iteration.
+  goes on from that iteration (what each iteration declares afresh, its
+  own locals and the fields of the vectors it makes, needs nothing from
+  the guard). With methods passing their parameters on to other inlined
+  methods (`oc.dot(dir)`), the ray tracer's whole sphere loop
+  (`spheres[i].hit(origin, dir)`) is one region.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline,
   `arr.push(x)` appends inline to an extensible fast array of a fresh
