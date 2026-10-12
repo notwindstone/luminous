@@ -182,8 +182,12 @@ fast paths that keep the engine's semantics:
   arena kept per size class (allocation-heavy code used to create and free
   an arena every few dozen objects); plain objects that keep their
   property array in their own allocation until it grows; defining the next
-  element of a fast array (`map`, `filter`, …) appends it; forward
-  `indexOf` searches by its first character with `memchr`;
+  element of a fast array (`map`, `filter`, …) appends it; `map`,
+  `filter`, `forEach`, `some`, `every`, `reduce` and `sort` read the
+  elements of fast arrays in place and call a native callback's fast entry
+  directly; forward `indexOf` searches by its first character with
+  `memchr`; the cycle collector first runs at 4MB and then whenever the
+  heap has doubled (rather than from 256KB, at every 50% growth);
   `x ** 2` is the correctly rounded square (as native code computes it).
 
 ## Backends
@@ -253,7 +257,8 @@ The differential tests run every case with both.
   - string, template, object and array literals;
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
-    check, then a load or store. A cache also covers the object's own
+    check (one comparison: other kinds of entries keep their shape in a
+    second field), then a load or store. A cache also covers the object's own
     getters and setters, methods, getters and setters found on the first
     or second prototype (checking the shapes on the way), and private
     fields and `super.name`. Sites that never cache stop trying;
@@ -273,6 +278,11 @@ The differential tests run every case with both.
   - `-`, `*`, `/`, `%` and `**` between a number and a JS value: the JS
     value is converted inline, and the result is a number (a BigInt
     throws, as mixing it with a number does);
+  - arithmetic between JS values (untyped property values, untyped
+    locals): numbers take an inline path, and a boxed result carries its
+    double along (through joins and in an extra variable of each untyped
+    local), so the next operation uses it directly and the boxing goes
+    unused unless the value is stored or passed on;
   - globals.
 
   Unboxed values are boxed where they meet JS values.
@@ -311,7 +321,12 @@ The differential tests run every case with both.
   builtins (checked at each call); `===`, `!==` and `switch` against
   string constants compare pointers, then lengths, before characters; a
   direct call with a JS value for a `number` or `boolean` parameter checks
-  it at the call instead of going through the callee's JS entry.
+  it at the call instead of going through the callee's JS entry. Where the
+  arguments cannot run code, the method is read without taking a
+  reference.
+- **Leaf functions** that can neither throw nor call (only unboxed numbers
+  and booleans) skip the stack check, and their callers the exception
+  check after the call.
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering

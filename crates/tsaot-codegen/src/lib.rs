@@ -329,6 +329,7 @@ struct Codegen {
     /// The atoms `Promise` and `resolve`, if used.
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     methods: std::rc::Rc<HashMap<ir::AtomId, lower::Method>>,
+    nothrow: std::rc::Rc<Vec<bool>>,
     /// Return types, by `FuncId`.
     rets: std::rc::Rc<Vec<Ty>>,
     /// `aot type` layouts.
@@ -412,6 +413,7 @@ impl Codegen {
                 .iter()
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
+            nothrow: std::rc::Rc::new(m.funcs.iter().map(nothrow_leaf).collect()),
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
             ),
@@ -449,6 +451,7 @@ impl Codegen {
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
             methods: self.methods.clone(),
+            nothrow: self.nothrow.clone(),
             fast: self.fast_funcs.clone(),
             rets: self.rets.clone(),
             layouts: self.layouts.clone(),
@@ -492,9 +495,13 @@ impl Codegen {
             k += n;
         }
         let exits = Exits { ret: Exit::Return, unwind: Exit::Return };
+        let leaf = self.nothrow.get(index).copied().unwrap_or(false);
         let mut l = Lower::new(b, env, js_ctx, ptr, f, &params, data, exits);
         l.this = this;
-        l.stack_check();
+        // (A leaf adds one frame: the caller's check covers it.)
+        if !leaf {
+            l.stack_check();
+        }
         let b = l.body(&f.body);
         self.module.define_function(self.funcs[index], b.finish());
         Ok(())
@@ -1142,4 +1149,47 @@ fn dup_inline(b: &mut FunctionBuilder, p: Value, t: Value) {
     b.ins().store(lower::M_RC, n, p, layout::REF_COUNT);
     b.ins().jump(join, &[]);
     b.switch_to_block(join);
+}
+
+/// A function that can neither throw nor call: only unboxed numbers and
+/// booleans, arithmetic, comparisons and control flow. Callers skip the
+/// unwinding check after calling it, and it skips the stack check.
+fn nothrow_leaf(f: &ir::Func) -> bool {
+    use ir::{ExprKind as K, Stmt};
+    fn expr_ok(e: &ir::Expr) -> bool {
+        e.ty != Ty::Any
+            && match &e.kind {
+                K::Num(_) | K::Bool(_) | K::Local(_) | K::Update { .. } => true,
+                K::SetLocal(_, x) | K::InitLocal(_, x) | K::Unary(_, x) | K::Truthy(x) => expr_ok(x),
+                K::Binary(_, x, y) | K::Compare(_, x, y) | K::Logical(_, x, y) => expr_ok(x) && expr_ok(y),
+                K::Cond(c, x, y) => expr_ok(c) && expr_ok(x) && expr_ok(y),
+                K::Math(_, xs) | K::Seq(xs) => xs.iter().all(expr_ok),
+                _ => false,
+            }
+    }
+    fn stmts_ok(ss: &[Stmt]) -> bool {
+        ss.iter().all(|s| match s {
+            Stmt::Expr(e) => expr_ok(e),
+            Stmt::If(c, a, b) => expr_ok(c) && stmts_ok(a) && stmts_ok(b),
+            Stmt::Loop { test, body, update, per_iteration, .. } => {
+                per_iteration.is_empty()
+                    && test.as_ref().is_none_or(expr_ok)
+                    && stmts_ok(body)
+                    && update.as_ref().is_none_or(expr_ok)
+            }
+            Stmt::Break(_) | Stmt::Continue(_) => true,
+            Stmt::Return(e) => e.as_ref().is_none_or(expr_ok),
+            Stmt::Block(b) => stmts_ok(b),
+            _ => false,
+        })
+    }
+    !f.is_async
+        && !f.is_generator
+        && !f.is_closure
+        && !f.has_this
+        && f.ret_slot.is_none()
+        && f.boxed.iter().all(|b| !b)
+        && f.locals.iter().all(|t| matches!(t, Ty::F64 | Ty::I32 | Ty::Bool))
+        && matches!(f.ret, Ty::F64 | Ty::I32 | Ty::Bool | Ty::Void)
+        && stmts_ok(&f.body)
 }

@@ -91,11 +91,14 @@ extern void *tsaot_shapes[];
  * setters are read from the holder at each use (they can be removed
  * without a shape change). */
 typedef struct TsaotIC {
-    void *shape; /* a referenced shape (of the object), or NULL */
+    void *shape; /* kind 0: the object's shape (referenced), else NULL */
     uint32_t slot;
     uint32_t kind;
     void *proto_shape; /* kinds 1-3: the holder's shape (referenced) */
     void *mid_shape;   /* a holder two levels up: the first prototype's shape */
+    /* Other kinds: the object's shape (referenced). Native code checks an
+     * own data property (the usual hit) with one comparison. */
+    void *alt_shape;
 } TsaotIC;
 #define TSAOT_IC_OWN 0
 #define TSAOT_IC_PROTO_DATA 1

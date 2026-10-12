@@ -239,6 +239,8 @@ pub(crate) struct Env {
     pub promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     /// Atoms naming builtin methods with fast paths.
     pub methods: std::rc::Rc<HashMap<ir::AtomId, Method>>,
+    /// Per function: it can neither throw nor call (see `nothrow_leaf`).
+    pub nothrow: std::rc::Rc<Vec<bool>>,
     /// JS entries (`tsaot_fast_<i>`), by `FuncId`.
     pub fast: Vec<FuncRef>,
     /// Return types, by `FuncId`.
@@ -2048,7 +2050,9 @@ impl Lower {
                 call_args.extend(vals);
                 let call = self.b.ins().call(self.env.funcs[*id], &call_args);
                 let results = self.b.inst_results(call).to_vec();
-                self.check_flag();
+                if !self.env.nothrow.get(*id).copied().unwrap_or(false) {
+                    self.check_flag();
+                }
                 self.unabi(e.ty, &results)
             }
             ExprKind::CallChecked { func, callee, args, checks } => {
@@ -2106,7 +2110,9 @@ impl Lower {
                 call_args.extend(vals);
                 let call = self.b.ins().call(self.env.funcs[*func], &call_args);
                 let results = self.b.inst_results(call).to_vec();
-                self.check_flag();
+                if !self.env.nothrow.get(*func).copied().unwrap_or(false) {
+                    self.check_flag();
+                }
                 let ret = self.env.rets[*func];
                 let r = self.unabi(ret, &results);
                 let (p, t) = self.boxed(r);
@@ -2717,6 +2723,27 @@ impl Lower {
                 let (obj, owned) = self.operand(o, &later);
                 let (op_, ot) = obj.any();
                 let ctx = self.ctx;
+                let method = match key {
+                    Key::Atom(a) if pred.is_none() => self.env.methods.get(a).copied(),
+                    _ => None,
+                };
+                // A builtin's fast path compares the method read and calls
+                // it only when it is not the builtin: read without a new
+                // reference while nothing can run before that (the arguments
+                // are pure).
+                if let (Some(method), Key::Atom(a)) = (method, key)
+                    && args.iter().all(|x| self.pure_arg(x))
+                    && (method != Method::ArrayPush || args.len() == 1)
+                {
+                    let (mp, mt, f_owned) = self.prop_get_inner(op_, ot, None, *a, None, true, true);
+                    let fv = V::Any(mp, mt);
+                    let r = match method {
+                        Method::CharCodeAt => self.char_code_at(fv, f_owned, obj, args),
+                        Method::ArrayPush => self.array_push(fv, f_owned, obj, &args[0]),
+                    };
+                    self.drop_operand(obj, owned);
+                    return r;
+                }
                 let m = match key {
                     Key::Atom(a) => {
                         let (mp, mt) = self.method_get(op_, ot, *a);
@@ -2730,13 +2757,9 @@ impl Lower {
                 self.check_value(m[1]);
                 let fv = V::Any(m[0], m[1]);
                 self.hold(fv);
-                let method = match key {
-                    Key::Atom(a) if pred.is_none() => self.env.methods.get(a).copied(),
-                    _ => None,
-                };
                 let r = match method {
-                    Some(Method::CharCodeAt) => self.char_code_at(fv, obj, args),
-                    Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, obj, &args[0]),
+                    Some(Method::CharCodeAt) => self.char_code_at(fv, None, obj, args),
+                    Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, None, obj, &args[0]),
                     Some(Method::ArrayPush) | None => self.call_values(fv, obj, args, pred),
                 };
                 self.drop_operand(obj, owned);
@@ -3492,8 +3515,18 @@ impl Lower {
     /// `this.charCodeAt(args)` with `f` (held) the method read: inline when
     /// it is the original builtin, `this` a flat string and the position a
     /// number, else called. Frees `f`.
-    fn char_code_at(&mut self, f: V, this: V, args: &[Expr]) -> V {
-        let held = self.held_args(args);
+    /// `f_owned`: `f` is borrowed unless this (an `I8`) is set, rather than
+    /// held (see `prop_get_inner`).
+    fn char_code_at(&mut self, f: V, f_owned: Option<Value>, this: V, args: &[Expr]) -> V {
+        // (A number position stays unboxed: boxed only for a call.)
+        let held: Vec<V> = args
+            .iter()
+            .map(|a| {
+                let v = self.unboxed_operand(a);
+                self.hold(v);
+                v
+            })
+            .collect();
         let (fp, ft) = f.any();
         let (sp, st) = this.any();
         let join = self.b.create_block();
@@ -3530,7 +3563,8 @@ impl Lower {
             }
             Some(&V::Void) => unreachable!("void argument"),
         };
-        let word = self.b.ins().uload32(M_HEADER, sp, layout::STRING_KIND);
+        // (A string's length and kind never change: invariant loads.)
+        let word = self.b.ins().uload32(M_CONST, sp, layout::STRING_KIND);
         let kind = self.b.ins().ushr_imm_u(word, 28);
         let kind = self.b.ins().band_imm_u(kind, 3);
         let flat = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
@@ -3542,7 +3576,7 @@ impl Lower {
         self.b.ins().brif(flat, chars, &[], slow, &[]);
         self.b.switch_to_block(chars);
         // (`uload32` zero-extends to an `I64`.)
-        let head = self.b.ins().uload32(M_HEADER, sp, layout::STRING_LEN);
+        let head = self.b.ins().uload32(M_CONST, sp, layout::STRING_LEN);
         let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
         let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
         let load = self.b.create_block();
@@ -3571,16 +3605,27 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(bits), BlockArg::Value(float)]);
         self.b.switch_to_block(slow);
         let mut vals = vec![(fp, ft), (sp, st)];
-        vals.extend(held.iter().map(|v| v.any()));
+        for &v in &held {
+            let b = self.boxed(v);
+            vals.push(b);
+        }
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, held.len() as i64);
         let ctx = self.ctx;
         let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        // (A borrowed method is held while it runs.)
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup((fp, ft));
+        }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
             let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
+        if borrowed {
+            self.free((fp, ft));
+        }
         self.check_value(gt);
         self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
         self.b.switch_to_block(join);
@@ -3588,15 +3633,45 @@ impl Lower {
             self.release(v);
             self.free_v(v);
         }
-        self.release(f);
-        self.free_v(f);
+        self.drop_method(f, f_owned);
         V::Any(rp, rt)
+    }
+
+    /// Release the method read for a builtin's fast path: held (`None`), or
+    /// a new reference only if `f_owned` is set.
+    fn drop_method(&mut self, f: V, f_owned: Option<Value>) {
+        match f_owned {
+            None => {
+                self.release(f);
+                self.free_v(f);
+            }
+            Some(flag) => {
+                let yes = self.b.create_block();
+                let join = self.b.create_block();
+                self.b.ins().brif(flag, yes, &[], join, &[]);
+                self.b.switch_to_block(yes);
+                self.free(f.any());
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
+            }
+        }
+    }
+
+    /// An argument whose evaluation runs no code and cannot throw.
+    fn pure_arg(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Undefined | ExprKind::Null => true,
+            ExprKind::Local(l) => !matches!(self.vars[*l], LVar::Boxed { .. }),
+            ExprKind::Box(x) | ExprKind::Unary(UnOp::Not, x) => self.pure_arg(x),
+            ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul, x, y) => self.pure_arg(x) && self.pure_arg(y),
+            _ => false,
+        }
     }
 
     /// `this.push(arg)` with `f` (held) the method read: through the
     /// engine's fast path (`JS_ArrayPushFast`) while it is the original
     /// builtin, else called. Frees `f`.
-    fn array_push(&mut self, f: V, this: V, arg: &Expr) -> V {
+    fn array_push(&mut self, f: V, f_owned: Option<Value>, this: V, arg: &Expr) -> V {
         let held = self.held_args(std::slice::from_ref(arg));
         let (fp, ft) = f.any();
         let (sp, st) = this.any();
@@ -3627,10 +3702,17 @@ impl Lower {
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup((fp, ft));
+        }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), 1, argv, false, |l| {
             let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
+        if borrowed {
+            self.free((fp, ft));
+        }
         self.check_value(gt);
         self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
         self.b.switch_to_block(join);
@@ -3638,8 +3720,7 @@ impl Lower {
             self.release(v);
             self.free_v(v);
         }
-        self.release(f);
-        self.free_v(f);
+        self.drop_method(f, f_owned);
         V::Any(rp, rt)
     }
 
@@ -5005,10 +5086,38 @@ impl Lower {
         pred: Option<Pred>,
         strings: bool,
     ) -> (Value, Value) {
+        let (rp, rt, _) = self.prop_get_inner(p, t, receiver, a, pred, strings, false);
+        (rp, rt)
+    }
+
+    /// `prop_get_from`; with `borrow`, data properties are read without a
+    /// new reference, and the third result says whether the value is one
+    /// (an `I8`: getters and the engine return new references).
+    #[allow(clippy::too_many_arguments)]
+    fn prop_get_inner(
+        &mut self,
+        p: Value,
+        t: Value,
+        receiver: Option<(Value, Value)>,
+        a: ir::AtomId,
+        pred: Option<Pred>,
+        strings: bool,
+        borrow: bool,
+    ) -> (Value, Value, Option<Value>) {
         let ic = self.new_ic();
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
+        let owned = borrow.then(|| self.b.append_block_param(join, I8));
+        // The join's arguments: a borrowed value (not dup'ed when
+        // borrowing), or a new reference.
+        let args = |l: &mut Self, vp: Value, vt: Value, new_ref: bool| -> Vec<BlockArg> {
+            let mut a = vec![BlockArg::Value(vp), BlockArg::Value(vt)];
+            if borrow {
+                a.push(BlockArg::Value(l.b.ins().iconst(I8, new_ref as i64)));
+            }
+            a
+        };
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         let not_obj = if strings { self.b.create_block() } else { slow };
@@ -5036,8 +5145,11 @@ impl Lower {
             let at = self.ic_slot_addr(proto, ic);
             let vp = self.b.ins().load(I64, M_SLOT, at, 0);
             let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-            self.dup((vp, vt));
-            self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+            if !borrow {
+                self.dup((vp, vt));
+            }
+            let ja = args(self, vp, vt, false);
+            self.b.ins().jump(join, &ja);
             self.b.switch_to_block(after);
         }
         let own = self.b.create_block();
@@ -5054,8 +5166,11 @@ impl Lower {
         let at = self.ic_slot_addr(p, ic);
         let vp = self.b.ins().load(I64, M_SLOT, at, 0);
         let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        self.dup((vp, vt));
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        if !borrow {
+            self.dup((vp, vt));
+        }
+        let ja = args(self, vp, vt, false);
+        self.b.ins().jump(join, &ja);
         // On the prototype: its value; or a call of a getter (own or on the
         // prototype).
         self.b.switch_to_block(proto);
@@ -5070,7 +5185,8 @@ impl Lower {
             self.b.ins().brif(is_struct, st, &[], rest, &[]);
             self.b.switch_to_block(st);
             let (vp, vt) = self.struct_ic_read(p, kind, ic, slow);
-            self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+            let ja = args(self, vp, vt, true);
+            self.b.ins().jump(join, &ja);
             self.b.switch_to_block(rest);
         }
         let data = self.b.create_block();
@@ -5081,8 +5197,11 @@ impl Lower {
         let pat = self.ic_proto_slot(shape, ic, slow);
         let vp = self.b.ins().load(I64, M_SLOT, pat, 0);
         let vt = self.b.ins().load(I64, M_SLOT, pat, TAG_OFFSET);
-        self.dup((vp, vt));
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        if !borrow {
+            self.dup((vp, vt));
+        }
+        let ja = args(self, vp, vt, false);
+        self.b.ins().jump(join, &ja);
         self.b.switch_to_block(getter);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
         let g = self.b.ins().load(I64, M_SLOT, pat, 0);
@@ -5096,7 +5215,8 @@ impl Lower {
             (r[0], r[1])
         });
         self.check_value(gt);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        let ja = args(self, gp, gt, true);
+        self.b.ins().jump(join, &ja);
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let r = match receiver {
@@ -5104,9 +5224,10 @@ impl Lower {
             None => self.helper("tsaot_ic_get_proto", &[ctx, p, t, atom, ic]),
         };
         self.check_value(r[1]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let ja = args(self, r[0], r[1], true);
+        self.b.ins().jump(join, &ja);
         self.b.switch_to_block(join);
-        (rp, rt)
+        (rp, rt, owned)
     }
 
     /// A field of an `aot type` object (`p`) cached in `ic`
@@ -5190,12 +5311,23 @@ impl Lower {
         self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
         self.b.switch_to_block(obj);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+        // An own data property: `shape` (kind 0); any other kind: `alt_shape`.
         let cached = self.b.ins().load(I64, M_IC, ic, 0);
         let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
         let hit = self.b.create_block();
-        self.b.ins().brif(same, hit, &[], slow, &[]);
+        let kind = self.b.append_block_param(hit, I64);
+        let other = self.b.create_block();
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().brif(same, hit, &[BlockArg::Value(zero)], other, &[]);
+        self.b.switch_to_block(other);
+        let alt = self.b.ins().load(I64, M_IC, ic, 32);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, alt);
+        let kinded = self.b.create_block();
+        self.b.ins().brif(same, kinded, &[], slow, &[]);
+        self.b.switch_to_block(kinded);
+        let k = self.b.ins().uload32(M_IC, ic, 12);
+        self.b.ins().jump(hit, &[BlockArg::Value(k)]);
         self.b.switch_to_block(hit);
-        let kind = self.b.ins().uload32(M_IC, ic, 12);
         (shape, kind)
     }
 
@@ -5564,7 +5696,7 @@ impl V {
 }
 
 /// Size of a `TsaotIC` (an inline cache entry).
-pub(crate) const IC_SIZE: usize = 32;
+pub(crate) const IC_SIZE: usize = 40;
 /// `TSAOT_IC_STRUCT`: a cached field of an `aot type` object.
 const IC_STRUCT: i64 = 7;
 

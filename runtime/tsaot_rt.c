@@ -397,6 +397,9 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         if (tsaot_ics[i].mid_shape)
             JS_FreeCachedShape(rt, tsaot_ics[i].mid_shape);
         tsaot_ics[i].mid_shape = NULL;
+        if (tsaot_ics[i].alt_shape)
+            JS_FreeCachedShape(rt, tsaot_ics[i].alt_shape);
+        tsaot_ics[i].alt_shape = NULL;
     }
 }
 
@@ -426,6 +429,8 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
             JS_MarkCachedShape(rt, tsaot_ics[i].proto_shape, mark_func);
         if (tsaot_ics[i].mid_shape)
             JS_MarkCachedShape(rt, tsaot_ics[i].mid_shape, mark_func);
+        if (tsaot_ics[i].alt_shape)
+            JS_MarkCachedShape(rt, tsaot_ics[i].alt_shape, mark_func);
     }
 }
 
@@ -648,7 +653,11 @@ static void tsaot_ic_store(JSContext *ctx, TsaotIC *ic, void *shape, void *proto
         JS_FreeCachedShape(rt, ic->proto_shape);
     if (ic->mid_shape)
         JS_FreeCachedShape(rt, ic->mid_shape);
-    ic->shape = shape;
+    if (ic->alt_shape)
+        JS_FreeCachedShape(rt, ic->alt_shape);
+    /* (See TsaotIC.) */
+    ic->shape = kind == TSAOT_IC_OWN ? shape : NULL;
+    ic->alt_shape = kind == TSAOT_IC_OWN ? NULL : shape;
     ic->proto_shape = proto_shape;
     ic->mid_shape = mid_shape;
     ic->slot = slot;
@@ -1308,8 +1317,9 @@ int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic)
 /* ---- inline caches of prototype properties ---- */
 
 /* Codegen reads entries at these offsets (lower::IC_SIZE). */
-_Static_assert(sizeof(TsaotIC) == 32 && offsetof(TsaotIC, slot) == 8 && offsetof(TsaotIC, kind) == 12 &&
-                   offsetof(TsaotIC, proto_shape) == 16 && offsetof(TsaotIC, mid_shape) == 24,
+_Static_assert(sizeof(TsaotIC) == 40 && offsetof(TsaotIC, slot) == 8 && offsetof(TsaotIC, kind) == 12 &&
+                   offsetof(TsaotIC, proto_shape) == 16 && offsetof(TsaotIC, mid_shape) == 24 &&
+                   offsetof(TsaotIC, alt_shape) == 32,
                "TsaotIC layout");
 
 /* Sites that never cache (as for objects with unshared shapes) stop trying
@@ -1320,12 +1330,12 @@ _Static_assert(sizeof(TsaotIC) == 32 && offsetof(TsaotIC, slot) == 8 && offsetof
 
 static bool tsaot_ic_gave_up(TsaotIC *ic)
 {
-    return !ic->shape && !ic->proto_shape && ic->slot >= TSAOT_IC_GIVE_UP;
+    return !ic->shape && !ic->alt_shape && !ic->proto_shape && ic->slot >= TSAOT_IC_GIVE_UP;
 }
 
 static void tsaot_ic_count_miss(TsaotIC *ic)
 {
-    if (!ic->shape && !ic->proto_shape)
+    if (!ic->shape && !ic->alt_shape && !ic->proto_shape)
         ic->slot++;
 }
 
