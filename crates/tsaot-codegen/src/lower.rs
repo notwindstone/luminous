@@ -12,7 +12,7 @@
 //! or `finally` block, or the function's exception exit, which frees all
 //! `Any` locals and propagates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::mir::types::{F32, F64, I8, I32, I64};
 use crate::mir::{
@@ -319,6 +319,9 @@ pub(crate) struct Lower {
     /// In a speculative region: whether every value its guard checked is
     /// a float (not an int32).
     spec_floats: bool,
+    /// In a speculative region's float code: the fields that keep their
+    /// float tag (only float results stored), whose tag a store leaves.
+    spec_float_slots: HashSet<(ir::LocalId, u32)>,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
     /// Inlined calls being lowered (innermost last): where their `return`s
@@ -456,6 +459,7 @@ impl Lower {
             num_shadow: HashMap::new(),
             spec_src: HashMap::new(),
             spec_floats: false,
+            spec_float_slots: HashSet::new(),
             loops: HashMap::new(),
             inline_rets: Vec::new(),
             pred: None,
@@ -2549,7 +2553,9 @@ impl Lower {
                 let (vp, vt) = if self.spec_floats && *arith { self.box_float(d) } else { self.box_number(d) };
                 let off = (*slot as usize * SIZE) as i32;
                 self.b.ins().store(M_SLOT, vp, props, off);
-                self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
+                if !(self.spec_floats && *arith && self.spec_float_slots.contains(&(*obj, *slot))) {
+                    self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
+                }
                 V::Num(d)
             }
             ExprKind::GetElem(o, k) => {
@@ -4169,23 +4175,25 @@ impl Lower {
             self.b.switch_to_block(next);
         }
         let props_of = |o: ir::LocalId| ptrs.iter().find(|x| x.0 == o).expect("guarded object").2;
-        let tags = |l: &mut Self| -> Vec<Value> {
-            fields
-                .iter()
-                .map(|&(o, slot)| l.b.ins().load(I64, M_SLOT, props_of(o), (slot as usize * SIZE) as i32 + TAG_OFFSET))
-                .collect()
+        let tag = |l: &mut Self, (o, slot): (ir::LocalId, u32), flags: MemFlags| {
+            l.b.ins().load(I64, flags, props_of(o), (slot as usize * SIZE) as i32 + TAG_OFFSET)
         };
         let locals: Vec<(Value, Value)> = nums.iter().map(|&(from, _)| self.use_local(from).any()).collect();
-        // Floats are tagged FLOAT64: every value is one iff no tag differs.
-        let mut diff = self.b.ins().iconst(I64, 0);
-        for t in tags(self).into_iter().chain(locals.iter().map(|x| x.1)) {
-            let d = self.b.ins().bxor_imm_u(t, TAG_FLOAT64);
-            diff = self.b.ins().bor(diff, d);
-        }
+        // Floats are tagged FLOAT64: each tag compared on its own (the
+        // tags are not kept for the int code, which reads them again).
         let floats = self.b.create_block();
         let check = self.b.create_block();
-        let all_floats = self.b.ins().icmp_imm_s(IntCC::Equal, diff, 0);
-        self.b.ins().brif(all_floats, floats, &[], check, &[]);
+        for k in 0..fields.len() + locals.len() {
+            let t = match fields.get(k) {
+                Some(&f) => tag(self, f, M_SLOT.volatile()),
+                None => locals[k - fields.len()].1,
+            };
+            let is_float = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
+            let next = self.b.create_block();
+            self.b.ins().brif(is_float, next, &[], check, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.b.ins().jump(floats, &[]);
         for &(o, _, props) in &ptrs {
             self.spec_src.insert(o, props);
         }
@@ -4195,8 +4203,18 @@ impl Lower {
             let d = self.b.ins().bitcast(F64, p);
             self.def_local(to, V::Num(d));
         }
+        // A field stays a float unless the region stores something else
+        // (an int constant, a copied value) in it.
+        let mut slots: HashSet<(ir::LocalId, u32)> = fields.iter().copied().collect();
+        ir::visit_stmts(fast, &mut |e| {
+            if let ExprKind::SlotStore { obj, slot, arith: false, .. } = e.kind {
+                slots.remove(&(obj, slot));
+            }
+        });
+        self.spec_float_slots = slots;
         self.spec_floats = true;
         self.stmts(fast);
+        self.spec_float_slots.clear();
         if !self.is_filled() {
             self.b.ins().jump(join, &[]);
         }
@@ -4204,7 +4222,7 @@ impl Lower {
         // Int32s (INT, 0) and floats are numbers: all are iff no tag has
         // another bit set.
         self.b.switch_to_block(check);
-        let tags = tags(self);
+        let tags: Vec<Value> = fields.iter().map(|&f| tag(self, f, M_SLOT)).collect();
         let mut any = self.b.ins().iconst(I64, 0);
         for &t in tags.iter().chain(locals.iter().map(|x| &x.1)) {
             any = self.b.ins().bor(any, t);

@@ -863,16 +863,17 @@ impl<'a> FnEmitter<'a> {
                 let p = self.address(addr, off);
                 let align = mem.bytes();
                 let md = mem_metadata(flags.region, true, mem);
+                let load = if flags.volatile { "load volatile" } else { "load" };
                 if mem == t && t == Type::I64 && self.ptr_like[results[0].index()] {
                     // A pointer, loaded as one.
-                    self.line(format!("{name}.p = load ptr, ptr {p}, align {align}{md}"));
+                    self.line(format!("{name}.p = {load} ptr, ptr {p}, align {align}{md}"));
                     self.line(format!("{name} = ptrtoint ptr {name}.p to i64"));
                 } else if mem == t {
-                    self.line(format!("{name} = load {}, ptr {p}, align {align}{md}", ty(t)));
+                    self.line(format!("{name} = {load} {}, ptr {p}, align {align}{md}", ty(t)));
                     self.ensure_ptr(results[0]);
                 } else {
                     let tmp = self.tmp();
-                    self.line(format!("{tmp} = load {}, ptr {p}, align {align}{md}", ty(mem)));
+                    self.line(format!("{tmp} = {load} {}, ptr {p}, align {align}{md}", ty(mem)));
                     let ext = if signed { "sext" } else { "zext" };
                     self.line(format!("{name} = {ext} {} {tmp} to {}", ty(mem), ty(t)));
                     self.ensure_ptr(results[0]);

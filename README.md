@@ -372,12 +372,13 @@ The differential tests run every case with both.
   locals (`const dx = a.x - b.x; ... a.vx -= dx * b.m * f;`) gets a second
   version where all of these are doubles. One guard before it checks the
   objects' shapes, that they are distinct objects if fields are written,
-  and that every field and untyped local it reads holds a number (one OR
-  of the tags when all are floats); the run then reads the fields as
-  doubles where it uses them, computes in registers, and stores the fields
-  it changed at its end (as floats, as the interpreter's float arithmetic
-  makes them; a copy for when some held int32s stores int32s where the
-  results are). Nothing in the run can call, throw or allocate, so what the
+  and that every field and untyped local it reads holds a number (each tag
+  compared with the float tag in turn, then one OR of the tags for
+  int32s); the run then reads the fields as doubles where it uses them,
+  computes in registers, and stores the fields it changed at its end (as
+  floats, as the interpreter's float arithmetic makes them, leaving their
+  float tags in place; a copy for when some held int32s stores int32s
+  where the results are). Nothing in the run can call, throw or allocate, so what the
   guard checked holds throughout. When it fails (a string, a BigInt, the
   same object twice, a getter), the statements run as before. Runs may
   contain `if`, `?:`, `&&`, `||`, comparisons, `return`, loops (with

@@ -197,6 +197,10 @@ impl Region {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MemFlags {
     pub region: Region,
+    /// Performed where it is, on its own: not merged with other accesses,
+    /// moved or combined into vector code (a guard's loads, each tested
+    /// right away rather than all held in registers).
+    pub volatile: bool,
 }
 
 impl MemFlags {
@@ -209,7 +213,11 @@ impl MemFlags {
     }
 
     pub const fn of(region: Region) -> Self {
-        MemFlags { region }
+        MemFlags { region, volatile: false }
+    }
+
+    pub const fn volatile(self) -> Self {
+        MemFlags { volatile: true, ..self }
     }
 }
 
