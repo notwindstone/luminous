@@ -54,6 +54,7 @@ pub fn speculate_numbers(m: &mut Module) {
             continue;
         }
         let refs = mentions(&f.body, f.locals.len());
+        let uses = local_uses(&f.body, f.locals.len());
         let mut body = std::mem::take(&mut f.body);
         let ret = f.ret;
         let this = f.has_this;
@@ -61,6 +62,7 @@ pub fn speculate_numbers(m: &mut Module) {
             f,
             nums: &nums,
             refs,
+            uses,
             atoms: &atoms,
             leaves: &leaves,
             methods: &methods,
@@ -189,8 +191,9 @@ struct Cx<'a> {
     leaves: &'a [Option<(Vec<Ty>, Ty)>],
     next_loop: LoopId,
     /// How many times each local is named in the function (before any
-    /// region is made).
+    /// region is made), by `mentions` and by `local_uses`.
     refs: Vec<usize>,
+    uses: Vec<usize>,
 }
 
 /// What a run of statements needs and changes.
@@ -240,9 +243,60 @@ struct Region {
     returned: bool,
     accesses: usize,
     work: usize,
+    /// How many of the region's loops the statements being copied are in.
+    depth: usize,
+    /// The loop (the region's only statement) whose iterations read
+    /// objects from arrays, while its body is copied: see `ElemLoop`.
+    elem_loop: Option<ElemLoop>,
+    /// Arrays whose elements its iterations read, the element objects
+    /// `(obj, arr, idx, record)`, the objects their fields hold, and the
+    /// fields of those read or written (see `ExprKind::ElemGuard`).
+    arrays: Vec<LocalId>,
+    elems: Vec<(LocalId, LocalId, LocalId, usize)>,
+    elem_derived: Vec<(LocalId, LocalId, u32, usize)>,
+    elem_fields: Vec<(LocalId, u32)>,
+    /// Whether an element's field is written.
+    elem_writes: bool,
+    /// The `Bool` local set when an iteration's objects are not what the
+    /// region needs (it then leaves, and the original loop goes on from
+    /// that iteration), once the loop reads elements.
+    bailed: Option<LocalId>,
+    /// Whether the statement being copied is the region's first (a loop
+    /// that reads elements must be its only one).
+    may_elems: bool,
+    /// Records whose shape (once known) must have a class's prototype:
+    /// `(record, class)`, for methods run inline on elements.
+    protos: Vec<(usize, usize)>,
+    /// How many method bodies with statements run inline (`Inline`) the
+    /// statements being copied are in: their `return`s give the call's
+    /// value.
+    inline: usize,
+    /// How many branches of `if`s the statements being copied are in (a
+    /// loop that reads elements is in none), and whether such a loop has
+    /// been copied (nothing may follow it).
+    branches: usize,
+    closed: bool,
+}
+
+/// The loop whose iterations read objects from arrays.
+#[derive(Clone)]
+struct ElemLoop {
+    /// The locals its body assigns, and whether its body (not its test or
+    /// update) is being copied, outside any inner loop.
+    assigned: HashSet<LocalId>,
+    in_body: bool,
+    /// The locals each iteration declares (`ir::iteration_locals`): dead
+    /// where an iteration starts.
+    iteration: HashSet<LocalId>,
 }
 
 impl Cx<'_> {
+    fn new_bool_local(&mut self) -> LocalId {
+        let l = self.new_local();
+        self.f.locals[l] = Ty::Bool;
+        l
+    }
+
     fn new_local(&mut self) -> LocalId {
         self.f.locals.push(Ty::F64);
         self.f.boxed.push(false);
@@ -268,16 +322,39 @@ impl Cx<'_> {
         for mut s in old {
             let saved = r.clone();
             let n = self.f.locals.len();
+            r.may_elems = run.is_empty();
             if !r.returned
                 && let Some(x) = r.stmt(&s, self)
             {
                 run.push(s);
                 fast.push(x);
+                // (A loop that reads elements is a region of its own.)
+                if r.bailed.is_some() {
+                    self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
+                    base = self.f.locals.len();
+                }
                 continue;
             }
             self.truncate_locals(n);
             r = saved;
+            let alone = run.is_empty();
             self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
+            base = self.f.locals.len();
+            // A loop that reads elements may be a region on its own.
+            if !alone && matches!(s, Stmt::Loop { .. }) {
+                r.may_elems = true;
+                if let Some(x) = r.stmt(&s, self)
+                    && r.bailed.is_some()
+                {
+                    run.push(s);
+                    fast.push(x);
+                    self.flush(list, &mut run, &mut fast, std::mem::replace(&mut r, fresh()), base);
+                    base = self.f.locals.len();
+                    continue;
+                }
+                self.truncate_locals(base);
+                r = fresh();
+            }
             self.nested(&mut s, ret);
             list.push(s);
             base = self.f.locals.len();
@@ -322,7 +399,13 @@ impl Cx<'_> {
             return;
         }
         if !r.returned {
-            fast.extend(r.leave(self, &run));
+            let leave = r.leave(self, &run);
+            match r.bailed {
+                // (After the loop that reads elements, the last statement:
+                // where it did not leave midway.)
+                Some(b) => resume_else(&mut fast, b, leave),
+                None => fast.extend(leave),
+            }
         }
         // A field the region writes is read from its local everywhere (in a
         // loop, a read before the write sees the previous iteration's).
@@ -357,9 +440,34 @@ impl Cx<'_> {
             derived: r.derived,
             methods: r.methods,
             cells: r.cells,
+            arrays: r.arrays,
+            protos: r.protos,
         };
         list.push(Stmt::If(Expr::new(Ty::Bool, guard), init, run));
     }
+}
+
+/// Put `leave` in the `else` branch of the `if (bailed)` after a loop that
+/// reads elements (see `Region::stmt`).
+fn resume_else(stmts: &mut [Stmt], bailed: LocalId, leave: Vec<Stmt>) {
+    let mut leave = Some(leave);
+    fn find(stmts: &mut [Stmt], b: LocalId, leave: &mut Option<Vec<Stmt>>) {
+        for s in stmts.iter_mut().rev() {
+            match s {
+                Stmt::If(Expr { kind: ExprKind::Local(l), .. }, _, els) if *l == b => {
+                    *els = leave.take().expect("one resume");
+                    return;
+                }
+                Stmt::Block(x) => find(x, b, leave),
+                _ => {}
+            }
+            if leave.is_none() {
+                return;
+            }
+        }
+    }
+    find(stmts, bailed, &mut leave);
+    assert!(leave.is_none(), "the resume of a loop that reads elements");
 }
 
 fn f64(kind: ExprKind) -> Expr {
@@ -428,6 +536,78 @@ impl Region {
         out
     }
 
+    /// The statements that leave the region in the middle of its loop, for
+    /// the original loop to go on: every JS-valued local assigned, and the
+    /// fields written so far, get their values.
+    fn leave_all(&mut self) -> Vec<Stmt> {
+        let mut out = Vec::new();
+        let dead = self.elem_loop.as_ref().map(|el| el.iteration.clone()).unwrap_or_default();
+        for l in self.assigned.clone() {
+            // (The loop's iteration locals are declared again first.)
+            if dead.contains(&l) {
+                continue;
+            }
+            let v = if self.undef.contains(&l) {
+                Expr::new(Ty::Any, ExprKind::Undefined)
+            } else {
+                let c = self.valid(l);
+                Expr::new(Ty::Any, ExprKind::Box(bx(f64(ExprKind::Local(c)))))
+            };
+            out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(l, bx(v)))));
+        }
+        for &(obj, slot, c) in &self.fields {
+            if let Some((c, arith)) = c {
+                let value = bx(f64(ExprKind::Local(c)));
+                out.push(Stmt::Expr(f64(ExprKind::SlotStore { obj, slot, value, arith })));
+            }
+        }
+        out
+    }
+
+    /// Whether `o` names an object read from an array in the region's loop
+    /// (or one such an object's field holds): guarded in each iteration.
+    fn is_elem(&self, o: LocalId) -> bool {
+        self.elems.iter().any(|e| e.0 == o) || self.elem_derived.iter().any(|d| d.0 == o)
+    }
+
+    /// Whether `l` can be the array of the region's element reads: a
+    /// JS-valued local the loop does not assign, used for nothing else.
+    fn array_local(&self, l: LocalId, cx: &Cx) -> bool {
+        cx.f.locals[l] == Ty::Any
+            && !cx.f.boxed[l]
+            && !self.copies.contains_key(&l)
+            && !self.strs.contains(&l)
+            && !self.is_obj(l)
+            && !self.undef.contains(&l)
+            && !self.assigned.contains(&l)
+            && self.elem_loop.as_ref().is_none_or(|el| !el.assigned.contains(&l))
+    }
+
+    /// The local naming element `arr[idx]` of an iteration of the region's
+    /// loop (in its body, outside inner loops), as an object of `record`
+    /// (`None`: only checks that the read can be one).
+    fn elem(&mut self, arr: &Expr, idx: &Expr, record: Option<usize>, cx: &mut Cx) -> Option<Option<LocalId>> {
+        let (&ExprKind::Local(a), &ExprKind::Local(i)) = (&arr.kind, &idx.kind) else { return None };
+        let el = self.elem_loop.as_ref()?;
+        if !el.in_body || self.depth != 1 {
+            return None;
+        }
+        let index = matches!(cx.f.locals[i], Ty::F64 | Ty::I32) && !cx.f.boxed[i] && !el.assigned.contains(&i);
+        if !index || !(self.arrays.contains(&a) || self.array_local(a, cx)) {
+            return None;
+        }
+        if !self.arrays.contains(&a) {
+            self.arrays.push(a);
+        }
+        let Some(record) = record else { return Some(None) };
+        if let Some(e) = self.elems.iter().find(|e| e.1 == a && e.2 == i) {
+            return (e.3 == record).then_some(Some(e.0));
+        }
+        let o = cx.new_local();
+        self.elems.push((o, a, i, record));
+        Some(Some(o))
+    }
+
     /// The copy of JS-valued local `l`, holding its value here: if it may
     /// not be assigned yet, the guard loads it.
     fn valid(&mut self, l: LocalId) -> LocalId {
@@ -450,7 +630,10 @@ impl Region {
                 }
                 let c = self.cond(c, cx)?;
                 let before = (self.defined.clone(), self.returned, self.consts.clone(), self.undef.clone());
-                let a = self.stmts(a, cx)?;
+                self.branches += 1;
+                let a = self.stmts(a, cx);
+                self.branches -= 1;
+                let a = a?;
                 let after_a = (
                     std::mem::replace(&mut self.defined, before.0.clone()),
                     self.returned,
@@ -458,7 +641,10 @@ impl Region {
                     std::mem::replace(&mut self.undef, before.3.clone()),
                 );
                 self.returned = before.1;
-                let b = self.stmts(b, cx)?;
+                self.branches += 1;
+                let b = self.stmts(b, cx);
+                self.branches -= 1;
+                let b = b?;
                 match (after_a.1, self.returned) {
                     (true, true) => {}
                     (true, false) => {}
@@ -482,6 +668,27 @@ impl Region {
                 let fresh = cx.next_loop;
                 cx.next_loop += 1;
                 self.loops.insert(*id, fresh);
+                // The region's only statement may read objects from arrays
+                // in its iterations.
+                let top = self.depth == 0
+                    && self.branches == 0
+                    && self.inline == 0
+                    && self.may_elems
+                    && self.elem_loop.is_none()
+                    && self.bailed.is_none();
+                if top {
+                    let mut assigned = HashSet::new();
+                    visit_stmts(body, &mut |e| {
+                        if let ExprKind::SetLocal(l, _) | ExprKind::InitLocal(l, _) | ExprKind::Update { local: l, .. } =
+                            e.kind
+                        {
+                            assigned.insert(l);
+                        }
+                    });
+                    let iteration = iteration_locals(body, &cx.uses, |_| true).into_iter().collect();
+                    self.elem_loop = Some(ElemLoop { assigned, in_body: false, iteration });
+                }
+                self.depth += 1;
                 // (What the loop assigns is not sure after it.)
                 let defined = self.defined.clone();
                 let undef = self.undef.clone();
@@ -490,18 +697,47 @@ impl Region {
                     Some(t) => Some(self.cond(t, cx)?),
                     None => None,
                 };
-                let body = self.stmts(body, cx)?;
+                if let Some(el) = self.elem_loop.as_mut().filter(|_| top) {
+                    el.in_body = true;
+                }
+                let mut body = self.stmts(body, cx)?;
+                if let Some(el) = self.elem_loop.as_mut().filter(|_| top) {
+                    el.in_body = false;
+                }
                 self.returned = false;
                 let update = match update {
                     Some(u) => Some(self.effect(u, cx)?),
                     None => None,
                 };
+                self.depth -= 1;
                 self.defined = defined;
                 self.consts.clear();
                 if self.undef != undef {
                     return None;
                 }
-                Some(Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() })
+                if top && !self.elems.is_empty() {
+                    // (The iteration runs in the guard's `then` branch.)
+                    let rest = std::mem::take(&mut body);
+                    body.push(self.elem_guard(fresh, rest, cx));
+                }
+                if top {
+                    self.elem_loop = None;
+                }
+                let copy = Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() };
+                match self.bailed.filter(|_| top) {
+                    // Where an iteration's objects are not what the region
+                    // needs, the original loop goes on from it (`leave` is
+                    // added to the other branch: see `flush`).
+                    Some(b) => {
+                        self.closed = true;
+                        Some(Stmt::Block(vec![
+                            Stmt::Expr(bool(ExprKind::InitLocal(b, bx(bool(ExprKind::Bool(false)))))),
+                            copy,
+                            Stmt::If(bool(ExprKind::Local(b)), vec![s.clone()], Vec::new()),
+                        ]))
+                    }
+                    None => Some(copy),
+                }
             }
             Stmt::Break(id) | Stmt::Continue(id) => {
                 let out = match self.loops.get(id) {
@@ -519,6 +755,13 @@ impl Region {
                 self.returned = true;
                 Some(out)
             }
+            // A `return` of a method body running inline: the call's value.
+            Stmt::Return(Some(e)) if self.inline > 0 => {
+                let v = self.num(e, cx).filter(|v| v.ty == Ty::F64)?;
+                self.returned = true;
+                Some(Stmt::Return(Some(v)))
+            }
+            Stmt::Return(_) if self.inline > 0 => None,
             Stmt::Return(e) => {
                 let ret = self.ret?;
                 let v = match (e, ret) {
@@ -541,12 +784,46 @@ impl Region {
         }
     }
 
+    /// The check that starts each iteration of loop `copy` (in the copy),
+    /// then the `iteration`: its elements are what the region needs, else
+    /// it leaves (the original loop goes on from this iteration).
+    fn elem_guard(&mut self, copy: LoopId, iteration: Vec<Stmt>, cx: &mut Cx) -> Stmt {
+        let bailed = cx.new_bool_local();
+        self.bailed = Some(bailed);
+        // Elements are read and written in place: they must not be objects
+        // whose fields the region keeps in locals, nor (if they are
+        // written) read as floats.
+        let writes = self.elem_writes;
+        let mut distinct: Vec<LocalId> = Vec::new();
+        let entry = self.objs.iter().map(|o| o.0).chain(self.derived.iter().map(|d| d.0));
+        for o in entry {
+            let cached = self.fields.iter().any(|f| f.0 == o && f.2.is_some());
+            if (writes || cached) && !distinct.contains(&o) {
+                distinct.push(o);
+            }
+        }
+        let mut leave = self.leave_all();
+        leave.push(Stmt::Expr(bool(ExprKind::SetLocal(bailed, bx(bool(ExprKind::Bool(true)))))));
+        leave.push(Stmt::Break(copy));
+        let guard = bool(ExprKind::ElemGuard {
+            elems: self.elems.clone(),
+            derived: self.elem_derived.clone(),
+            fields: self.elem_fields.clone(),
+            distinct,
+        });
+        Stmt::If(guard, iteration, leave)
+    }
+
     /// The copies of statements (those after a jump, unreachable, left out).
     fn stmts(&mut self, list: &[Stmt], cx: &mut Cx) -> Option<Vec<Stmt>> {
         let mut out = Vec::new();
         for s in list {
             if self.returned {
                 break;
+            }
+            // (A loop that reads elements is the region's last statement.)
+            if self.closed {
+                return None;
             }
             out.push(self.stmt(s, cx)?);
         }
@@ -563,6 +840,20 @@ impl Region {
             let ty = out.last().map_or(Ty::F64, |x| x.ty);
             return Some(Expr::new(ty, ExprKind::Seq(out)));
         }
+        // `const o = arr[i]` in the loop: `o` names the element.
+        if let ExprKind::InitLocal(l, x) = &e.kind
+            && let ExprKind::GetElem(a, i) = &x.kind
+            && cx.f.locals[*l] == Ty::Any
+            && !cx.f.boxed[*l]
+            && !self.is_obj(*l)
+            && !self.copies.contains_key(l)
+            && !self.strs.contains(l)
+            && !self.arrays.contains(l)
+        {
+            self.elem(a, i, None, cx)?;
+            self.aliases.insert(*l, ((**x).clone(), self.receivers.clone()));
+            return Some(Expr::num(0.0));
+        }
         let saved = self.clone();
         let n = cx.f.locals.len();
         if let Some(x) = self.num(e, cx) {
@@ -574,7 +865,11 @@ impl Region {
         match &e.kind {
             // `undefined` in a JS-valued local (a scalar-replaced object's).
             SetLocal(l, x) | InitLocal(l, x)
-                if !cx.f.boxed[*l] && cx.f.locals[*l] == Ty::Any && !self.is_obj(*l) && !self.strs.contains(l) =>
+                if !cx.f.boxed[*l]
+                    && cx.f.locals[*l] == Ty::Any
+                    && !self.is_obj(*l)
+                    && !self.strs.contains(l)
+                    && !self.arrays.contains(l) =>
             {
                 let v = self.void(x, cx)?;
                 if !self.assigned.contains(l) {
@@ -694,12 +989,23 @@ impl Region {
             return None;
         }
         let o = self.obj(recv, record, cx)?;
-        let k = (Some(o), class, *method, *func);
+        // (An element's prototype is its shape's: the guard checks that
+        // shape's.)
+        let k = if self.is_elem(o) {
+            if !self.protos.contains(&(record, class)) {
+                self.protos.push((record, class));
+            }
+            (None, class, *method, *func)
+        } else {
+            (Some(o), class, *method, *func)
+        };
         if !self.methods.contains(&k) {
             self.methods.push(k);
         }
-        let (exprs, v) = inline_parts(body)?;
-        let exprs = self.bind_objects(body, exprs, cx)?;
+        let parts = inline_parts(body);
+        if parts.is_none() && !num {
+            return None;
+        }
         let mut out = Vec::new();
         // Parameters: those used as objects name their argument; the
         // others get its value.
@@ -737,7 +1043,18 @@ impl Region {
             }
         }
         self.receivers.push(o);
+        let Some((exprs, v)) = parts else {
+            // A body with statements (an early `return`): its copy runs
+            // inline, its `return`s giving the value.
+            let stmts = self.inline_stmts(body, cx);
+            self.receivers.pop();
+            let mut stmts = stmts?;
+            let mut all: Vec<Stmt> = out.into_iter().map(Stmt::Expr).collect();
+            all.append(&mut stmts);
+            return Some(Expr::new(Ty::F64, Inline { body: all, locals: Vec::new() }));
+        };
         let body = (|| {
+            let exprs = self.bind_objects(body, exprs, cx)?;
             for x in exprs {
                 out.push(self.effect(x, cx)?);
             }
@@ -748,6 +1065,47 @@ impl Region {
         body?;
         let ty = if num { out.last().map_or(Ty::F64, |x| x.ty) } else { Ty::F64 };
         Some(Expr::new(ty, Seq(out)))
+    }
+
+    /// The copy of a method body with statements, run inline: the locals
+    /// it declares as objects name their initializers (as `bind_objects`
+    /// does), and its `return`s give numbers.
+    fn inline_stmts(&mut self, body: &[Stmt], cx: &mut Cx) -> Option<Vec<Stmt>> {
+        fn flat<'a>(b: &'a [Stmt], out: &mut Vec<&'a Stmt>) {
+            for s in b {
+                match s {
+                    Stmt::Block(x) => flat(x, out),
+                    _ => out.push(s),
+                }
+            }
+        }
+        let mut all = Vec::new();
+        flat(body, &mut all);
+        let saved = (self.ret, self.returned);
+        self.inline += 1;
+        let copy = (|| {
+            let mut out = Vec::new();
+            for s in all {
+                if self.returned {
+                    break;
+                }
+                if let Stmt::Expr(Expr { kind: ExprKind::InitLocal(l, init), .. }) = s
+                    && !cx.f.boxed[*l]
+                    && cx.f.locals[*l] == Ty::Any
+                    && matches!(init.kind, ExprKind::This | ExprKind::Local(_) | ExprKind::ShapeGet { .. })
+                    && object_param(body, *l)
+                    && !stmts_assign(body, *l)
+                {
+                    self.aliases.insert(*l, ((**init).clone(), self.receivers.clone()));
+                    continue;
+                }
+                out.push(self.stmt(s, cx)?);
+            }
+            Some(out)
+        })();
+        self.inline -= 1;
+        (self.ret, self.returned) = saved;
+        copy
     }
 
     /// The copy of a call of a leaf function, if its arguments have copies
@@ -800,6 +1158,7 @@ impl Region {
         let ok = cx.f.locals[l] == Ty::Any
             && !cx.f.boxed[l]
             && !self.copies.contains_key(&l)
+            && !self.arrays.contains(&l)
             && !self.objs.iter().any(|&(o, _)| o == l);
         if ok && !self.strs.contains(&l) {
             self.strs.push(l);
@@ -842,29 +1201,39 @@ impl Region {
                     && !cx.f.boxed[o]
                     && !self.copies.contains_key(&o)
                     && !self.strs.contains(&o)
+                    && !self.arrays.contains(&o)
                     && !self.undef.contains(&o);
                 if !ok {
                     return None;
                 }
                 o
             }
+            // An element of an array, in an iteration of the region's loop.
+            ExprKind::GetElem(a, i) => return self.elem(a, i, Some(record), cx)?,
             // An object a guarded object's field holds (the region writes
-            // no such field).
+            // no such field); an element's, guarded in each iteration.
             ExprKind::ShapeGet { obj: of, record: r, slot, .. } if !cx.nums[*r][*slot as usize] => {
                 let of = self.obj(of, *r, cx)?;
-                return match self.derived.iter().find(|d| d.1 == of && d.2 == *slot) {
+                let elem = self.is_elem(of);
+                let list = if elem { &mut self.elem_derived } else { &mut self.derived };
+                return match list.iter().find(|d| d.1 == of && d.2 == *slot) {
                     Some(d) => (d.3 == record).then_some(d.0),
                     None => {
                         let d = cx.new_local();
-                        self.derived.push((d, of, *slot, record));
+                        let list = if elem { &mut self.elem_derived } else { &mut self.derived };
+                        list.push((d, of, *slot, record));
                         Some(d)
                     }
                 };
             }
             _ => return None,
         };
-        if let Some(d) = self.derived.iter().find(|d| d.0 == o) {
+        if let Some(d) = self.derived.iter().chain(&self.elem_derived).find(|d| d.0 == o) {
             return (d.3 == record).then_some(o);
+        }
+        // (`this` of a method run inline on an element.)
+        if let Some(e) = self.elems.iter().find(|e| e.0 == o) {
+            return (e.3 == record).then_some(o);
         }
         if !self.objs.iter().all(|&(p, r)| p != o || r == record) {
             return None;
@@ -879,6 +1248,14 @@ impl Region {
     /// arithmetic or not, if `write`).
     fn field(&mut self, o: LocalId, slot: u32, write: Option<bool>, cx: &mut Cx) -> Option<LocalId> {
         self.accesses += 1;
+        // (An element's fields are read and written in place.)
+        if self.is_elem(o) {
+            if !self.elem_fields.contains(&(o, slot)) {
+                self.elem_fields.push((o, slot));
+            }
+            self.elem_writes |= write.is_some();
+            return None;
+        }
         let i = match self.fields.iter().position(|f| f.0 == o && f.1 == slot) {
             Some(i) => i,
             None => {
@@ -968,7 +1345,9 @@ impl Region {
             Num(_) => e.clone(),
             Local(l) if !cx.f.boxed[*l] => match cx.f.locals[*l] {
                 Ty::F64 | Ty::I32 => e.clone(),
-                Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) => {
+                Ty::Any
+                    if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) && !self.arrays.contains(l) =>
+                {
                     f64(Local(self.copy(*l, true, cx)))
                 }
                 _ => return None,
@@ -1055,6 +1434,15 @@ impl Region {
                 let s = self.string(s, cx)?;
                 f64(StrLen { s })
             }
+            // An array's (guarded as a dense fast array).
+            &Length(ref a, _) if matches!(a.kind, Local(l) if self.arrays.contains(&l) || self.array_local(l, cx)) => {
+                let Local(arr) = a.kind else { unreachable!() };
+                if !self.arrays.contains(&arr) {
+                    self.arrays.push(arr);
+                }
+                self.accesses += 1;
+                f64(ArrLen { arr })
+            }
             ShapeGet { obj, record, slot, .. } if cx.nums[*record][*slot as usize] => {
                 let o = self.obj(obj, *record, cx)?;
                 match self.field(o, *slot, None, cx) {
@@ -1066,8 +1454,11 @@ impl Region {
                 let o = self.obj(obj, *record, cx)?;
                 let v = self.num(value, cx)?;
                 let arith = matches!(v.kind, Binary(..) | Unary(..));
-                let c = self.field(o, *slot, Some(arith), cx).expect("written field");
-                f64(SetLocal(c, bx(v)))
+                match self.field(o, *slot, Some(arith), cx) {
+                    Some(c) => f64(SetLocal(c, bx(v))),
+                    // An element's: in place.
+                    None => f64(SlotStore { obj: o, slot: *slot, value: bx(v), arith }),
+                }
             }
             SetLocal(l, x) | InitLocal(l, x) if !cx.f.boxed[*l] => {
                 let init = matches!(e.kind, InitLocal(..));
@@ -1076,7 +1467,7 @@ impl Region {
                         let v = bx(self.num(x, cx)?);
                         f64(if init { InitLocal(*l, v) } else { SetLocal(*l, v) })
                     }
-                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) => {
+                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.arrays.contains(l) => {
                         let v = self.num(x, cx)?;
                         let c = self.copy(*l, false, cx);
                         if !self.assigned.contains(l) {
@@ -1137,14 +1528,25 @@ fn stmts_assign(stmts: &[Stmt], l: LocalId) -> bool {
 /// Whether parameter `p` is used as an object in `body` (whose fields are
 /// read, or whose methods are called).
 fn object_param(body: &[Stmt], p: LocalId) -> bool {
+    object_use(body, p, 4)
+}
+
+/// `object_param` through up to `depth` locals that `p` initializes (the
+/// parameters of the methods run inline that it is passed to).
+fn object_use(body: &[Stmt], p: LocalId, depth: usize) -> bool {
     let is_p = |x: &Expr| matches!(x.kind, ExprKind::Local(l) if l == p);
     let mut found = false;
+    let mut passed = Vec::new();
     visit_stmts(body, &mut |e| {
         found |= match &e.kind {
             ExprKind::ShapeGet { obj, .. } | ExprKind::ShapeSet { obj, .. } => is_p(obj),
             ExprKind::CallMethod(o, ..) | ExprKind::GetProp(o, _) => is_p(o),
+            ExprKind::InitLocal(m, x) if is_p(x) && *m != p => {
+                passed.push(*m);
+                false
+            }
             _ => false,
         }
     });
-    found
+    found || (depth > 0 && passed.into_iter().any(|m| object_use(body, m, depth - 1)))
 }

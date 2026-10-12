@@ -412,8 +412,25 @@ The differential tests run every case with both.
   class's and still has the method, and that the class binding is
   initialized), and the vectors such methods return (scalar-replaced, see
   below) keep their fields in float locals, so `origin.sub(this.center)
-  .dot(dir)` is float code throughout. A run that stores no field needs
-  enough arithmetic (or a loop) to be worth its guard.
+  .dot(dir)` is float code throughout (a method body with an early
+  `return` runs inline too). A run that stores no field needs enough
+  arithmetic (or a loop) to be worth its guard. Untyped locals that hold
+  int32s are converted once and do not keep the fields' float code from
+  running.
+  A loop over the objects of an array (`for (let j = i + 1; j < n; j++) {
+  const bj = bodies[j]; ... }`, `spheres[i].center.dot(dir)`) can be a
+  region as a whole: the guard checks once what the iterations share (the
+  array is a dense fast array, so `arr.length` is its element count and
+  stays so; the other objects; the methods), and each iteration starts by
+  checking its element: its shape, that the fields the loop uses hold
+  numbers, the objects its fields hold, and that it is none of the
+  objects whose fields the region keeps in registers. Elements' fields are
+  read and written in place: an iteration has two copies, one where they
+  all hold floats (read as doubles, their tags left in place) and one
+  where some hold int32s. Where an element is not what
+  the region needs (another shape, a string field, a hole, the same object
+  as another), the region stores what it changed and the original loop
+  goes on from that iteration.
 - **Builtins**: method calls on strings read `String.prototype`'s methods
   through their inline caches; `s.charCodeAt(i)` runs inline,
   `arr.push(x)` appends inline to an extensible fast array of a fresh

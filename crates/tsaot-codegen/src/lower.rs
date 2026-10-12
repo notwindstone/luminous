@@ -327,6 +327,11 @@ pub(crate) struct Lower {
     /// In a speculative region's float code: the fields that keep their
     /// float tag (only float results stored), whose tag a store leaves.
     spec_float_slots: HashSet<(ir::LocalId, u32)>,
+    /// The objects of a region's iterations (`ElemGuard`), and whether the
+    /// iteration being lowered is the copy where their fields hold floats
+    /// (else int32s too: read and written with their tags).
+    spec_elems: HashSet<ir::LocalId>,
+    spec_elem_floats: bool,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
     /// Inlined calls being lowered (innermost last): where their `return`s
@@ -472,6 +477,8 @@ impl Lower {
             spec_src: HashMap::new(),
             spec_floats: false,
             spec_float_slots: HashSet::new(),
+            spec_elems: HashSet::new(),
+            spec_elem_floats: false,
             loops: HashMap::new(),
             inline_rets: Vec::new(),
             pred: None,
@@ -1004,7 +1011,20 @@ impl Lower {
             Stmt::Block(b) => self.stmts(b),
             Stmt::If(
                 Expr {
-                    kind: ExprKind::SpecGuard { objs, distinct, fields, nums, strs, char_code_at, derived, methods, cells },
+                    kind:
+                        ExprKind::SpecGuard {
+                            objs,
+                            distinct,
+                            fields,
+                            nums,
+                            strs,
+                            char_code_at,
+                            derived,
+                            methods,
+                            cells,
+                            arrays,
+                            protos,
+                        },
                     ..
                 },
                 fast,
@@ -1020,8 +1040,13 @@ impl Lower {
                     derived,
                     methods,
                     cells,
+                    arrays,
+                    protos,
                 };
                 self.spec_region(&guard, fast, slow)
+            }
+            Stmt::If(Expr { kind: ExprKind::ElemGuard { elems, derived, fields, distinct }, .. }, then, bail) => {
+                self.elem_guard(elems, derived, fields, distinct, then, bail)
             }
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
@@ -2619,7 +2644,12 @@ impl Lower {
                 self.drop_operand(o, owned);
                 v
             }
-            ExprKind::SpecGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::SpecGuard { .. } | ExprKind::ElemGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::ArrLen { arr } => {
+                let (p, _) = self.use_local(*arr).any();
+                let n = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
+                V::Num(self.b.ins().fcvt_from_sint(F64, n))
+            }
             ExprKind::StrLen { s } => {
                 let (p, _) = self.use_local(*s).any();
                 let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
@@ -2634,7 +2664,8 @@ impl Lower {
             ExprKind::SlotLoad { obj, slot } => {
                 let props = self.spec_src[obj];
                 let off = (*slot as usize * SIZE) as i32;
-                if self.spec_floats {
+                let floats = if self.spec_elems.contains(obj) { self.spec_elem_floats } else { self.spec_floats };
+                if floats {
                     V::Num(self.b.ins().load(F64, M_SLOT, props, off))
                 } else {
                     let p = self.b.ins().load(I64, M_SLOT, props, off);
@@ -2649,10 +2680,15 @@ impl Lower {
                 // A number replaces a number: nothing to free. Where only
                 // floats were read, the result is a float, as the
                 // interpreter's float arithmetic makes it.
-                let (vp, vt) = if self.spec_floats && *arith { self.box_float(d) } else { self.box_number(d) };
+                let elem = self.spec_elems.contains(obj);
+                let floats = self.spec_floats && *arith && (!elem || self.spec_elem_floats);
+                let (vp, vt) = if floats { self.box_float(d) } else { self.box_number(d) };
                 let off = (*slot as usize * SIZE) as i32;
                 self.b.ins().store(M_SLOT, vp, props, off);
-                if !(self.spec_floats && *arith && self.spec_float_slots.contains(&(*obj, *slot))) {
+                // (A float replacing a float keeps its tag: an element's
+                // where its fields hold floats.)
+                let kept = if elem { self.spec_elem_floats } else { self.spec_float_slots.contains(&(*obj, *slot)) };
+                if !(floats && kept) {
                     self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
                 }
                 V::Num(d)
@@ -4281,6 +4317,39 @@ impl Lower {
         }
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs = Vec::new();
+        // Arrays whose elements the region's loop reads: dense fast arrays
+        // (no code runs in the region: they stay so).
+        for &a in g.arrays {
+            let (p, t) = self.use_local(a).any();
+            let yes = self.b.ins().iconst(I8, 1);
+            let count = self.array_part(p, t, yes, slow_b);
+            let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
+            let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
+            let len = self.b.ins().uload32(M_SLOT, prop, 0);
+            let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
+            let dense = self.b.ins().icmp(IntCC::Equal, len, count);
+            let ok = self.b.ins().band(is_int, dense);
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
+        // Records whose objects (elements) have a class's prototype: their
+        // shape's (once known; until then no element has it).
+        for &(r, class) in g.protos {
+            let want = self.b.ins().load(I64, M_IC, table, (r * 8) as i32);
+            let known = self.b.ins().icmp_imm_s(IntCC::NotEqual, want, 0);
+            let check = self.b.create_block();
+            let next = self.b.create_block();
+            self.b.ins().brif(known, check, &[], next, &[]);
+            self.b.switch_to_block(check);
+            let proto = self.b.ins().load(I64, M_HEADER, want, layout::SHAPE_PROTO);
+            let (hp, ht) = self.table_value(self.env.homes, 2 * class);
+            let same = self.b.ins().icmp(IntCC::Equal, proto, hp);
+            let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ht, TAG_OBJECT);
+            let ok = self.b.ins().band(same, is_obj);
+            self.b.ins().brif(ok, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
         // Class bindings read by the region (whose TDZ checks it skips).
         for &k in g.cells {
             let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
@@ -4341,15 +4410,27 @@ impl Lower {
             l.b.ins().load(I64, flags, props_of(o), (slot as usize * SIZE) as i32 + TAG_OFFSET)
         };
         let locals: Vec<(Value, Value)> = nums.iter().map(|&(from, _)| self.use_local(from).any()).collect();
-        // Floats are tagged FLOAT64: each tag compared on its own (the
-        // tags are not kept for the int code, which reads them again).
+        // The locals hold numbers (int32s or floats: no tag with another
+        // bit set), converted once.
+        if !locals.is_empty() {
+            let mut any = self.b.ins().iconst(I64, 0);
+            for &(_, t) in &locals {
+                any = self.b.ins().bor(any, t);
+            }
+            let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
+            let numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+            let next = self.b.create_block();
+            self.b.ins().brif(numbers, next, &[], slow_b, &[]);
+            self.b.switch_to_block(next);
+        }
+        let values: Vec<Value> = locals.iter().map(|&(p, t)| self.number_tagged(p, t)).collect();
+        // Fields holding floats are tagged FLOAT64: each tag compared on its
+        // own (the tags are not kept for the int code, which reads them
+        // again).
         let floats = self.b.create_block();
         let check = self.b.create_block();
-        for k in 0..fields.len() + locals.len() {
-            let t = match fields.get(k) {
-                Some(&f) => tag(self, f, M_SLOT.volatile()),
-                None => locals[k - fields.len()].1,
-            };
+        for &f in fields {
+            let t = tag(self, f, M_SLOT.volatile());
             let is_float = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
             let next = self.b.create_block();
             self.b.ins().brif(is_float, next, &[], check, &[]);
@@ -4361,8 +4442,7 @@ impl Lower {
         }
 
         self.b.switch_to_block(floats);
-        for (&(_, to), &(p, _)) in nums.iter().zip(&locals) {
-            let d = self.b.ins().bitcast(F64, p);
+        for (&(_, to), &d) in nums.iter().zip(&values) {
             self.def_local(to, V::Num(d));
         }
         // A field stays a float unless the region stores something else
@@ -4386,7 +4466,7 @@ impl Lower {
         self.b.switch_to_block(check);
         let tags: Vec<Value> = fields.iter().map(|&f| tag(self, f, M_SLOT)).collect();
         let mut any = self.b.ins().iconst(I64, 0);
-        for &t in tags.iter().chain(locals.iter().map(|x| &x.1)) {
+        for &t in &tags {
             any = self.b.ins().bor(any, t);
         }
         let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
@@ -4394,8 +4474,7 @@ impl Lower {
         let mixed = self.b.create_block();
         self.b.ins().brif(numbers, mixed, &[], slow_b, &[]);
         self.b.switch_to_block(mixed);
-        for (&(_, to), &(p, t)) in nums.iter().zip(&locals) {
-            let d = self.number_tagged(p, t);
+        for (&(_, to), &d) in nums.iter().zip(&values) {
             self.def_local(to, V::Num(d));
         }
         self.spec_floats = false;
@@ -4406,6 +4485,122 @@ impl Lower {
 
         self.b.switch_to_block(slow_b);
         self.stmts(slow);
+        if !self.is_filled() {
+            self.b.ins().jump(join, &[]);
+        }
+        self.b.switch_to_block(join);
+    }
+
+    /// The check that starts an iteration of a region's loop (see
+    /// `ExprKind::ElemGuard`), then `then`; where it fails, `bail` (which
+    /// leaves the loop).
+    fn elem_guard(
+        &mut self,
+        elems: &[(ir::LocalId, ir::LocalId, ir::LocalId, usize)],
+        derived: &[(ir::LocalId, ir::LocalId, u32, usize)],
+        fields: &[(ir::LocalId, u32)],
+        distinct: &[ir::LocalId],
+        then: &[Stmt],
+        bail: &[Stmt],
+    ) {
+        let fail = self.b.create_block();
+        self.b.set_cold_block(fail);
+        let join = self.b.create_block();
+        let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
+        let mut ptrs: Vec<(ir::LocalId, Value)> = Vec::new();
+        for &(o, arr, idx, record) in elems {
+            let (ap, _) = self.use_local(arr).any();
+            let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
+            // An integer index below the count.
+            let (i, exact) = match self.use_local(idx) {
+                V::Num(d) => match self.int_of.get(&d) {
+                    Some(&i) => (i, None),
+                    None => {
+                        let i = self.b.ins().fcvt_to_sint_sat(I64, d);
+                        let back = self.b.ins().fcvt_from_sint(F64, i);
+                        (i, Some(self.b.ins().fcmp(FloatCC::Equal, back, d)))
+                    }
+                },
+                V::Int(i) => (i, None),
+                other => unreachable!("index {other:?}"),
+            };
+            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, i, count);
+            let ok = match exact {
+                Some(e) => self.b.ins().band(inside, e),
+                None => inside,
+            };
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, next, &[], fail, &[]);
+            self.b.switch_to_block(next);
+            let at = self.array_slot(ap, i);
+            let p = self.b.ins().load(I64, M_SLOT, at, 0);
+            let t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+            let props = self.guard_record((p, t), record, table, fail);
+            ptrs.push((o, props));
+        }
+        for &(o, of, slot, r) in derived {
+            let props = ptrs.iter().find(|x| x.0 == of).expect("guarded holder").1;
+            let off = (slot as usize * SIZE) as i32;
+            let p = self.b.ins().load(I64, M_SLOT, props, off);
+            let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
+            let props = self.guard_record((p, t), r, table, fail);
+            ptrs.push((o, props));
+        }
+        // Their fields hold numbers: floats (all tags FLOAT64), or int32s
+        // (INT, 0) too (no tag with another bit set).
+        let mut floats = self.b.ins().iconst(I8, 1);
+        let mut numbers = self.b.ins().iconst(I8, 1);
+        if !fields.is_empty() {
+            let mut any = self.b.ins().iconst(I64, 0);
+            let mut not8 = self.b.ins().iconst(I64, 0);
+            for &(o, slot) in fields {
+                let props = ptrs.iter().find(|x| x.0 == o).expect("guarded element").1;
+                let t = self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32 + TAG_OFFSET);
+                any = self.b.ins().bor(any, t);
+                let x = self.b.ins().bxor_imm_u(t, TAG_FLOAT64);
+                not8 = self.b.ins().bor(not8, x);
+            }
+            let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
+            numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+            floats = self.b.ins().icmp_imm_s(IntCC::Equal, not8, 0);
+        }
+        // Not the region's other objects (compared by property arrays, which
+        // objects do not share).
+        if !distinct.is_empty() {
+            let mut same = self.b.ins().iconst(I8, 0);
+            for &(_, props) in &ptrs {
+                for d in distinct {
+                    let eq = self.b.ins().icmp(IntCC::Equal, props, self.spec_src[d]);
+                    same = self.b.ins().bor(same, eq);
+                }
+            }
+            let next = self.b.create_block();
+            self.b.ins().brif(same, fail, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
+        for (o, props) in ptrs {
+            self.spec_src.insert(o, props);
+            self.spec_elems.insert(o);
+        }
+        // The iteration where the fields hold floats, else where some hold
+        // int32s.
+        let float_b = self.b.create_block();
+        let check = self.b.create_block();
+        let mixed_b = self.b.create_block();
+        self.b.ins().brif(floats, float_b, &[], check, &[]);
+        self.b.switch_to_block(check);
+        self.b.ins().brif(numbers, mixed_b, &[], fail, &[]);
+        for (block, f) in [(float_b, true), (mixed_b, false)] {
+            self.b.switch_to_block(block);
+            self.spec_elem_floats = f;
+            self.stmts(then);
+            if !self.is_filled() {
+                self.b.ins().jump(join, &[]);
+            }
+        }
+        self.spec_elem_floats = false;
+        self.b.switch_to_block(fail);
+        self.stmts(bail);
         if !self.is_filled() {
             self.b.ins().jump(join, &[]);
         }
@@ -7895,6 +8090,8 @@ pub(crate) struct Pred {
 
 /// The parts of a speculative region's guard (`ExprKind::SpecGuard`).
 struct SpecGuard<'a> {
+    arrays: &'a [ir::LocalId],
+    protos: &'a [(usize, usize)],
     objs: &'a [(ir::LocalId, usize)],
     distinct: bool,
     fields: &'a [(ir::LocalId, u32)],

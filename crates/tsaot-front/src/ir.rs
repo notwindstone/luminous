@@ -674,6 +674,36 @@ pub enum ExprKind {
         methods: Vec<(Option<LocalId>, usize, AtomId, usize)>,
         /// Cells (class bindings) that must be initialized.
         cells: Vec<CellId>,
+        /// Locals that must hold dense fast arrays (`Array`s whose
+        /// `length` is their element count), whose elements the region's
+        /// loop reads (`ElemGuard`).
+        arrays: Vec<LocalId>,
+        /// `(record, class)`: once its shape is known, `record`'s objects
+        /// have `class`'s prototype (elements whose methods run inline).
+        protos: Vec<(usize, usize)>,
+    },
+    /// In a speculative region's loop, around each iteration: whether the
+    /// objects the iteration reads from arrays hold what the region needs
+    /// (only as the condition of its `Stmt::If`, whose `then` branch is the
+    /// iteration and whose other branch leaves the region: see `spec`). `elems`: `(obj, arr, idx, record)`, element
+    /// `idx` (an `F64` or `I32` local) of the array in local `arr` (one of
+    /// the guard's `arrays`) is an object of `record`'s shape, named `obj`
+    /// in the region (the array holds it); `derived`: objects their fields
+    /// hold, as `SpecGuard`'s; `fields`: their fields that hold numbers
+    /// (int32s or floats), read and written in place (`SlotLoad`,
+    /// `SlotStore`); `distinct`: the objects each of them must not be (the
+    /// region's, whose fields it keeps in locals, or reads as floats
+    /// where elements are written). `Bool`.
+    ElemGuard {
+        elems: Vec<(LocalId, LocalId, LocalId, usize)>,
+        derived: Vec<(LocalId, LocalId, u32, usize)>,
+        fields: Vec<(LocalId, u32)>,
+        distinct: Vec<LocalId>,
+    },
+    /// In a speculative region: the length of the dense fast array in local
+    /// `arr` (a guard's `arrays`). `F64`.
+    ArrLen {
+        arr: LocalId,
     },
     /// In a speculative region: `s.charCodeAt(idx)` for the flat string in
     /// local `s` (the builtin, checked by the guard), `idx` a number. `F64`.
@@ -1032,6 +1062,8 @@ macro_rules! visitor {
                 | SuperGetAtom(..)
                 | ProtoMethodIs { .. }
                 | SpecGuard { .. }
+                | ElemGuard { .. }
+                | ArrLen { .. }
                 | SlotLoad { .. }
                 | StrLen { .. }
                 | Closure(..) => {}
@@ -1405,6 +1437,7 @@ fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | Update { local: l, .. }
         | StrCharCode { s: l, .. }
         | StrLen { s: l }
+        | ArrLen { arr: l }
         | SlotLoad { obj: l, .. }
         | SlotStore { obj: l, .. } => f(*l),
         IterOpen(_, a, b, _) | IterClose(a, b) => {
@@ -1420,7 +1453,21 @@ fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             locals.iter().for_each(|&l| f(l));
             stmt_locals(body, f);
         }
-        SpecGuard { objs, fields, nums, strs, derived, methods, .. } => {
+        ElemGuard { elems, derived, fields, distinct, .. } => {
+            elems.iter().for_each(|&(o, a, i, _)| {
+                f(o);
+                f(a);
+                f(i);
+            });
+            derived.iter().for_each(|&(l, of, _, _)| {
+                f(l);
+                f(of);
+            });
+            fields.iter().for_each(|&(l, _)| f(l));
+            distinct.iter().for_each(|&l| f(l));
+        }
+        SpecGuard { objs, fields, nums, strs, derived, methods, arrays, .. } => {
+            arrays.iter().for_each(|&l| f(l));
             objs.iter().for_each(|&(l, _)| f(l));
             derived.iter().for_each(|&(l, of, _, _)| {
                 f(l);
