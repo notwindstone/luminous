@@ -420,7 +420,8 @@ impl Codegen {
                     && !g.is_async
                     && !g.is_generator
                 {
-                    let id = module.declare_function(&format!("tsaot_cmp_{func}"), Linkage::Local, &native_signature(g));
+                    let id =
+                        module.declare_function(&format!("tsaot_cmp_{func}"), Linkage::Local, &native_signature(g));
                     sort_cmps.insert(func, id);
                 }
             });
@@ -1268,4 +1269,3 @@ fn rest_arg(
 /// A new reference to `(p, t)`: nothing to do, as `Lower::dup` (the
 /// engine's collector traces references).
 fn dup_inline(_b: &mut FunctionBuilder, _p: Value, _t: Value) {}
-

@@ -676,11 +676,15 @@ pub enum ExprKind {
         cells: Vec<CellId>,
         /// Locals that must hold dense fast arrays (`Array`s whose
         /// `length` is their element count), whose elements the region's
-        /// loop reads (`ElemGuard`).
+        /// loop reads (`ElemGuard`); those of typed array types, typed
+        /// arrays with a pristine shape (`length` the element count).
         arrays: Vec<LocalId>,
         /// `(record, class)`: once its shape is known, `record`'s objects
         /// have `class`'s prototype (elements whose methods run inline).
         protos: Vec<(usize, usize)>,
+        /// Typed arrays the region writes (`RegionTypedSet`): their buffers
+        /// must not be immutable.
+        typed_writes: Vec<LocalId>,
         /// Locals that must hold `Array`s `push` appends to (`RegionPush`):
         /// fast, extensible, with a fresh array's shape and `length` their
         /// element count, `Array.prototype.push` the builtin, and no index
@@ -698,9 +702,15 @@ pub enum ExprKind {
     /// (int32s or floats), read and written in place (`SlotLoad`,
     /// `SlotStore`); `distinct`: the objects each of them must not be (the
     /// region's, whose fields it keeps in locals, or reads as floats
-    /// where elements are written). `Bool`.
+    /// where elements are written); `nums`: `(to, arr, idx)`, element
+    /// `idx` of the array in local `arr` is a number (an int32 or a
+    /// float), loaded into `F64` local `to`; `bounds`: `(arr, idx)`,
+    /// index `idx` is inside the typed array in local `arr` (whose
+    /// elements the iteration reads, `RegionTypedGet`). `Bool`.
     ElemGuard {
         elems: Vec<(LocalId, LocalId, LocalId, usize)>,
+        nums: Vec<(LocalId, LocalId, LocalId)>,
+        bounds: Vec<(LocalId, LocalId)>,
         derived: Vec<(LocalId, LocalId, u32, usize)>,
         fields: Vec<(LocalId, u32)>,
         distinct: Vec<LocalId>,
@@ -709,6 +719,22 @@ pub enum ExprKind {
     /// `arr` (a guard's `arrays`). `F64`.
     ArrLen {
         arr: LocalId,
+    },
+    /// In a speculative region's loop: element `idx` (an index local) of
+    /// the typed array in local `arr`, inside it (the iteration's guard
+    /// checked: `bounds`). `F64`.
+    RegionTypedGet {
+        arr: LocalId,
+        idx: LocalId,
+    },
+    /// In a speculative region: `arr[idx] = value` for the typed array in
+    /// local `arr` (a guard's `typed_writes`), `idx` and `value` numbers:
+    /// nothing where `idx` is not an index inside it. Evaluates to the
+    /// value. `F64`.
+    RegionTypedSet {
+        arr: LocalId,
+        idx: Box<Expr>,
+        value: Box<Expr>,
     },
     /// In a speculative region: `s.charCodeAt(idx)` for the flat string in
     /// local `s` (the builtin, checked by the guard), `idx` a number. `F64`.
@@ -1076,6 +1102,7 @@ macro_rules! visitor {
                 | SpecGuard { .. }
                 | ElemGuard { .. }
                 | ArrLen { .. }
+                | RegionTypedGet { .. }
                 | SlotLoad { .. }
                 | StrLen { .. }
                 | Closure(..) => {}
@@ -1095,6 +1122,10 @@ macro_rules! visitor {
                 }
                 ShapeGet { obj, .. } => $name(obj, f),
                 SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => $name(value, f),
+                RegionTypedSet { idx, value, .. } => {
+                    $name(idx, f);
+                    $name(value, f);
+                }
                 ShapeSet { obj, value, .. } => {
                     $name(obj, f);
                     $name(value, f);
@@ -1451,6 +1482,7 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         | StrLen { s: l }
         | ArrLen { arr: l }
         | RegionPush { arr: l, .. }
+        | RegionTypedSet { arr: l, .. }
         | SlotLoad { obj: l, .. }
         | SlotStore { obj: l, .. } => f(*l),
         IterOpen(_, a, b, _) | IterClose(a, b) => {
@@ -1466,9 +1498,18 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             locals.iter().for_each(|&l| f(l));
             stmt_locals(body, f);
         }
-        ElemGuard { elems, derived, fields, distinct, .. } => {
+        ElemGuard { elems, nums, bounds, derived, fields, distinct } => {
+            bounds.iter().for_each(|&(a, i)| {
+                f(a);
+                f(i);
+            });
             elems.iter().for_each(|&(o, a, i, _)| {
                 f(o);
+                f(a);
+                f(i);
+            });
+            nums.iter().for_each(|&(to, a, i)| {
+                f(to);
                 f(a);
                 f(i);
             });
@@ -1479,8 +1520,13 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             fields.iter().for_each(|&(l, _)| f(l));
             distinct.iter().for_each(|&l| f(l));
         }
-        SpecGuard { objs, fields, nums, strs, derived, methods, arrays, appends, .. } => {
+        RegionTypedGet { arr, idx } => {
+            f(*arr);
+            f(*idx);
+        }
+        SpecGuard { objs, fields, nums, strs, derived, methods, arrays, appends, typed_writes, .. } => {
             arrays.iter().for_each(|&l| f(l));
+            typed_writes.iter().for_each(|&l| f(l));
             appends.iter().for_each(|&l| f(l));
             objs.iter().for_each(|&(l, _)| f(l));
             derived.iter().for_each(|&(l, of, _, _)| {
@@ -2840,16 +2886,21 @@ pub fn fold_new_instances(m: &mut Module) {
                 while j < list.len() {
                     let (o, a, v) = match &list[j] {
                         Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) => (o, a, v),
-                        Stmt::Expr(Expr { kind: ExprKind::ShapeSet { obj, atom, value, .. }, .. }) => (obj, atom, value),
+                        Stmt::Expr(Expr { kind: ExprKind::ShapeSet { obj, atom, value, .. }, .. }) => {
+                            (obj, atom, value)
+                        }
                         _ => break,
                     };
                     let (a, v) = (*a, (**v).clone());
                     if !matches!(o.kind, ExprKind::Local(l) if l == n) || !pure_value(&v, &boxed) {
                         break;
                     }
-                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = &mut list[i] else { unreachable!() };
+                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = &mut list[i] else {
+                        unreachable!()
+                    };
                     let ExprKind::NewInstance { fields, .. } = &mut inst.kind else { unreachable!() };
-                    let Some((_, slot)) = fields.iter_mut().find(|(b, x)| *b == a && matches!(x.kind, ExprKind::Undefined))
+                    let Some((_, slot)) =
+                        fields.iter_mut().find(|(b, x)| *b == a && matches!(x.kind, ExprKind::Undefined))
                     else {
                         break;
                     };
@@ -2926,9 +2977,7 @@ fn callback_plain(f: &Func) -> bool {
 /// Whether a closure (its parameter types, return type, and whether it is
 /// `callback_plain` without captures) can be `JS_SortNative`'s comparator.
 fn comparator_ok((params, ret, plain): &(Vec<Ty>, Ty, bool)) -> bool {
-    *plain
-        && matches!(params.as_slice(), [Ty::Any, Ty::Any] | [Ty::F64, Ty::F64])
-        && matches!(ret, Ty::F64 | Ty::Any)
+    *plain && matches!(params.as_slice(), [Ty::Any, Ty::Any] | [Ty::F64, Ty::F64]) && matches!(ret, Ty::F64 | Ty::Any)
 }
 
 /// Native loops for array callbacks, as JIT compilers inline a builtin's
@@ -2991,7 +3040,8 @@ pub fn inline_callbacks(m: &mut Module) {
             };
             let mut inner = t.body.clone();
             visit_stmts_mut(&mut inner, &mut |x| remap_locals(x, &map));
-            let locals: Vec<LocalId> = (0..t.locals.len()).filter(|l| !t.captures.contains(l)).map(|l| base + l).collect();
+            let locals: Vec<LocalId> =
+                (0..t.locals.len()).filter(|l| !t.captures.contains(l)).map(|l| base + l).collect();
             let func = nfuncs + *cid;
             let ty = e.ty;
             let ExprKind::CallMethod(recv, Key::Atom(method), mut args) =
@@ -3438,7 +3488,10 @@ fn virtual_value(e: Expr, class: usize, slots: &[LocalId], flag: LocalId) -> Exp
                 .zip(slots)
                 .map(|((_, v), &s)| Expr::new(Ty::Any, ExprKind::SetLocal(s, Box::new(v))))
                 .collect();
-            seq.push(Expr::new(Ty::Bool, ExprKind::SetLocal(flag, Box::new(Expr::new(Ty::Bool, ExprKind::Bool(true))))));
+            seq.push(Expr::new(
+                Ty::Bool,
+                ExprKind::SetLocal(flag, Box::new(Expr::new(Ty::Bool, ExprKind::Bool(true)))),
+            ));
             seq.push(Expr::new(Ty::Any, ExprKind::Undefined));
             Expr::new(Ty::Any, ExprKind::Seq(seq))
         }
@@ -3570,7 +3623,9 @@ pub fn virtualize_instances(m: &mut Module) {
                 inits[*l] += 1;
                 fresh[*l] |= fresh_instance(x).is_some();
             }
-            ExprKind::SetLocal(l, _) | ExprKind::Update { local: l, .. } | ExprKind::ArrayPush(l, _) => assigns[*l] += 1,
+            ExprKind::SetLocal(l, _) | ExprKind::Update { local: l, .. } | ExprKind::ArrayPush(l, _) => {
+                assigns[*l] += 1
+            }
             ExprKind::Seq(xs) => {
                 for x in &xs[..xs.len().saturating_sub(1)] {
                     if let ExprKind::InitLocal(l, _) = x.kind {
@@ -3707,7 +3762,10 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
                 let x = std::mem::replace(&mut **x, Expr::new(Ty::Any, ExprKind::Undefined));
                 let mut seq = vec![Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(bool_(false))))];
                 for &s in &slots {
-                    seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(s, Box::new(Expr::new(Ty::Any, ExprKind::Undefined)))));
+                    seq.push(Expr::new(
+                        Ty::Any,
+                        ExprKind::InitLocal(s, Box::new(Expr::new(Ty::Any, ExprKind::Undefined))),
+                    ));
                 }
                 seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(ph, Box::new(virtual_value(x, class, &slots, flag)))));
                 *e = Expr::new(Ty::Any, ExprKind::Seq(seq));
@@ -3720,7 +3778,9 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
                 virtual_uses += 1;
                 // (The object's read, on the object: `ph`.)
                 let mut real = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
-                let (ExprKind::GetProp(o, _) | ExprKind::ShapeGet { obj: o, .. }) = &mut real.kind else { unreachable!() };
+                let (ExprKind::GetProp(o, _) | ExprKind::ShapeGet { obj: o, .. }) = &mut real.kind else {
+                    unreachable!()
+                };
                 **o = local(ph);
                 *e = Expr::new(ty, ExprKind::Cond(Box::new(flag_e()), Box::new(local(slots[i])), Box::new(real)));
             }

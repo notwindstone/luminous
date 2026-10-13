@@ -480,6 +480,17 @@ The differential tests run every case with both.
   the guard). With methods passing their parameters on to other inlined
   methods (`oc.dot(dir)`), the ray tracer's whole sphere loop
   (`spheres[i].hit(origin, dir)`) is one region.
+  A loop's elements may be numbers too: `s += xs[i]` over a `number[]`
+  checks in each iteration that the element is an int32 or a float (else
+  the original loop goes on from it), and reads it as a double. Typed
+  arrays need no such check: with a pristine shape, a typed array's
+  `length` is its element count, the iteration checks that its index is
+  inside the arrays it reads, and reads them in place (so a write earlier
+  in the iteration, through any view of the buffer, is seen); writes check
+  their index and do nothing outside the array, as the engine does, and
+  the guard checks that the buffer is not immutable. A sieve's inner
+  loop, `dot` over two `Float64Array`s and `sum` over a `number[]` run as
+  plain loops over doubles.
   A region may append numbers, or object literals of numbers, to arrays
   in locals (`tokens.push({ kind: 1, start, end: i })`): the guard checks
   that each is an extensible fast array of a fresh array's shape whose

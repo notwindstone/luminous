@@ -274,6 +274,12 @@ struct Region {
     /// fields of those read or written (see `ExprKind::ElemGuard`).
     arrays: Vec<LocalId>,
     elems: Vec<(LocalId, LocalId, LocalId, usize)>,
+    /// Elements its iterations read as numbers: `(local, arr, idx)`; of
+    /// typed arrays, `(arr, idx)` (read in place).
+    elem_nums: Vec<(LocalId, LocalId, LocalId)>,
+    elem_bounds: Vec<(LocalId, LocalId)>,
+    /// Typed arrays it writes.
+    typed_writes: Vec<LocalId>,
     elem_derived: Vec<(LocalId, LocalId, u32, usize)>,
     elem_fields: Vec<(LocalId, u32)>,
     /// Whether an element's field is written.
@@ -468,6 +474,7 @@ impl Cx<'_> {
             methods: r.methods,
             cells: r.cells,
             arrays: r.arrays,
+            typed_writes: r.typed_writes,
             protos: r.protos,
             appends: r.appends,
         };
@@ -614,6 +621,13 @@ impl Region {
             && self.elem_loop.as_ref().is_none_or(|el| !el.assigned.contains(&l))
     }
 
+    /// Whether `l` can be a typed array the region reads (its `length`, the
+    /// elements its loop reads): a local of a typed array type it does not
+    /// assign (it assigns none: see `num`).
+    fn typed_local(&self, l: LocalId, cx: &Cx) -> bool {
+        matches!(cx.f.locals[l], Ty::Arr(_)) && !cx.f.boxed[l]
+    }
+
     /// The local naming element `arr[idx]` of an iteration of the region's
     /// loop (in its body, outside inner loops), as an object of `record`
     /// (`None`: only checks that the read can be one).
@@ -624,7 +638,8 @@ impl Region {
             return None;
         }
         let index = matches!(cx.f.locals[i], Ty::F64 | Ty::I32) && !cx.f.boxed[i] && !el.assigned.contains(&i);
-        if !index || !(self.arrays.contains(&a) || self.array_local(a, cx)) {
+        let typed = self.typed_local(a, cx);
+        if !index || !(self.arrays.contains(&a) || self.array_local(a, cx) || typed) || (typed && record.is_some()) {
             return None;
         }
         if !self.arrays.contains(&a) {
@@ -637,6 +652,23 @@ impl Region {
         let o = cx.new_local();
         self.elems.push((o, a, i, record));
         Some(Some(o))
+    }
+
+    /// The `F64` local holding element `arr[idx]` of an iteration of the
+    /// region's loop, read as a number (the iteration's guard checks it
+    /// is one, and loads it).
+    fn elem_num(&mut self, arr: &Expr, idx: &Expr, cx: &mut Cx) -> Option<LocalId> {
+        if matches!(arr.kind, ExprKind::Local(a) if self.typed_local(a, cx)) {
+            return None;
+        }
+        self.elem(arr, idx, None, cx)?;
+        let (&ExprKind::Local(a), &ExprKind::Local(i)) = (&arr.kind, &idx.kind) else { unreachable!() };
+        if let Some(e) = self.elem_nums.iter().find(|e| e.1 == a && e.2 == i) {
+            return Some(e.0);
+        }
+        let c = cx.new_local();
+        self.elem_nums.push((c, a, i));
+        Some(c)
     }
 
     /// The copy of JS-valued local `l`, holding its value here: if it may
@@ -711,8 +743,9 @@ impl Region {
                 if top {
                     let mut assigned = HashSet::new();
                     visit_stmts(body, &mut |e| {
-                        if let ExprKind::SetLocal(l, _) | ExprKind::InitLocal(l, _) | ExprKind::Update { local: l, .. } =
-                            e.kind
+                        if let ExprKind::SetLocal(l, _)
+                        | ExprKind::InitLocal(l, _)
+                        | ExprKind::Update { local: l, .. } = e.kind
                         {
                             assigned.insert(l);
                         }
@@ -748,10 +781,12 @@ impl Region {
                 // bodies it runs inline, are set before they are read.)
                 let fresh_locals = scoped_locals(body_src, &cx.uses);
                 self.undef.retain(|l| !fresh_locals.contains(l));
-                if self.undef.iter().any(|l| !undef.contains(l)) || undef.iter().any(|l| !fresh_locals.contains(l) && !self.undef.contains(l)) {
+                if self.undef.iter().any(|l| !undef.contains(l))
+                    || undef.iter().any(|l| !fresh_locals.contains(l) && !self.undef.contains(l))
+                {
                     return None;
                 }
-                if top && !self.elems.is_empty() {
+                if top && !(self.elems.is_empty() && self.elem_nums.is_empty() && self.elem_bounds.is_empty()) {
                     // (The iteration runs in the guard's `then` branch.)
                     let rest = std::mem::take(&mut body);
                     body.push(self.elem_guard(fresh, rest, cx));
@@ -759,7 +794,8 @@ impl Region {
                 if top {
                     self.elem_loop = None;
                 }
-                let copy = Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() };
+                let copy =
+                    Stmt::Loop { id: fresh, test, post_test: *post_test, body, update, per_iteration: Vec::new() };
                 match self.bailed.filter(|_| top) {
                     // Where an iteration's objects are not what the region
                     // needs, the original loop goes on from it (`leave` is
@@ -843,6 +879,8 @@ impl Region {
         leave.push(Stmt::Break(copy));
         let guard = bool(ExprKind::ElemGuard {
             elems: self.elems.clone(),
+            nums: self.elem_nums.clone(),
+            bounds: self.elem_bounds.clone(),
             derived: self.elem_derived.clone(),
             fields: self.elem_fields.clone(),
             distinct,
@@ -1431,7 +1469,10 @@ impl Region {
             Local(l) if !cx.f.boxed[*l] => match cx.f.locals[*l] {
                 Ty::F64 | Ty::I32 => e.clone(),
                 Ty::Any
-                    if !self.is_obj(*l) && !self.strs.contains(l) && !self.undef.contains(l) && !self.arrays.contains(l)
+                    if !self.is_obj(*l)
+                        && !self.strs.contains(l)
+                        && !self.undef.contains(l)
+                        && !self.arrays.contains(l)
                         && !self.appends.contains(l) =>
                 {
                     f64(Local(self.copy(*l, true, cx)))
@@ -1520,6 +1561,47 @@ impl Region {
                 let s = self.string(s, cx)?;
                 f64(StrLen { s })
             }
+            // An element the loop reads, a number (see `elem_num`).
+            GetElem(a, i) => {
+                let c = self.elem_num(a, i, cx)?;
+                self.accesses += 1;
+                f64(Local(c))
+            }
+            // An element of a typed array the loop reads, inside it (the
+            // iteration's guard checks: read in place, as it may be written).
+            TypedGet(_, a, i) => {
+                let (&Local(arr), &Local(idx)) = (&a.kind, &i.kind) else { return None };
+                if !self.typed_local(arr, cx) {
+                    return None;
+                }
+                self.elem(a, i, None, cx)?;
+                if !self.elem_bounds.contains(&(arr, idx)) {
+                    self.elem_bounds.push((arr, idx));
+                }
+                self.accesses += 1;
+                f64(RegionTypedGet { arr, idx })
+            }
+            // A typed array's element written (nothing outside it).
+            TypedSet(_, a, i, x) if matches!(a.kind, Local(l) if self.typed_local(l, cx)) => {
+                let Local(arr) = a.kind else { unreachable!() };
+                let idx = self.num(i, cx)?;
+                let value = self.num(x, cx)?;
+                if !self.typed_writes.contains(&arr) {
+                    self.typed_writes.push(arr);
+                }
+                self.accesses += 1;
+                f64(RegionTypedSet { arr, idx: bx(idx), value: bx(value) })
+            }
+            // A typed array's (guarded: with a pristine shape, its `length`
+            // is its element count).
+            &Length(ref a, _) if matches!(a.kind, Local(l) if self.typed_local(l, cx)) => {
+                let Local(arr) = a.kind else { unreachable!() };
+                if !self.arrays.contains(&arr) {
+                    self.arrays.push(arr);
+                }
+                self.accesses += 1;
+                f64(ArrLen { arr })
+            }
             // An array's (guarded as a dense fast array).
             &Length(ref a, _) if matches!(a.kind, Local(l) if self.arrays.contains(&l) || self.array_local(l, cx)) => {
                 let Local(arr) = a.kind else { unreachable!() };
@@ -1555,7 +1637,12 @@ impl Region {
                         let v = bx(self.num(x, cx)?);
                         f64(if init { InitLocal(*l, v) } else { SetLocal(*l, v) })
                     }
-                    Ty::Any if !self.is_obj(*l) && !self.strs.contains(l) && !self.arrays.contains(l) && !self.appends.contains(l) => {
+                    Ty::Any
+                        if !self.is_obj(*l)
+                            && !self.strs.contains(l)
+                            && !self.arrays.contains(l)
+                            && !self.appends.contains(l) =>
+                    {
                         let v = self.num(x, cx)?;
                         let c = self.copy(*l, false, cx);
                         if !self.assigned.contains(l) {

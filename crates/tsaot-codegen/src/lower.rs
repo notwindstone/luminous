@@ -16,8 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::mir::types::{F32, F64, I8, I32, I64};
 use crate::mir::{
-    Block, BlockArg, FloatCC, FuncRef, FunctionBuilder, GlobalValue, Ins, IntCC, MemFlags, Region, SigRef,
-    StackSlot, StackSlotData, StackSlotKind, Type, Value, Variable,
+    Block, BlockArg, FloatCC, FuncRef, FunctionBuilder, GlobalValue, Ins, IntCC, MemFlags, Region, SigRef, StackSlot,
+    StackSlotData, StackSlotKind, Type, Value, Variable,
 };
 use tsaot_front::ir::{
     self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, LoopKind,
@@ -1034,6 +1034,7 @@ impl Lower {
                             arrays,
                             protos,
                             appends,
+                            typed_writes,
                         },
                     ..
                 },
@@ -1053,12 +1054,15 @@ impl Lower {
                     arrays,
                     protos,
                     appends,
+                    typed_writes,
                 };
                 self.spec_region(&guard, fast, slow)
             }
-            Stmt::If(Expr { kind: ExprKind::ElemGuard { elems, derived, fields, distinct }, .. }, then, bail) => {
-                self.elem_guard(elems, derived, fields, distinct, then, bail)
-            }
+            Stmt::If(
+                Expr { kind: ExprKind::ElemGuard { elems, nums, bounds, derived, fields, distinct }, .. },
+                then,
+                bail,
+            ) => self.elem_guard(elems, nums, bounds, derived, fields, distinct, then, bail),
             Stmt::If(c, then, els) => {
                 let cv = self.expr(c).boolean();
                 let tb = self.b.create_block();
@@ -2735,10 +2739,48 @@ impl Lower {
                 v
             }
             ExprKind::SpecGuard { .. } | ExprKind::ElemGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::RegionTypedGet { arr, idx } => {
+                let Ty::Arr(kind) = self.locals[*arr] else { unreachable!("a typed array") };
+                let (ap, _) = self.use_local(*arr).any();
+                // (An integer inside it: see `guard_index`.)
+                let i = match self.use_local(*idx) {
+                    V::Num(d) => match self.int_of.get(&d) {
+                        Some(&i) => i,
+                        None => self.b.ins().fcvt_to_sint_sat(I64, d),
+                    },
+                    V::Int(i) => i,
+                    other => unreachable!("index {other:?}"),
+                };
+                let base = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_ARRAY_VALUES);
+                let at = self.b.ins().imul_imm_s(i, kind.size() as i64);
+                let at = self.b.ins().iadd(base, at);
+                V::Num(self.load_element(kind, at))
+            }
+            ExprKind::RegionTypedSet { arr, idx, value } => {
+                let Ty::Arr(kind) = self.locals[*arr] else { unreachable!("a typed array") };
+                let index = self.expr(idx);
+                let d = self.expr(value).num();
+                let (ap, _) = self.use_local(*arr).any();
+                let (ok, i) = self.elem_index(index);
+                let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
+                let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, i, count);
+                let inb = self.b.ins().band(ok, inb);
+                let store = self.b.create_block();
+                let join = self.b.create_block();
+                self.b.ins().brif(inb, store, &[], join, &[]);
+                self.b.switch_to_block(store);
+                let base = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_ARRAY_VALUES);
+                let at = self.b.ins().imul_imm_s(i, kind.size() as i64);
+                let at = self.b.ins().iadd(base, at);
+                self.store_element(kind, at, d);
+                self.b.ins().jump(join, &[]);
+                self.b.switch_to_block(join);
+                V::Num(d)
+            }
             ExprKind::ArrLen { arr } => {
                 let (p, _) = self.use_local(*arr).any();
                 let n = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
-                V::Num(self.b.ins().fcvt_from_sint(F64, n))
+                V::Num(self.int_f64(n))
             }
             ExprKind::StrLen { s } => {
                 let (p, _) = self.use_local(*s).any();
@@ -3979,7 +4021,9 @@ impl Lower {
             (LoopKind::Map | LoopKind::Filter, Some(a)) => a.any(),
             (LoopKind::Some, _) => (zero, self.b.ins().iconst(I64, TAG_BOOL)),
             (LoopKind::Every, _) => (self.b.ins().iconst(I64, 1), self.b.ins().iconst(I64, TAG_BOOL)),
-            (LoopKind::FindIndex, _) => (self.b.ins().iconst(I64, -1i32 as u32 as i64), self.b.ins().iconst(I64, TAG_INT)),
+            (LoopKind::FindIndex, _) => {
+                (self.b.ins().iconst(I64, -1i32 as u32 as i64), self.b.ins().iconst(I64, TAG_INT))
+            }
             _ => (zero, self.b.ins().iconst(I64, TAG_UNDEFINED)),
         };
         let more = self.b.ins().icmp(IntCC::SignedLessThan, k, len);
@@ -4334,16 +4378,15 @@ impl Lower {
         // The property's reference is dropped after the call.
         let tag = self.b.ins().iconst(I64, TAG_OBJECT);
         let argv = self.values_slot(&[(vp, vt)]);
-        let (sp, st) =
-            self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
-                l.dup((vp, vt));
-                let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
-                let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
-                let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
-                let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
-                let zero = l.b.ins().iconst(I64, 0);
-                (zero, l.b.ins().select(failed, exc, undef))
-            });
+        let (sp, st) = self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
+            l.dup((vp, vt));
+            let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
+            let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+            let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
+            let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
+            let zero = l.b.ins().iconst(I64, 0);
+            (zero, l.b.ins().select(failed, exc, undef))
+        });
         self.free((vp, vt));
         self.free((sp, st));
         self.check_value(st);
@@ -4456,12 +4499,33 @@ impl Lower {
                 self.b.switch_to_block(next);
             }
         }
+        // Typed arrays the region writes: not of an immutable buffer.
+        for &a in g.typed_writes {
+            let (p, _) = self.use_local(a).any();
+            let ta = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_TYPED_ARRAY);
+            let buf = self.b.ins().load(I64, M_HEADER, ta, layout::TA_BUFFER);
+            let abuf = self.b.ins().load(I64, M_HEADER, buf, layout::OBJ_ARRAY_BUFFER);
+            let immutable = self.b.ins().uload8(I32, M_HEADER, abuf, layout::ABUF_IMMUTABLE);
+            let next = self.b.create_block();
+            self.b.ins().brif(immutable, slow_b, &[], next, &[]);
+            self.b.switch_to_block(next);
+        }
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs = Vec::new();
         // Arrays whose elements the region's loop reads: dense fast arrays
-        // (no code runs in the region: they stay so).
+        // (no code runs in the region: they stay so); typed arrays with a
+        // pristine shape (`length` their element count, which nothing in
+        // the region changes).
         for &a in g.arrays {
             let (p, t) = self.use_local(a).any();
+            if let Ty::Arr(kind) = self.locals[a] {
+                let k = self.b.ins().iconst(I32, kind as i64);
+                let ok = self.pristine_shape(p, k);
+                let next = self.b.create_block();
+                self.b.ins().brif(ok, next, &[], slow_b, &[]);
+                self.b.switch_to_block(next);
+                continue;
+            }
             let yes = self.b.ins().iconst(I8, 1);
             let count = self.array_part(p, t, yes, slow_b);
             let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
@@ -4502,7 +4566,8 @@ impl Lower {
         }
         // The objects, then those their fields hold: of their records.
         for &(o, r) in objs {
-            let (p, t) = if o == ir::THIS_LOCAL { self.this.expect("`this` in a region") } else { self.use_local(o).any() };
+            let (p, t) =
+                if o == ir::THIS_LOCAL { self.this.expect("`this` in a region") } else { self.use_local(o).any() };
             let props = self.guard_record((p, t), r, table, slow_b);
             ptrs.push((o, p, props));
         }
@@ -4635,9 +4700,12 @@ impl Lower {
     /// The check that starts an iteration of a region's loop (see
     /// `ExprKind::ElemGuard`), then `then`; where it fails, `bail` (which
     /// leaves the loop).
+    #[allow(clippy::too_many_arguments)]
     fn elem_guard(
         &mut self,
         elems: &[(ir::LocalId, ir::LocalId, ir::LocalId, usize)],
+        nums: &[(ir::LocalId, ir::LocalId, ir::LocalId)],
+        bounds: &[(ir::LocalId, ir::LocalId)],
         derived: &[(ir::LocalId, ir::LocalId, u32, usize)],
         fields: &[(ir::LocalId, u32)],
         distinct: &[ir::LocalId],
@@ -4650,34 +4718,30 @@ impl Lower {
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs: Vec<(ir::LocalId, Value)> = Vec::new();
         for &(o, arr, idx, record) in elems {
-            let (ap, _) = self.use_local(arr).any();
-            let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
-            // An integer index below the count.
-            let (i, exact) = match self.use_local(idx) {
-                V::Num(d) => match self.int_of.get(&d) {
-                    Some(&i) => (i, None),
-                    None => {
-                        let i = self.b.ins().fcvt_to_sint_sat(I64, d);
-                        let back = self.b.ins().fcvt_from_sint(F64, i);
-                        (i, Some(self.b.ins().fcmp(FloatCC::Equal, back, d)))
-                    }
-                },
-                V::Int(i) => (i, None),
-                other => unreachable!("index {other:?}"),
-            };
-            let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, i, count);
-            let ok = match exact {
-                Some(e) => self.b.ins().band(inside, e),
-                None => inside,
-            };
-            let next = self.b.create_block();
-            self.b.ins().brif(ok, next, &[], fail, &[]);
-            self.b.switch_to_block(next);
-            let at = self.array_slot(ap, i);
-            let p = self.b.ins().load(I64, M_SLOT, at, 0);
-            let t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+            let (p, t) = self.guard_elem(arr, idx, fail);
             let props = self.guard_record((p, t), record, table, fail);
             ptrs.push((o, props));
+        }
+        // Indexes inside the typed arrays the iteration reads.
+        for &(arr, idx) in bounds {
+            let (ap, _) = self.use_local(arr).any();
+            self.guard_index(ap, idx, fail);
+        }
+        // Elements read as numbers: int32s (INT, 0) or floats.
+        for &(to, arr, idx) in nums {
+            let (p, t) = self.guard_elem(arr, idx, fail);
+            let float = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
+            let int = self.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
+            let number = self.b.ins().bor(float, int);
+            let next = self.b.create_block();
+            self.b.ins().brif(number, next, &[], fail, &[]);
+            self.b.switch_to_block(next);
+            let bits = self.b.ins().bitcast(F64, p);
+            let n32 = self.b.ins().ireduce(I32, p);
+            let n = self.b.ins().sextend(I64, n32);
+            let from_int = self.b.ins().fcvt_from_sint(F64, n);
+            let d = self.b.ins().select(float, bits, from_int);
+            self.def_local(to, V::Num(d));
         }
         for &(o, of, slot, r) in derived {
             let props = ptrs.iter().find(|x| x.0 == of).expect("guarded holder").1;
@@ -4746,6 +4810,45 @@ impl Lower {
             self.b.ins().jump(join, &[]);
         }
         self.b.switch_to_block(join);
+    }
+
+    /// An iteration guard's element `idx` of the dense fast array in local
+    /// `arr` (a region guard's `arrays`), the index an integer below its
+    /// element count, else to `fail`.
+    fn guard_elem(&mut self, arr: ir::LocalId, idx: ir::LocalId, fail: Block) -> (Value, Value) {
+        let (ap, _) = self.use_local(arr).any();
+        let i = self.guard_index(ap, idx, fail);
+        let at = self.array_slot(ap, i);
+        let p = self.b.ins().load(I64, M_SLOT, at, 0);
+        let t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        (p, t)
+    }
+
+    /// The value of index local `idx` as an integer below the element count
+    /// of array (or typed array) `ap`, else to `fail`.
+    fn guard_index(&mut self, ap: Value, idx: ir::LocalId, fail: Block) -> Value {
+        let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
+        let (i, exact) = match self.use_local(idx) {
+            V::Num(d) => match self.int_of.get(&d) {
+                Some(&i) => (i, None),
+                None => {
+                    let i = self.b.ins().fcvt_to_sint_sat(I64, d);
+                    let back = self.b.ins().fcvt_from_sint(F64, i);
+                    (i, Some(self.b.ins().fcmp(FloatCC::Equal, back, d)))
+                }
+            },
+            V::Int(i) => (i, None),
+            other => unreachable!("index {other:?}"),
+        };
+        let inside = self.b.ins().icmp(IntCC::UnsignedLessThan, i, count);
+        let ok = match exact {
+            Some(e) => self.b.ins().band(inside, e),
+            None => inside,
+        };
+        let next = self.b.create_block();
+        self.b.ins().brif(ok, next, &[], fail, &[]);
+        self.b.switch_to_block(next);
+        i
     }
 
     /// A region guard's check that `(p, t)` is an object of `record`'s
@@ -7735,6 +7838,7 @@ fn predicted_params(f: &ir::Func, params: &[Vec<Ty>]) -> Vec<ir::LocalId> {
             out.extend(locals.iter().take(params[*func].len()));
         }
         ExprKind::SpecGuard { nums, .. } => out.extend(nums.iter().map(|n| n.1)),
+        ExprKind::ElemGuard { nums, .. } => out.extend(nums.iter().map(|n| n.0)),
         _ => {}
     });
     out
@@ -8339,6 +8443,7 @@ struct SpecGuard<'a> {
     methods: &'a [(Option<ir::LocalId>, usize, ir::AtomId, usize)],
     cells: &'a [ir::CellId],
     appends: &'a [ir::LocalId],
+    typed_writes: &'a [ir::LocalId],
 }
 
 /// The parts of a template literal's concatenation (`a${x}b` is checked as
