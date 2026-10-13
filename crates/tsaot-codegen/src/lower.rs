@@ -779,51 +779,17 @@ impl Lower {
             }
         }
     }
-    // ---- reference counting ----
+    // ---- references ----
+    // The engine traces what is reachable (from the native stack too, so
+    // values in registers and stack slots are found): taking or dropping
+    // a reference costs nothing. The calls stay as the places where values
+    // are owned, for the analyses that move them.
 
-    fn is_refcounted(&mut self, t: Value) -> Value {
-        self.b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0)
-    }
+    /// A new reference to `v` (borrowed).
+    fn dup(&mut self, _v: (Value, Value)) {}
 
-    /// A new reference to `v` (borrowed): the reference count, in the
-    /// allocator header before the pointer, is incremented inline.
-    fn dup(&mut self, (p, t): (Value, Value)) {
-        let rc = self.is_refcounted(t);
-        let yes = self.b.create_block();
-        let join = self.b.create_block();
-        self.b.ins().brif(rc, yes, &[], join, &[]);
-        self.b.switch_to_block(yes);
-        let n = self.b.ins().load(I32, M_RC, p, layout::REF_COUNT);
-        let n = self.b.ins().iadd_imm_s(n, 1);
-        self.b.ins().store(M_RC, n, p, layout::REF_COUNT);
-        self.b.ins().jump(join, &[]);
-        self.b.switch_to_block(join);
-    }
-
-    /// Release a reference: decremented inline unless it is the last one,
-    /// which the engine frees.
-    fn free(&mut self, (p, t): (Value, Value)) {
-        let rc = self.is_refcounted(t);
-        let yes = self.b.create_block();
-        let dec = self.b.create_block();
-        let last = self.b.create_block();
-        let join = self.b.create_block();
-        self.b.set_cold_block(last);
-        self.b.ins().brif(rc, yes, &[], join, &[]);
-        self.b.switch_to_block(yes);
-        let n = self.b.ins().load(I32, M_RC, p, layout::REF_COUNT);
-        let shared = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, n, 1);
-        self.b.ins().brif(shared, dec, &[], last, &[]);
-        self.b.switch_to_block(dec);
-        let n = self.b.ins().iadd_imm_s(n, -1);
-        self.b.ins().store(M_RC, n, p, layout::REF_COUNT);
-        self.b.ins().jump(join, &[]);
-        self.b.switch_to_block(last);
-        let ctx = self.ctx;
-        self.helper("JS_FreeValue", &[ctx, p, t]);
-        self.b.ins().jump(join, &[]);
-        self.b.switch_to_block(join);
-    }
+    /// Release a reference.
+    fn free(&mut self, _v: (Value, Value)) {}
     fn free_v(&mut self, v: V) {
         if let V::Any(p, t) = v {
             self.free((p, t));
@@ -3931,13 +3897,6 @@ impl Lower {
         let null = self.b.ins().iconst(I64, 0);
         self.b.ins().store(M_HEADER, null, p, layout::OBJ_WEAK_REF);
         self.b.ins().store(M_HEADER, null, p, layout::OBJ_OPAQUE_WORD);
-        // At the end of the GC object list.
-        let head = self.b.ins().iadd_imm_s(rt, layout::RT_GC_OBJ_LIST as i64);
-        let tail = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_OBJ_LIST);
-        self.b.ins().store(M_ALLOC, tail, p, 0);
-        self.b.ins().store(M_ALLOC, head, p, 8);
-        self.b.ins().store(M_ALLOC, p, tail, 8);
-        self.b.ins().store(M_ALLOC, p, rt, layout::RT_GC_OBJ_LIST);
         p
     }
 

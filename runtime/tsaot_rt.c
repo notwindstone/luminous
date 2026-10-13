@@ -144,8 +144,9 @@ static void tsaot_box_finalizer(JSRuntime *rt, JSValueConst val)
 static void tsaot_box_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     TsaotBox *b = JS_GetOpaque(val, tsaot_box_class);
+    /* (the box, a traced block: its value with it) */
     if (b)
-        JS_MarkValue(rt, b->value, mark_func);
+        mark_func(rt, (JSGCObjectHeader *)b);
 }
 
 /* A new box holding an uninitialized binding; *slot receives the address
