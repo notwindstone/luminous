@@ -300,15 +300,24 @@ static JSValue tsaot_class(JSContext *ctx, JSValueConst this_val, int argc, JSVa
 
 static JSValue tsaot_exports[4];
 
+/* (The collector's roots until the module holds them.) */
+static void tsaot_mark_exports(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func)
+{{
+    for (int i = 0; i < 3; i++)
+        JS_MarkValue(rt, tsaot_exports[i], mark_func);
+}}
+
 static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 {{
+    JSValue state = tsaot_exports[0], init = tsaot_exports[1], cells = tsaot_exports[2];
+    tsaot_exports[0] = tsaot_exports[1] = tsaot_exports[2] = JS_UNDEFINED;
     if (JS_SetModuleExport(ctx, m, "{BIND_FN}",
                            JS_NewCFunction(ctx, tsaot_bind, "{BIND_FN}", 2)) < 0)
         return -1;
     /* The module owns the state object: its finalizer releases the cells. */
-    if (JS_SetModuleExport(ctx, m, "__tsaot_state", tsaot_exports[0]) < 0 ||
-        JS_SetModuleExport(ctx, m, "{INIT_FN}", tsaot_exports[1]) < 0 ||
-        JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", tsaot_exports[2]) < 0 ||
+    if (JS_SetModuleExport(ctx, m, "__tsaot_state", state) < 0 ||
+        JS_SetModuleExport(ctx, m, "{INIT_FN}", init) < 0 ||
+        JS_SetModuleExport(ctx, m, "{CELLS_OBJ}", cells) < 0 ||
         JS_SetModuleExport(ctx, m, "{METHOD_FN}",
                            JS_NewCFunction(ctx, tsaot_method, "{METHOD_FN}", 5)) < 0)
         return -1;
@@ -326,6 +335,8 @@ static int tsaot_module_init(JSContext *ctx, JSModuleDef *m)
 JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
 {{
     JSModuleDef *m;
+    if (JS_AddGCMarkHook(JS_GetRuntime(ctx), tsaot_mark_exports, NULL) < 0)
+        return NULL;
     if (tsaot_runtime_init(ctx, &tsaot_exports[0], &tsaot_exports[1], &tsaot_exports[2]) < 0)
         return NULL;
     m = JS_NewCModule(ctx, name, tsaot_module_init);

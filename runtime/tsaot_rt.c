@@ -152,7 +152,8 @@ static void tsaot_box_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
    of its value, which stays valid as long as the box object lives. */
 JSValue tsaot_box_new(JSContext *ctx, JSValue **slot)
 {
-    TsaotBox *b = js_malloc(ctx, sizeof(*b));
+    /* (Traced: native code may hold only *slot.) */
+    TsaotBox *b = JS_MallocTraced(ctx, sizeof(*b));
     JSValue obj;
     if (!b)
         return JS_EXCEPTION;
@@ -424,6 +425,17 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
    for the cycle collector: marking them through this object (which the
    module keeps alive) lets cycles that go through cells be collected once
    the module itself goes away. */
+static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
+static void tsaot_mark_strings(JSRuntime *rt, JS_MarkFunc *mark_func);
+
+/* The tables above, among the collector's roots from the start (before the
+   state object holds them), with the strings. */
+static void tsaot_mark_statics(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func)
+{
+    tsaot_state_mark(rt, JS_UNDEFINED, mark_func);
+    tsaot_mark_strings(rt, mark_func);
+}
+
 static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     int i;
@@ -500,6 +512,8 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
         fprintf(stderr, "tsaot: the engine's object layout is not the one native code was compiled for\n");
         abort();
     }
+    if (JS_AddGCMarkHook(rt, tsaot_mark_statics, NULL) < 0)
+        return -1;
     if (tsaot_lock_builtins(ctx) < 0)
         return -1;
     /* Absolute limit for native frames, below the stack in use now. */
@@ -884,7 +898,7 @@ static JSValue *tsaot_array_values(JSContext *ctx, JSValue arr, int *pcount)
         JS_ThrowRangeError(ctx, "too many arguments in function call (only 65535 allowed)");
         return NULL;
     }
-    tab = js_malloc(ctx, sizeof(JSValue) * (len > 0 ? len : 1));
+    tab = JS_MallocTraced(ctx, sizeof(JSValue) * (len > 0 ? len : 1));
     if (!tab)
         return NULL;
     for (i = 0; i < len; i++) {
@@ -2427,4 +2441,17 @@ static int tsaot_sarr_init(JSContext *ctx)
     JS_SetArrayClass(tsaot_sarr_class);
     tsaot_atom_length = JS_NewAtom(ctx, "length");
     return 0;
+}
+
+/* The string constants (atoms' strings) and the `aot type` literal
+   strings. */
+static void tsaot_mark_strings(JSRuntime *rt, JS_MarkFunc *mark_func)
+{
+    int i;
+    for (i = 0; i < tsaot_nstrings; i++)
+        JS_MarkValue(rt, tsaot_strings[i], mark_func);
+    if (tsaot_struct_lit_values) {
+        for (i = 0; i < tsaot_nstruct_lits; i++)
+            JS_MarkValue(rt, tsaot_struct_lit_values[i], mark_func);
+    }
 }

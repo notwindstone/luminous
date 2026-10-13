@@ -83,7 +83,14 @@ fn run_case(case: &Path, out_dir: &Path, backends: &[String]) -> Result<(), Stri
         if !b.status.success() {
             return Err(format!("build ({suffix}) failed: {}", String::from_utf8_lossy(&b.stderr)));
         }
-        let r = Command::new(&exe).output().unwrap();
+        let mut run = Command::new(&exe);
+        if repo().join("build/quickjs-check/libqjs.a").exists() {
+            // With the engine built with assertions: collect often, and check
+            // that every object something holds is reached from the
+            // collector's roots (see QJS_GC_VERIFY in the engine).
+            run.env("QJS_GC_VERIFY", "1").env("QJS_GC_STRESS", "50");
+        }
+        let r = run.output().unwrap();
         outputs.push((
             r.status.code(),
             String::from_utf8_lossy(&r.stdout).into_owned(),
