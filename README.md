@@ -233,7 +233,13 @@ unreachable, and never moves anything.
   to-finalize. Allocation bumps a pointer through a run of free cells,
   counted allocated as a whole when the run begins (which is where a
   collection starts); native code allocates objects inline the same way,
-  a compare, a bump and the header stores.
+  a compare, a bump and the header stores. QuickJS's list of GC objects
+  is gone, and with it 16 bytes of every object (a plain object is 56
+  bytes and its properties).
+- **Tracing.** A cell is marked by its chunk's bit alone, without reading
+  it (the bit also tells an old cell from a young one); its header and
+  body are read when it is traced, a few cells later, prefetched in the
+  meantime, as marking waits on memory more than anything.
 - **Roots.** The contexts, the job queue, the pending exception, the atoms
   referenced as atoms, mark hooks for values that C structures hold (the
   native runtime's state and inline caches, libc's timers), and the native
