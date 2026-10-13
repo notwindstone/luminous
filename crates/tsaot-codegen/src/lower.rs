@@ -3855,55 +3855,71 @@ impl Lower {
 
     /// A new plain object of the shape `shape` that allocation site `ic`
     /// cached, allocated inline as `JS_NewObjectWithCachedShape`'s fast path
-    /// would (a block from the allocator's cache for its size class, while
-    /// no collection is due): its address, with every field but the
+    /// would (a cell from its class's run in the GC heap, while no
+    /// collection is due): its address, with every field but the
     /// properties set. Else (or if objects of the shape are too big) it
     /// goes to `call`.
     fn alloc_object(&mut self, ic: Value, shape: Value, call: Block) -> Value {
-        // The site's size class and accounted bytes (`JS_ShapeAllocInfo`).
+        // The site's cell class and cell size (`JS_ShapeAllocInfo`).
         let info = self.b.ins().uload32(M_IC, ic, 8);
         let alloc = self.b.create_block();
         self.b.ins().brif(info, alloc, &[], call, &[]);
         self.b.switch_to_block(alloc);
         let idx = self.b.ins().band_imm_u(info, 0xff);
-        let used = self.b.ins().ushr_imm_u(info, 8);
+        let cell = self.b.ins().ushr_imm_u(info, 8);
+        let used = self.b.ins().iadd_imm_s(cell, layout::MALLOC_OVERHEAD - 8);
         let ctx = self.ctx;
         let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
-        let off = self.b.ins().imul_imm_s(idx, layout::ARENA_CACHE_SIZE as i64);
-        let entry = self.b.ins().iadd(rt, off);
-        let p = self.b.ins().load(I64, M_ALLOC, entry, layout::RT_ARENA_CACHE);
         let size = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_SIZE);
         let new_size = self.b.ins().iadd(size, used);
         let threshold = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_THRESHOLD);
         let limit = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_LIMIT);
-        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, p, 0);
         let no_gc = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_size, threshold);
         // (As the engine compares: a limit of 0 is none.)
         let limit = self.b.ins().iadd_imm_s(limit, -1);
         let in_limit = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_size, limit);
-        let ok = self.b.ins().band(has, no_gc);
-        let ok = self.b.ins().band(ok, in_limit);
-        let init = self.b.create_block();
-        self.b.ins().brif(ok, init, &[], call, &[]);
-        self.b.switch_to_block(init);
-        // Take the block from the cache; account for it.
-        let next = self.b.ins().load(I64, M_ALLOC, p, 0);
-        self.b.ins().store(M_ALLOC, next, entry, layout::RT_ARENA_CACHE);
-        let count_at = layout::RT_ARENA_CACHE + layout::ARENA_CACHE_COUNT;
-        let count = self.b.ins().load(I32, M_ALLOC, entry, count_at);
-        let count = self.b.ins().iadd_imm_s(count, -1);
-        self.b.ins().store(M_ALLOC, count, entry, count_at);
+        let ok = self.b.ins().band(no_gc, in_limit);
+        let pick = self.b.create_block();
+        self.b.ins().brif(ok, pick, &[], call, &[]);
+        // A cell freed before, else one from the run.
+        self.b.switch_to_block(pick);
+        let off8 = self.b.ins().imul_imm_s(idx, 8);
+        let free_at = self.b.ins().iadd(rt, off8);
+        let head = self.b.ins().load(I64, M_ALLOC, free_at, layout::RT_GC_FREE_CELLS);
+        let got = self.b.create_block();
+        let p = self.b.append_block_param(got, I64);
+        let cached = self.b.create_block();
+        let from_run = self.b.create_block();
+        self.b.ins().brif(head, cached, &[], from_run, &[]);
+        self.b.switch_to_block(cached);
+        let next = self.b.ins().load(I64, M_ALLOC, head, 0);
+        self.b.ins().store(M_ALLOC, next, free_at, layout::RT_GC_FREE_CELLS);
+        self.b.ins().jump(got, &[BlockArg::Value(head)]);
+        self.b.switch_to_block(from_run);
+        let off = self.b.ins().imul_imm_s(idx, layout::GC_RUN_SIZE as i64);
+        let run = self.b.ins().iadd(rt, off);
+        let cp = self.b.ins().load(I64, M_ALLOC, run, layout::RT_GC_RUNS);
+        let end = self.b.ins().load(I64, M_ALLOC, run, layout::RT_GC_RUNS + 8);
+        let next = self.b.ins().iadd(cp, cell);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, next, end);
+        let bump = self.b.create_block();
+        self.b.ins().brif(room, bump, &[], call, &[]);
+        self.b.switch_to_block(bump);
+        self.b.ins().store(M_ALLOC, next, run, layout::RT_GC_RUNS);
+        let cp8 = self.b.ins().iadd_imm_s(cp, 8);
+        self.b.ins().jump(got, &[BlockArg::Value(cp8)]);
+        self.b.switch_to_block(got);
+        // Account for it.
         let n = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_MALLOC_COUNT);
         let n = self.b.ins().iadd_imm_s(n, 1);
         self.b.ins().store(M_ALLOC, n, rt, layout::RT_MALLOC_COUNT);
         self.b.ins().store(M_ALLOC, new_size, rt, layout::RT_MALLOC_SIZE);
-        // The object: a JS object (unmarked) with one reference, extensible,
-        // of class Object, with the shape (referenced) and its properties
-        // after it, no weak references.
-        let zero8 = self.b.ins().iconst(I32, 0);
-        self.b.ins().istore8(M_RC, zero8, p, layout::OBJ_GC_BYTE);
-        let one = self.b.ins().iconst(I32, 1);
-        self.b.ins().store(M_RC, one, p, layout::REF_COUNT);
+        // Its header: a GC cell of its class, a JS object (unmarked) with one
+        // reference.
+        let word = self.b.ins().bor_imm_u(idx, layout::GC_CELL_WORD | (1 << 32));
+        self.b.ins().store(M_RC, word, p, -8);
+        // The object: extensible, of class Object, with the shape
+        // (referenced) and its properties after it, no weak references.
         let flags = self.b.ins().iconst(I32, layout::OBJ_PLAIN_FLAGS);
         self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
         self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);

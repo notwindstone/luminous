@@ -123,6 +123,12 @@ pub mod layout {
     pub const SHAPE_PROP_COUNT: i32 = 32;
     pub const CLASS_MAP: i64 = 36;
     pub const CLASS_SET: i64 = 37;
+    // Allocating GC cells inline.
+    pub const RT_GC_RUNS: i32 = 2296;
+    pub const GC_RUN_SIZE: i32 = 16;
+    pub const RT_GC_FREE_CELLS: i32 = 3112;
+    pub const GC_CELL_WORD: i64 = 0xfe0000;
+    pub const MALLOC_OVERHEAD: i64 = 8;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -171,6 +177,11 @@ pub mod layout {
         ("SHAPE_PROP_COUNT", SHAPE_PROP_COUNT as i64),
         ("CLASS_MAP", CLASS_MAP),
         ("CLASS_SET", CLASS_SET),
+        ("RT_GC_RUNS", RT_GC_RUNS as i64),
+        ("GC_RUN_SIZE", GC_RUN_SIZE as i64),
+        ("RT_GC_FREE_CELLS", RT_GC_FREE_CELLS as i64),
+        ("GC_CELL_WORD", GC_CELL_WORD),
+        ("MALLOC_OVERHEAD", MALLOC_OVERHEAD),
     ];
 }
 
