@@ -343,7 +343,9 @@ pub(crate) struct Lower {
     /// iteration being lowered is the copy where their fields hold floats
     /// (else int32s too: read and written with their tags).
     spec_elems: HashSet<ir::LocalId>,
-    spec_elem_floats: bool,
+    /// The elements (of the iterations being lowered) whose fields hold
+    /// floats (see `elem_guard`).
+    spec_float_elems: HashSet<ir::LocalId>,
     /// loop id -> (continue target, break target)
     loops: HashMap<ir::LoopId, (Option<Block>, Block)>,
     /// Inlined calls being lowered (innermost last): where their `return`s
@@ -490,7 +492,7 @@ impl Lower {
             spec_floats: false,
             spec_float_slots: HashSet::new(),
             spec_elems: HashSet::new(),
-            spec_elem_floats: false,
+            spec_float_elems: HashSet::new(),
             loops: HashMap::new(),
             inline_rets: Vec::new(),
             pred: None,
@@ -2740,6 +2742,7 @@ impl Lower {
                 v
             }
             ExprKind::SpecGuard { .. } | ExprKind::ElemGuard { .. } => unreachable!("a guard outside its region"),
+            ExprKind::RegionLeave(_) => unreachable!("a region's jump not made"),
             ExprKind::RegionTypedGet { arr, idx } => {
                 let Ty::Arr(kind) = self.locals[*arr] else { unreachable!("a typed array") };
                 let (ap, _) = self.use_local(*arr).any();
@@ -2828,7 +2831,8 @@ impl Lower {
             ExprKind::SlotLoad { obj, slot } => {
                 let props = self.spec_src[obj];
                 let off = (*slot as usize * SIZE) as i32;
-                let floats = if self.spec_elems.contains(obj) { self.spec_elem_floats } else { self.spec_floats };
+                let floats =
+                    if self.spec_elems.contains(obj) { self.spec_float_elems.contains(obj) } else { self.spec_floats };
                 if floats {
                     V::Num(self.b.ins().load(F64, M_SLOT, props, off))
                 } else {
@@ -2845,13 +2849,17 @@ impl Lower {
                 // floats were read, the result is a float, as the
                 // interpreter's float arithmetic makes it.
                 let elem = self.spec_elems.contains(obj);
-                let floats = self.spec_floats && *arith && (!elem || self.spec_elem_floats);
+                let floats = self.spec_floats && *arith && (!elem || self.spec_float_elems.contains(obj));
                 let (vp, vt) = if floats { self.box_float(d) } else { self.box_number(d) };
                 let off = (*slot as usize * SIZE) as i32;
                 self.b.ins().store(M_SLOT, vp, props, off);
                 // (A float replacing a float keeps its tag: an element's
                 // where its fields hold floats.)
-                let kept = if elem { self.spec_elem_floats } else { self.spec_float_slots.contains(&(*obj, *slot)) };
+                let kept = if elem {
+                    self.spec_float_elems.contains(obj)
+                } else {
+                    self.spec_float_slots.contains(&(*obj, *slot))
+                };
                 if !(floats && kept) {
                     self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
                 }
@@ -4776,6 +4784,7 @@ impl Lower {
             self.b.ins().brif(same, fail, &[], next, &[]);
             self.b.switch_to_block(next);
         }
+        let mine: Vec<ir::LocalId> = ptrs.iter().map(|p| p.0).collect();
         for (o, props) in ptrs {
             self.spec_src.insert(o, props);
             self.spec_elems.insert(o);
@@ -4790,13 +4799,21 @@ impl Lower {
         self.b.ins().brif(numbers, mixed_b, &[], fail, &[]);
         for (block, f) in [(float_b, true), (mixed_b, false)] {
             self.b.switch_to_block(block);
-            self.spec_elem_floats = f;
+            for &o in &mine {
+                if f {
+                    self.spec_float_elems.insert(o);
+                } else {
+                    self.spec_float_elems.remove(&o);
+                }
+            }
             self.stmts(then);
             if !self.is_filled() {
                 self.b.ins().jump(join, &[]);
             }
         }
-        self.spec_elem_floats = false;
+        for o in &mine {
+            self.spec_float_elems.remove(o);
+        }
         self.b.switch_to_block(fail);
         self.stmts(bail);
         if !self.is_filled() {

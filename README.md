@@ -486,6 +486,19 @@ The differential tests run every case with both.
   the guard). With methods passing their parameters on to other inlined
   methods (`oc.dot(dir)`), the ray tracer's whole sphere loop
   (`spheres[i].hit(origin, dir)`) is one region.
+  A loop in such a loop's body may read elements too (`const bi =
+  bodies[i]; for (let j = i + 1; j < n; j++) { const bj = bodies[j]; ...
+  }`): the whole nest is one region, the outer element checked once per
+  outer iteration, the inner one in each inner iteration (and checked not
+  to be the outer one where the iteration writes elements' fields). Where
+  an inner element is not what the region needs, the original code goes
+  on from that inner iteration: the outer iteration's elements named
+  again, the rest of the inner loop, the rest of the outer iteration, the
+  outer loop from its next iteration. An n-body step is one region.
+  A jump out of a region from inside its loops (`break` or `continue` of an
+  enclosing loop, `return`) stores every field the region keeps in a
+  local and every local it may have assigned, in this iteration or in an
+  earlier one (those the guard loads first).
   A loop's elements may be numbers too: `s += xs[i]` over a `number[]`
   checks in each iteration that the element is an int32 or a float (else
   the original loop goes on from it), and reads it as a double. Typed

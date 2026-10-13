@@ -715,6 +715,10 @@ pub enum ExprKind {
         fields: Vec<(LocalId, u32)>,
         distinct: Vec<LocalId>,
     },
+    /// While speculative regions are made (`spec`), where one leaves by a
+    /// jump from inside its loops: replaced by the statements that leave
+    /// (once the region is known). `Void`.
+    RegionLeave(usize),
     /// In a speculative region: the length of the dense fast array in local
     /// `arr` (a guard's `arrays`). `F64`.
     ArrLen {
@@ -1103,6 +1107,7 @@ macro_rules! visitor {
                 | ElemGuard { .. }
                 | ArrLen { .. }
                 | RegionTypedGet { .. }
+                | RegionLeave(_)
                 | SlotLoad { .. }
                 | StrLen { .. }
                 | Closure(..) => {}
