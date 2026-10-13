@@ -623,7 +623,9 @@ int tsaot_lock_builtins(JSContext *ctx)
         "             g.Array.prototype.filter, g.Array.prototype.some, g.Array.prototype.every,\n"
         "             g.Array.prototype.find, g.Array.prototype.findIndex, g.Array.prototype.sort,\n"
         "             g.String.prototype.slice, g.String.prototype.substring, g.String.prototype.indexOf,\n"
-        "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith);\n"
+        "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
+        "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
+        "             g.Set.prototype.has);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -1625,10 +1627,22 @@ int tsaot_is_promise_resolve(JSValue promise, JSValue resolve)
 }
 
 /* A global variable read: the global object's property is looked for at
- * the index where this site last found it (in `slot`). */
+ * the index where this site last found it (in `slot`). While there are no
+ * global let/const definitions, an own data property of the global object
+ * is cached, as an own property read's (native code reads it inline). */
 JSValue tsaot_global_get(JSContext *ctx, JSAtom prop, TsaotIC *ic)
 {
-    return JS_GetGlobalVariableHint(ctx, prop, &ic->slot);
+    JSValue v = JS_GetGlobalVariableHint(ctx, prop, &ic->slot);
+    JSValue var_obj = *(JSValue *)((char *)ctx + JS_LAYOUT_CTX_GLOBAL_VAR_OBJ);
+    JSValue global = *(JSValue *)((char *)ctx + JS_LAYOUT_CTX_GLOBAL_OBJ);
+    void *var_shape = *(void **)((char *)JS_VALUE_GET_PTR(var_obj) + JS_LAYOUT_OBJ_SHAPE);
+    if (!JS_IsException(v) && *(uint32_t *)((char *)var_shape + JS_LAYOUT_SHAPE_PROP_COUNT) == 0) {
+        /* (Redefined properties, as tsaot_lock_builtins's, leave it a
+           shape of its own, which caches cannot hold.) */
+        JS_ShareObjectShape(ctx, global);
+        tsaot_ic_fill(ctx, global, prop, 0, ic);
+    }
+    return v;
 }
 
 /* ---- `aot type` objects ----

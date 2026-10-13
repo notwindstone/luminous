@@ -193,6 +193,9 @@ pub(crate) enum Method {
     /// `startsWith`, `endsWith` (in this order; `JS_CallStringFn`), with
     /// at most two arguments.
     StringFn(i32),
+    /// `Map.prototype.get`, `set`, `has` (or `Set.prototype.has`),
+    /// `Set.prototype.add` (`JS_CallMapFn`), with at most two arguments.
+    MapFn(i32),
 }
 
 impl Method {
@@ -206,6 +209,10 @@ impl Method {
             "includes" => Some(Method::StringFn(3)),
             "startsWith" => Some(Method::StringFn(4)),
             "endsWith" => Some(Method::StringFn(5)),
+            "get" => Some(Method::MapFn(0)),
+            "set" => Some(Method::MapFn(1)),
+            "has" => Some(Method::MapFn(2)),
+            "add" => Some(Method::MapFn(3)),
             _ => None,
         }
     }
@@ -225,6 +232,8 @@ const PIN_ARRAY_LOOPS: i32 = 27;
 const PIN_ARRAY_SORT: i32 = 34;
 /// The methods of `Method::StringFn`.
 const PIN_STRING_FNS: i32 = 35;
+/// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
+const PIN_MAP_FNS: i32 = 41;
 /// `TSAOT_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -274,6 +283,8 @@ pub(crate) struct Env {
     pub layouts: std::rc::Rc<Vec<ir::Layout>>,
     /// Stores into `int` fields wrap.
     pub int_wrapping: bool,
+    /// The string constants' text (`ir::Module::strings`).
+    pub texts: std::rc::Rc<Vec<String>>,
     /// The signature of `JSCFunctionFast` entries.
     pub fast_sig: SigRef,
 }
@@ -1455,7 +1466,56 @@ impl Lower {
         let lb = self.b.ins().uload32(M_CONST, kp, layout::STRING_LEN);
         let lb = self.b.ins().band_imm_u(lb, 0x7fff_ffff);
         let same_len = self.b.ins().icmp(IntCC::Equal, la, lb);
-        self.b.ins().brif(same_len, slow, &[], join, &[BlockArg::Value(no)]);
+        // A short 8-bit constant: compared with an 8-bit string's
+        // characters inline (a few loads, as immediates).
+        let text: Vec<u32> = self.env.texts[id].chars().map(|c| c as u32).collect();
+        let narrow = !text.is_empty() && text.len() <= 16 && text.iter().all(|&c| c <= 0xff);
+        let chars = if narrow { self.b.create_block() } else { slow };
+        self.b.ins().brif(same_len, chars, &[], join, &[BlockArg::Value(no)]);
+        if narrow {
+            self.b.switch_to_block(chars);
+            let word = self.b.ins().uload32(M_HEADER, p, layout::STRING_LEN);
+            let wide = self.b.ins().ushr_imm_u(word, 31);
+            let kind = self.b.ins().uload32(M_HEADER, p, layout::STRING_KIND);
+            let kind = self.b.ins().ushr_imm_u(kind, 28);
+            let kind = self.b.ins().band_imm_u(kind, 3);
+            let other = self.b.ins().bor(wide, kind);
+            let flat = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+            let cmp = self.b.create_block();
+            self.b.ins().brif(flat, cmp, &[], slow, &[]);
+            self.b.switch_to_block(cmp);
+            let bytes: Vec<u8> = text.iter().map(|&c| c as u8).collect();
+            let n = bytes.len();
+            // (Loads within the characters: the last of a run of 3, 5, 6 or
+            // 7 overlaps the one before.)
+            let mut parts: Vec<(usize, usize)> = Vec::new();
+            let mut off = 0;
+            while off < n {
+                let c = (n - off).min(8);
+                match c {
+                    1 | 2 | 4 | 8 => parts.push((off, c)),
+                    3 => parts.extend([(off, 2), (off + 1, 2)]),
+                    _ => parts.extend([(off, 4), (off + c - 4, 4)]),
+                }
+                off += c;
+            }
+            let mut diff = self.b.ins().iconst(I64, 0);
+            for (o, w) in parts {
+                let at = layout::STRING_DATA + o as i32;
+                let v = match w {
+                    1 => self.b.ins().uload8(I64, M_HEADER, p, at),
+                    2 => self.b.ins().uload16(I64, M_HEADER, p, at),
+                    4 => self.b.ins().uload32(M_HEADER, p, at),
+                    _ => self.b.ins().load(I64, M_HEADER, p, at),
+                };
+                let mut want = [0u8; 8];
+                want[..w].copy_from_slice(&bytes[o..o + w]);
+                let x = self.b.ins().bxor_imm_u(v, i64::from_le_bytes(want));
+                diff = self.b.ins().bor(diff, x);
+            }
+            let eq = self.b.ins().icmp_imm_s(IntCC::Equal, diff, 0);
+            self.b.ins().jump(join, &[BlockArg::Value(eq)]);
+        }
         self.b.switch_to_block(slow);
         let ctx = self.ctx;
         let kt = self.b.ins().iconst(I64, TAG_STRING);
@@ -2549,9 +2609,37 @@ impl Lower {
                 let atom = self.atom(*a);
                 let ctx = self.ctx;
                 let ic = self.new_ic();
+                // While there are no global let/const definitions, an own
+                // data property of the global object (cached as an own
+                // property read's, by `tsaot_global_get`).
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                let vars = self.b.ins().load(I64, M_HEADER, ctx, layout::CTX_GLOBAL_VAR_OBJ);
+                let vars_shape = self.b.ins().load(I64, M_HEADER, vars, layout::OBJ_SHAPE);
+                let count = self.b.ins().uload32(M_HEADER, vars_shape, layout::SHAPE_PROP_COUNT);
+                let none = self.b.ins().icmp_imm_s(IntCC::Equal, count, 0);
+                let g = self.b.ins().load(I64, M_HEADER, ctx, layout::CTX_GLOBAL_OBJ);
+                let shape = self.b.ins().load(I64, M_HEADER, g, layout::OBJ_SHAPE);
+                let cached = self.b.ins().load(I64, M_IC, ic, 0);
+                let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+                let ok = self.b.ins().band(none, same);
+                let hit = self.b.create_block();
+                self.b.ins().brif(ok, hit, &[], slow, &[]);
+                self.b.switch_to_block(hit);
+                let at = self.ic_slot_addr(g, ic);
+                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
+                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+                self.dup((vp, vt));
+                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                self.b.switch_to_block(slow);
                 let r = self.helper("tsaot_global_get", &[ctx, atom, ic]);
                 self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                V::Any(rp, rt)
             }
             ExprKind::GlobalOrUndefined(a) => {
                 let atom = self.atom(*a);
@@ -3003,7 +3091,7 @@ impl Lower {
                 // are pure).
                 let fits = |m: Method| match m {
                     Method::ArrayPush => args.len() == 1,
-                    Method::StringFn(_) => args.len() <= 2,
+                    Method::StringFn(_) | Method::MapFn(_) => args.len() <= 2,
                     Method::CharCodeAt => true,
                 };
                 if let (Some(method), Key::Atom(a)) = (method, key)
@@ -3016,6 +3104,7 @@ impl Lower {
                         Method::CharCodeAt => self.char_code_at(fv, f_owned, obj, args),
                         Method::ArrayPush => self.array_push(fv, f_owned, obj, &args[0]),
                         Method::StringFn(k) => self.string_fn(k, fv, f_owned, obj, args),
+                        Method::MapFn(k) => self.map_fn(k, fv, f_owned, obj, args),
                     };
                     self.drop_operand(obj, owned);
                     return r;
@@ -3037,7 +3126,10 @@ impl Lower {
                     Some(Method::CharCodeAt) => self.char_code_at(fv, None, obj, args),
                     Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, None, obj, &args[0]),
                     Some(Method::StringFn(k)) if args.len() <= 2 => self.string_fn(k, fv, None, obj, args),
-                    Some(Method::ArrayPush | Method::StringFn(_)) | None => self.call_values(fv, obj, args, pred),
+                    Some(Method::MapFn(k)) if args.len() <= 2 => self.map_fn(k, fv, None, obj, args),
+                    Some(Method::ArrayPush | Method::StringFn(_) | Method::MapFn(_)) | None => {
+                        self.call_values(fv, obj, args, pred)
+                    }
                 };
                 self.drop_operand(obj, owned);
                 r
@@ -5054,6 +5146,100 @@ impl Lower {
             self.dup((fp, ft));
         }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
+            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            (r[0], r[1])
+        });
+        if borrowed {
+            self.free((fp, ft));
+        }
+        self.check_value_method(gt, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.switch_to_block(join);
+        for v in held.into_iter().rev() {
+            self.release(v);
+            self.free_v(v);
+        }
+        self.drop_method(f, f_owned);
+        V::Any(rp, rt)
+    }
+
+    /// `this.get(k)`, `set(k, v)`, `has(k)`, `add(k)` with `f` (held) the
+    /// method read: directly (`JS_CallMapFn`) while it is the original
+    /// builtin and `this` a Map (a Set for `add`, either for `has`), else
+    /// called. Frees `f`.
+    fn map_fn(&mut self, k: i32, f: V, f_owned: Option<Value>, this: V, args: &[Expr]) -> V {
+        let held: Vec<V> = args
+            .iter()
+            .map(|a| {
+                let v = self.expr(a);
+                self.hold(v);
+                v
+            })
+            .collect();
+        let (fp, ft) = f.any();
+        let (sp, st) = this.any();
+        let join = self.b.create_block();
+        let rp = self.b.append_block_param(join, I64);
+        let rt = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAG_OBJECT);
+        let f_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let both = self.b.ins().band(is_obj, f_obj);
+        let objs = self.b.create_block();
+        self.b.ins().brif(both, objs, &[], slow, &[]);
+        self.b.switch_to_block(objs);
+        let class = self.b.ins().uload16(I32, M_HEADER, sp, layout::OBJ_CLASS_ID);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let fits = |l: &mut Self, which: i32, cls: i64| {
+            let orig = l.b.ins().load(I64, M_CONST, table, (PIN_MAP_FNS + which) * 8);
+            let same = l.b.ins().icmp(IntCC::Equal, fp, orig);
+            let of = l.b.ins().icmp_imm_s(IntCC::Equal, class, cls);
+            l.b.ins().band(same, of)
+        };
+        let (ok, which) = match k {
+            // (A Map's `has`, or a Set's.)
+            2 => {
+                let map = fits(self, 2, layout::CLASS_MAP);
+                let set = fits(self, 4, layout::CLASS_SET);
+                let four = self.b.ins().iconst(I32, 4);
+                let two = self.b.ins().iconst(I32, 2);
+                let which = self.b.ins().select(set, four, two);
+                (self.b.ins().bor(map, set), which)
+            }
+            _ => {
+                let cls = if k == 3 { layout::CLASS_SET } else { layout::CLASS_MAP };
+                (fits(self, k, cls), self.b.ins().iconst(I32, k as i64))
+            }
+        };
+        let direct = self.b.create_block();
+        self.b.ins().brif(ok, direct, &[], slow, &[]);
+        self.b.switch_to_block(direct);
+        let undef = self.konst(0, TAG_UNDEFINED).any();
+        let mut vals: Vec<(Value, Value)> = held.iter().map(|&v| self.boxed(v)).collect();
+        vals.resize(2, undef);
+        let (_, argv) = self.values_slot_raw(&vals);
+        let ctx = self.ctx;
+        let argc = self.b.ins().iconst(I32, held.len() as i64);
+        let r = self.helper("JS_CallMapFn", &[ctx, sp, st, which, argc, argv]);
+        self.check_value_method(r[1], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.switch_to_block(slow);
+        let mut vals = vec![(fp, ft), (sp, st)];
+        for &v in &held {
+            let b = self.boxed(v);
+            vals.push(b);
+        }
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, held.len() as i64);
+        let n = held.len();
+        // (A borrowed method is held while it runs.)
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup((fp, ft));
+        }
+        let (gp, gt) = self.call_linked((fp, ft), (sp, st), n, argv, false, |l| {
             let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });

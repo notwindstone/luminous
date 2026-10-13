@@ -215,7 +215,16 @@ engine's semantics:
   `memchr` (8-bit strings: only where a match can start), and native
   code's `indexOf`, `includes`, `startsWith` and `endsWith` with a string
   argument skip the conversions; 8-bit strings of up to 16 characters
-  compared for equality (`===`, `Map` keys) with a few word loads; `parseInt`, `Number(s)` and `+s` read small decimal integers
+  compared for equality (`===`, `Map` keys) with a few word loads, and
+  native code compares a string with a short constant (`switch` cases,
+  `=== "user"`) by length, then by its characters as immediates; a
+  string that is not an atom keeps its hash once a `Map` or `Set` has
+  computed it (cleared where it grows in place); native code calls
+  `Map.prototype.get`, `set`, `has` and `Set.prototype.add`, `has` on a
+  Map or Set directly while they are the builtins; global variables
+  (`parseInt`, `String`) are read through an inline cache of the global
+  object's property (while there are no global `let`/`const`
+  definitions); `parseInt`, `Number(s)` and `+s` read small decimal integers
   directly; the cycle collector first runs at 4MB and then whenever the
   heap has doubled, or grown eightfold after a collection that freed little
   (rather than from 256KB, at every 50% growth);

@@ -117,6 +117,12 @@ pub mod layout {
     pub const OBJ_APPEND_MASK: i64 = 0xffff_0012;
     pub const OBJ_APPEND_FLAGS: i64 = 0x2_0012;
     pub const CTX_STD_ARRAY_PROTO: i32 = 48;
+    // Reading global variables inline.
+    pub const CTX_GLOBAL_OBJ: i32 = 504;
+    pub const CTX_GLOBAL_VAR_OBJ: i32 = 520;
+    pub const SHAPE_PROP_COUNT: i32 = 32;
+    pub const CLASS_MAP: i64 = 36;
+    pub const CLASS_SET: i64 = 37;
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
@@ -160,6 +166,11 @@ pub mod layout {
         ("OBJ_APPEND_MASK", OBJ_APPEND_MASK),
         ("OBJ_APPEND_FLAGS", OBJ_APPEND_FLAGS),
         ("CTX_STD_ARRAY_PROTO", CTX_STD_ARRAY_PROTO as i64),
+        ("CTX_GLOBAL_OBJ", CTX_GLOBAL_OBJ as i64),
+        ("CTX_GLOBAL_VAR_OBJ", CTX_GLOBAL_VAR_OBJ as i64),
+        ("SHAPE_PROP_COUNT", SHAPE_PROP_COUNT as i64),
+        ("CLASS_MAP", CLASS_MAP),
+        ("CLASS_SET", CLASS_SET),
     ];
 }
 
@@ -337,6 +348,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_array_push_ok", &[P], &[Int]),
         ("tsaot_region_push", &[P, W, W, W, W], &[Int]),
         ("JS_CallStringFn", &[P, W, W, Int, Int, P], &[W, W]),
+        ("JS_CallMapFn", &[P, W, W, Int, Int, P], &[W, W]),
         ("JS_ConcatStrings", &[P, P, Int], &[W, W]),
         ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
         ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
@@ -395,6 +407,8 @@ struct Codegen {
     /// `aot type` layouts.
     layouts: std::rc::Rc<Vec<ir::Layout>>,
     int_wrapping: bool,
+    /// The string constants' text.
+    texts: std::rc::Rc<Vec<String>>,
 }
 
 impl Codegen {
@@ -506,6 +520,7 @@ impl Codegen {
             rets: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect()),
             layouts: std::rc::Rc::new(m.layouts.clone()),
             int_wrapping: m.int_wrapping,
+            texts: std::rc::Rc::new(m.strings.clone()),
             promise_resolve: m
                 .atoms
                 .iter()
@@ -569,6 +584,7 @@ impl Codegen {
             rets: self.rets.clone(),
             layouts: self.layouts.clone(),
             int_wrapping: self.int_wrapping,
+            texts: self.texts.clone(),
             fast_sig: self.fast_sig,
         }
     }
