@@ -691,6 +691,8 @@ impl Lower {
         let slot = self.box_slot(l);
         self.b.ins().store(M_SLOT, p, slot, 0);
         self.b.ins().store(M_SLOT, t, slot, TAG_OFFSET);
+        // (The slot starts the box's traced block.)
+        self.write_barrier(slot, t);
     }
 
     /// ReferenceError if a boxed local is still uninitialized.
@@ -790,6 +792,36 @@ impl Lower {
 
     /// Release a reference.
     fn free(&mut self, _v: (Value, Value)) {}
+
+    /// The collector's write barrier, after a value tagged `t` is stored
+    /// in the GC cell `owner` (an object, or a traced block such as a
+    /// box): an old cell (one that survived a collection) not yet
+    /// remembered is remembered, for the next minor collection to trace.
+    /// Its header's flags byte: `mark` (old) the top bit, `gc_remembered`
+    /// the next.
+    fn write_barrier(&mut self, owner: Value, t: Value) {
+        let rc = self.is_refcounted(t);
+        let check = self.b.create_block();
+        let call = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.set_cold_block(call);
+        self.b.ins().brif(rc, check, &[], join, &[]);
+        self.b.switch_to_block(check);
+        let flags = self.b.ins().uload8(I32, M_RC, owner, layout::GC_FLAGS);
+        let bits = self.b.ins().band_imm_u(flags, 0xc0);
+        let old = self.b.ins().icmp_imm_s(IntCC::Equal, bits, 0x80);
+        self.b.ins().brif(old, call, &[], join, &[]);
+        self.b.switch_to_block(call);
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        self.helper("JS_GCWriteBarrier", &[rt, owner]);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+    }
+
+    fn is_refcounted(&mut self, t: Value) -> Value {
+        self.b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0)
+    }
     fn free_v(&mut self, v: V) {
         if let V::Any(p, t) = v {
             self.free((p, t));
@@ -1995,6 +2027,7 @@ impl Lower {
                     let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
                     self.b.ins().store(M_SLOT, vp, at, 0);
                     self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+                    self.write_barrier(op_, vt);
                     self.free((old_p, old_t));
                     self.b.ins().jump(join, &[]);
                 } else {
@@ -2689,6 +2722,7 @@ impl Lower {
                 let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
                 self.b.ins().store(M_SLOT, vp, at, 0);
                 self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+                self.write_barrier(p, vt);
                 self.free((old_p, old_t));
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
@@ -2729,6 +2763,7 @@ impl Lower {
                 let slot = self.array_slot(ap, count);
                 self.b.ins().store(M_SLOT, vp, slot, 0);
                 self.b.ins().store(M_SLOT, vt, slot, TAG_OFFSET);
+                self.write_barrier(ap, vt);
                 let k1 = self.b.ins().iadd_imm_s(count, 1);
                 self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
                 let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
@@ -2837,6 +2872,7 @@ impl Lower {
                 let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
                 self.b.ins().store(M_SLOT, vp, at, 0);
                 self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+                self.write_barrier(op_, vt);
                 self.free((old_p, old_t));
                 self.b.ins().jump(join, &[]);
                 // Appending (index == count): the engine's append fast path,
@@ -3313,6 +3349,7 @@ impl Lower {
                 let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
                 self.b.ins().store(M_SLOT, vp, at, 0);
                 self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+                self.write_barrier(op_, vt);
                 self.free((old_p, old_t));
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
@@ -4352,6 +4389,7 @@ impl Lower {
         let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
         self.b.ins().store(M_SLOT, vp, at, 0);
         self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        self.write_barrier(p, vt);
         self.free((old_p, old_t));
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(slow);
@@ -7162,6 +7200,7 @@ impl Lower {
         self.b.ins().store(M_SLOT, vp, at, 0);
         self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
+        self.write_barrier(ap, vt);
         k1
     }
 
@@ -7195,6 +7234,7 @@ impl Lower {
         self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
         let k1 = self.b.ins().iadd_imm_s(k, 1);
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
+        self.write_barrier(ap, vt);
         if length {
             let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
             self.b.ins().istore32(M_SLOT, k1, prop, 0);

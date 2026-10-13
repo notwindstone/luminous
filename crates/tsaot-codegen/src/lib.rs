@@ -75,6 +75,7 @@ pub mod jsvalue {
 /// `_Static_assert`s against these values.
 pub mod layout {
     pub const REF_COUNT: i32 = -4;
+    pub const GC_FLAGS: i32 = -5;
     pub const STRING_LEN: i32 = 0;
     pub const OBJ_CLASS_ID: i32 = 18;
     pub const OBJ_SHAPE: i32 = 24;
@@ -132,6 +133,7 @@ pub mod layout {
 
     pub const ALL: &[(&str, i64)] = &[
         ("REF_COUNT", REF_COUNT as i64),
+        ("GC_FLAGS", GC_FLAGS as i64),
         ("STRING_LEN", STRING_LEN as i64),
         ("OBJ_CLASS_ID", OBJ_CLASS_ID as i64),
         ("OBJ_SHAPE", OBJ_SHAPE as i64),
@@ -269,6 +271,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
     &[
         ("JS_DupValue", &[P, W, W], &[W, W]),
         ("JS_FreeValue", &[P, W, W], &[]),
+        ("JS_GCWriteBarrier", &[P, P], &[]),
         ("JS_BinaryOperator", &[P, Int, W, W, W, W], &[W, W]),
         ("JS_UnaryOperator", &[P, Int, W, W], &[W, W]),
         ("JS_ToBool", &[P, W, W], &[Int]),

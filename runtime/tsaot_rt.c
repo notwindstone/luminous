@@ -257,6 +257,8 @@ JSValue tsaot_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, 
     }
     f->resolve = funcs[0];
     f->reject = funcs[1];
+    /* (the frame object may have survived a collection since made) */
+    JS_GCWriteBarrier(JS_GetRuntime(ctx), JS_VALUE_GET_PTR(obj));
     *slots = f->slots;
     return obj;
 }
@@ -268,6 +270,8 @@ void tsaot_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value,
     TsaotFrame *f = tsaot_frame_of(slots);
     JSValue r = tsaot_steps[f->fn](ctx, slots, state, value, is_throw);
     JSValue settle, arg, ret;
+    /* (the slots, the reactions: written by the step) */
+    JS_GCWriteBarrier(JS_GetRuntime(ctx), f->self);
     if (JS_IsUninitialized(r))
         return; /* suspended at an await */
     if (JS_IsException(r)) {
@@ -1068,6 +1072,8 @@ static JSValue tsaot_gen_step(JSContext *ctx, JSValueConst frame, int magic, JSV
     TsaotFrame *f = JS_GetOpaque(frame, tsaot_frame_class);
     JSValue io = value, r;
     r = tsaot_steps[f->fn](ctx, f->slots, f->state, &io, magic);
+    /* (the slots: written by the step) */
+    JS_GCWriteBarrier(JS_GetRuntime(ctx), f->self);
     if (JS_IsUninitialized(r)) {
         /* suspended: 4 * state + kind (0: yield, 1: yield an iterator
            result as is, 3: await) */
@@ -1087,6 +1093,7 @@ JSValue tsaot_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data)
     TsaotFrame *f = JS_GetOpaque(frame, tsaot_frame_class);
     JSValue io = JS_UNDEFINED, r;
     r = tsaot_steps[f->fn](ctx, f->slots, 0, &io, 0);
+    JS_GCWriteBarrier(JS_GetRuntime(ctx), f->self);
     if (JS_IsException(r)) {
         JS_FreeValue(ctx, frame);
         return r;
@@ -1101,6 +1108,7 @@ JSValue tsaot_async_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_da
     TsaotFrame *f = JS_GetOpaque(frame, tsaot_frame_class);
     JSValue io = JS_UNDEFINED, r;
     r = tsaot_steps[f->fn](ctx, f->slots, 0, &io, 0);
+    JS_GCWriteBarrier(JS_GetRuntime(ctx), f->self);
     if (JS_IsException(r)) {
         JS_FreeValue(ctx, frame);
         return r;
@@ -1821,6 +1829,9 @@ static int tsaot_put_raw(JSContext *ctx, TsaotStruct *s, int fi, JSValue v, JSVa
     default:
         *old = *(JSValue *)at;
         *(JSValue *)at = v;
+        /* (the object, whose data the struct is) */
+        if (JS_VALUE_HAS_REF_COUNT(v))
+            JS_GCWriteBarrier(JS_GetRuntime(ctx), (char *)s - JS_LAYOUT_OBJ_SIZE);
         return 0;
     }
     JS_FreeValue(ctx, v);
@@ -2239,6 +2250,8 @@ int tsaot_sarr_set(JSContext *ctx, JSValue obj, int64_t idx, JSValue v)
     }
     JS_FreeValue(ctx, a->items[idx]);
     a->items[idx] = v;
+    if (JS_VALUE_HAS_REF_COUNT(v))
+        JS_GCWriteBarrier(JS_GetRuntime(ctx), JS_VALUE_GET_PTR(obj));
     return 0;
 }
 

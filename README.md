@@ -86,10 +86,10 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 6. **Shared state.** Module-level bindings that native code uses live in
    *cells*, which both sides access. Interpreted references to reassigned
    bindings are rewritten to go through an accessor object (`__tsaot_m.count`).
-   Variables captured by native closures live in GC-visible boxes. Every
-   reference in native code is counted exactly like the interpreter's. The
-   test suite runs on an engine built with assertions, which aborts if any
-   object leaks.
+   Variables captured by native closures live in GC-visible boxes. Native
+   code takes and drops references for free: the engine's collector traces
+   what is reachable, native frames included (see
+   [Memory](#memory-a-generational-tracing-collector)).
 
 ### Crossing from interpreted to native code
 
@@ -153,8 +153,8 @@ engine's semantics:
 - `JS_NewNativeAsyncGenerator`: the same for async generators. The step
   function also reports awaits; the engine keeps the request queue, awaits,
   and resumes it with the settled value;
-- `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
-  counts, array elements, typed array storage, string length). It is
+- `JS_LAYOUT_*`: the object layout that inline fast paths read (cell
+  headers, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
 - `JS_CachePlainShape` / `JS_NewObjectWithCachedShape` and
   `JS_NewCFunctionDataShaped`: objects and native closures made directly
@@ -191,20 +191,12 @@ engine's semantics:
   arena kept per size class (allocation-heavy code used to create and free
   an arena every few dozen objects), and recently freed blocks cached per
   size class, up to 64MB each (a free and the next allocation are a push
-  and a pop, even after a large structure is freed at once); plain
-  objects made from an allocation site's shape in one short function, and
-  freed (with the plain objects only they referenced) in a loop rather than
-  through the collector's queue, without a look at each property's kind
-  when the shape never had an accessor (nor does the cycle collector), and
-  the allocator's counts updated
-  once per loop; arrays freed the same way with their
-  plain elements; an empty size-class cache refilled 32 blocks at a time,
+  and a pop); plain objects made from an allocation site's shape in one
+  short function; an empty size-class cache refilled 32 blocks at a time,
   in address order; strings allocated from the cache inline, in a path
   that makes no calls (so it saves no registers); pieces of 8-bit strings
   up to 32 bytes (`slice`, `substring`, `split`) copied with a few
-  overlapping moves into a block popped from the cache, and the last
-  reference to a plain string, released from native code, pushing its
-  block straight back; plain objects
+  overlapping moves into a cell taken inline; plain objects
   that keep their property array in their own allocation until it grows;
   defining the next element of a fast array (`map`, `filter`, `split`,
   `Array.from`, …) appends it, and a growing array makes room for 8
@@ -219,16 +211,56 @@ engine's semantics:
   native code compares a string with a short constant (`switch` cases,
   `=== "user"`) by length, then by its characters as immediates; a
   string that is not an atom keeps its hash once a `Map` or `Set` has
-  computed it (cleared where it grows in place); native code calls
+  computed it; native code calls
   `Map.prototype.get`, `set`, `has` and `Set.prototype.add`, `has` on a
   Map or Set directly while they are the builtins; global variables
   (`parseInt`, `String`) are read through an inline cache of the global
   object's property (while there are no global `let`/`const`
   definitions); `parseInt`, `Number(s)` and `+s` read small decimal integers
-  directly; the cycle collector first runs at 4MB and then whenever the
-  heap has doubled, or grown eightfold after a collection that freed little
-  (rather than from 256KB, at every 50% growth);
-  `x ** 2` is the correctly rounded square (as native code computes it).
+  directly; `x ** 2` is the correctly rounded square (as native code
+  computes it).
+
+### Memory: a generational, tracing collector
+
+The patch replaces the engine's reference counting and cycle collector.
+Values are not counted, so taking or dropping a reference costs nothing,
+in native code and in the engine; a mark-sweep collector frees what is
+unreachable, and never moves anything.
+
+- **Heap.** Objects, strings, ropes, bigints, shapes, function bytecode,
+  closure variables and async function states are *cells* in 256KB chunks,
+  one cell size per chunk, with a bit per cell for allocated, marked and
+  to-finalize. Allocation bumps a pointer through a run of free cells;
+  native code allocates objects inline the same way.
+- **Roots.** The contexts, the job queue, the pending exception, the atoms
+  referenced as atoms, mark hooks for values that C structures hold (the
+  native runtime's state and inline caches, libc's timers), and the native
+  stack and registers, scanned conservatively: a word pointing into a cell
+  keeps it. Native code needs no stack maps: what its registers and stack
+  slots hold is found.
+- **Generations.** A cell that survives a collection is old (a bit in its
+  header) and keeps its mark. A minor collection traces from the roots and
+  from the old cells given references since the last collection, which a
+  write barrier (an inline test of that bit, in the engine and in native
+  code) remembers; the old cells are kept without being traced. The young
+  generation starts at 4MB and grows, up to 64MB, while much of it
+  survives; a major collection traces everything once the old cells have
+  doubled.
+- **Sweeping.** Dead cells are not visited, but for those with something
+  to release (class finalizers, property arrays of their own, weak
+  references, shapes, function bytecode), whose finalizers run before any
+  cell is freed: plain objects, arrays, strings and closures die without
+  being touched. A minor collection sweeps only the chunks with young
+  cells.
+- **Weak references.** Strings referenced only as values leave the atom
+  table once unreachable, shapes the shape hash; WeakMap entries, WeakRefs
+  and FinalizationRegistry callbacks are processed when their targets die.
+- **Checking it.** `QJS_GC_STRESS=n` collects every n allocations;
+  `QJS_GC_VERIFY=1` poisons dead cells and keeps them for a collection
+  (aborting on a reference to one), and after each minor collection checks
+  that everything reachable is marked, naming the holder of a reference
+  whose barrier is missing. The test suite runs with both;
+  `QJS_GC_STATS=1` prints the counts at exit.
 
 ## Backends
 
@@ -250,15 +282,11 @@ The differential tests run every case with both.
     partly inlined into itself), drops the unused ones and picks their
     calling convention;
   - every load and store carries its alias region as type-based alias
-    analysis metadata: reference counts, `JSValue` slots (properties,
+    analysis metadata: cell headers, `JSValue` slots (properties,
     elements, cells, frames), the engine's object headers, typed array
     elements, `aot type` storage, inline caches, constant tables. Values
-    then stay in registers across stores to other regions (a field is not
-    read again after a reference count update), and dead stores go;
-  - reference counts loaded by native code carry the range of a live value
-    (at least 1), so a new reference and its release with nothing in
-    between cancel out (`t.left === null` reads the field without touching
-    its count);
+    then stay in registers across stores to other regions, and dead
+    stores go;
   - addresses derived from globals, stack slots and loaded pointers stay
     pointers (`getelementptr`), and the tables filled before any native code
     runs (atoms, strings, shapes) are invariant loads, hoisted out of loops
