@@ -74,7 +74,6 @@ pub mod jsvalue {
 /// constants of the engine patch, which the generated C glue
 /// `_Static_assert`s against these values.
 pub mod layout {
-    pub const REF_COUNT: i32 = -4;
     pub const GC_FLAGS: i32 = -5;
     pub const STRING_LEN: i32 = 0;
     pub const OBJ_CLASS_ID: i32 = 18;
@@ -99,15 +98,6 @@ pub mod layout {
     pub const STRING_DATA: i32 = 24;
     // Allocating plain objects inline (see `JS_ShapeAllocInfo`).
     pub const CTX_RT: i32 = 16;
-    pub const RT_MALLOC_COUNT: i32 = 40;
-    pub const RT_MALLOC_SIZE: i32 = 48;
-    pub const RT_MALLOC_LIMIT: i32 = 56;
-    pub const RT_ARENA_CACHE: i32 = 72;
-    pub const ARENA_CACHE_SIZE: i32 = 16;
-    pub const ARENA_CACHE_COUNT: i32 = 8;
-    pub const RT_GC_OBJ_LIST: i32 = 1968;
-    pub const RT_GC_THRESHOLD: i32 = 2024;
-    pub const OBJ_GC_BYTE: i32 = -5;
     pub const OBJ_FLAGS: i32 = 16;
     pub const OBJ_PLAIN_FLAGS: i64 = 0x10002;
     pub const OBJ_WEAK_REF: i32 = 40;
@@ -127,12 +117,9 @@ pub mod layout {
     // Allocating GC cells inline.
     pub const RT_GC_RUNS: i32 = 2296;
     pub const GC_RUN_SIZE: i32 = 16;
-    pub const RT_GC_FREE_CELLS: i32 = 3112;
     pub const GC_CELL_WORD: i64 = 0xfe0000;
-    pub const MALLOC_OVERHEAD: i64 = 8;
 
     pub const ALL: &[(&str, i64)] = &[
-        ("REF_COUNT", REF_COUNT as i64),
         ("GC_FLAGS", GC_FLAGS as i64),
         ("STRING_LEN", STRING_LEN as i64),
         ("OBJ_CLASS_ID", OBJ_CLASS_ID as i64),
@@ -156,15 +143,6 @@ pub mod layout {
         ("STRING_KIND", STRING_KIND as i64),
         ("STRING_DATA", STRING_DATA as i64),
         ("CTX_RT", CTX_RT as i64),
-        ("RT_MALLOC_COUNT", RT_MALLOC_COUNT as i64),
-        ("RT_MALLOC_SIZE", RT_MALLOC_SIZE as i64),
-        ("RT_MALLOC_LIMIT", RT_MALLOC_LIMIT as i64),
-        ("RT_ARENA_CACHE", RT_ARENA_CACHE as i64),
-        ("ARENA_CACHE_SIZE", ARENA_CACHE_SIZE as i64),
-        ("ARENA_CACHE_COUNT", ARENA_CACHE_COUNT as i64),
-        ("RT_GC_OBJ_LIST", RT_GC_OBJ_LIST as i64),
-        ("RT_GC_THRESHOLD", RT_GC_THRESHOLD as i64),
-        ("OBJ_GC_BYTE", OBJ_GC_BYTE as i64),
         ("OBJ_FLAGS", OBJ_FLAGS as i64),
         ("OBJ_PLAIN_FLAGS", OBJ_PLAIN_FLAGS),
         ("OBJ_WEAK_REF", OBJ_WEAK_REF as i64),
@@ -181,9 +159,7 @@ pub mod layout {
         ("CLASS_SET", CLASS_SET),
         ("RT_GC_RUNS", RT_GC_RUNS as i64),
         ("GC_RUN_SIZE", GC_RUN_SIZE as i64),
-        ("RT_GC_FREE_CELLS", RT_GC_FREE_CELLS as i64),
         ("GC_CELL_WORD", GC_CELL_WORD),
-        ("MALLOC_OVERHEAD", MALLOC_OVERHEAD),
     ];
 }
 

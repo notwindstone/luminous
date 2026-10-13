@@ -230,8 +230,10 @@ unreachable, and never moves anything.
 - **Heap.** Objects, strings, ropes, bigints, shapes, function bytecode,
   closure variables and async function states are *cells* in 256KB chunks,
   one cell size per chunk, with a bit per cell for allocated, marked and
-  to-finalize. Allocation bumps a pointer through a run of free cells;
-  native code allocates objects inline the same way.
+  to-finalize. Allocation bumps a pointer through a run of free cells,
+  counted allocated as a whole when the run begins (which is where a
+  collection starts); native code allocates objects inline the same way,
+  a compare, a bump and the header stores.
 - **Roots.** The contexts, the job queue, the pending exception, the atoms
   referenced as atoms, mark hooks for values that C structures hold (the
   native runtime's state and inline caches, libc's timers), and the native
