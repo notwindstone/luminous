@@ -240,8 +240,9 @@ const IC_STRING: i64 = 8;
 pub(crate) struct Env {
     pub helpers: HashMap<&'static str, FuncRef>,
     pub funcs: Vec<FuncRef>,
-    /// The copies of native `sort` comparators with borrowed parameters.
-    pub sort_cmps: HashMap<usize, FuncRef>,
+    /// The merge sorts calling native `sort` comparators
+    /// (`Codegen::define_sorter`).
+    pub sorters: HashMap<usize, FuncRef>,
     pub stack_limit: GlobalValue,
     pub unwinding: GlobalValue,
     pub cells: GlobalValue,
@@ -4274,16 +4275,9 @@ impl Lower {
         self.b.ins().brif(ok, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let numbers = self.env.params[func].first() == Some(&Ty::F64);
-        let boxed_ret = self.env.rets[func] != Ty::F64;
-        // (Mode 4: the comparator borrows the elements.)
-        let (cmp, borrowed) = match self.env.sort_cmps.get(&func) {
-            Some(&c) => (c, true),
-            None => (self.env.funcs[func], false),
-        };
-        let mode = self.b.ins().iconst(I32, numbers as i64 | (boxed_ret as i64) << 1 | (borrowed as i64) << 2);
-        let cmp = self.b.ins().func_addr(self.ptr, cmp);
-        let flag = self.b.ins().symbol_value(self.ptr, self.env.unwinding);
-        let r = self.helper("JS_SortNative", &[ctx, op_, ot, cmp, mode, flag])[0];
+        let numbers = self.b.ins().iconst(I32, numbers as i64);
+        let sorter = self.b.ins().func_addr(self.ptr, self.env.sorters[&func]);
+        let r = self.helper("JS_SortNative", &[ctx, op_, ot, sorter, numbers])[0];
         self.check_int(r);
         let sorted = self.b.create_block();
         let done = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);

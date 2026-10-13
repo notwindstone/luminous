@@ -161,7 +161,7 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
             Some(body) => {
                 let mut e = FnEmitter::new(m, body, &mut intrinsics);
                 e.x86 = triple.starts_with("x86_64");
-                let text = e.function(&f.name, f.linkage);
+                let text = e.function(&f.name, f.linkage, f.always_inline);
                 out.push_str(&text);
             }
         }
@@ -172,6 +172,7 @@ pub fn emit(m: &mir::Module, opts: &Options) -> Result<String> {
     }
     writeln!(out, "\nattributes #0 = {{ nounwind }}").unwrap();
     writeln!(out, "attributes #1 = {{ nounwind }}").unwrap();
+    writeln!(out, "attributes #2 = {{ nounwind alwaysinline }}").unwrap();
     // Functions of their arguments only (`errno`, which libm may set, is
     // never read): LLVM may reuse and hoist their results.
     writeln!(out, "attributes #3 = {{ nounwind readnone willreturn }}").unwrap();
@@ -598,7 +599,7 @@ impl<'a> FnEmitter<'a> {
         t
     }
 
-    fn function(&mut self, name: &str, linkage: Linkage) -> String {
+    fn function(&mut self, name: &str, linkage: Linkage, always_inline: bool) -> String {
         let f = self.f;
         let entry = &f.blocks[f.entry.index()];
         let params: Vec<String> = f
@@ -620,7 +621,9 @@ impl<'a> FnEmitter<'a> {
         // as Cranelift's do: their speed then does not depend on the code
         // before them.
         let align = if exported { " align 64" } else { "" };
-        let mut head = format!("define {linkage}{} @{name}({}) #1{align} {{\n", ret_type(&f.sig), params.join(", "));
+        let attrs = if always_inline { 2 } else { 1 };
+        let mut head =
+            format!("define {linkage}{} @{name}({}) #{attrs}{align} {{\n", ret_type(&f.sig), params.join(", "));
         head.push_str("entry:\n");
         self.out = head;
         for (i, s) in f.slots.iter().enumerate() {

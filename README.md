@@ -184,8 +184,8 @@ engine's semantics:
 - `JS_ArrayPushFast`: `push`'s own fast path, for native code;
 - for native array loops: `JS_ArraySpeciesCreateRoom` (a `map` result with
   room for every element), `JS_TryGetElement`, `JS_DefineElement` (appends
-  in place), and `JS_SortNative`, a stable merge sort that calls a native
-  comparator directly through its native signature;
+  in place), and `JS_SortNative`, which sorts a fast array's elements
+  with a merge sort compiled with the native comparator;
 - faster engine internals that every program benefits from, interpreted
   or not: 64KB allocator arenas handed out by a bump index, with one empty
   arena kept per size class (allocation-heavy code used to create and free
@@ -526,12 +526,11 @@ The differential tests run every case with both.
   constructor made the result itself (no species constructor ran), no
   other code holds it, so an element is stored wherever there is room,
   with no other check.
-  `xs.sort((a, b) => ...)` with an arrow that captures nothing has the
-  engine sort calling the compiled comparator directly: a merge sort per
-  comparator signature (and per borrowing) with the call inlined and its
-  state in registers, and a copy of the comparator that borrows the
-  elements the sort holds (no reference taken or released per
-  comparison).
+  `xs.sort((a, b) => ...)` with an arrow that captures nothing is sorted
+  by a merge sort compiled per comparator (the engine's stable algorithm:
+  insertion sorts of up to 8 elements, halves merged), which runs a copy
+  of the comparator inline at each comparison; the engine takes the
+  elements out of the array and puts them back.
 - **Leaf functions** that can neither throw nor call (only unboxed numbers
   and booleans) skip the stack check, and their callers the exception
   check after the call.

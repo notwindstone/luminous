@@ -1087,6 +1087,8 @@ pub struct FuncDecl {
     pub sig: Signature,
     pub linkage: Linkage,
     pub body: Option<Function>,
+    /// Inlined wherever it is called (where the backend inlines).
+    pub always_inline: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1115,7 +1117,13 @@ impl Module {
     pub fn declare_function(&mut self, name: &str, linkage: Linkage, sig: &Signature) -> FuncId {
         assert!(self.funcs.iter().all(|f| f.name != name), "function {name} declared twice");
         self.decls = None;
-        self.funcs.push(FuncDecl { name: name.to_string(), sig: sig.clone(), linkage, body: None });
+        self.funcs.push(FuncDecl {
+            name: name.to_string(),
+            sig: sig.clone(),
+            linkage,
+            body: None,
+            always_inline: false,
+        });
         FuncId(self.funcs.len() as u32 - 1)
     }
 
@@ -1142,6 +1150,10 @@ impl Module {
             })
             .clone();
         FunctionBuilder::new(sig, decls)
+    }
+
+    pub fn set_always_inline(&mut self, id: FuncId) {
+        self.funcs[id.index()].always_inline = true;
     }
 
     pub fn define_function(&mut self, id: FuncId, f: Function) {

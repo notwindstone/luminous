@@ -218,6 +218,7 @@ pub fn lower_module(m: &ir::Module) -> Result<mir::Module> {
     for (i, id) in cmps {
         let f = m.funcs.iter().chain(&m.closures).nth(i).expect("comparator");
         cg.define_as(id, i, f, true).with_context(|| format!("compiling the comparator `{}`", f.name))?;
+        cg.define_sorter(cg.sorters[&i], id, f);
     }
     cg.define_ics();
     Ok(cg.module)
@@ -230,6 +231,133 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Output> {
         Backend::Cranelift => Output::Object(clif::emit(&module, &opts.opt_level)?),
         Backend::Llvm => Output::LlvmIr(llvm::emit(&module, &opts.llvm)?),
     })
+}
+
+/// `tsaot_sort_<i>`'s signature: (ctx, values, room for half of them and
+/// one more, count) -> 1 if the comparator threw, else 0.
+fn sorter_signature() -> Signature {
+    Signature {
+        params: vec![AbiParam::pointer(), AbiParam::pointer(), AbiParam::pointer(), AbiParam::new(I64)],
+        returns: vec![AbiParam::new(I32)],
+    }
+}
+
+/// JS value `i` of the array at `a`.
+fn elem(b: &mut FunctionBuilder, a: Value, i: Value) -> (Value, Value) {
+    let off = b.ins().imul_imm_s(i, 16);
+    let at = b.ins().iadd(a, off);
+    (b.ins().load(I64, M_SLOT, at, 0), b.ins().load(I64, M_SLOT, at, 8))
+}
+
+fn set_elem(b: &mut FunctionBuilder, a: Value, i: Value, (p, t): (Value, Value)) {
+    let off = b.ins().imul_imm_s(i, 16);
+    let at = b.ins().iadd(a, off);
+    b.ins().store(M_SLOT, p, at, 0);
+    b.ins().store(M_SLOT, t, at, 8);
+}
+
+/// Copy `n` JS values from `src` to `dst` (in ascending order).
+fn copy_elems(b: &mut FunctionBuilder, dst: Value, src: Value, n: Value) {
+    let k = b.declare_var(I64);
+    let zero = b.ins().iconst(I64, 0);
+    b.def_var(k, zero);
+    let head = b.create_block();
+    let body = b.create_block();
+    let out = b.create_block();
+    b.ins().jump(head, &[]);
+    b.switch_to_block(head);
+    let kv = b.use_var(k);
+    let more = b.ins().icmp(IntCC::SignedLessThan, kv, n);
+    b.ins().brif(more, body, &[], out, &[]);
+    b.switch_to_block(body);
+    let kv = b.use_var(k);
+    let v = elem(b, src, kv);
+    set_elem(b, dst, kv, v);
+    let k1 = b.ins().iadd_imm_s(kv, 1);
+    b.def_var(k, k1);
+    b.ins().jump(head, &[]);
+    b.switch_to_block(out);
+}
+
+/// A merge sort's comparator calls (see `Codegen::define_sorter`).
+struct Sorter<'a> {
+    cmp: FuncId,
+    f: &'a ir::Func,
+    unwinding: mir::DataId,
+    to_float: FuncId,
+    ctx: Value,
+}
+
+impl Sorter<'_> {
+    /// Whether `x` orders after `y` (an `I8`), else (the comparator threw)
+    /// to `fail`.
+    fn after(&self, b: &mut FunctionBuilder, x: (Value, Value), y: (Value, Value), fail: Block) -> Value {
+        let mut args = vec![self.ctx];
+        if self.f.is_closure {
+            args.push(b.ins().iconst(I64, 0));
+        }
+        for (&t, (p, tag)) in self.f.params.iter().zip([x, y]) {
+            match t {
+                // (Numbers: `JS_SortNative` checked that every value is one.)
+                Ty::F64 => {
+                    let is_int = b.ins().icmp_imm_s(IntCC::Equal, tag, jsvalue::TAG_INT);
+                    let i = b.ins().ireduce(I32, p);
+                    let i = b.ins().sextend(I64, i);
+                    let from_int = b.ins().fcvt_from_sint(F64, i);
+                    let bits = b.ins().bitcast(F64, p);
+                    args.push(b.ins().select(is_int, from_int, bits));
+                }
+                _ => args.extend([p, tag]),
+            }
+        }
+        let call = b.ins().call(self.cmp, &args);
+        let r = b.inst_results(call).to_vec();
+        let flag_addr = b.ins().symbol_value(I64, self.unwinding);
+        let flag = b.ins().load(I8, M_FLAG, flag_addr, 0);
+        let ok = b.create_block();
+        b.ins().brif(flag, fail, &[], ok, &[]);
+        b.switch_to_block(ok);
+        let zero = b.ins().f64const(0.0);
+        if self.f.ret == Ty::F64 {
+            return b.ins().fcmp(FloatCC::GreaterThan, r[0], zero);
+        }
+        // A JS value: an int32, a float, else converted (which may throw).
+        let (p, t) = (r[0], r[1]);
+        let join = b.create_block();
+        let res = b.append_block_param(join, I8);
+        let not_int = b.create_block();
+        let is_int = b.ins().icmp_imm_s(IntCC::Equal, t, jsvalue::TAG_INT);
+        let int_b = b.create_block();
+        b.ins().brif(is_int, int_b, &[], not_int, &[]);
+        b.switch_to_block(int_b);
+        let i = b.ins().ireduce(I32, p);
+        let pos = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, i, 0);
+        b.ins().jump(join, &[BlockArg::Value(pos)]);
+        b.switch_to_block(not_int);
+        let is_float = b.ins().icmp_imm_s(IntCC::Equal, t, jsvalue::TAG_FLOAT64);
+        let float_b = b.create_block();
+        let other = b.create_block();
+        b.set_cold_block(other);
+        b.ins().brif(is_float, float_b, &[], other, &[]);
+        b.switch_to_block(float_b);
+        let d = b.ins().bitcast(F64, p);
+        let pos = b.ins().fcmp(FloatCC::GreaterThan, d, zero);
+        b.ins().jump(join, &[BlockArg::Value(pos)]);
+        b.switch_to_block(other);
+        let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let out = b.ins().stack_addr(I64, slot, 0);
+        let rc = b.ins().call(self.to_float, &[self.ctx, out, p, t]);
+        let rc = b.inst_results(rc)[0];
+        let threw = b.ins().icmp_imm_s(IntCC::SignedLessThan, rc, 0);
+        let conv = b.create_block();
+        b.ins().brif(threw, fail, &[], conv, &[]);
+        b.switch_to_block(conv);
+        let d = b.ins().stack_load(I64, F64, slot, 0);
+        let pos = b.ins().fcmp(FloatCC::GreaterThan, d, zero);
+        b.ins().jump(join, &[BlockArg::Value(pos)]);
+        b.switch_to_block(join);
+        res
+    }
 }
 
 /// ABI parameters of a value of type `t`.
@@ -331,7 +459,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_ArraySpeciesCreateRoom", &[P, W, W, P, P], &[W, W]),
         ("JS_TryGetElement", &[P, W, W, P, P], &[W, W]),
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
-        ("JS_SortNative", &[P, W, W, P, Int, P], &[Int]),
+        ("JS_SortNative", &[P, W, W, P, Int], &[Int]),
         ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
         ("tsaot_record_learn", &[P, W, W, Int], &[]),
         ("tsaot_char_code_at_ok", &[P], &[Int]),
@@ -377,6 +505,8 @@ struct Codegen {
     /// Native `sort` comparators (by function): a copy whose JS-valued
     /// parameters are borrowed (`tsaot_cmp_<i>`).
     sort_cmps: HashMap<usize, FuncId>,
+    /// Their merge sorts (`tsaot_sort_<i>`: see `define_sorter`).
+    sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
     data: [DataId; 12],
@@ -412,6 +542,7 @@ impl Codegen {
             funcs.push(module.declare_function(&symbol_name(i), linkage, &native_signature(f)));
         }
         let mut sort_cmps = HashMap::new();
+        let mut sorters = HashMap::new();
         for f in m.funcs.iter().chain(&m.closures) {
             ir::visit_stmts(&f.body, &mut |e| {
                 if let ir::ExprKind::ArraySort { func, .. } = e.kind
@@ -423,6 +554,11 @@ impl Codegen {
                     let id =
                         module.declare_function(&format!("tsaot_cmp_{func}"), Linkage::Local, &native_signature(g));
                     sort_cmps.insert(func, id);
+                    // (Its merge sort's calls run it inline.)
+                    module.set_always_inline(id);
+                    let id =
+                        module.declare_function(&format!("tsaot_sort_{func}"), Linkage::Local, &sorter_signature());
+                    sorters.insert(func, id);
                 }
             });
         }
@@ -524,6 +660,7 @@ impl Codegen {
             module,
             funcs,
             sort_cmps,
+            sorters,
             fast_funcs,
             helpers,
             data: data.try_into().unwrap(),
@@ -551,7 +688,7 @@ impl Codegen {
         Env {
             helpers: self.helpers.clone(),
             funcs: self.funcs.clone(),
-            sort_cmps: self.sort_cmps.clone(),
+            sorters: self.sorters.clone(),
             stack_limit,
             unwinding,
             cells,
@@ -582,6 +719,178 @@ impl Codegen {
 
     /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, `IC_SIZE` bytes per
     /// entry, zeroed) and its length `tsaot_nics`.
+    /// Defines `tsaot_sort_<i>` (`id`, `sorter_signature`): the engine's
+    /// stable merge sort of `JS_SortNative` (insertion sorts of up to 8
+    /// values, halves merged through `tmp`) with comparator `cmp` (`f`'s
+    /// copy with borrowed parameters) called directly, for the backend to
+    /// inline. A value orders after another where the comparator's result
+    /// for the two is above 0 (NaN is not); where it throws, the sort
+    /// stops with every value still in the array, and returns 1.
+    fn define_sorter(&mut self, id: FuncId, cmp: FuncId, f: &ir::Func) {
+        let env = self.env();
+        let mut b = self.module.builder(sorter_signature());
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let raw = b.block_params(entry).to_vec();
+        let (ctx, a, tmp, n) = (raw[0], raw[1], raw[2], raw[3]);
+        let sorter = Sorter { cmp, f, unwinding: env.unwinding, to_float: env.helpers["JS_ToFloat64"], ctx };
+        let fail = b.create_block();
+        b.set_cold_block(fail);
+        let small = b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, n, 8);
+        let insertion = b.create_block();
+        let merge = b.create_block();
+        b.ins().brif(small, insertion, &[], merge, &[]);
+
+        // Insertion sort: each value moved down past those after it.
+        b.switch_to_block(insertion);
+        let i = b.declare_var(I64);
+        let j = b.declare_var(I64);
+        let one = b.ins().iconst(I64, 1);
+        b.def_var(i, one);
+        let head = b.create_block();
+        let body = b.create_block();
+        let inner = b.create_block();
+        let compare = b.create_block();
+        let shift = b.create_block();
+        let place = b.create_block();
+        let done = b.create_block();
+        let place_fail = b.create_block();
+        b.set_cold_block(place_fail);
+        b.ins().jump(head, &[]);
+        b.switch_to_block(head);
+        let iv = b.use_var(i);
+        let more = b.ins().icmp(IntCC::SignedLessThan, iv, n);
+        b.ins().brif(more, body, &[], done, &[]);
+        b.switch_to_block(body);
+        let iv = b.use_var(i);
+        let x = elem(&mut b, a, iv);
+        b.def_var(j, iv);
+        b.ins().jump(inner, &[]);
+        b.switch_to_block(inner);
+        let jv = b.use_var(j);
+        let positive = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, jv, 0);
+        b.ins().brif(positive, compare, &[], place, &[]);
+        b.switch_to_block(compare);
+        let jv = b.use_var(j);
+        let j1 = b.ins().iadd_imm_s(jv, -1);
+        let y = elem(&mut b, a, j1);
+        let after = sorter.after(&mut b, y, x, place_fail);
+        b.ins().brif(after, shift, &[], place, &[]);
+        b.switch_to_block(shift);
+        let jv = b.use_var(j);
+        let j1 = b.ins().iadd_imm_s(jv, -1);
+        let y = elem(&mut b, a, j1);
+        set_elem(&mut b, a, jv, y);
+        b.def_var(j, j1);
+        b.ins().jump(inner, &[]);
+        b.switch_to_block(place);
+        let jv = b.use_var(j);
+        set_elem(&mut b, a, jv, x);
+        let iv = b.use_var(i);
+        let i1 = b.ins().iadd_imm_s(iv, 1);
+        b.def_var(i, i1);
+        b.ins().jump(head, &[]);
+        b.switch_to_block(place_fail);
+        let jv = b.use_var(j);
+        set_elem(&mut b, a, jv, x);
+        b.ins().jump(fail, &[]);
+        b.switch_to_block(done);
+        let zero = b.ins().iconst(I32, 0);
+        b.ins().return_(&[zero]);
+
+        // Merge sort: both halves sorted, then merged (unless already in
+        // order), the first through `tmp`.
+        b.switch_to_block(merge);
+        let m = b.ins().ushr_imm_u(n, 1);
+        let r = b.ins().call(id, &[ctx, a, tmp, m]);
+        let r = b.inst_results(r)[0];
+        let next = b.create_block();
+        b.ins().brif(r, fail, &[], next, &[]);
+        b.switch_to_block(next);
+        let off = b.ins().imul_imm_s(m, 16);
+        let a2 = b.ins().iadd(a, off);
+        let n2 = b.ins().isub(n, m);
+        let r = b.ins().call(id, &[ctx, a2, tmp, n2]);
+        let r = b.inst_results(r)[0];
+        let next = b.create_block();
+        b.ins().brif(r, fail, &[], next, &[]);
+        b.switch_to_block(next);
+        let m1 = b.ins().iadd_imm_s(m, -1);
+        let last = elem(&mut b, a, m1);
+        let first = elem(&mut b, a, m);
+        let after = sorter.after(&mut b, last, first, fail);
+        let merging = b.create_block();
+        b.ins().brif(after, merging, &[], done, &[]);
+        b.switch_to_block(merging);
+        copy_elems(&mut b, tmp, a, m);
+        let (i, j, k) = (b.declare_var(I64), b.declare_var(I64), b.declare_var(I64));
+        let zero = b.ins().iconst(I64, 0);
+        b.def_var(i, zero);
+        b.def_var(j, m);
+        b.def_var(k, zero);
+        let head = b.create_block();
+        let both = b.create_block();
+        let compare = b.create_block();
+        let take_b = b.create_block();
+        let take_a = b.create_block();
+        let rest = b.create_block();
+        let rest_fail = b.create_block();
+        b.set_cold_block(rest_fail);
+        b.ins().jump(head, &[]);
+        b.switch_to_block(head);
+        let iv = b.use_var(i);
+        let more = b.ins().icmp(IntCC::SignedLessThan, iv, m);
+        b.ins().brif(more, both, &[], rest, &[]);
+        b.switch_to_block(both);
+        let jv = b.use_var(j);
+        let more = b.ins().icmp(IntCC::SignedLessThan, jv, n);
+        b.ins().brif(more, compare, &[], rest, &[]);
+        b.switch_to_block(compare);
+        let iv = b.use_var(i);
+        let jv = b.use_var(j);
+        let x = elem(&mut b, tmp, iv);
+        let y = elem(&mut b, a, jv);
+        let after = sorter.after(&mut b, x, y, rest_fail);
+        b.ins().brif(after, take_b, &[], take_a, &[]);
+        for (blk, from_b) in [(take_b, true), (take_a, false)] {
+            b.switch_to_block(blk);
+            let kv = b.use_var(k);
+            let (src, var) = if from_b { (a, j) } else { (tmp, i) };
+            let at = b.use_var(var);
+            let v = elem(&mut b, src, at);
+            set_elem(&mut b, a, kv, v);
+            let k1 = b.ins().iadd_imm_s(kv, 1);
+            b.def_var(k, k1);
+            let at1 = b.ins().iadd_imm_s(at, 1);
+            b.def_var(var, at1);
+            b.ins().jump(head, &[]);
+        }
+        // What is left of the first half (after the comparator threw too:
+        // every value back in the array).
+        for (blk, threw) in [(rest, false), (rest_fail, true)] {
+            b.switch_to_block(blk);
+            let iv = b.use_var(i);
+            let kv = b.use_var(k);
+            let left = b.ins().isub(m, iv);
+            let src = b.ins().imul_imm_s(iv, 16);
+            let src = b.ins().iadd(tmp, src);
+            let dst = b.ins().imul_imm_s(kv, 16);
+            let dst = b.ins().iadd(a, dst);
+            copy_elems(&mut b, dst, src, left);
+            if threw {
+                b.ins().jump(fail, &[]);
+            } else {
+                b.ins().jump(done, &[]);
+            }
+        }
+
+        b.switch_to_block(fail);
+        let one = b.ins().iconst(I32, 1);
+        b.ins().return_(&[one]);
+        self.module.define_function(id, b.finish());
+    }
+
     fn define_ics(&mut self) {
         let n = self.ics.get();
         self.module.define_data(self.data[10], mir::DataInit::Zeroed { size: n.max(1) * lower::IC_SIZE }, 8);
