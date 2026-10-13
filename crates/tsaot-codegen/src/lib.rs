@@ -80,19 +80,19 @@ pub mod layout {
     pub const OBJ_SHAPE: i32 = 8;
     pub const SHAPE_PROTO: i32 = 32;
     pub const OBJ_PROP: i32 = 16;
-    pub const OBJ_TYPED_ARRAY: i32 = 32;
-    pub const OBJ_ARRAY_BUFFER: i32 = 32;
-    pub const OBJ_ARRAY_VALUES: i32 = 40;
-    pub const OBJ_ARRAY_COUNT: i32 = 48;
+    pub const OBJ_TYPED_ARRAY: i32 = 24;
+    pub const OBJ_ARRAY_BUFFER: i32 = 24;
+    pub const OBJ_ARRAY_VALUES: i32 = 32;
+    pub const OBJ_ARRAY_COUNT: i32 = 40;
     pub const TA_BUFFER: i32 = 24;
     pub const ABUF_IMMUTABLE: i32 = 9;
     pub const CLASS_ARRAY: i64 = 2;
     pub const CLASS_TYPED_ARRAY: i64 = 22;
-    pub const OBJ_FUNC_DATA: i32 = 32;
+    pub const OBJ_FUNC_DATA: i32 = 24;
     pub const FDATA_FAST: i32 = 8;
     pub const FDATA_DATA: i32 = 32;
     pub const CLASS_C_FUNCTION_DATA: i64 = 15;
-    pub const OBJ_OPAQUE: i32 = 32;
+    pub const OBJ_OPAQUE: i32 = 24;
     pub const CLASS_C_FUNCTION: i64 = 12;
     pub const STRING_KIND: i32 = 4;
     pub const STRING_DATA: i32 = 24;
@@ -100,11 +100,10 @@ pub mod layout {
     pub const CTX_RT: i32 = 0;
     pub const OBJ_FLAGS: i32 = 0;
     pub const OBJ_PLAIN_FLAGS: i64 = 0x10002;
-    pub const OBJ_WEAK_REF: i32 = 24;
-    pub const OBJ_OPAQUE_WORD: i32 = 32;
-    pub const OBJ_SIZE: i32 = 56;
+    pub const OBJ_WEAK_REF: i32 = 4;
+    pub const OBJ_SIZE: i32 = 24;
     // Appending to a fast array inline.
-    pub const OBJ_ARRAY_SIZE: i32 = 32;
+    pub const OBJ_ARRAY_SIZE: i32 = 24;
     pub const OBJ_APPEND_MASK: i64 = 0xffff_0012;
     pub const OBJ_APPEND_FLAGS: i64 = 0x2_0012;
     pub const CTX_STD_ARRAY_PROTO: i32 = 32;
@@ -146,7 +145,6 @@ pub mod layout {
         ("OBJ_FLAGS", OBJ_FLAGS as i64),
         ("OBJ_PLAIN_FLAGS", OBJ_PLAIN_FLAGS),
         ("OBJ_WEAK_REF", OBJ_WEAK_REF as i64),
-        ("OBJ_OPAQUE_WORD", OBJ_OPAQUE_WORD as i64),
         ("OBJ_SIZE", OBJ_SIZE as i64),
         ("OBJ_ARRAY_SIZE", OBJ_ARRAY_SIZE as i64),
         ("OBJ_APPEND_MASK", OBJ_APPEND_MASK),

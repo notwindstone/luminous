@@ -234,8 +234,14 @@ unreachable, and never moves anything.
   counted allocated as a whole when the run begins (which is where a
   collection starts); native code allocates objects inline the same way,
   a compare, a bump and the header stores. QuickJS's list of GC objects
-  is gone, and with it 16 bytes of every object (a plain object is 56
-  bytes and its properties).
+  is gone, and with it 16 bytes of every object; a plain object's
+  properties start where other classes keep their own part, and the
+  weak references to an object are listed off the runtime (the object
+  keeps a 32-bit index in what was padding): a plain object is 24 bytes
+  and its properties, and `{ left, right }` with its 8-byte cell header
+  fills one 64-byte cache line (it took 112 bytes). Memory traffic is
+  what allocation-heavy code waits on: 32 more bytes per object cost a
+  binary-trees run 14%.
 - **Tracing.** A cell is marked by its chunk's bit alone, without reading
   it (the bit also tells an old cell from a young one); its header and
   body are read when it is traced, a few cells later, prefetched in the

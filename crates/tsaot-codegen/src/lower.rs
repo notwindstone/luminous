@@ -3931,17 +3931,16 @@ impl Lower {
         // with one reference.
         let word = self.b.ins().bor_imm_u(idx, layout::GC_CELL_WORD | (1 << 32));
         self.b.ins().store(M_RC, word, p, -8);
-        // The object: extensible, of class Object, with the shape (pinned:
-        // not counted, see `JSShape`) and its properties after it, no weak
-        // references.
-        let flags = self.b.ins().iconst(I32, layout::OBJ_PLAIN_FLAGS);
+        // The object: extensible, of class Object, no weak references (the
+        // flags word, then the weak index, 0, in one store), with the shape
+        // (pinned: not counted, see `JSShape`) and its properties after
+        // it.
+        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
+        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
         self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
         self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
         let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
         self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
-        let null = self.b.ins().iconst(I64, 0);
-        self.b.ins().store(M_HEADER, null, p, layout::OBJ_WEAK_REF);
-        self.b.ins().store(M_HEADER, null, p, layout::OBJ_OPAQUE_WORD);
         p
     }
 
