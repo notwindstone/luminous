@@ -37,6 +37,14 @@ fn reject<T>(span: Span, msg: impl Into<String>) -> R<T> {
     Err(Reject { span, msg: msg.into(), retry: false, callee: false })
 }
 
+const LONE_SURROGATES: &str = "string with a lone surrogate (the interpreter keeps it exact)";
+
+/// Native code keeps literal strings as UTF-8, which cannot hold a lone
+/// surrogate (`"\uD800"`; oxc marks such a literal's value as escaped).
+fn lone_surrogates(s: &StringLiteral) -> R<()> {
+    if s.lone_surrogates { reject(s.span, LONE_SURROGATES) } else { Ok(()) }
+}
+
 fn callee_failed<T>(span: Span, name: &str) -> R<T> {
     let msg = format!("calls `{name}`, which is not compiled natively");
     Err(Reject { span, msg, retry: false, callee: true })
@@ -3306,7 +3314,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn pattern_key(&mut self, key: &'a PropertyKey<'a>, computed: bool, out: &mut Vec<Stmt>) -> R<(Key, Expr)> {
         let name = match key {
             PropertyKey::StaticIdentifier(id) if !computed => id.name.to_string(),
-            PropertyKey::StringLiteral(s) => s.value.to_string(),
+            PropertyKey::StringLiteral(s) => {
+                lone_surrogates(s)?;
+                s.value.to_string()
+            }
             PropertyKey::NumericLiteral(n) if n.value.fract() == 0.0 && n.value >= 0.0 && n.value < 4294967295.0 => {
                 format!("{}", n.value as u64)
             }
@@ -3702,6 +3713,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             Expression::BooleanLiteral(b) => Expr::new(Ty::Bool, ExprKind::Bool(b.value)),
             Expression::StringLiteral(s) => {
+                lone_surrogates(s)?;
                 let id = self.m.string(s.value.as_str());
                 Expr::new(Ty::Any, ExprKind::Str(id))
             }
@@ -4067,6 +4079,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let Some(cooked) = &q.value.cooked else {
                 return reject(q.span, "invalid escape in template literal");
             };
+            if q.lone_surrogates {
+                return reject(q.span, LONE_SURROGATES);
+            }
             if i == 0 || !cooked.is_empty() {
                 let id = self.m.string(cooked.as_str());
                 parts.push(Expr::new(Ty::Any, ExprKind::Str(id)));
@@ -4203,7 +4218,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             let name = match &p.key {
                 PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                PropertyKey::StringLiteral(s) => s.value.to_string(),
+                PropertyKey::StringLiteral(s) => {
+                    lone_surrogates(s)?;
+                    s.value.to_string()
+                }
                 PropertyKey::NumericLiteral(n) if n.value.fract() == 0.0 && n.value >= 0.0 => {
                     format!("{}", n.value as u64)
                 }
@@ -4263,7 +4281,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A property key: an atom for constant names.
     fn key(&mut self, e: &'a Expression<'a>) -> R<Key> {
         Ok(match e.without_parentheses() {
-            Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
+            Expression::StringLiteral(s) => {
+                lone_surrogates(s)?;
+                Key::Atom(self.m.atom(s.value.as_str()))
+            }
             other => Key::Value(Box::new(any(self.expr(other)?))),
         })
     }
@@ -4271,7 +4292,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A key of element access: numbers stay unboxed.
     fn elem_key(&mut self, e: &'a Expression<'a>) -> R<Key> {
         Ok(match e.without_parentheses() {
-            Expression::StringLiteral(s) => Key::Atom(self.m.atom(s.value.as_str())),
+            Expression::StringLiteral(s) => {
+                lone_surrogates(s)?;
+                Key::Atom(self.m.atom(s.value.as_str()))
+            }
             other => {
                 let k = self.expr(other)?;
                 Key::Value(Box::new(if k.ty.is_number() { k } else { any(k) }))

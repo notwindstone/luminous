@@ -70,7 +70,8 @@ pub struct EmbedOpts {
     pub init_fn: Option<String>,
     /// `int FUNCTION(JSContext *ctx)`: runs the event loop after the
     /// program's module code, instead of the engine's (`js_std_loop`); its
-    /// result is the exit status.
+    /// result is the exit status (and an exception it leaves pending is
+    /// printed).
     #[arg(long, value_name = "FUNCTION")]
     pub loop_fn: Option<String>,
     /// An object file, static library or linker argument (repeatable).
@@ -154,7 +155,7 @@ int main(int argc, char **argv)
   js_std_add_helpers(ctx, argc, argv);
 {init}  js_std_eval_binary(ctx, lum_program, lum_program_size, 0);
   r = {lp};
-  if (r)
+  if (r && JS_HasException(ctx))
     js_std_dump_error(ctx);
 done:
   js_std_free_handlers(rt);
