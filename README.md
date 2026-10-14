@@ -219,7 +219,10 @@ engine's semantics:
   `new Map(entries)` take an array's elements without its iterator while
   the array and its iteration are the builtin ones; `+` on a string and a
   string or an int32 concatenates directly (an int32's digits written
-  into the result); a regular expression search whose pattern starts with
+  into the result), and `s += x` onto a string longer than 8KB appends
+  into a buffer with room for as much again, of which the strings are
+  slices (one that is no longer the end of its buffer is copied when
+  appended to), rather than making a rope; a regular expression search whose pattern starts with
   a character (not under `i` or `y`) tries the pattern only where
   `memchr` finds that character, and a global `replace` by a string
   without `$` on a standard RegExp loops over the matches without
@@ -979,11 +982,10 @@ what would come next:
   instances and arrays are allocated inline by native code; `+` on strings,
   template literals and `+` chains build their result with one engine call
   (int32s written as digits), regular expression literals are compiled
-  once and searched from their first character, and `Map`/`Set` keys hash
-  and compare cheaply, so `bench/maps.ts` and `bench/strbuild.ts` run
-  faster than under bun. Next: `+=` onto a long string (a rope) without
-  rebalancing it every 60 levels (about a fifth of `bench/strbuild.ts`),
-  `Map`/`Set` entries in an open-addressing table rather than linked
+  once and searched from their first character, `Map`/`Set` keys hash and
+  compare cheaply, and `+=` onto a long string appends in place, so
+  `bench/maps.ts` and `bench/strbuild.ts` run faster than under bun.
+  Next: `Map`/`Set` entries in an open-addressing table rather than linked
   records (fewer pointer chases, smaller entries), substrings that share
   their parent's characters at shorter lengths (most of
   `bench/logparser.ts`'s slices are copies), and native paths for the
