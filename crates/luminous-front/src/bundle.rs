@@ -321,13 +321,34 @@ fn glob(pattern: &str, text: &str) -> bool {
     go(pattern.as_bytes(), text.as_bytes())
 }
 
+/// What a program built by an embedder (a runtime built on Luminous) has
+/// besides its own modules.
+#[derive(Debug, Clone, Default)]
+pub struct Embedding {
+    /// Modules that run before the entry, in this order (as if it imported
+    /// them first).
+    pub preludes: Vec<PathBuf>,
+    /// Specifier prefixes of the embedder's modules: `prefix` + `name` is
+    /// `dir/name`, resolved as a relative path is (`beyond:http` with
+    /// `("beyond:", lib)`: `lib/http.ts`).
+    pub module_dirs: Vec<(String, PathBuf)>,
+    /// Modules the embedder provides natively (C modules): imports of them
+    /// stay, as those of the engine's own modules.
+    pub externals: Vec<String>,
+}
+
 /// Resolve a module specifier imported by `from`.
-fn resolve(from: &Path, spec: &str) -> Result<Resolved, String> {
-    if spec.starts_with("qjs:") || spec.starts_with("luminous:") {
+fn resolve(from: &Path, spec: &str, emb: &Embedding) -> Result<Resolved, String> {
+    if spec.starts_with("qjs:") || spec.starts_with("luminous:") || emb.externals.iter().any(|e| e == spec) {
         return Ok(Resolved::External(spec.to_string()));
     }
-    let dir = from.parent().unwrap_or(Path::new("."));
     let not_found = || format!("cannot find module `{spec}`");
+    for (prefix, dir) in &emb.module_dirs {
+        if let Some(name) = spec.strip_prefix(prefix.as_str()) {
+            return resolve_path(&dir.join(name)).map(Resolved::File).ok_or_else(not_found);
+        }
+    }
+    let dir = from.parent().unwrap_or(Path::new("."));
     if spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/') || spec == "." || spec == ".." {
         return resolve_path(&dir.join(spec)).map(Resolved::File).ok_or_else(not_found);
     }
@@ -844,6 +865,12 @@ fn synthesize(path: &Path, kind: Kind) -> Result<String, String> {
 
 /// Build the bundle of the program whose entry module is `entry`.
 pub fn bundle(entry: &Path) -> Result<Bundle, String> {
+    bundle_with(entry, &Embedding::default())
+}
+
+/// Build the bundle of the program whose entry module is `entry`, with what
+/// an embedder adds (`Embedding`).
+pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
     let allocator = Allocator::default();
     let mut units: Vec<Unit> = Vec::new();
     let mut index: HashMap<(PathBuf, Kind), usize> = HashMap::new();
@@ -853,6 +880,17 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
     // (The entry's own path, canonical, is its index too.)
     if let Ok(c) = entry.canonicalize() {
         index.insert((c, Kind::Script), 0);
+    }
+    // The preludes: modules 1, 2, ...
+    let mut preludes = Vec::new();
+    for p in &emb.preludes {
+        let p = p.canonicalize().map_err(|e| format!("reading {}: {e}", p.display()))?;
+        let n = queue.len();
+        let k = *index.entry((p.clone(), Kind::Script)).or_insert(n);
+        if k == n {
+            queue.push((p, Kind::Script));
+        }
+        preludes.push((Target::Module(k), true));
     }
     let mut i = 0;
     while i < queue.len() {
@@ -892,7 +930,7 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
             dyn_externals: Vec::new(),
         };
         let mut resolve_target = |spec: &str, attr: Option<String>| -> Result<Target, String> {
-            Ok(match resolve(&path, spec)? {
+            Ok(match resolve(&path, spec, emb)? {
                 Resolved::External(s) => Target::External(s),
                 Resolved::File(p) => {
                     let kind = match attr.as_deref() {
@@ -918,6 +956,9 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
         }
         units.push(unit);
         i += 1;
+    }
+    if let Some(entry) = units.first_mut() {
+        entry.deps.splice(0..0, preludes);
     }
     // One module: as written (the compiler reports its errors).
     if units.len() == 1

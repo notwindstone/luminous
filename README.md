@@ -853,6 +853,28 @@ instructions.
   point into the module they are in; stack traces of interpreted code show
   the merged program's lines.
 
+## Embedding: runtimes built on Luminous
+
+A runtime (Beyond) builds programs with its own modules, native code and
+event loop. `luminous build` (and the `luminous_cli` library: `build` with
+`BuildOpts::embed`) takes:
+
+- `--prelude FILE`: a module that runs before the program's entry, as if the
+  entry imported it first (where a runtime installs its globals);
+- `--module-dir PREFIX=DIR`: specifiers that start with `PREFIX` name the
+  modules of `DIR` (`--module-dir beyond:=lib`: `beyond:http` is
+  `lib/http.ts`), compiled with the program;
+- `--c-module SPECIFIER=FUNCTION`: a native module, made by
+  `JSModuleDef *FUNCTION(JSContext *, const char *)` (with the engine's
+  `JS_NewCModule`); its imports stay imports;
+- `--init-fn FUNCTION`: `int FUNCTION(JSContext *, int argc, char **argv)`,
+  called before the program runs;
+- `--loop-fn FUNCTION`: `int FUNCTION(JSContext *)`, the event loop that runs
+  after the program's module code, instead of the engine's;
+- `--link ARG`: an object file, static library or linker argument.
+
+`tests/embed` is an example, built by `crates/luminous-cli/tests/embed.rs`.
+
 ## The `int` type
 
 `type int = number` declares an integer type that the compiler checks:
