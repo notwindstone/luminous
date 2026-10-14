@@ -250,6 +250,9 @@ pub struct ClassTable {
     pub fields: Vec<(String, Hint)>,
     /// Its instance fields annotated as numbers.
     pub nums: Vec<String>,
+    /// Classes whose instances native constructors make: the fields they
+    /// define, in order (its superclasses' first), else empty.
+    pub instance_fields: Vec<String>,
 }
 
 /// What a type annotation says a value is, for predicting the methods it
@@ -2681,6 +2684,23 @@ pub fn predict_calls(m: &mut Module) {
     let typed = |f: &Func| f.params.iter().all(|t| matches!(t, Ty::Any | Ty::F64 | Ty::MaybeF64 | Ty::Bool));
     let small: Vec<bool> = (0..total).map(|g| inline_ok(get(m, g), INLINE_SIZE, true) && typed(get(m, g))).collect();
     let orig: Vec<usize> = (0..total).map(|g| get(m, g).locals.len()).collect();
+    // Per class: its subclasses (all the way down).
+    let subclasses: Vec<Vec<usize>> = (0..m.classes.len())
+        .map(|c| {
+            (0..m.classes.len())
+                .filter(|&k| {
+                    let mut up = m.classes[k].superclass;
+                    while let Some(u) = up {
+                        if u == c {
+                            return true;
+                        }
+                        up = m.classes[u].superclass;
+                    }
+                    false
+                })
+                .collect()
+        })
+        .collect();
     for _ in 0..2 {
         let templates: Vec<Option<Func>> = (0..total)
             .map(|g| (small[g] && inline_ok(get(m, g), usize::MAX, true)).then(|| get(m, g).clone()))
@@ -2737,6 +2757,49 @@ pub fn predict_calls(m: &mut Module) {
                     _ => None,
                 }
             };
+            // Polymorphic call sites: a method call whose receiver may be an
+            // instance of a class or of any of its subclasses (`this` in an
+            // instance method; what annotations say), where they have
+            // different methods: each of them predicted, in turn (nested
+            // `Predicted`s), up to POLY_TARGETS. (Not the locals that only
+            // ever hold new instances: their class is known.)
+            let mut fresh_writes: HashMap<LocalId, bool> = HashMap::new();
+            visit_stmts(&body, &mut |e| {
+                if let ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) = &e.kind {
+                    let fresh = fresh_instance(x).is_some();
+                    fresh_writes.entry(*l).and_modify(|f| *f &= fresh).or_insert(fresh);
+                }
+            });
+            let poly = |e: &Expr| -> Option<Vec<usize>> {
+                let ExprKind::CallMethod(o, Key::Atom(a), _) = &e.kind else { return None };
+                let hinted = || match expr_hint(m_ref, fg, &fg.hints, o)? {
+                    Hint::Class(k) => Some(k),
+                    _ => None,
+                };
+                let c = match &o.kind {
+                    ExprKind::This => match &this {
+                        Some(Recv::Class(c, false)) => *c,
+                        _ => return None,
+                    },
+                    ExprKind::Local(l) if fresh_writes.get(l) == Some(&true) => return None,
+                    ExprKind::Local(l) => match recv.get(l) {
+                        Some(Recv::Class(c, false)) => *c,
+                        Some(_) => return None,
+                        None => hinted()?,
+                    },
+                    _ => hinted()?,
+                };
+                let name = &m_ref.atoms[*a];
+                let mut out: Vec<usize> = Vec::new();
+                for k in std::iter::once(c).chain(subclasses[c].iter().copied()) {
+                    if let Some(f) = class_member(m_ref, Some(k), false, name, 0)
+                        && !out.contains(&f)
+                    {
+                        out.push(f);
+                    }
+                }
+                (out.len() > 1).then_some(out)
+            };
             let mut budget = INLINE_CALLER_LIMIT.saturating_sub(ir_size(&body));
             let mut added: Vec<Ty> = Vec::new();
             // Attached bodies are set aside while the function is searched
@@ -2756,24 +2819,30 @@ pub fn predict_calls(m: &mut Module) {
                 if wrapped.contains(&(e as *const Expr)) {
                     return;
                 }
-                let Some(k) = resolve(e) else { return };
-                let Some(t) = templates[k].as_ref() else { return };
-                let size = ir_size(&t.body);
-                if size > budget {
+                let targets: Vec<usize> = match poly(e) {
+                    Some(ks) => ks.into_iter().filter(|&k| templates[k].is_some()).take(POLY_TARGETS).collect(),
+                    None => resolve(e).into_iter().filter(|&k| templates[k].is_some()).collect(),
+                };
+                let size: usize = targets.iter().map(|&k| ir_size(&templates[k].as_ref().unwrap().body)).sum();
+                if targets.is_empty() || size > budget {
                     return;
                 }
                 budget -= size;
-                let base = base0 + added.len();
-                added.extend(&t.locals);
-                if t.locals.is_empty() {
-                    added.push(Ty::Bool);
-                }
-                pending.insert(base, k);
-                let locals = (base..base + t.locals.len().max(1)).collect();
                 let ty = e.ty;
-                let expr = Box::new(std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined)));
-                wrapped.insert(&*expr as *const Expr);
-                *e = Expr { ty, kind: ExprKind::Predicted { expr, func: k, body: Vec::new(), locals } };
+                // (The first target outermost: its guard is tried first.)
+                for &k in targets.iter().rev() {
+                    let t = templates[k].as_ref().unwrap();
+                    let base = base0 + added.len();
+                    added.extend(&t.locals);
+                    if t.locals.is_empty() {
+                        added.push(Ty::Bool);
+                    }
+                    pending.insert(base, k);
+                    let locals = (base..base + t.locals.len().max(1)).collect();
+                    let expr = Box::new(std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined)));
+                    wrapped.insert(&*expr as *const Expr);
+                    *e = Expr { ty, kind: ExprKind::Predicted { expr, func: k, body: Vec::new(), locals } };
+                }
             });
             visit_stmts_mut(&mut body, &mut |e| {
                 let ExprKind::Predicted { body, locals, .. } = &mut e.kind else { return };
@@ -2805,6 +2874,17 @@ pub fn class_records(m: &mut Module) {
                 found.push((*class, fields.iter().map(|(a, _)| *a).collect()));
             }
         });
+    }
+    // (A derived class's instances get its superclasses' fields from their
+    // constructors, then its own: the whole list, which no `NewInstance`
+    // has before `fold_new_instances`.)
+    let atom_of = |m: &Module, n: &String| m.atoms.iter().position(|a| a == n);
+    for k in 0..m.classes.len() {
+        let names = &m.classes[k].instance_fields;
+        let atoms: Option<Vec<AtomId>> = names.iter().map(|n| atom_of(m, n)).collect();
+        if let Some(atoms) = atoms.filter(|a| !a.is_empty()) {
+            found.insert(0, (k, atoms));
+        }
     }
     for (k, fields) in found {
         if k >= m.classes.len() || m.class_records[k].is_some() || fields.is_empty() {
@@ -2991,6 +3071,9 @@ fn fold_list(list: &mut Vec<Stmt>, uses: &mut [usize], boxed: &[bool]) -> bool {
     }
     changed
 }
+
+/// Most methods a polymorphic call site predicts (`predict_calls`).
+const POLY_TARGETS: usize = 4;
 
 /// IR nodes in a callback body that `inline_callbacks` inlines.
 const CALLBACK_SIZE: usize = 160;

@@ -161,6 +161,9 @@ pub struct CtorInfo<'a> {
     /// declaration names (each `(class, superclass)`), else the class is
     /// constructed as interpreted code would.
     pub checks: Vec<(usize, usize)>,
+    /// (`home == class`) the fields of the instances, in the order they
+    /// are defined: its superclasses' first.
+    pub instance_fields: Vec<String>,
 }
 
 impl Candidate<'_> {
@@ -1010,12 +1013,16 @@ fn class_ctor<'a>(
     // Its own (called by `new`), checking its superclasses, then its
     // superclasses' (each called by `super(...)`).
     let mut checks = Vec::new();
+    let mut chain = vec![&def];
     let mut at = &def;
     while let Some(p) = at.parent {
         checks.push((at.index, defs[p].index));
         at = &defs[p];
+        chain.push(at);
     }
-    let mut make = |d: &CtorDef<'a>, checks: Vec<(usize, usize)>| {
+    let instance_fields: Vec<String> =
+        chain.iter().rev().flat_map(|d| d.fields.iter().map(|(n, _)| n.clone())).collect();
+    let mut make = |d: &CtorDef<'a>, checks: Vec<(usize, usize)>, instance_fields: Vec<String>| {
         let name = if d.index == index { name.clone() } else { format!("{} (constructing {name})", d.name) };
         // Called only directly by native code, with JS values.
         let params = d.params.iter().map(|p| Param { ty: Ty::Any, ..p.clone() }).collect();
@@ -1042,13 +1049,14 @@ fn class_ctor<'a>(
                 parent: d.parent.map(|p| defs[p].index),
                 forward: d.forward,
                 checks,
+                instance_fields,
             }),
         });
     };
-    make(&def, checks);
+    make(&def, checks, instance_fields);
     let mut up = def.parent;
     while let Some(p) = up {
-        make(&defs[p], Vec::new());
+        make(&defs[p], Vec::new(), Vec::new());
         up = defs[p].parent;
     }
     defs.push(def);
@@ -5508,11 +5516,17 @@ fn class_tables(classes: &[ClassInfo], cands: &[Candidate]) -> Vec<ir::ClassTabl
             members: Vec::new(),
             fields: c.fields.iter().filter_map(|(n, h)| Some((n.clone(), resolve_hint(h, classes)?))).collect(),
             nums: c.nums.clone(),
+            instance_fields: Vec::new(),
         })
         .collect();
     for (i, c) in cands.iter().enumerate() {
         if let (Some((k, is_static)), Site::Method { key, accessor, .. }) = (c.class, &c.site) {
             tables[k].members.push((key.clone(), *accessor, is_static, i));
+        }
+        if let Some(k) = &c.ctor
+            && k.home == k.class
+        {
+            tables[k.class].instance_fields = k.instance_fields.clone();
         }
     }
     tables

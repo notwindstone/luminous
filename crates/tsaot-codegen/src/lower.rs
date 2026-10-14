@@ -353,7 +353,11 @@ pub(crate) struct Lower {
     inline_rets: Vec<(Block, Ty)>,
     /// A prediction for the next call, getter or setter lowered (see
     /// `ExprKind::Predicted`).
-    pred: Option<Pred>,
+    preds: Vec<Pred>,
+    /// The method read being lowered is a predicted call's (one of a
+    /// polymorphic call site's methods, or a method its receivers of
+    /// several classes inherit: see `prop_get_inner`).
+    poly_site: bool,
     /// Owned values to free if an exception occurs now.
     temps: Vec<(Value, Value)>,
     /// Innermost-last exception handler blocks.
@@ -495,7 +499,8 @@ impl Lower {
             spec_float_elems: HashSet::new(),
             loops: HashMap::new(),
             inline_rets: Vec::new(),
-            pred: None,
+            preds: Vec::new(),
+            poly_site: false,
             temps: Vec::new(),
             handlers: Vec::new(),
             scopes: Vec::new(),
@@ -2173,14 +2178,19 @@ impl Lower {
             }
             ExprKind::Predicted { expr, func, body, locals } => {
                 // Taken first thing by the call, getter or setter `expr`
-                // lowers to (not by an update in place).
-                let taken = match &expr.kind {
+                // lowers to (not by an update in place); a polymorphic
+                // site's predictions are nested, the first one outermost.
+                let mut inner = &**expr;
+                while let ExprKind::Predicted { expr, .. } = &inner.kind {
+                    inner = expr;
+                }
+                let taken = match &inner.kind {
                     ExprKind::GetProp(..) | ExprKind::CallMethod(..) | ExprKind::CallThis(..) => true,
                     ExprKind::SetProp(o, a, x) => self.prop_step(o, *a, x).is_none(),
                     _ => false,
                 };
                 if taken {
-                    self.pred = Some(Pred { func: *func, body: body.clone(), locals: locals.clone() });
+                    self.preds.push(Pred { func: *func, body: body.clone(), locals: locals.clone() });
                 }
                 self.expr(expr)
             }
@@ -2686,7 +2696,7 @@ impl Lower {
                 v
             }
             ExprKind::GetProp(o, a) => {
-                let pred = self.pred.take();
+                let pred = std::mem::take(&mut self.preds);
                 let (obj, owned) = self.operand(o, &[]);
                 let (p, t) = obj.any();
                 let (rp, rt) = self.prop_get_from(p, t, None, *a, pred, false);
@@ -2698,7 +2708,7 @@ impl Lower {
                 self.prop_update(o, *a, step, true)
             }
             ExprKind::SetProp(o, a, x) => {
-                let pred = self.pred.take();
+                let pred = std::mem::take(&mut self.preds);
                 let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
@@ -2726,7 +2736,7 @@ impl Lower {
                 self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
                 self.b.switch_to_block(slow);
                 self.record_learn(p, t, *record);
-                let (gp, gt) = self.prop_get_from(p, t, None, *atom, None, false);
+                let (gp, gt) = self.prop_get_from(p, t, None, *atom, Vec::new(), false);
                 self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
                 self.b.switch_to_block(join);
                 self.drop_operand(o, owned);
@@ -2753,7 +2763,7 @@ impl Lower {
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
                 self.record_learn(p, t, *record);
-                self.prop_set_ic(p, t, *atom, (vp, vt), None);
+                self.prop_set_ic(p, t, *atom, (vp, vt), Vec::new());
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
                 self.release(v);
@@ -3146,10 +3156,10 @@ impl Lower {
                 let fv = self.expr(f);
                 self.hold(fv);
                 let undef = self.konst(0, TAG_UNDEFINED);
-                self.call_values(fv, undef, args, None)
+                self.call_values(fv, undef, args, Vec::new())
             }
             ExprKind::CallThis(f, this, args) => {
-                let pred = self.pred.take();
+                let pred = std::mem::take(&mut self.preds);
                 let fv = self.expr(f);
                 self.hold(fv);
                 let tv = self.expr(this);
@@ -3160,7 +3170,7 @@ impl Lower {
                 r
             }
             ExprKind::CallMethod(o, key, args) => {
-                let pred = self.pred.take();
+                let pred = std::mem::take(&mut self.preds);
                 // The method is read before the arguments are evaluated.
                 let mut later: Vec<&Expr> = args.iter().collect();
                 if let Key::Value(k) = key {
@@ -3170,7 +3180,7 @@ impl Lower {
                 let (op_, ot) = obj.any();
                 let ctx = self.ctx;
                 let method = match key {
-                    Key::Atom(a) if pred.is_none() => self.env.methods.get(a).copied(),
+                    Key::Atom(a) if pred.is_empty() => self.env.methods.get(a).copied(),
                     _ => None,
                 };
                 // A builtin's fast path compares the method read and calls
@@ -3186,7 +3196,7 @@ impl Lower {
                     && args.iter().all(|x| self.pure_arg(x))
                     && fits(method)
                 {
-                    let (mp, mt, f_owned) = self.prop_get_inner(op_, ot, None, *a, None, true, true);
+                    let (mp, mt, f_owned) = self.prop_get_inner(op_, ot, None, *a, Vec::new(), true, true);
                     let fv = V::Any(mp, mt);
                     let r = match method {
                         Method::CharCodeAt => self.char_code_at(fv, f_owned, obj, args),
@@ -3199,7 +3209,9 @@ impl Lower {
                 }
                 let m = match key {
                     Key::Atom(a) => {
+                        self.poly_site = !pred.is_empty();
                         let (mp, mt) = self.method_get(op_, ot, *a);
+                        self.poly_site = false;
                         vec![mp, mt]
                     }
                     Key::Value(k) => {
@@ -3504,7 +3516,7 @@ impl Lower {
             ExprKind::SuperGetAtom(home, a) => {
                 let (hp, ht) = self.table_value(self.env.homes, *home);
                 let this = self.this.expect("`super` in a method");
-                let (rp, rt) = self.prop_get_from(hp, ht, Some(this), *a, None, false);
+                let (rp, rt) = self.prop_get_from(hp, ht, Some(this), *a, Vec::new(), false);
                 V::Any(rp, rt)
             }
             ExprKind::SuperGet(home, k) => {
@@ -3844,7 +3856,7 @@ impl Lower {
     #[allow(clippy::too_many_arguments)]
     fn call_or_inline(
         &mut self,
-        pred: Option<&Pred>,
+        preds: &[Pred],
         f: (Value, Value),
         this: (Value, Value),
         args: &[(Value, Value)],
@@ -3852,20 +3864,24 @@ impl Lower {
         borrowed: bool,
         generic: impl FnOnce(&mut Self) -> (Value, Value),
     ) -> (Value, Value) {
-        let guard = pred.and_then(|p| self.pred_guard(p, f.0, f.1, args));
-        let (Some(pred), Some(ok)) = (pred, guard) else {
+        if preds.is_empty() {
             return self.call_linked(f, this, args.len(), argv, borrowed, generic);
-        };
+        }
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
-        let inline = self.b.create_block();
-        let call = self.b.create_block();
-        self.b.ins().brif(ok, inline, &[], call, &[]);
-        self.b.switch_to_block(inline);
-        let (p, t) = self.inline_method(pred, this, args);
-        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
-        self.b.switch_to_block(call);
+        // Each prediction in turn (a polymorphic site has several), then
+        // the call.
+        for pred in preds {
+            let Some(ok) = self.pred_guard(pred, f.0, f.1, args) else { continue };
+            let inline = self.b.create_block();
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, inline, &[], next, &[]);
+            self.b.switch_to_block(inline);
+            let (p, t) = self.inline_method(pred, this, args);
+            self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+            self.b.switch_to_block(next);
+        }
         let (p, t) = self.call_linked(f, this, args.len(), argv, borrowed, generic);
         self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
         self.b.switch_to_block(join);
@@ -4394,7 +4410,7 @@ impl Lower {
     /// `p.a = v` (`(p, t)` borrowed; `v` taken by the property) through an
     /// inline cache: an own writable data property of a cached shape, or a
     /// setter (own or of the prototype), else the engine.
-    fn prop_set_ic(&mut self, p: Value, t: Value, a: ir::AtomId, (vp, vt): (Value, Value), pred: Option<Pred>) {
+    fn prop_set_ic(&mut self, p: Value, t: Value, a: ir::AtomId, (vp, vt): (Value, Value), pred: Vec<Pred>) {
         let ic = self.new_ic();
         let join = self.b.create_block();
         let slow = self.b.create_block();
@@ -4414,7 +4430,7 @@ impl Lower {
         // The property's reference is dropped after the call.
         let tag = self.b.ins().iconst(I64, TAG_OBJECT);
         let argv = self.values_slot(&[(vp, vt)]);
-        let (sp, st) = self.call_or_inline(pred.as_ref(), (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
+        let (sp, st) = self.call_or_inline(&pred, (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
             l.dup((vp, vt));
             let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
             let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
@@ -4999,7 +5015,7 @@ impl Lower {
     }
 
     /// Call `f` (held) with `this` (borrowed) and `args`; frees `f`.
-    fn call_values(&mut self, f: V, this: V, args: &[Expr], pred: Option<Pred>) -> V {
+    fn call_values(&mut self, f: V, this: V, args: &[Expr], pred: Vec<Pred>) -> V {
         if args.iter().any(|a| lazy_part(a).is_some()) {
             return self.call_lazy(f, this, args, pred);
         }
@@ -5009,7 +5025,7 @@ impl Lower {
 
     /// `call_values` with `Lazy` arguments: evaluated only for the call (an
     /// inline body gets `undefined` for their parameters).
-    fn call_lazy(&mut self, f: V, this: V, args: &[Expr], pred: Option<Pred>) -> V {
+    fn call_lazy(&mut self, f: V, this: V, args: &[Expr], pred: Vec<Pred>) -> V {
         let mut held = Vec::new();
         let undef = self.konst(0, TAG_UNDEFINED).any();
         let mut vals = vec![f.any(), this.any()];
@@ -5031,21 +5047,19 @@ impl Lower {
         let argc = self.b.ins().iconst(I32, args.len() as i64);
         let ctx = self.ctx;
         let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
-        let guard = pred.as_ref().and_then(|p| self.pred_guard(p, f.any().0, f.any().1, &js_args));
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
-        let call = self.b.create_block();
-        if let (Some(pred), Some(ok)) = (pred.as_ref(), guard) {
+        for p in &pred {
+            let Some(ok) = self.pred_guard(p, f.any().0, f.any().1, &js_args) else { continue };
             let inline = self.b.create_block();
-            self.b.ins().brif(ok, inline, &[], call, &[]);
+            let next = self.b.create_block();
+            self.b.ins().brif(ok, inline, &[], next, &[]);
             self.b.switch_to_block(inline);
-            let (p, t) = self.inline_method(pred, this.any(), &js_args);
-            self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
-        } else {
-            self.b.ins().jump(call, &[]);
+            let (rp_, rt_) = self.inline_method(p, this.any(), &js_args);
+            self.b.ins().jump(join, &[BlockArg::Value(rp_), BlockArg::Value(rt_)]);
+            self.b.switch_to_block(next);
         }
-        self.b.switch_to_block(call);
         let mut lazy = Vec::new();
         for (i, a) in args.iter().enumerate() {
             if let Some((_, x)) = lazy_part(a) {
@@ -5088,7 +5102,7 @@ impl Lower {
     }
 
     /// `call_values` with the arguments evaluated (and held), which it frees.
-    fn call_held(&mut self, f: V, this: V, held: Vec<V>, pred: Option<Pred>) -> V {
+    fn call_held(&mut self, f: V, this: V, held: Vec<V>, pred: Vec<Pred>) -> V {
         let mut vals = vec![f.any(), this.any()];
         vals.extend(held.iter().map(|v| v.any()));
         let slot = self.values_slot(&vals);
@@ -5096,7 +5110,7 @@ impl Lower {
         let argc = self.b.ins().iconst(I32, held.len() as i64);
         let ctx = self.ctx;
         let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
-        let (rp, rt) = self.call_or_inline(pred.as_ref(), f.any(), this.any(), &js_args, argv, false, |l| {
+        let (rp, rt) = self.call_or_inline(&pred, f.any(), this.any(), &js_args, argv, false, |l| {
             let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
@@ -6861,13 +6875,13 @@ impl Lower {
     /// property, or a data property (a method) or getter of the direct
     /// prototype. A new reference.
     fn prop_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
-        self.prop_get_from(p, t, None, a, None, false)
+        self.prop_get_from(p, t, None, a, Vec::new(), false)
     }
 
     /// `prop_get` for a method call: its cache also serves strings, whose
     /// methods it reads from String.prototype (`TSAOT_IC_STRING`).
     fn method_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
-        self.prop_get_from(p, t, None, a, None, true)
+        self.prop_get_from(p, t, None, a, Vec::new(), true)
     }
 
     /// `prop_get`, or with a receiver: `super.a` (`p`, `t`: the home object;
@@ -6878,7 +6892,7 @@ impl Lower {
         t: Value,
         receiver: Option<(Value, Value)>,
         a: ir::AtomId,
-        pred: Option<Pred>,
+        pred: Vec<Pred>,
         strings: bool,
     ) -> (Value, Value) {
         let (rp, rt, _) = self.prop_get_inner(p, t, receiver, a, pred, strings, false);
@@ -6895,10 +6909,13 @@ impl Lower {
         t: Value,
         receiver: Option<(Value, Value)>,
         a: ir::AtomId,
-        pred: Option<Pred>,
+        pred: Vec<Pred>,
         strings: bool,
         borrow: bool,
     ) -> (Value, Value, Option<Value>) {
+        // A polymorphic call site's method: its cache's other entries are
+        // checked inline, and are no cold path.
+        let poly = std::mem::take(&mut self.poly_site);
         let ic = self.new_ic();
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
@@ -6914,7 +6931,9 @@ impl Lower {
             a
         };
         let slow = self.b.create_block();
-        self.b.set_cold_block(slow);
+        if !poly {
+            self.b.set_cold_block(slow);
+        }
         let not_obj = if strings { self.b.create_block() } else { slow };
         let (shape, kind) = self.ic_shape_hit_or(p, t, ic, not_obj, slow);
         if strings {
@@ -7003,10 +7022,10 @@ impl Lower {
         self.nonnull(g, slow);
         let ctx = self.ctx;
         let (thp, tht) = receiver.unwrap_or((p, t));
-        let (gp, gt) = if pred.is_some() {
+        let (gp, gt) = if !pred.is_empty() {
             let tag = self.b.ins().iconst(I64, TAG_OBJECT);
             let none = self.b.ins().iconst(I64, 0);
-            self.call_or_inline(pred.as_ref(), (g, tag), (thp, tht), &[], none, true, |l| {
+            self.call_or_inline(&pred, (g, tag), (thp, tht), &[], none, true, |l| {
                 let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
                 (r[0], r[1])
             })
@@ -7023,7 +7042,7 @@ impl Lower {
         if receiver.is_none() {
             // A polymorphic site's other entries (`TsaotIC.poly`): the
             // property's address, without a lookup.
-            let at = self.ic_poly_addr(p, t, ic);
+            let at = if poly { self.ic_poly_inline(p, t, ic) } else { self.ic_poly_addr(p, t, ic) };
             let found = self.b.create_block();
             let miss = self.b.create_block();
             self.b.ins().brif(at, found, &[], miss, &[]);
@@ -7164,6 +7183,82 @@ impl Lower {
         let call = self.b.create_block();
         self.b.ins().brif(probe, call, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(call);
+        let r = self.helper("tsaot_ic_poly_addr", &[ic, p])[0];
+        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(join);
+        at
+    }
+
+    /// `ic_poly_addr` with the entries checked inline (an own data
+    /// property, or a prototype's up to three levels up), for a predicted
+    /// call's method, where they are what usually hits.
+    fn ic_poly_inline(&mut self, p: Value, t: Value, ic: Value) -> Value {
+        let join = self.b.create_block();
+        let at = self.b.append_block_param(join, I64);
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let poly = self.b.ins().load(I64, M_IC, ic, IC_POLY);
+        let zero = self.b.ins().iconst(I64, 0);
+        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, poly, 0);
+        let probe = self.b.ins().band(is_obj, has);
+        let entries = self.b.create_block();
+        self.b.ins().brif(probe, entries, &[], join, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(entries);
+        let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+        for k in 0..POLY_ENTRIES {
+            let e = self.b.ins().iadd_imm_s(poly, (k * IC_SIZE) as i64);
+            let own = self.b.create_block();
+            let other = self.b.create_block();
+            let next = self.b.create_block();
+            let s0 = self.b.ins().load(I64, M_IC, e, 0);
+            let is_own = self.b.ins().icmp(IntCC::Equal, s0, shape);
+            self.b.ins().brif(is_own, own, &[], other, &[]);
+            self.b.switch_to_block(own);
+            let a = self.ic_slot_addr(p, e);
+            self.b.ins().jump(join, &[BlockArg::Value(a)]);
+            // A data property of a prototype: up to two levels up as the
+            // primary entry is checked; three (the entry's `mid2_shape`,
+            // where a site's entry has `poly`) through one more shape.
+            self.b.switch_to_block(other);
+            let alt = self.b.ins().load(I64, M_IC, e, 32);
+            let kind = self.b.ins().uload32(M_IC, e, 12);
+            let same = self.b.ins().icmp(IntCC::Equal, alt, shape);
+            let data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
+            let ok = self.b.ins().band(same, data);
+            let proto = self.b.create_block();
+            self.b.ins().brif(ok, proto, &[], next, &[]);
+            self.b.switch_to_block(proto);
+            let mid2 = self.b.ins().load(I64, M_IC, e, IC_POLY);
+            let near = self.b.create_block();
+            let far = self.b.create_block();
+            self.b.ins().brif(mid2, far, &[], near, &[]);
+            self.b.switch_to_block(near);
+            let a = self.ic_proto_slot(shape, e, next);
+            self.b.ins().jump(join, &[BlockArg::Value(a)]);
+            // shape -> first prototype (mid_shape) -> second (mid2_shape)
+            // -> the holder (proto_shape).
+            self.b.switch_to_block(far);
+            let mut cur = shape;
+            for off in [24, IC_POLY] {
+                let obj = self.b.ins().load(I64, M_HEADER, cur, layout::SHAPE_PROTO);
+                let s = self.b.ins().load(I64, M_HEADER, obj, layout::OBJ_SHAPE);
+                let want = self.b.ins().load(I64, M_IC, e, off);
+                let same = self.b.ins().icmp(IntCC::Equal, s, want);
+                let up = self.b.create_block();
+                self.b.ins().brif(same, up, &[], next, &[]);
+                self.b.switch_to_block(up);
+                cur = s;
+            }
+            let holder = self.b.ins().load(I64, M_HEADER, cur, layout::SHAPE_PROTO);
+            let hs = self.b.ins().load(I64, M_HEADER, holder, layout::OBJ_SHAPE);
+            let want = self.b.ins().load(I64, M_IC, e, 16);
+            let same = self.b.ins().icmp(IntCC::Equal, hs, want);
+            let hit = self.b.create_block();
+            self.b.ins().brif(same, hit, &[], next, &[]);
+            self.b.switch_to_block(hit);
+            let a = self.ic_slot_addr(holder, e);
+            self.b.ins().jump(join, &[BlockArg::Value(a)]);
+            self.b.switch_to_block(next);
+        }
         let r = self.helper("tsaot_ic_poly_addr", &[ic, p])[0];
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
@@ -7647,6 +7742,8 @@ pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 pub(crate) const IC_SIZE: usize = 48;
 /// `TsaotIC.poly`.
 const IC_POLY: i32 = 40;
+/// `TSAOT_POLY`: the entries `TsaotIC.poly` points to.
+const POLY_ENTRIES: usize = 4;
 /// `TSAOT_IC_STRUCT`: a cached field of an `aot type` object.
 const IC_STRUCT: i64 = 7;
 

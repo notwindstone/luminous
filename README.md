@@ -463,6 +463,15 @@ The differential tests run every case with both.
   parameters of arrow functions passed to `xs.map`, `filter`, `forEach`,
   `sort`, `reduce`, ...), and what `slice`, `filter`, `sort` or `find`
   return.
+- **Polymorphic call sites**: where such a receiver (or `this`) may be an
+  instance of the class or of its subclasses, which have methods of their
+  own (`s: Shape` with `Circle` and `Rect` overriding `area`), each of the
+  methods is predicted in turn (up to four): the method the receiver
+  reaches is read through the site's inline cache, whose other shapes'
+  entries are checked inline there, and compared with each; the one it is
+  runs inline, any other is called. A derived class's records list its
+  superclasses' fields then its own, so the inlined methods read fields of
+  subclass instances at fixed slots too.
 - **Fields of annotated object types**: where an annotation names an
   object type alias, an interface or a class with plain public fields
   (`b: Body`, `bs: Body[]`, a field `pos: Body`), its fields are read and
