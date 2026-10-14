@@ -4211,12 +4211,7 @@
 +        ch->touched = 1;
 +    return dead;
 +}
- 
--    list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
--        p = list_entry(el, JSGCObjectHeader, link);
--        assert(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT ||
--               JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
--        js_free_rt(rt, p);
++
 +/* The dead cells free; the bytes allocated after. */
 +static size_t js_gc_sweep(JSRuntime *rt)
 +{
@@ -4249,7 +4244,7 @@
 +                list_add_tail(&ch->link, &empty);
 +            }
 +        }
-     }
++    }
 +    list_for_each_safe(el, el1, &h->large) {
 +        JSGCChunk *ch = list_entry(el, JSGCChunk, link);
 +        ch->touched = 0;
@@ -4306,7 +4301,11 @@
 +    }
 +}
  
--    init_list_head(&rt->gc_zero_ref_count_list);
+-    list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
+-        p = list_entry(el, JSGCObjectHeader, link);
+-        assert(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT ||
+-               JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+-        js_free_rt(rt, p);
 +/* The cells freed explicitly since the last collection, no longer kept
 +   for reuse: dead (as any unmarked cell) for the sweep, which counts them
 +   free again. */
@@ -4325,10 +4324,10 @@
 +            p = *(void **)p;
 +        }
 +        h->free_cells[i] = NULL;
-+    }
- }
+     }
++}
  
--void JS_RunGC(JSRuntime *rt)
+-    init_list_head(&rt->gc_zero_ref_count_list);
 +/* A collection (unless one cannot happen now: while the compiler holds
 +   values in its structures, while collecting, or freeing the runtime).
 +   Minor: the young cells (allocated since the last collection) reachable
@@ -4341,8 +4340,9 @@
 +    struct timespec ts;
 +    clock_gettime(CLOCK_MONOTONIC, &ts);
 +    return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-+}
-+
+ }
+ 
+-void JS_RunGC(JSRuntime *rt)
 +static void js_gc_collect(JSRuntime *rt, bool major)
 +{
 +    JSGCHeap *h = &rt->gc_heap;
@@ -7000,7 +7000,26 @@
      case JS_TAG_STRING_ROPE:
          h = hash_string_rope(key, 0);
          break;
-@@ -53473,13 +56851,13 @@
+@@ -53424,7 +56802,17 @@
+         h = 0;
+         break;
+     }
+-    return h ^ ctx->hash_seed ^ hash32(tag);
++    /* tsaot: mixed (murmur3's finalizer), as the table takes the low bits:
++       a small integer's double differs from another's in the high bits
++       only, and a pointer is aligned, so that without it they all fell
++       into a few buckets. */
++    h ^= ctx->hash_seed ^ hash32(tag);
++    h ^= h >> 16;
++    h *= 0x85ebca6b;
++    h ^= h >> 13;
++    h *= 0xc2b2ae35;
++    h ^= h >> 16;
++    return h;
+ }
+ 
+ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
+@@ -53473,13 +56861,13 @@
      s->record_count_threshold = new_hash_size * 2;
  }
  
@@ -7016,7 +7035,7 @@
              }
              break;
          case JS_TAG_SYMBOL:
-@@ -53494,6 +56872,18 @@
+@@ -53494,6 +56882,18 @@
          return NULL; // pacify compiler
  }
  
@@ -7035,7 +7054,7 @@
  static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
                                     JSValueConst key)
  {
-@@ -53506,6 +56896,7 @@
+@@ -53506,6 +56906,7 @@
      mr->ref_count = 1;
      mr->map = s;
      mr->empty = false;
@@ -7043,7 +7062,7 @@
      if (s->is_weak) {
          JSWeakRefRecord *wr = js_malloc(ctx, sizeof(*wr));
          if (!wr) {
-@@ -53514,7 +56905,11 @@
+@@ -53514,7 +56915,11 @@
          }
          wr->kind = JS_WEAK_REF_KIND_MAP;
          wr->u.map_record = mr;
@@ -7056,7 +7075,7 @@
          mr->key = unsafe_unconst(key);
      } else {
          mr->key = js_dup(key);
-@@ -53526,6 +56921,7 @@
+@@ -53526,6 +56931,7 @@
      if (s->record_count >= s->record_count_threshold) {
          map_hash_resize(ctx, s);
      }
@@ -7064,7 +7083,7 @@
      return mr;
  }
  
-@@ -53537,7 +56933,7 @@
+@@ -53537,7 +56943,7 @@
  {
      JSWeakRefRecord **pwr, *wr;
  
@@ -7073,7 +7092,7 @@
      for(;;) {
          wr = *pwr;
          assert(wr != NULL);
-@@ -53609,6 +57005,7 @@
+@@ -53609,6 +57015,7 @@
              return JS_EXCEPTION;
      }
      mr->value = js_dup(value);
@@ -7081,7 +7100,7 @@
      return js_dup(this_val);
  }
  
-@@ -53664,6 +57061,7 @@
+@@ -53664,6 +57071,7 @@
              return JS_EXCEPTION;
          }
          mr->value = value;
@@ -7089,7 +7108,7 @@
      }
      return js_dup(mr->value);
  }
-@@ -53682,6 +57080,23 @@
+@@ -53682,6 +57090,23 @@
      return js_bool(mr != NULL);
  }
  
@@ -7113,7 +7132,7 @@
  static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int magic)
  {
-@@ -54955,7 +58370,7 @@
+@@ -54955,7 +58380,7 @@
      js_free_rt(rt, ds->resources);
  }
  
@@ -7122,7 +7141,7 @@
                                     JSValueConst value, JSValueConst method,
                                     int hint)
  {
-@@ -54971,6 +58386,8 @@
+@@ -54971,6 +58396,8 @@
      }
      ds->resources[ds->resource_count].value = js_dup(value);
      ds->resources[ds->resource_count].method = js_dup(method);
@@ -7131,7 +7150,7 @@
      ds->resources[ds->resource_count].hint = hint;
      ds->resource_count++;
      return 0;
-@@ -55123,7 +58540,7 @@
+@@ -55123,7 +58550,7 @@
          /* For async stacks, a null/undefined resource still needs a record
             so disposeAsync performs the required Await(undefined). */
          if (class_id == JS_CLASS_ASYNC_DISPOSABLE_STACK) {
@@ -7140,7 +7159,7 @@
                                          JS_DISPOSE_HINT_SYNC) < 0)
                  return JS_EXCEPTION;
          }
-@@ -55134,7 +58551,7 @@
+@@ -55134,7 +58561,7 @@
      method = js_get_dispose_method(ctx, value, hint);
      if (JS_IsException(method))
          return JS_EXCEPTION;
@@ -7149,7 +7168,7 @@
          JS_FreeValue(ctx, method);
          return JS_EXCEPTION;
      }
-@@ -55155,7 +58572,7 @@
+@@ -55155,7 +58582,7 @@
      on_dispose = argv[1];
      if (!JS_IsFunction(ctx, on_dispose))
          return JS_ThrowTypeError(ctx, "not a function");
@@ -7158,7 +7177,7 @@
          return JS_EXCEPTION;
      return js_dup(value);
  }
-@@ -55172,7 +58589,7 @@
+@@ -55172,7 +58599,7 @@
      on_dispose = argv[0];
      if (!JS_IsFunction(ctx, on_dispose))
          return JS_ThrowTypeError(ctx, "not a function");
@@ -7167,7 +7186,7 @@
          return JS_EXCEPTION;
      return JS_UNDEFINED;
  }
-@@ -55668,6 +59085,7 @@
+@@ -55668,6 +59095,7 @@
      if (!s || s->promise_state != JS_PROMISE_PENDING)
          return; /* should never happen */
      set_value(ctx, &s->promise_result, js_dup(value));
@@ -7175,7 +7194,7 @@
      s->promise_state = JS_PROMISE_FULFILLED + is_reject;
  
      promise_trace(ctx, "fulfill_or_reject_promise: is_reject=%d\n", is_reject);
-@@ -56073,6 +59491,48 @@
+@@ -56073,6 +59501,48 @@
      return result_promise;
  }
  
@@ -7224,7 +7243,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
-@@ -56081,14 +59541,24 @@
+@@ -56081,14 +59551,24 @@
  
      if (!JS_IsObject(this_val))
          return JS_ThrowTypeErrorNotAnObject(ctx);
@@ -7254,7 +7273,7 @@
          if (is_same)
              return js_dup(argv[0]);
      }
-@@ -56106,6 +59576,562 @@
+@@ -56106,6 +59586,562 @@
      return result_promise;
  }
  
@@ -7817,7 +7836,7 @@
  static JSValue js_promise_withResolvers(JSContext *ctx, JSValueConst this_val,
                                          int argc, JSValueConst *argv)
  {
-@@ -56479,6 +60505,25 @@
+@@ -56479,6 +60515,25 @@
      JSPromiseReactionData *rd_array[2], *rd;
      int i, j;
  
@@ -7843,7 +7862,7 @@
      rd_array[0] = NULL;
      rd_array[1] = NULL;
      for(i = 0; i < 2; i++) {
-@@ -56498,23 +60543,9 @@
+@@ -56498,23 +60553,9 @@
          rd_array[i] = rd;
      }
  
@@ -7870,7 +7889,7 @@
      s->is_handled = true;
      return 0;
  }
-@@ -61680,6 +65711,7 @@
+@@ -61680,6 +65721,7 @@
      p->u.typed_array = ta;
      p->u.array.count = len;
      p->u.array.u.ptr = abuf->data + offset;
@@ -7878,7 +7897,7 @@
      return 0;
  }
  
-@@ -62036,6 +66068,7 @@
+@@ -62036,6 +66078,7 @@
      ta->track_rab = track_rab;
      list_add_tail(&ta->link, &abuf->array_list);
      p->u.typed_array = ta;
@@ -7886,7 +7905,7 @@
      return obj;
  }
  
-@@ -63041,6 +67074,8 @@
+@@ -63041,6 +67084,8 @@
  
  bool JS_IsStrictEqual(JSContext *ctx, JSValueConst op1, JSValueConst op2)
  {
@@ -7895,7 +7914,7 @@
      return js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
  }
  
-@@ -63072,7 +67107,7 @@
+@@ -63072,7 +67117,7 @@
      /* Delete weak ref */
      JSWeakRefRecord **pwr, *wr;
  
@@ -7904,7 +7923,7 @@
      for(;;) {
          wr = *pwr;
          assert(wr != NULL);
-@@ -63112,7 +67147,12 @@
+@@ -63112,7 +67157,12 @@
      wrd->obj = obj;
      wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
      wr->u.weak_ref_data = wrd;
@@ -7918,7 +7937,7 @@
  
      JS_SetOpaqueInternal(obj, wrd);
      return obj;
-@@ -63156,7 +67196,7 @@
+@@ -63156,7 +67206,7 @@
  {
      JSWeakRefRecord **pwr, *wr;
  
@@ -7927,7 +7946,7 @@
      for(;;) {
          wr = *pwr;
          assert(wr != NULL);
-@@ -63268,15 +67308,20 @@
+@@ -63268,15 +67318,20 @@
          js_free(ctx, fre);
          return JS_EXCEPTION;
      }
@@ -7951,7 +7970,7 @@
  
      return JS_UNDEFINED;
  }
-@@ -63411,29 +67456,20 @@
+@@ -63411,29 +67466,20 @@
              break;
          case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY: {
              fre = wr->u.fin_rec_entry;
@@ -7994,7 +8013,7 @@
              }
              js_finrec_free(rt, fre);
              break;
-@@ -63466,13 +67502,68 @@
+@@ -63466,13 +67512,68 @@
      return true;
  }
  
