@@ -2316,11 +2316,14 @@ fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
 /// small native function (`inlinable`) becomes its body, with its locals
 /// appended to the caller's (its parameters first, set from the
 /// arguments). A few rounds inline calls in the inlined bodies too.
+/// A small function that calls itself inlines its own body once (in the
+/// first round): each call then does two levels of the recursion, which
+/// halves the calls' cost (`fib`, a tree walk).
 pub fn inline_calls(m: &mut Module) {
     let nfuncs = m.funcs.len();
     // Callees qualify by their own size; what they inlined comes along.
     let small: Vec<bool> = m.funcs.iter().map(|f| inlinable(f, INLINE_SIZE)).collect();
-    for _ in 0..3 {
+    for round in 0..3 {
         let callees: Vec<Option<Func>> =
             m.funcs.iter().zip(&small).map(|(f, &s)| (s && inlinable(f, usize::MAX)).then(|| f.clone())).collect();
         if callees.iter().all(Option::is_none) {
@@ -2338,7 +2341,7 @@ pub fn inline_calls(m: &mut Module) {
             visit_stmts_mut(&mut f.body, &mut |e| {
                 let ExprKind::Call(k, args) = &mut e.kind else { return };
                 let Some(callee) = callees[*k].as_ref() else { return };
-                if (g < nfuncs && *k == g) || args.len() != callee.params.len() {
+                if (g < nfuncs && *k == g && round > 0) || args.len() != callee.params.len() {
                     return;
                 }
                 // Arguments are of the parameters' ABI types; a parameter

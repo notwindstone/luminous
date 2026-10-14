@@ -364,7 +364,9 @@ The differential tests run every case with both.
     (`JS_ShapeAllocInfo`; the engine call otherwise);
   - `typeof`, `in`, `instanceof`, `new`;
   - calls to any function: native functions directly (small ones without
-    loops or closures are inlined, as JIT compilers inline them); a callee only known
+    loops or closures are inlined, as JIT compilers inline them; a small
+    one that calls itself has its own body inlined once, so that each call
+    does two levels of the recursion: `fib`, tree walks); a callee only known
     at run time (a method, a getter, a callback) is checked for being a
     native function and then entered through its native entry, skipping
     the engine's call path; interpreted ones through the engine; where
