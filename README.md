@@ -882,15 +882,75 @@ the same program built with `--no-native`, i.e. plain QuickJS-NG bytecode.
 
 In `boundary`, the interpreted loop around the calls dominates.
 
+### Against node and bun
+
+Median wall time of 7 runs (the program's own `elapsed`), LLVM backend
+with `--march x86-64-v3`, against the same program's erased JavaScript
+under node 22.22 and bun 1.4.2, on a 4-core x86-64 cloud VM (timings
+there vary by about ±10%):
+
+| benchmark    | tsaot  | node    | bun    | tsaot / bun |
+|--------------|-------:|--------:|-------:|------------:|
+| fib          |  10 ms |   47 ms |  20 ms |       0.50× |
+| xorshift     |  49 ms |  137 ms |  72 ms |       0.68× |
+| raytracer    |  30 ms |   63 ms |  41 ms |       0.73× |
+| mandelbrot   |  24 ms |   45 ms |  29 ms |       0.83× |
+| objects      | 398 ms | 1066 ms | 440 ms |       0.90× |
+| logparser    | 920 ms | 1364 ms | 1026 ms |       0.90× |
+| tokenizer    | 254 ms |  580 ms | 267 ms |       0.95× |
+| binary_trees | 347 ms |  344 ms | 363 ms |       0.96× |
+| integrate    | 225 ms |  361 ms | 235 ms |       0.96× |
+| arrays       | 132 ms |  185 ms | 136 ms |       0.97× |
+| nbody        | 141 ms |  127 ms | 145 ms |       0.97× |
+| primes       | 203 ms |  310 ms | 203 ms |       1.00× |
+| records      | 611 ms | 1043 ms | 597 ms |       1.02× |
+| shapes       | 196 ms |  258 ms | 125 ms |       1.57× |
+
 ## Roadmap
 
 - **`int` fields and elements**: `{ value: int }`, `int[]` (checked reads),
   and `int` parameters of closures.
-- Shapes for class instances (inline property access), and calls to methods
-  of known classes without the engine.
 - **Multi-module programs** (`import` between `.ts` files).
 - **Position-preserving type stripping**, so interpreter stack traces point
   at the original `.ts` lines.
+
+### Open performance work
+
+Five open-ended lines of work, each left at a finished, tested point, with
+what would come next:
+
+- **LLVM code quality.** Most of the benchmarks above already run faster
+  than bun; what remains is in code the compiler cannot specialize yet. A
+  method call on a receiver of several classes (`for (const s of shapes)
+  s.area()`) goes through the site's inline cache and the callee's generic
+  native entry: about 100 instructions per call in `bench/shapes.ts`,
+  which runs at about 1.6× bun's time. Next: dispatch on the receiver's
+  shape at the call site and call (or inline) each class's method
+  directly, as JIT compilers' polymorphic inlining does; keep numbers
+  unboxed across such calls.
+- **Engine fast paths: allocation, strings, builtins.** Objects, class
+  instances and arrays are allocated inline by native code, but string
+  building (`+=` in loops, `join`, template literals), `Map`/`Set` and
+  most builtins still go through the engine's C entry points. Next: a
+  string builder for `+=` chains, inline `Map`/`Set` lookups of string and
+  small-integer keys, and native paths for the builtins that profiles of
+  real programs show (closure-heavy and graph-traversal test programs
+  measured at about 1.25–1.5× bun's time).
+- **Float code (nbody, raytracer).** Speculative regions read and write
+  `number` fields as doubles, and non-escaping class instances become
+  locals, so both run faster than bun. Next: scalar replacement through
+  calls that are not inlined (a `Vec` passed to and returned from a
+  method), and SIMD for the pair loop of nbody-like code.
+- **Numeric regions in methods.** Regions cover `this` fields in methods
+  and the bodies of inlined methods. Next: regions that span calls to
+  small methods of other objects (predicted and guarded), and regions over
+  loops that call such methods.
+- **Garbage collector.** The engine's reference counting is replaced by a
+  tracing, non-moving mark-sweep collector with generations (sticky mark
+  bits and a write barrier), conservative stack roots and inline bump
+  allocation. Next: parallel marking, lazy (incremental) sweeping, and a
+  copying young generation, which needs the objects that conservative
+  roots reach to be pinned (as mostly-copying collectors do).
 
 ## Layout
 
