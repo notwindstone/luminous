@@ -31,7 +31,7 @@ fn c_str(s: &str) -> String {
     out
 }
 
-pub fn generate(m: &ir::Module, mutable: &[usize], classes: &[ClassDecl], int_wrapping: bool) -> String {
+pub fn generate(m: &ir::Module, mutable: &[(usize, bool)], classes: &[ClassDecl], int_wrapping: bool) -> String {
     let mut c = String::new();
     write!(
         c,
@@ -77,8 +77,8 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
     let nclasses = m.homes / 2;
     let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
-    // kind: 0 plain, 1 async, 2 generator, 3 async generator (see
-    // tsaot_function_kind).
+    // kind: 0 plain, 1 async, 2 generator, 3 async generator, 4 an ordinary
+    // function (a constructor: see tsaot_function_kind).
     c.push_str(
         "\nstatic const struct { JSCFunctionFast *fast; const char *name; int length, kind; } tsaot_table[] = {\n",
     );
@@ -86,7 +86,8 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
         let kind = match (f.is_generator, f.is_async) {
             (true, true) => 3,
             (true, false) => 2,
-            (false, a) => a as u8,
+            (false, true) => 1,
+            (false, false) => 4 * f.constructor as u8,
         };
         writeln!(c, "    {{ tsaot_fast_{i}, {}, {}, {kind} }},", c_str(&f.name), f.js_length).unwrap();
     }
@@ -142,8 +143,14 @@ _Static_assert(TSAOT_NATIVE_STACK == {budget}u, "stack budget mismatch");
         list(m.strings.iter().map(|s| s.len().to_string()).collect())
     )
     .unwrap();
-    write!(c, "const int tsaot_mutable_cells[] = {{\n{}}};\n\n", list(mutable.iter().map(|k| k.to_string()).collect()))
+    write!(c, "const int tsaot_mutable_cells[] = {{\n{}}};\n", list(mutable.iter().map(|k| k.0.to_string()).collect()))
         .unwrap();
+    write!(
+        c,
+        "const unsigned char tsaot_mutable_const[] = {{\n{}}};\n\n",
+        list(mutable.iter().map(|k| (k.1 as u8).to_string()).collect())
+    )
+    .unwrap();
 
     // Classes: private name values and home objects, and what each class
     // hands over.

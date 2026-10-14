@@ -40,6 +40,7 @@ extern const char *const tsaot_atom_names[];
 extern const char *const tsaot_string_data[];
 extern const size_t tsaot_string_lens[];
 extern const int tsaot_mutable_cells[];
+extern const unsigned char tsaot_mutable_const[];
 extern const int tsaot_ncells, tsaot_nstrings, tsaot_natoms, tsaot_nmutable;
 /* Private name values and home objects of classes (filled by the classes
  * as they are defined). */

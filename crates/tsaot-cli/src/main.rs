@@ -183,8 +183,10 @@ fn disable_native(a: &mut Analysis) {
     a.classes.clear();
 }
 
-fn mutable_cells(a: &Analysis) -> Vec<usize> {
-    a.cells.iter().enumerate().filter(|(_, c)| c.mutable).map(|(i, _)| i).collect()
+/// The cells interpreted code reaches through accessors, and whether each
+/// is a constant (assigning to it throws).
+fn mutable_cells(a: &Analysis) -> Vec<(usize, bool)> {
+    a.cells.iter().enumerate().filter(|(_, c)| c.mutable).map(|(i, c)| (i, c.constant)).collect()
 }
 
 fn print_report(bundle: &Bundle, a: &Analysis) {

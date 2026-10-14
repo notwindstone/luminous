@@ -15,6 +15,11 @@
 //! contributes its type declarations only. Imports of modules the engine
 //! provides (`qjs:os`, ...) stay.
 //!
+//! Writes to an import binding throw a TypeError (through an accessor), as
+//! `ns.x = v` does on a namespace object (a Proxy with the semantics of a
+//! module namespace). Modules of JSON, text or bytes (`with { type: ... }`)
+//! export their content as `default`.
+//!
 //! A program of one module is left untouched.
 
 use std::collections::{HashMap, HashSet};
@@ -24,6 +29,7 @@ use oxc::allocator::Allocator;
 use oxc::ast::AstKind;
 use oxc::ast::ast::*;
 use oxc::ast_visit::{Visit, walk};
+use oxc::diagnostics::OxcDiagnostic;
 use oxc::parser::Parser;
 use oxc::semantic::{NodeId, ScopeId, Semantic, SemanticBuilder, SymbolId};
 use oxc::span::{GetSpan, SourceType, Span};
@@ -123,6 +129,15 @@ struct Import {
     bindings: Vec<(SymbolId, Name)>,
 }
 
+/// What a module's file holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Script,
+    Json,
+    Text,
+    Bytes,
+}
+
 struct Unit<'a> {
     path: PathBuf,
     original: String,
@@ -140,6 +155,18 @@ struct Unit<'a> {
     default_expr: Option<DefaultExport>,
     /// Why the module cannot be part of a program of several modules.
     unsupported: Option<String>,
+    /// `export { a } from`: where, the module and the name it re-exports
+    /// (which must resolve, used or not).
+    reexports: Vec<(Span, usize, String)>,
+    /// Its early errors (parse and semantic).
+    errors: Vec<OxcDiagnostic>,
+    /// `import(...)` expressions: where, and the module of a string
+    /// specifier that resolves (else it stays the engine's).
+    dynamic: Vec<(Span, Option<Target>)>,
+    /// Where `import.meta` is.
+    metas: Vec<Span>,
+    /// Whether its code awaits at the top level.
+    tla: bool,
 }
 
 impl Unit<'_> {
@@ -158,9 +185,11 @@ impl Unit<'_> {
         }
     }
 
-    /// Whether `sym` is referenced in a value position.
-    fn used_as_value(&self, sym: SymbolId) -> bool {
-        self.sem.scoping().get_resolved_references(sym).any(|r| r.flags().is_value())
+    /// Whether `sym` is referenced, and only in type positions (an import
+    /// of it is elided, as TypeScript does).
+    fn types_only(&self, sym: SymbolId) -> bool {
+        let mut refs = self.sem.scoping().get_resolved_references(sym).peekable();
+        refs.peek().is_some() && refs.all(|r| !r.flags().is_value())
     }
 
     /// Whether a binding named `name` in a scope from `scope` up to (not
@@ -187,8 +216,15 @@ struct DefaultExport {
     /// declaration: hoisted, compiled as one); else an expression for a
     /// `const`.
     name_at: Option<u32>,
-    /// Its `name` is `default` (an anonymous function or class).
-    anonymous: bool,
+    /// An anonymous function or class: its `name` is `default`.
+    anonymous: Anon,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Anon {
+    No,
+    Function,
+    Class,
 }
 
 enum Resolved {
@@ -340,7 +376,24 @@ fn loc(path: &Path, source: &str, pos: u32) -> String {
 }
 
 /// The module records of a module: its imports and exports.
-fn records(unit: &mut Unit, program: &Program, resolve_target: &mut dyn FnMut(&str) -> Result<Target, String>) -> Result<(), String> {
+/// The `type` import attribute of a `with { ... }` clause.
+fn attr_type(w: &Option<oxc::allocator::Box<WithClause>>) -> Option<String> {
+    w.as_ref()?
+        .with_entries
+        .iter()
+        .find(|e| match &e.key {
+            ImportAttributeKey::Identifier(i) => i.name == "type",
+            ImportAttributeKey::StringLiteral(s) => s.value == "type",
+        })
+        .map(|e| e.value.value.to_string())
+}
+
+#[allow(clippy::type_complexity)]
+fn records(
+    unit: &mut Unit,
+    program: &Program,
+    resolve_target: &mut dyn FnMut(&str, Option<String>) -> Result<Target, String>,
+) -> Result<(), String> {
     let scoping = unit.sem.scoping();
     let root = scoping.root_scope_id();
     let at = |span: Span| loc(&unit.path, &unit.original, span.start);
@@ -353,23 +406,31 @@ fn records(unit: &mut Unit, program: &Program, resolve_target: &mut dyn FnMut(&s
     let mut deps = Vec::new();
     let mut deletions = Vec::new();
     let mut default_expr = None;
-    let mut target_of = |src: &StringLiteral| resolve_target(src.value.as_str()).map_err(|e| format!("{}: {e}", at(src.span)));
+    let mut reexports = Vec::new();
+    let mut target_of = |src: &StringLiteral, attr: Option<String>| {
+        resolve_target(src.value.as_str(), attr).map_err(|e| format!("{}: {e}", at(src.span)))
+    };
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(d) => {
-                let target = target_of(&d.source)?;
+                let target = target_of(&d.source, attr_type(&d.with_clause))?;
                 let mut bindings = Vec::new();
+                // (Whether each is a type only: `type`, or only used so.)
+                let mut types = Vec::new();
                 for s in d.specifiers.iter().flatten() {
-                    let (local, name) = match s {
-                        ImportDeclarationSpecifier::ImportSpecifier(s) => (&s.local, Name::Named(s.imported.name().to_string())),
-                        ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => (&s.local, Name::Named("default".into())),
-                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (&s.local, Name::Namespace),
+                    let (local, name, ty) = match s {
+                        ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                            (&s.local, Name::Named(s.imported.name().to_string()), s.import_kind.is_type())
+                        }
+                        ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => (&s.local, Name::Named("default".into()), false),
+                        ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => (&s.local, Name::Namespace, false),
                     };
+                    types.push(ty || unit.types_only(local.symbol_id()));
                     bindings.push((local.symbol_id(), name));
                 }
-                let runtime = !d.import_kind.is_type()
-                    && (d.specifiers.as_ref().is_none_or(|s| s.is_empty())
-                        || bindings.iter().any(|(s, _)| unit.used_as_value(*s)));
+                // An import whose bindings are all types is elided (one with
+                // none, or an unused binding, runs the module).
+                let runtime = !d.import_kind.is_type() && (types.is_empty() || types.iter().any(|t| !t));
                 deps.push((target.clone(), runtime));
                 imports.push(Import { span: d.span, target, bindings });
             }
@@ -395,18 +456,25 @@ fn records(unit: &mut Unit, program: &Program, resolve_target: &mut dyn FnMut(&s
             }
             Statement::ExportFromDeclaration(e) => {
                 deletions.push(e.span);
-                let target = target_of(&e.source)?;
+                let target = target_of(&e.source, attr_type(&e.with_clause))?;
                 if matches!(target, Target::External(_)) {
                     unit.unsupported.get_or_insert(format!("{}: re-exports of `{}` are not supported yet", at(e.span), e.source.value));
                 }
                 for s in &e.specifiers {
-                    exports.push((s.exported.name().to_string(), Export::From(target.clone(), Name::Named(s.local.name().to_string()))));
+                    let name = s.local.name().to_string();
+                    if let Target::Module(t) = target
+                        && !e.export_kind.is_type()
+                        && !s.export_kind.is_type()
+                    {
+                        reexports.push((s.span, t, name.clone()));
+                    }
+                    exports.push((s.exported.name().to_string(), Export::From(target.clone(), Name::Named(name))));
                 }
                 deps.push((target, !e.export_kind.is_type()));
             }
             Statement::ExportAllDeclaration(e) => {
                 deletions.push(e.span);
-                let target = target_of(&e.source)?;
+                let target = target_of(&e.source, attr_type(&e.with_clause))?;
                 if matches!(target, Target::External(_)) {
                     unit.unsupported.get_or_insert(format!("{}: re-exports of `{}` are not supported yet", at(e.span), e.source.value));
                 }
@@ -431,16 +499,21 @@ fn records(unit: &mut Unit, program: &Program, resolve_target: &mut dyn FnMut(&s
                     None => {
                         let decl = e.declaration.span();
                         let text = &unit.original;
+                        // (An anonymous function or class, parenthesized or
+                        // not, is named `default`.)
                         let (name_at, anonymous) = match &e.declaration {
-                            ExportDefaultDeclarationKind::FunctionDeclaration(f) => (Some(f.params.span.start), true),
+                            ExportDefaultDeclarationKind::FunctionDeclaration(f) => (Some(f.params.span.start), Anon::Function),
                             ExportDefaultDeclarationKind::ClassDeclaration(c) => {
                                 let at = text[c.span.start as usize..].find("class").map(|i| c.span.start + i as u32 + 5);
-                                (at, true)
+                                (at, Anon::Class)
                             }
-                            ExportDefaultDeclarationKind::FunctionExpression(f) => (None, f.id.is_none()),
-                            ExportDefaultDeclarationKind::ClassExpression(c) => (None, c.id.is_none()),
-                            ExportDefaultDeclarationKind::ArrowFunctionExpression(_) => (None, true),
-                            _ => (None, false),
+                            ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => (None, Anon::No),
+                            other => match other.to_expression().without_parentheses() {
+                                Expression::FunctionExpression(f) if f.id.is_none() => (None, Anon::Function),
+                                Expression::ArrowFunctionExpression(_) => (None, Anon::Function),
+                                Expression::ClassExpression(c) if c.id.is_none() => (None, Anon::Class),
+                                _ => (None, Anon::No),
+                            },
                         };
                         default_expr = Some(DefaultExport {
                             prefix: keywords(text, e.span.start, true),
@@ -461,64 +534,171 @@ fn records(unit: &mut Unit, program: &Program, resolve_target: &mut dyn FnMut(&s
             _ => {}
         }
     }
+    let mut dynamic = Dynamic::default();
+    dynamic.visit_program(program);
+    unit.dynamic = dynamic
+        .imports
+        .into_iter()
+        .map(|(span, spec)| {
+            // (One that does not resolve rejects when it runs, as the
+            // engine's does.)
+            let t = spec.and_then(|(s, ty)| resolve_target(&s, ty).ok()).filter(|t| matches!(t, Target::Module(_)));
+            (span, t)
+        })
+        .collect();
+    unit.metas = dynamic.metas;
+    unit.tla = dynamic.tla;
+    // An export name declared twice is an early error.
+    let mut seen = HashSet::new();
+    for (name, _) in &exports {
+        if !seen.insert(name.as_str()) {
+            return Err(format!("{}: duplicate export `{name}`", unit.path.display()));
+        }
+    }
     unit.imports = imports;
     unit.exports = exports;
     unit.stars = stars;
     unit.deps = deps;
     unit.deletions = deletions;
     unit.default_expr = default_expr;
+    unit.reexports = reexports;
     Ok(())
 }
 
-/// `import(...)` of the program's modules and `import.meta` are not
-/// supported yet.
-struct Unsupported {
-    found: Option<(Span, &'static str)>,
+/// A module's `import(...)` expressions (string specifiers, and a `type`
+/// in `{ with: { type } }`), `import.meta`, and whether it awaits at the
+/// top level.
+#[derive(Default)]
+struct Dynamic {
+    imports: Vec<(Span, Option<(String, Option<String>)>)>,
+    metas: Vec<Span>,
+    tla: bool,
+    depth: u32,
 }
 
-impl<'a> Visit<'a> for Unsupported {
+impl<'a> Visit<'a> for Dynamic {
     fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
-        self.found.get_or_insert((it.span, "dynamic `import()` in a program of several modules is not supported yet"));
+        let spec = match &it.source {
+            Expression::StringLiteral(s) => Some(s.value.to_string()),
+            Expression::TemplateLiteral(t) if t.expressions.is_empty() => {
+                t.quasis.first().and_then(|q| q.value.cooked.map(|c| c.to_string()))
+            }
+            _ => None,
+        };
+        let ty = it.options.as_ref().and_then(|o| {
+            let Expression::ObjectExpression(o) = o.without_parentheses() else { return None };
+            o.properties.iter().find_map(|p| {
+                let ObjectPropertyKind::ObjectProperty(p) = p else { return None };
+                if p.key.static_name().as_deref() != Some("with") {
+                    return None;
+                }
+                let Expression::ObjectExpression(w) = p.value.without_parentheses() else { return None };
+                w.properties.iter().find_map(|q| {
+                    let ObjectPropertyKind::ObjectProperty(q) = q else { return None };
+                    match (&q.key.static_name().as_deref(), &q.value) {
+                        (Some("type"), Expression::StringLiteral(v)) => Some(v.value.to_string()),
+                        _ => None,
+                    }
+                })
+            })
+        });
+        self.imports.push((it.span, spec.map(|s| (s, ty))));
+        walk::walk_import_expression(self, it);
     }
 
     fn visit_import_meta(&mut self, it: &ImportMeta) {
-        self.found.get_or_insert((it.span, "`import.meta` in a program of several modules is not supported yet"));
+        self.metas.push(it.span);
     }
+
+    fn visit_await_expression(&mut self, it: &AwaitExpression<'a>) {
+        if self.depth == 0 {
+            self.tla = true;
+        }
+        walk::walk_await_expression(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        if it.r#await && self.depth == 0 {
+            self.tla = true;
+        }
+        walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: oxc::syntax::scope::ScopeFlags) {
+        self.depth += 1;
+        walk::walk_function(self, it, flags);
+        self.depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        self.depth += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.depth -= 1;
+    }
+
+    fn visit_class(&mut self, it: &Class<'a>) {
+        // (Field initializers and static blocks are functions of their own.)
+        self.depth += 1;
+        walk::walk_class(self, it);
+        self.depth -= 1;
+    }
+}
+
+/// The source of a module of JSON, text or bytes: its content as a default
+/// export.
+fn synthesize(path: &Path, kind: Kind) -> Result<String, String> {
+    let read_err = |e: std::io::Error| format!("reading {}: {e}", path.display());
+    Ok(match kind {
+        Kind::Script => unreachable!(),
+        Kind::Json => {
+            let text = std::fs::read_to_string(path).map_err(read_err)?;
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{}: invalid JSON: {e}", path.display()))?;
+            format!("export default JSON.parse({});\n", serde_json::to_string(&text).unwrap())
+        }
+        Kind::Text => {
+            let text = std::fs::read_to_string(path).map_err(read_err)?;
+            format!("export default {};\n", serde_json::to_string(&text).unwrap())
+        }
+        Kind::Bytes => {
+            let bytes = std::fs::read(path).map_err(read_err)?;
+            let list: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+            format!("export default new Uint8Array([{}]);\n", list.join(","))
+        }
+    })
 }
 
 /// Build the bundle of the program whose entry module is `entry`.
 pub fn bundle(entry: &Path) -> Result<Bundle, String> {
     let allocator = Allocator::default();
     let mut units: Vec<Unit> = Vec::new();
-    let mut index: HashMap<PathBuf, usize> = HashMap::new();
-    let mut queue = vec![entry.to_path_buf()];
-    index.insert(entry.to_path_buf(), 0);
+    let mut index: HashMap<(PathBuf, Kind), usize> = HashMap::new();
+    let mut queue = vec![(entry.to_path_buf(), Kind::Script)];
+    index.insert((entry.to_path_buf(), Kind::Script), 0);
     // (The entry's own path, canonical, is its index too.)
     if let Ok(c) = entry.canonicalize() {
-        index.insert(c, 0);
+        index.insert((c, Kind::Script), 0);
     }
     let mut i = 0;
     while i < queue.len() {
-        let path = queue[i].clone();
-        let original = std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let (path, kind) = queue[i].clone();
+        let original = match kind {
+            Kind::Script => std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?,
+            _ => synthesize(&path, kind)?,
+        };
         let stripped = allocator.alloc_str(&marker::strip(&original).source);
         let parsed = Parser::new(&allocator, stripped, SourceType::ts().with_module(true)).parse();
-        if !parsed.diagnostics.is_empty() {
-            // (The compiler reports them, for the entry; another module's
-            // are reported here.)
-            if i == 0 {
-                return Ok(single(entry, original));
-            }
-            let d = &parsed.diagnostics[0];
-            return Err(format!("{}: {}", path.display(), d.message));
-        }
+        let mut errors: Vec<OxcDiagnostic> = parsed.diagnostics.into_iter().collect();
         let program: &Program = allocator.alloc(parsed.program);
-        let sem = SemanticBuilder::new().with_build_nodes(true).build(program).semantic;
+        let ret = SemanticBuilder::new().with_build_nodes(true).with_check_syntax_error(true).build(program);
+        if errors.is_empty() {
+            errors.extend(ret.diagnostics);
+        }
         let mut unit = Unit {
             path: path.clone(),
             original,
             program,
-            sem,
+            sem: ret.semantic,
             imports: Vec::new(),
             exports: Vec::new(),
             stars: Vec::new(),
@@ -526,38 +706,56 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
             deletions: Vec::new(),
             default_expr: None,
             unsupported: None,
+            reexports: Vec::new(),
+            errors,
+            dynamic: Vec::new(),
+            metas: Vec::new(),
+            tla: false,
         };
-        let mut resolve_target = |spec: &str| -> Result<Target, String> {
+        let mut resolve_target = |spec: &str, attr: Option<String>| -> Result<Target, String> {
             Ok(match resolve(&path, spec)? {
                 Resolved::External(s) => Target::External(s),
                 Resolved::File(p) => {
+                    let kind = match attr.as_deref() {
+                        Some("json") => Kind::Json,
+                        Some("text") => Kind::Text,
+                        Some("bytes") => Kind::Bytes,
+                        Some("javascript") | None if p.extension().is_some_and(|e| e == "json") => Kind::Json,
+                        Some("javascript") | None => Kind::Script,
+                        Some(t) => return Err(format!("unsupported import type `{t}`")),
+                    };
                     let p = p.canonicalize().unwrap_or(p);
                     let n = queue.len();
-                    let k = *index.entry(p.clone()).or_insert(n);
+                    let k = *index.entry((p.clone(), kind)).or_insert(n);
                     if k == n {
-                        queue.push(p);
+                        queue.push((p, kind));
                     }
                     Target::Module(k)
                 }
             })
         };
-        records(&mut unit, program, &mut resolve_target)?;
+        if unit.errors.is_empty() {
+            records(&mut unit, program, &mut resolve_target)?;
+        }
         units.push(unit);
         i += 1;
     }
-    // One module: as written.
-    if units.len() == 1 && units[0].imports.iter().all(|i| matches!(i.target, Target::External(_))) {
+    // One module: as written (the compiler reports its errors).
+    if units.len() == 1
+        && units[0].imports.iter().all(|i| matches!(i.target, Target::External(_)))
+        && units[0].dynamic.iter().all(|d| d.1.is_none())
+    {
         let u = units.pop().unwrap();
         return Ok(single(&u.path, u.original));
+    }
+    for u in &mut units {
+        if !u.errors.is_empty() {
+            return Err(crate::erase::render(std::mem::take(&mut u.errors), &u.original, &u.path));
+        }
     }
     for u in &units {
         if let Some(e) = &u.unsupported {
             return Err(e.clone());
-        }
-        let mut v = Unsupported { found: None };
-        v.visit_program(u.program);
-        if let Some((span, msg)) = v.found {
-            return Err(format!("{}: {msg}", loc(&u.path, &u.original, span.start)));
         }
     }
     link(&units)
@@ -595,6 +793,20 @@ impl<'a> Visit<'a> for Shorthands {
     }
 }
 
+/// Names the merged program defines besides the modules' own.
+struct Names {
+    /// Each binding's name in the merged program (namespaces: the function
+    /// that returns the module's namespace object).
+    of: HashMap<Binding, String>,
+    /// Import bindings that are assigned to: the function that returns an
+    /// object whose `v` reads the binding and throws when set.
+    writes: HashMap<(usize, SymbolId), String>,
+}
+
+/// The JavaScript globals the code this adds refers to: no module's
+/// top-level binding may take their names.
+const GLOBALS_USED: [&str; 7] = ["Object", "Proxy", "Reflect", "Symbol", "TypeError", "JSON", "Uint8Array"];
+
 /// Order, name and merge the modules.
 fn link(units: &[Unit]) -> Result<Bundle, String> {
     // Evaluation order: dependencies first (run-time ones), depth first.
@@ -617,6 +829,19 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     let typed_only: Vec<usize> = (0..units.len()).filter(|&m| state[m] == 0).collect();
     let all: Vec<usize> = typed_only.iter().copied().chain(order.iter().copied()).collect();
 
+    // `export { a } from` must resolve, used or not (as ESM links them).
+    for u in units {
+        for (span, t, name) in &u.reexports {
+            if resolve_export(units, *t, name, &mut Vec::new()).is_none() {
+                return Err(format!(
+                    "{}: module `{}` has no export `{name}` (or more than one through `export *`)",
+                    loc(&u.path, &u.original, span.start),
+                    units[*t].path.display()
+                ));
+            }
+        }
+    }
+
     // What each import binding resolves to.
     let mut resolved: HashMap<(usize, SymbolId), Binding> = HashMap::new();
     for (m, u) in units.iter().enumerate() {
@@ -627,7 +852,7 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
                     Name::Namespace => Binding::Namespace(t),
                     Name::Named(n) => resolve_export(units, t, n, &mut Vec::new()).ok_or_else(|| {
                         format!(
-                            "{}: module `{}` has no export `{n}`",
+                            "{}: module `{}` has no export `{n}` (or more than one through `export *`)",
                             loc(&u.path, &u.original, imp.span.start),
                             units[t].path.display()
                         )
@@ -641,10 +866,14 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     // Namespace objects that are needed: of namespace imports used other
     // than as `ns.x` (with their references' scopes), and those they hold.
     let mut ns_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
+    let mut writes: Vec<(usize, SymbolId)> = Vec::new();
     for (&(m, sym), &b) in &resolved {
-        let Binding::Namespace(t) = b else { continue };
         let u = &units[m];
         for r in u.sem.scoping().get_resolved_references(sym) {
+            if r.flags().is_write() && !writes.contains(&(m, sym)) {
+                writes.push((m, sym));
+            }
+            let Binding::Namespace(t) = b else { continue };
             match member_of_namespace(units, u.sem.nodes(), r.node_id(), t) {
                 Some((_, Binding::Namespace(k))) => ns_sites.entry(k).or_default().push((m, u.ref_scope(r.node_id()))),
                 Some(_) => {}
@@ -652,7 +881,15 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             }
         }
     }
+    writes.sort();
     let mut needed: Vec<usize> = ns_sites.keys().copied().collect();
+    for &(m, sym) in &writes {
+        if let Binding::Namespace(t) = resolved[&(m, sym)]
+            && !needed.contains(&t)
+        {
+            needed.push(t);
+        }
+    }
     let mut k = 0;
     while k < needed.len() {
         let t = needed[k];
@@ -669,9 +906,10 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
 
     // Names: each top-level binding of each module (but import bindings of
     // the program's modules), each default expression and each namespace
-    // object, unique, not the name of a global the modules use, and not that
-    // of a binding in a scope where a reference to it is.
-    let mut taken: HashSet<String> = HashSet::new();
+    // object, unique, not the name of a global the modules (or the code
+    // added) use, and not that of a binding in a scope where a reference to
+    // it is.
+    let mut taken: HashSet<String> = GLOBALS_USED.iter().map(|s| s.to_string()).collect();
     for u in units {
         for name in u.sem.scoping().root_unresolved_references().keys() {
             taken.insert(name.to_string());
@@ -700,7 +938,7 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         }
         v
     };
-    let mut names: HashMap<Binding, String> = HashMap::new();
+    let mut names = Names { of: HashMap::new(), writes: HashMap::new() };
     // `type int = number` in several modules is one alias (the checker
     // knows `int` by its name).
     let mut int_aliases: Vec<(usize, SymbolId)> = Vec::new();
@@ -718,20 +956,20 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             if name == "int" && scoping.symbol_flags(sym).is_type_alias() {
                 int_aliases.push((m, sym));
                 if int_aliases.len() > 1 {
-                    names.insert(b, "int".into());
+                    names.of.insert(b, "int".into());
                     continue;
                 }
             }
             let own = scoping.get_resolved_references(sym).map(|r| (m, u.ref_scope(r.node_id()))).collect();
             let n = pick(name, &sites_of(b, own), &taken);
             taken.insert(n.clone());
-            names.insert(b, n);
+            names.of.insert(b, n);
         }
         if u.default_expr.is_some() {
             let b = Binding::Default(m);
             let n = pick(&format!("{}_default", stem(&u.path)), &sites_of(b, Vec::new()), &taken);
             taken.insert(n.clone());
-            names.insert(b, n);
+            names.of.insert(b, n);
         }
     }
     for &t in &needed {
@@ -740,13 +978,45 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         taken.insert(n.clone());
         // (and its cache, `<name>$`)
         taken.insert(format!("{n}$"));
-        names.insert(Binding::Namespace(t), n);
+        names.of.insert(Binding::Namespace(t), n);
     }
+    for &(m, sym) in &writes {
+        let u = &units[m];
+        let sites: Vec<(usize, ScopeId)> =
+            u.sem.scoping().get_resolved_references(sym).map(|r| (m, u.ref_scope(r.node_id()))).collect();
+        let n = pick(&format!("{}_import", u.sem.scoping().symbol_name(sym)), &sites, &taken);
+        taken.insert(n.clone());
+        taken.insert(format!("{n}$"));
+        names.writes.insert((m, sym), n);
+    }
+    let helper = (!needed.is_empty()).then(|| {
+        let n = pick("__namespace", &[], &taken);
+        taken.insert(n.clone());
+        n
+    });
 
-    // The text of each module, edited, in order.
+    // The text of each module, edited, in order; what must run before any
+    // of them (`.name` of anonymous default functions, which are hoisted)
+    // is put first, on the first line.
     let mut source = String::new();
     let mut modules = Vec::new();
     let mut line = 1u32;
+    let mut prelude = String::new();
+    for &m in &all {
+        let u = &units[m];
+        let typed = typed_only.contains(&m);
+        if let Some(d) = u.default_expr
+            && !typed
+            && d.anonymous == Anon::Function
+            && d.name_at.is_some()
+        {
+            prelude.push_str(&format!(
+                "Object.defineProperty({}, \"name\", {{ value: \"default\" }}); ",
+                names.of[&Binding::Default(m)]
+            ));
+        }
+    }
+    source.push_str(&prelude);
     for &m in &all {
         let u = &units[m];
         let mut edits = edits(units, m, &resolved, &names, typed_only.contains(&m), &int_aliases)?;
@@ -774,10 +1044,12 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         modules.push(ModuleSource { path: u.path.clone(), original: u.original.clone(), start, end, first_line: line, map });
         line += source[start as usize..].matches('\n').count() as u32;
     }
-    // Namespace objects: made on first use, a getter for each export (they
-    // are live), frozen.
+    // Namespace objects: made on first use (`__namespace` below).
+    if let Some(helper) = &helper {
+        source.push_str(&format!("function {helper}{NAMESPACE_HELPER}\n"));
+    }
     for &t in &needed {
-        let name = &names[&Binding::Namespace(t)];
+        let name = &names.of[&Binding::Namespace(t)];
         // (Not types: they are not values at run time.)
         let is_value = |b: &Binding| match *b {
             Binding::Symbol(k, sym) => units[k].sem.scoping().symbol_flags(sym).is_value(),
@@ -788,25 +1060,68 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             .filter_map(|n| resolve_export(units, t, &n, &mut Vec::new()).map(|b| (n, b)))
             .filter(|(_, b)| is_value(b))
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut props: Vec<String> = entries
+        // (In the order of their UTF-16 code units, as the spec sorts them.)
+        entries.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+        let keys: Vec<String> = entries.iter().map(|(n, _)| serde_json::to_string(n).unwrap()).collect();
+        let cases: Vec<String> = entries
             .iter()
             .map(|(n, b)| {
                 let value = match b {
-                    Binding::Namespace(k) => format!("{}()", names[&Binding::Namespace(*k)]),
-                    b => names[b].clone(),
+                    Binding::Namespace(k) => format!("{}()", names.of[&Binding::Namespace(*k)]),
+                    b => names.of[b].clone(),
                 };
-                format!("{}: {{ get: () => {value}, enumerable: true }}", serde_json::to_string(n).unwrap())
+                format!("case {}: return {value};", serde_json::to_string(n).unwrap())
             })
             .collect();
-        props.push("[Symbol.toStringTag]: { value: \"Module\" }".into());
         source.push_str(&format!(
-            "var {name}$; function {name}() {{ return {name}$ || ({name}$ = Object.freeze(Object.defineProperties(Object.create(null), {{ {} }}))); }}\n",
-            props.join(", "),
+            "var {name}$; function {name}() {{ return {name}$ || ({name}$ = {}([{}], (k) => {{ switch (k) {{ {} }} }})); }}\n",
+            helper.as_ref().unwrap(),
+            keys.join(", "),
+            cases.join(" "),
+        ));
+    }
+    // Import bindings that are assigned to: read through `v`, which throws
+    // when set.
+    for (&(m, sym), name) in &names.writes {
+        let target = match resolved[&(m, sym)] {
+            Binding::Namespace(t) => format!("{}()", names.of[&Binding::Namespace(t)]),
+            b => names.of[&b].clone(),
+        };
+        source.push_str(&format!(
+            "var {name}$; function {name}() {{ return {name}$ || ({name}$ = {{ get v() {{ return {target}; }}, set v(_) {{ throw new TypeError(\"Assignment to constant variable.\"); }} }}); }}\n"
         ));
     }
     Ok(Bundle { source, modules })
 }
+
+/// A module namespace object (after `function <name>`): a Proxy over a
+/// non-extensible object with the module's export names, whose traps are
+/// those of module namespace exotic objects (ECMA-262 10.4.6): values of
+/// live bindings (throwing while uninitialized), not writable, not
+/// deletable, a null prototype, `@@toStringTag` "Module".
+const NAMESPACE_HELPER: &str = "(names, get) { \
+const target = Object.create(null); \
+for (const n of names) Object.defineProperty(target, n, { value: undefined, writable: true, enumerable: true, configurable: false }); \
+Object.defineProperty(target, Symbol.toStringTag, { value: \"Module\" }); \
+Object.preventExtensions(target); \
+const has = (k) => typeof k === \"string\" && names.includes(k); \
+return new Proxy(target, { \
+get(t, k) { return has(k) ? get(k) : Reflect.get(t, k); }, \
+set() { return false; }, \
+has(t, k) { return has(k) || Reflect.has(t, k); }, \
+deleteProperty(t, k) { return has(k) ? false : Reflect.deleteProperty(t, k); }, \
+getOwnPropertyDescriptor(t, k) { return has(k) ? { value: get(k), writable: true, enumerable: true, configurable: false } : Reflect.getOwnPropertyDescriptor(t, k); }, \
+defineProperty(t, k, d) { \
+if (!has(k)) return Reflect.defineProperty(t, k, d); \
+const v = get(k); \
+if (d.configurable === true || d.enumerable === false || \"get\" in d || \"set\" in d || d.writable === false) return false; \
+if (\"value\" in d && !Object.is(d.value, v)) return false; \
+Reflect.defineProperty(t, k, { value: v }); return true; }, \
+ownKeys() { return [...names, Symbol.toStringTag]; }, \
+getPrototypeOf() { return null; }, \
+setPrototypeOf(t, p) { return p === null; }, \
+isExtensible() { return false; }, \
+preventExtensions() { return true; } }); }";
 
 fn stem(path: &Path) -> String {
     let s: String = path
@@ -839,7 +1154,8 @@ fn export_names(units: &[Unit], m: usize) -> Vec<String> {
     out
 }
 
-/// What export `name` of module `m` resolves to.
+/// What export `name` of module `m` resolves to (none: not found, or
+/// ambiguous through `export *`).
 fn resolve_export(units: &[Unit], m: usize, name: &str, seen: &mut Vec<(usize, String)>) -> Option<Binding> {
     if seen.iter().any(|s| s.0 == m && s.1 == name) {
         return None;
@@ -880,16 +1196,74 @@ fn resolve_export(units: &[Unit], m: usize, name: &str, seen: &mut Vec<(usize, S
     found
 }
 
+/// Whether the function that binding `b` names uses `this` (a call
+/// `ns.f()` passes the namespace object as `this`): a function declaration
+/// or expression whose body (not that of a nested function) has `this`.
+fn uses_this(units: &[Unit], b: Binding) -> bool {
+    struct This(bool);
+    impl<'a> Visit<'a> for This {
+        fn visit_this_expression(&mut self, _: &ThisExpression) {
+            self.0 = true;
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: oxc::syntax::scope::ScopeFlags) {}
+        fn visit_class(&mut self, _: &Class<'a>) {}
+    }
+    let Binding::Symbol(m, sym) = b else { return false };
+    let u = &units[m];
+    let scoping = u.sem.scoping();
+    let mut v = This(false);
+    match u.sem.nodes().get_node(scoping.symbol_declaration(sym)).kind() {
+        AstKind::Function(f) => {
+            if let Some(body) = &f.body {
+                v.visit_function_body(body);
+            }
+        }
+        AstKind::VariableDeclarator(d) => match d.init.as_ref().map(|e| e.without_parentheses()) {
+            Some(Expression::FunctionExpression(f)) => {
+                if let Some(body) = &f.body {
+                    v.visit_function_body(body);
+                }
+            }
+            Some(Expression::ArrowFunctionExpression(_)) => {}
+            // (Another value: its methods might.)
+            _ => return true,
+        },
+        AstKind::Class(_) => {}
+        _ => return true,
+    }
+    v.0
+}
+
 /// For a reference to a namespace import at `node`: `ns.x` (or the type
-/// `ns.X`) as a whole, and what `x` is in module `t`.
+/// `ns.X`) as a whole, and what `x` is in module `t`, where it reads `x`
+/// (not where it is assigned or deleted, or called with the namespace as
+/// `this` by a function that uses it).
 fn member_of_namespace(units: &[Unit], nodes: &oxc::semantic::AstNodes, node: NodeId, t: usize) -> Option<(Span, Binding)> {
     let span = nodes.get_node(node).kind().span();
-    let (whole, prop) = match nodes.parent_kind(node) {
-        AstKind::StaticMemberExpression(e) if e.object.span() == span => (e.span, e.property.name.as_str()),
-        AstKind::TSQualifiedName(q) if q.left.span() == span => (q.span, q.right.name.as_str()),
+    let (whole, prop, is_type) = match nodes.parent_kind(node) {
+        AstKind::StaticMemberExpression(e) if e.object.span() == span => (e.span, e.property.name.as_str(), false),
+        AstKind::TSQualifiedName(q) if q.left.span() == span => (q.span, q.right.name.as_str(), true),
         _ => return None,
     };
     let b = resolve_export(units, t, prop, &mut Vec::new())?;
+    if !is_type {
+        let member = nodes.parent_id(node);
+        match nodes.parent_kind(member) {
+            AstKind::AssignmentExpression(a) if a.left.span() == whole => return None,
+            AstKind::UpdateExpression(_)
+            | AstKind::ArrayAssignmentTarget(_)
+            | AstKind::ObjectAssignmentTarget(_)
+            | AstKind::AssignmentTargetWithDefault(_)
+            | AstKind::AssignmentTargetPropertyProperty(_)
+            | AstKind::AssignmentTargetRest(_) => return None,
+            AstKind::UnaryExpression(u) if u.operator == UnaryOperator::Delete => return None,
+            AstKind::ForInStatement(f) if f.left.span() == whole => return None,
+            AstKind::ForOfStatement(f) if f.left.span() == whole => return None,
+            AstKind::CallExpression(c) if c.callee.span() == whole && uses_this(units, b) => return None,
+            AstKind::TaggedTemplateExpression(c) if c.tag.span() == whole && uses_this(units, b) => return None,
+            _ => {}
+        }
+    }
     Some((whole, b))
 }
 
@@ -899,7 +1273,7 @@ fn edits(
     units: &[Unit],
     m: usize,
     resolved: &HashMap<(usize, SymbolId), Binding>,
-    names: &HashMap<Binding, String>,
+    names: &Names,
     typed_only: bool,
     int_aliases: &[(usize, SymbolId)],
 ) -> Result<Vec<(Span, String)>, String> {
@@ -925,7 +1299,7 @@ fn edits(
     if let Some(d) = u.default_expr
         && !typed_only
     {
-        let name = &names[&Binding::Default(m)];
+        let name = &names.of[&Binding::Default(m)];
         let mut after = String::new();
         match d.name_at {
             Some(at) => {
@@ -939,8 +1313,17 @@ fn edits(
                 }
             }
         }
-        if d.anonymous {
-            after.push_str(&format!(" Object.defineProperty({name}, \"name\", {{ value: \"default\" }});"));
+        // (A function declaration's is set first: it is hoisted. A class
+        // keeps a static `name` member of its own.)
+        match (d.anonymous, d.name_at) {
+            (Anon::Function, None) => {
+                after.push_str(&format!(" Object.defineProperty({name}, \"name\", {{ value: \"default\" }});"));
+            }
+            (Anon::Class, _) => after.push_str(&format!(
+                " if (typeof Object.getOwnPropertyDescriptor({name}, \"name\")?.value === \"string\") \
+                 Object.defineProperty({name}, \"name\", {{ value: \"default\" }});"
+            )),
+            _ => {}
         }
         if !after.is_empty() {
             out.push((Span::new(d.end, d.end), after));
@@ -990,16 +1373,20 @@ fn edits(
         let old = scoping.symbol_name(sym);
         if let Some(&target) = resolved.get(&(m, sym)) {
             // An import binding: its references are to the binding it
-            // resolves to.
+            // resolves to (assignments: through an accessor that throws).
             for r in scoping.get_resolved_references(sym) {
                 let node = r.node_id();
                 let span = nodes.get_node(node).kind().span();
+                if r.flags().is_write() {
+                    rename_at(&mut out, span, old, &format!("{}().v", names.writes[&(m, sym)]), shorthand_ref(node));
+                    continue;
+                }
                 let new = match target {
                     Binding::Namespace(t) => match member_of_namespace(units, nodes, node, t) {
                         Some((whole, b)) => {
                             let new = match b {
-                                Binding::Namespace(k) => format!("{}()", names[&Binding::Namespace(k)]),
-                                b => names[&b].clone(),
+                                Binding::Namespace(k) => format!("{}()", names.of[&Binding::Namespace(k)]),
+                                b => names.of[&b].clone(),
                             };
                             out.push((whole, new));
                             continue;
@@ -1010,15 +1397,15 @@ fn edits(
                                 loc(&u.path, text, span.start)
                             ));
                         }
-                        None => format!("{}()", names[&target]),
+                        None => format!("{}()", names.of[&target]),
                     },
-                    b => names[&b].clone(),
+                    b => names.of[&b].clone(),
                 };
                 rename_at(&mut out, span, old, &new, shorthand_ref(node));
             }
             continue;
         }
-        let Some(new) = names.get(&Binding::Symbol(m, sym)) else { continue };
+        let Some(new) = names.of.get(&Binding::Symbol(m, sym)) else { continue };
         if new == old {
             continue;
         }

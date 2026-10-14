@@ -332,6 +332,9 @@ pub struct Func {
     /// `function*`: compiled as a resumable step function over a heap
     /// frame, as async functions are.
     pub is_generator: bool,
+    /// An ordinary function (a `function` declaration or expression, not a
+    /// method): a constructor in JS, with a `prototype`.
+    pub constructor: bool,
     /// In functions that suspend: holds the return value while `finally`
     /// blocks run on the way out (`Any`).
     pub ret_slot: Option<LocalId>,

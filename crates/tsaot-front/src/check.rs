@@ -227,6 +227,8 @@ pub struct CellInfo {
     pub init: CellInit,
     /// `var`: `undefined` from the module header until its declaration runs.
     pub hoisted_undefined: bool,
+    /// `const` (or an import): assigning to it throws a TypeError.
+    pub constant: bool,
 }
 
 pub struct Outcome<'a> {
@@ -1429,6 +1431,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                     mutable: b.written || segment,
                     init,
                     hoisted_undefined: b.kind == BindingKind::Var,
+                    constant: matches!(b.kind, BindingKind::Const | BindingKind::Import),
                 }
             })
             .collect()
@@ -1895,7 +1898,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // Parameters before the first default, not counting a rest one.
         let fixed = params.len() - self.rest as usize;
         let js_length = params[..fixed].iter().take_while(|p| p.2.is_none()).count();
+        // (A named function expression's `.name` is its own name, not that
+        // of the binding it initializes.)
+        let name = match node {
+            FnNode::Function(f) if let Some(id) = &f.id => id.name.to_string(),
+            _ => name,
+        };
+        let constructor = matches!(node, FnNode::Function(f) if !f.r#async && !f.generator) && !self.has_this;
         let mut func = ir::Func {
+            constructor,
             name,
             js_length,
             params: abi,

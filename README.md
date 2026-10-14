@@ -428,6 +428,12 @@ The differential tests run every case with both.
   captured by value: no box is allocated for it. Closures of one function
   share a shape. Side effects on module-level bindings (`count++`) are shared with
   interpreted code.
+- **Ordinary functions** (`function` declarations and expressions, not
+  methods or arrows) are constructors, as in JS: a native one has a
+  `prototype` (made when first read), and `new f()` makes an object of
+  it, runs `f` and returns the object unless `f` returns one (so
+  `function Foo() {}` with `Foo.prototype.m = ...`, older JavaScript's
+  classes, works).
 - **Class methods, getters and setters** (`this` included; static ones
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
@@ -781,12 +787,26 @@ instructions.
   so imports are the exporting module's own bindings, live. Modules run in
   ESM's order (dependencies first, in the order of the `import`s; in a
   cycle, the module that started evaluating is not waited for, and its
-  `let` bindings throw until it runs). Default exports, namespace imports
-  (`ns.x` is the binding itself; `ns` as a value is a frozen object of
-  getters, without a prototype), `export *`, `export * as ns` and
-  `export { a as b } from` resolve as in ESM. An import whose bindings
-  are used only as types is elided, as TypeScript does: a module imported
-  only so does not run.
+  `let` bindings throw until it runs). Default exports (an anonymous
+  function or class named `default`), namespace imports, `export *`,
+  `export * as ns` and `export { a as b } from` resolve as in ESM, and a
+  re-export that does not resolve (missing, ambiguous through `export *`,
+  circular) is an error, as are duplicate export names and the module's
+  other early errors. Assigning to an import binding throws a TypeError.
+  `ns.x` is the binding itself where it is read; `ns` as a value is a
+  module namespace object (a Proxy with its semantics: live, throwing
+  while a binding is uninitialized, not writable, no prototype). An
+  import whose bindings are used only as types is elided, as TypeScript
+  does: a module imported only so does not run (an import of a value it
+  does not use still runs it). `with { type: "json" }` (or a `.json`
+  file), `"text"` and `"bytes"` import a file's content as `default`.
+- **Conformance.** test262's module tests (`language/module-code`,
+  `language/import`, `language/export`): 611 of 722 pass, as many as
+  with the engine's own module loader (QuickJS-NG), though not the same:
+  JSON and text imports pass here only, dynamic `import()` (not supported
+  yet) and an async module that runs while a sibling waits there only.
+  Most of the rest are proposals the engine lacks (`import defer`,
+  immutable `bytes` buffers, source phase imports).
 - **Not yet:** dynamic `import()`, `import.meta`, CommonJS (`require`,
   `module.exports`), `export =`. Errors point into the module they are
   in; stack traces of interpreted code show the merged program's lines.

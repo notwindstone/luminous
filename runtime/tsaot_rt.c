@@ -538,6 +538,15 @@ static JSValue tsaot_cell_set(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_UNDEFINED;
 }
 
+/* The setter of a constant's cell: as assigning to a `const`. */
+static JSValue tsaot_cell_set_const(JSContext *ctx, JSValueConst this_val, int argc,
+                                    JSValueConst *argv, int cell)
+{
+    if (JS_IsUninitialized(tsaot_cells[cell]))
+        return tsaot_throw_uninitialized(ctx, cell), JS_EXCEPTION;
+    return JS_ThrowTypeError(ctx, "'%s' is read-only", tsaot_cell_names[cell]);
+}
+
 /* __tsaot_init(cell, value): the binding's declaration ran; returns value. */
 static JSValue tsaot_cell_init(JSContext *ctx, JSValueConst this_val, int argc,
                                JSValueConst *argv)
@@ -619,8 +628,8 @@ int tsaot_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue
         JSAtom name = JS_NewAtom(ctx, tsaot_cell_names[cell]);
         JSValue get = JS_NewCFunctionMagic(ctx, tsaot_cell_get, tsaot_cell_names[cell], 0,
                                            JS_CFUNC_generic_magic, cell);
-        JSValue set = JS_NewCFunctionMagic(ctx, tsaot_cell_set, tsaot_cell_names[cell], 1,
-                                           JS_CFUNC_generic_magic, cell);
+        JSValue set = JS_NewCFunctionMagic(ctx, tsaot_mutable_const[i] ? tsaot_cell_set_const : tsaot_cell_set,
+                                           tsaot_cell_names[cell], 1, JS_CFUNC_generic_magic, cell);
         int r = JS_DefinePropertyGetSet(ctx, *cells_obj, name, get, set, 0);
         JS_FreeAtom(ctx, name);
         if (r < 0)
@@ -1486,6 +1495,13 @@ JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback,
     int r;
     if (kind == 0 || JS_IsException(func))
         return func;
+    if (kind == 4) {
+        /* An ordinary function: a constructor with a `prototype` (made when
+           first read). */
+        if (JS_SetCFunctionDataConstructor(ctx, func) < 0)
+            goto fail;
+        return func;
+    }
     if (JS_IsUndefined(fallback))
         proto = JS_DupValue(ctx, tsaot_pins[kind == 1   ? TSAOT_PIN_ASYNC_FUNCTION_PROTO
                                             : kind == 2 ? TSAOT_PIN_GENERATOR_FUNCTION_PROTO

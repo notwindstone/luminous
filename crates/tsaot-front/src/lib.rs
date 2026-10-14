@@ -70,6 +70,8 @@ pub struct CellDecl {
     pub init: CellInitSite,
     /// `var`: initialized to `undefined` in the module header.
     pub hoisted_undefined: bool,
+    /// `const` (or an import): interpreted code's assignments throw.
+    pub constant: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -313,6 +315,7 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
                 check::CellInit::Native => CellInitSite::Native,
             },
             hoisted_undefined: c.hoisted_undefined,
+            constant: c.constant,
         })
         .collect();
     let mutable: std::collections::HashMap<oxc::semantic::SymbolId, ir::CellId> =

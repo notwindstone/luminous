@@ -209,8 +209,9 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     for (pos, v) in suffixes {
         edits.push((pos, pos, v.concat()));
     }
-    // Nothing else of a segment's statements remains.
-    edits.retain(|&(s, e, _)| !segments.iter().any(|&(ss, se, _)| ss <= s && e <= se));
+    // Nothing else of a segment's statements remains (but what is inserted
+    // where it starts: after the statement before it).
+    edits.retain(|&(s, e, _)| !segments.iter().any(|&(ss, se, _)| ss <= s && e <= se && !(s == e && s == ss)));
     edits.extend(segments);
     // Back to front; at equal starts, the replacement before the insertion.
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
