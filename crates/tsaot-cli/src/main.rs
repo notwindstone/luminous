@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tsaot_codegen::{Backend, Output};
 use tsaot_front::Analysis;
+use tsaot_front::bundle::Bundle;
 use tsaot_front::erase::NATIVE_MODULE;
 
 const RT_C: &str = include_str!("../../../runtime/tsaot_rt.c");
@@ -138,8 +139,8 @@ fn real_main() -> Result<()> {
             std::process::exit(r?);
         }
         Cmd::Report { input } => {
-            let (_, analysis) = analyze(&input, &fopts)?;
-            print_report(&input, &analysis);
+            let (bundle, analysis) = analyze(&input, &fopts)?;
+            print_report(&bundle, &analysis);
             Ok(())
         }
         Cmd::EmitJs { input, no_native } => {
@@ -163,10 +164,12 @@ fn real_main() -> Result<()> {
     }
 }
 
-fn analyze(input: &Path, fopts: &tsaot_front::Options) -> Result<(String, Analysis)> {
-    let src = std::fs::read_to_string(input).with_context(|| format!("reading {}", input.display()))?;
-    let analysis = tsaot_front::analyze(&src, input, fopts).map_err(anyhow::Error::msg)?;
-    Ok((src, analysis))
+/// The program's modules (merged into one; see `tsaot_front::bundle`),
+/// analyzed.
+fn analyze(input: &Path, fopts: &tsaot_front::Options) -> Result<(Bundle, Analysis)> {
+    let bundle = tsaot_front::bundle::bundle(input).map_err(anyhow::Error::msg)?;
+    let analysis = tsaot_front::analyze_bundle(&bundle, fopts).map_err(anyhow::Error::msg)?;
+    Ok((bundle, analysis))
 }
 
 fn disable_native(a: &mut Analysis) {
@@ -184,16 +187,18 @@ fn mutable_cells(a: &Analysis) -> Vec<usize> {
     a.cells.iter().enumerate().filter(|(_, c)| c.mutable).map(|(i, _)| i).collect()
 }
 
-fn print_report(input: &Path, a: &Analysis) {
-    let file = input.display();
+fn print_report(bundle: &Bundle, a: &Analysis) {
     let mut lines: Vec<(u32, String)> =
         a.natives.iter().map(|n| (n.line, format!("native       {}", n.name))).collect();
-    lines.extend(
-        a.rejected.iter().map(|r| (r.line, format!("interpreted  {} — {} (line {})", r.name, r.reason, r.reason_line))),
-    );
+    lines.extend(a.rejected.iter().map(|r| {
+        let (file, line) = bundle.line(r.reason_line);
+        let at = if bundle.line(r.line).0 == file { format!("line {line}") } else { format!("{}:{line}", file.display()) };
+        (r.line, format!("interpreted  {} — {} ({at})", r.name, r.reason))
+    }));
     lines.sort_by_key(|l| l.0);
     for (line, text) in lines {
-        println!("{file}:{line}: {text}");
+        let (file, line) = bundle.line(line);
+        println!("{}:{line}: {text}", file.display());
     }
 }
 
@@ -248,12 +253,12 @@ fn run(cmd: &mut Command) -> Result<()> {
 
 fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
-    let (_, mut analysis) = analyze(input, fopts)?;
+    let (bundle, mut analysis) = analyze(input, fopts)?;
     if opts.no_native {
         disable_native(&mut analysis);
     }
     if opts.verbose {
-        print_report(input, &analysis);
+        print_report(&bundle, &analysis);
     }
     let js = tsaot_front::erased_js(input, &analysis).map_err(anyhow::Error::msg)?;
 

@@ -34,10 +34,10 @@ use std::path::Path;
 
 use oxc::allocator::Allocator;
 use oxc::codegen::Codegen;
-use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, NamedSource, OxcDiagnostic};
+use oxc::diagnostics::{GraphicalReportHandler, GraphicalTheme, LabeledSpan, NamedSource, OxcDiagnostic};
 use oxc::parser::Parser;
 use oxc::semantic::SemanticBuilder;
-use oxc::span::SourceType;
+use oxc::span::{SourceType, Span};
 use oxc::transformer::{TransformOptions, Transformer};
 
 use std::collections::HashMap;
@@ -258,6 +258,43 @@ pub fn strip_types(source: &str, path: &Path) -> Result<String, String> {
         return Err(render(ret.diagnostics, source, path));
     }
     Ok(Codegen::new().build(&program).code)
+}
+
+/// Render diagnostics of a bundle's source: each with the text of the
+/// module its first label is in (its labels in that module, at their places
+/// there).
+pub(crate) fn render_in(
+    diags: impl IntoIterator<Item = OxcDiagnostic>,
+    source: &str,
+    path: &Path,
+    bundle: Option<&crate::bundle::Bundle>,
+) -> String {
+    let Some(bundle) = bundle.filter(|b| !b.is_single()) else { return render(diags, source, path) };
+    let mut out = Vec::new();
+    for d in diags {
+        let first = d.labels.first().map(|l| l.offset() as u32);
+        let Some(m) = first.and_then(|p| bundle.module_at(p)) else {
+            out.push(render([d], "", path));
+            continue;
+        };
+        let labels: Vec<LabeledSpan> = d
+            .labels
+            .iter()
+            .filter(|l| bundle.module_at(l.offset() as u32).is_some_and(|k| std::ptr::eq(k, m)))
+            .map(|l| {
+                let start = m.original_offset(l.offset() as u32);
+                let end = m.original_offset((l.offset() + l.len()) as u32).max(start);
+                let span = Span::new(start, end);
+                if l.primary() {
+                    LabeledSpan::new_primary_with_span(l.label().map(str::to_string), span)
+                } else {
+                    LabeledSpan::new_with_span(l.label().map(str::to_string), span)
+                }
+            })
+            .collect();
+        out.push(render([d.with_labels(labels)], &m.original, &m.path));
+    }
+    out.join("\n")
 }
 
 /// Render diagnostics with source snippets (colored when stderr is a terminal).

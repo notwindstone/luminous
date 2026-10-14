@@ -757,6 +757,40 @@ Known observable differences:
   static block first in its body (handing them to native code), which shows
   in the class's `toString()`.
 
+## Modules
+
+A program can be several modules: `tsaot build main.ts` follows the
+`import`s of `main.ts` (and theirs) and merges the modules into one
+(scope hoisting, as bundlers do), which the compiler then sees whole:
+calls between modules are direct calls that can be inlined, and a class
+imported from another module has its native constructor and fixed field
+slots. Splitting `bench/raytracer.ts` into three modules runs the same
+instructions.
+
+- **Resolution.** Relative and absolute specifiers name files as
+  TypeScript resolves them: as written, a `.js` specifier's `.ts` file,
+  with `.ts`, `.mts`, `.js` or `.mjs` added, or a directory's `index`.
+  Other specifiers are packages, from the nearest `node_modules` up: a
+  package's `exports` (subpaths and `*` patterns; the `import`, `module`
+  and `default` conditions), else its `module` or `main` field, else its
+  `index`. Their JavaScript is compiled like TypeScript without types.
+  The engine's modules (`qjs:os`, `qjs:std`) stay imports.
+- **Semantics.** Each module's top-level names stay its own: a name two
+  modules declare, or that a global another module uses has, is renamed
+  in one of them (where no scope that refers to it declares the new name),
+  so imports are the exporting module's own bindings, live. Modules run in
+  ESM's order (dependencies first, in the order of the `import`s; in a
+  cycle, the module that started evaluating is not waited for, and its
+  `let` bindings throw until it runs). Default exports, namespace imports
+  (`ns.x` is the binding itself; `ns` as a value is a frozen object of
+  getters, without a prototype), `export *`, `export * as ns` and
+  `export { a as b } from` resolve as in ESM. An import whose bindings
+  are used only as types is elided, as TypeScript does: a module imported
+  only so does not run.
+- **Not yet:** dynamic `import()`, `import.meta`, CommonJS (`require`,
+  `module.exports`), `export =`. Errors point into the module they are
+  in; stack traces of interpreted code show the merged program's lines.
+
 ## The `int` type
 
 `type int = number` declares an integer type that the compiler checks:
@@ -961,7 +995,9 @@ as long.
 
 - **`int` fields and elements**: `{ value: int }`, `int[]` (checked reads),
   and `int` parameters of closures.
-- **Multi-module programs** (`import` between `.ts` files).
+- **Modules**: dynamic `import()` of the program's modules (evaluated when
+  first imported), `import.meta`, CommonJS packages, `tsconfig.json`
+  `paths`.
 - **Position-preserving type stripping**, so interpreter stack traces point
   at the original `.ts` lines.
 
@@ -1009,7 +1045,7 @@ what would come next:
 ## Layout
 
 ```
-crates/tsaot-front    oxc front end, checker, typed IR, type erasure, `aot` marker
+crates/tsaot-front    oxc front end: module graph (bundle.rs), checker, typed IR, type erasure, `aot` marker
 crates/tsaot-codegen  lowering to a backend-neutral SSA IR (mir.rs); Cranelift (clif.rs) and LLVM (llvm.rs) backends
 crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + clang + cc driver; differential tests
 runtime/              C runtime linked into every program (helpers, boxes, async frames, cells)

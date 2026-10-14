@@ -2,6 +2,7 @@
 //! lower them to typed IR, and produce the type-erased JS for the rest.
 
 pub mod builtins;
+pub mod bundle;
 pub mod check;
 pub mod erase;
 pub mod ints;
@@ -154,11 +155,20 @@ pub struct Analysis {
     pub array_sites: Vec<((u32, u32), u32)>,
 }
 
-fn parse_error(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
-    erase::render(diags, source, path)
+pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, String> {
+    analyze_in(original, path, opts, None)
 }
 
-pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, String> {
+/// Analyze a program's modules (see `bundle`); diagnostics show the
+/// modules' own text.
+pub fn analyze_bundle(bundle: &bundle::Bundle, opts: &Options) -> Result<Analysis, String> {
+    let entry = &bundle.modules.last().expect("a bundle has its entry").path;
+    analyze_in(&bundle.source, entry, opts, Some(bundle))
+}
+
+fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundle::Bundle>) -> Result<Analysis, String> {
+    let parse_error =
+        |diags: Vec<OxcDiagnostic>, source: &str, path: &Path| erase::render_in(diags, source, path, bundle);
     let stripped = marker::strip(original);
     let source = stripped.source;
 
@@ -175,12 +185,12 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
             OxcDiagnostic::error(format!("`{keyword}` can only mark {what}"))
                 .with_label(Span::sized(at, keyword.len() as u32))
         });
-        return Err(parse_error(misplaced.chain(parsed.diagnostics), original, path));
+        return Err(parse_error(misplaced.chain(parsed.diagnostics).collect(), original, path));
     }
     let program = allocator.alloc(parsed.program);
     let sem = SemanticBuilder::new().build(program);
     if !sem.diagnostics.is_empty() {
-        return Err(parse_error(sem.diagnostics, original, path));
+        return Err(parse_error(sem.diagnostics.into_iter().collect(), original, path));
     }
     let scoping = sem.semantic.into_scoping();
 
@@ -190,7 +200,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
     if !struct_errors.is_empty() {
         // Checking assumes well-formed `aot type`s and literals.
         errors.append(&mut struct_errors);
-        return Err(erase::render(errors, original, path));
+        return Err(erase::render_in(errors, original, path, bundle));
     }
     // The `int` type, over the whole module.
     let mut ints = ints::check(program, &scoping, opts.int_wrapping);
@@ -275,7 +285,7 @@ pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, 
         });
     }
     if !errors.is_empty() {
-        return Err(erase::render(errors, original, path));
+        return Err(erase::render_in(errors, original, path, bundle));
     }
 
     let mut rejected: Vec<Rejected> = out
