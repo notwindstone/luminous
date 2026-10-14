@@ -9,8 +9,8 @@ machine code with [Cranelift](https://cranelift.dev), or with
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
 
-Whatever the compiler does not handle (`eval`, constructors of derived
-classes, and every function it cannot compile) keeps running in the QuickJS
+Whatever the compiler does not handle (`eval`, classes inside functions,
+and every function it cannot compile) keeps running in the QuickJS
 interpreter, linked into the same executable.
 
 ```console
@@ -354,8 +354,9 @@ The differential tests run every case with both.
     or second prototype (checking the shapes on the way), and private
     fields and `super.name`. A site that sees objects of several shapes
     (a class hierarchy) keeps up to four more own or prototype data
-    properties, which its misses check before a lookup; sites that never
-    cache stop trying;
+    properties (methods up to the third prototype: a class two superclasses
+    up), which its misses check before a lookup; sites that never cache
+    stop trying;
   - object literals: each site caches the literal's final shape, and
     later objects are made with it directly (as JSC's allocation profiles
     do), allocated inline: a block popped from the allocator's cache for
@@ -396,10 +397,11 @@ The differential tests run every case with both.
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
   `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
-- **Class constructors** of base classes whose instances are plain objects
+- **Class constructors** of classes whose instances are plain objects
   with public fields (no private names, accessors or computed keys,
   initializers that do not use `this`, a constructor that returns nothing
-  but the instance). Native `new C(args)` calls the native constructor
+  but the instance), TS parameter properties (`constructor(public x:
+  number)`) included. Native `new C(args)` calls the native constructor
   directly (after reading `C`, which may be in its TDZ): the instance is
   made with the class's fields, initializers evaluated first, through an
   allocation site that caches the instance's final shape, then the body
@@ -407,6 +409,19 @@ The differential tests run every case with both.
   that run no code) makes the instance with them directly, so an inlined
   `new V(a, b)` is an object expression. Interpreted code keeps the
   class's own constructor.
+- **Constructors of derived classes** (`class B extends A`, `A` a class
+  with a native constructor) that start with their only `super(...)` call
+  (arguments that cannot see `this`, parameter defaults that are
+  literals), or have none (the default one passes its arguments on). Each
+  superclass constructor is also compiled once per subclass to make that
+  subclass's instances (`new.target` known), so `super(...)` is a direct
+  call that returns the instance; the subclass's fields are then defined
+  (never through a setter) and its parameter properties assigned. After
+  inlining, a whole chain of such constructors makes the instance with
+  all its fields in one allocation. `new B()` first checks that each
+  class of the chain still has its declared superclass as its prototype
+  (`Object.setPrototypeOf(B, X)`): if not, the class is constructed as
+  interpreted code would.
 - **Class instances that do not escape** (scalar replacement, as JIT
   compilers' escape analysis): a local holding a new instance (`new V()`,
   or the result of an inlined or predicted method that makes one, such as
@@ -433,12 +448,14 @@ The differential tests run every case with both.
 - **Fields of annotated object types**: where an annotation names an
   object type alias, an interface or a class with plain public fields
   (`b: Body`, `bs: Body[]`, a field `pos: Body`), its fields are read and
-  written at fixed slots. The first object of the type seen with exactly
-  the declared fields, in order, as writable data properties gives the
-  type's shape; each access then compares the object's shape with it (one
-  load and one comparison, shared by all the type's sites) and loads or
-  stores the slot. Any other object (fields in another order, missing or
-  extra ones, accessors, frozen) goes through the site's inline cache.
+  written at fixed slots. The first objects of the type seen with the
+  declared fields first, in order, as writable data properties give the
+  type's shapes (up to four: a class's own instances and its
+  subclasses'); each access then compares the object's shape with the
+  first one (one load and one comparison, shared by all the type's sites),
+  then the others, and loads or stores the slot. Any other object (fields
+  in another order, missing ones, accessors, frozen) goes through the
+  site's inline cache.
 - **Speculative numeric regions**, as JIT compilers speculate on what
   fields hold: a run of statements that only does arithmetic on fields
   annotated `number` (of locals holding such objects), numbers and untyped
@@ -584,8 +601,9 @@ The differential tests run every case with both.
   generator and async methods too; `super` in them
   is not supported yet).
 
-Not yet: `super()` and the constructors of derived classes or of classes
-with private names (which stay interpreted), computed method and accessor names in object
+Not yet: constructors of classes with private names, of derived classes
+whose superclass is not compiled natively or that run code before
+`super(...)` (which stay interpreted), computed method and accessor names in object
 literals, classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `tsaot report file.ts` says, for every

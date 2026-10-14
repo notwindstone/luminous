@@ -405,8 +405,8 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, tsaot_pins[i]);
         tsaot_pins[i] = JS_UNDEFINED;
     }
-    for (i = 0; i < tsaot_record_count(); i++) {
-        if (tsaot_record_shapes[i])
+    for (i = 0; i < tsaot_record_count() * TSAOT_RECORD_STRIDE; i++) {
+        if (i % TSAOT_RECORD_STRIDE < TSAOT_RECORD_SHAPES && tsaot_record_shapes[i])
             JS_FreeCachedShape(rt, tsaot_record_shapes[i]);
         tsaot_record_shapes[i] = NULL;
     }
@@ -435,6 +435,8 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
                     JS_FreeCachedShape(rt, e->proto_shape);
                 if (e->mid_shape)
                     JS_FreeCachedShape(rt, e->mid_shape);
+                if (e->mid2_shape)
+                    JS_FreeCachedShape(rt, e->mid2_shape);
             }
             js_free_rt(rt, tsaot_ics[i].poly);
             tsaot_ics[i].poly = NULL;
@@ -472,8 +474,8 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
         JS_MarkValue(rt, tsaot_homes[i], mark_func);
     for (i = 0; i < TSAOT_PINS; i++)
         JS_MarkValue(rt, tsaot_pins[i], mark_func);
-    for (i = 0; i < tsaot_record_count(); i++) {
-        if (tsaot_record_shapes[i])
+    for (i = 0; i < tsaot_record_count() * TSAOT_RECORD_STRIDE; i++) {
+        if (i % TSAOT_RECORD_STRIDE < TSAOT_RECORD_SHAPES && tsaot_record_shapes[i])
             JS_MarkCachedShape(rt, tsaot_record_shapes[i], mark_func);
     }
     for (i = 0; i < tsaot_ic_count(); i++) {
@@ -497,6 +499,8 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
                     JS_MarkCachedShape(rt, e->proto_shape, mark_func);
                 if (e->mid_shape)
                     JS_MarkCachedShape(rt, e->mid_shape, mark_func);
+                if (e->mid2_shape)
+                    JS_MarkCachedShape(rt, e->mid2_shape, mark_func);
             }
         }
     }
@@ -747,6 +751,12 @@ static JSValue *tsaot_ic_entry_slot(const TsaotIC *e, char *p, void *shape)
             if (first != e->mid_shape)
                 return NULL;
             holder = *(char **)((char *)first + JS_LAYOUT_SHAPE_PROTO);
+            if (e->mid2_shape) {
+                void *second = *(void **)(holder + JS_LAYOUT_OBJ_SHAPE);
+                if (second != e->mid2_shape)
+                    return NULL;
+                holder = *(char **)((char *)second + JS_LAYOUT_SHAPE_PROTO);
+            }
         }
         if (*(void **)(holder + JS_LAYOUT_OBJ_SHAPE) != e->proto_shape)
             return NULL;
@@ -868,6 +878,36 @@ static bool tsaot_ic_fill(JSContext *ctx, JSValue obj, JSAtom prop, int mode, Ts
     return true;
 }
 
+/* Cache a data property of the third prototype (a method of a class two
+   superclasses up) in a polymorphic entry of `ic` (native code checks
+   only two prototypes); returns whether it could. */
+static bool tsaot_ic_fill_deep(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    void *shapes[4];
+    int k, slot = JS_CacheDeepProtoProperty(ctx, obj, prop, shapes);
+    if (slot < 0)
+        return false;
+    if (!ic->poly)
+        ic->poly = js_mallocz_rt(rt, TSAOT_POLY * sizeof(TsaotIC));
+    for (k = 0; ic->poly && k < TSAOT_POLY; k++) {
+        TsaotIC *e = &ic->poly[k];
+        if (!tsaot_ic_polymorphic(e)) {
+            e->shape = NULL;
+            e->alt_shape = shapes[0];
+            e->mid_shape = shapes[1];
+            e->mid2_shape = shapes[2];
+            e->proto_shape = shapes[3];
+            e->slot = slot;
+            e->kind = TSAOT_IC_PROTO_DATA;
+            return true;
+        }
+    }
+    for (k = 0; k < 4; k++)
+        JS_FreeCachedShape(rt, shapes[k]);
+    return false;
+}
+
 /* Cache a property of a prototype (kind: TSAOT_IC_PROTO_x); returns
    whether it could. */
 static bool tsaot_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int kind, TsaotIC *ic)
@@ -880,16 +920,27 @@ static bool tsaot_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int ki
     return true;
 }
 
-/* Learn record r's shape from obj if it has the record's fields first, in
- * order, as writable data properties (of a shared shape). */
+/* Learn another shape of record r from obj if it has the record's fields
+ * first, in order, as writable data properties (of a shared shape): the
+ * objects of a class and its subclasses, of literals with more fields. */
 void tsaot_record_learn(JSContext *ctx, JSValue obj, int r)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     const int *f = tsaot_record_fields + tsaot_record_index[r];
+    void **known = &tsaot_record_shapes[r * TSAOT_RECORD_STRIDE];
+    uintptr_t *tries = (uintptr_t *)&known[TSAOT_RECORD_SHAPES];
     void *shape = NULL, *s;
-    int i;
-    if (tsaot_record_shapes[r] || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+    int i, k;
+    if (known[TSAOT_RECORD_SHAPES - 1] || *tries >= TSAOT_RECORD_TRIES)
         return;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT) {
+        ++*tries;
+        return;
+    }
+    for (k = 0; known[k]; k++) {
+        if (known[k] == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
+            return;
+    }
     for (i = 0; i < f[0]; i++) {
         int slot = JS_CacheOwnProperty(ctx, obj, tsaot_atoms[f[1 + i]], 1, &s);
         if (slot < 0)
@@ -901,10 +952,13 @@ void tsaot_record_learn(JSContext *ctx, JSValue obj, int r)
         if (slot != i)
             break;
     }
-    if (i == f[0])
-        tsaot_record_shapes[r] = shape;
-    else if (shape)
-        JS_FreeCachedShape(rt, shape);
+    if (i == f[0]) {
+        known[k] = shape;
+    } else {
+        if (shape)
+            JS_FreeCachedShape(rt, shape);
+        ++*tries;
+    }
 }
 
 /* Whether String.prototype.charCodeAt is still the builtin, as an own
@@ -1672,7 +1726,8 @@ JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic
     if (!JS_IsException(v) && !tsaot_ic_fill(ctx, obj, prop, 0, ic) &&
         !tsaot_ic_fill(ctx, obj, prop, 2, ic) &&
         !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_DATA, ic) &&
-        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_GETTER, ic))
+        !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_GETTER, ic) &&
+        !tsaot_ic_fill_deep(ctx, obj, prop, ic))
         tsaot_ic_count_miss(ic);
     return v;
 }

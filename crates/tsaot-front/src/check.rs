@@ -92,6 +92,7 @@ pub enum Site {
     Ctor { class: String },
 }
 
+#[derive(Clone)]
 struct Param<'a> {
     /// The binding (an identifier, or a pattern destructuring the argument).
     pattern: &'a BindingPattern<'a>,
@@ -128,9 +129,12 @@ pub struct Candidate<'a> {
     ctor: Option<CtorInfo<'a>>,
 }
 
-/// A class constructor compiled natively (see `class_ctor`): it makes the
-/// instance, with the class's fields defined in order to their
-/// initializers' values, then runs the body with `this` the instance.
+/// A class constructor compiled natively (see `class_ctor`): a base
+/// class's makes the instance, with the class's fields defined in order to
+/// their initializers' values (its parameter properties first, then
+/// assigned from the parameters), then runs the body with `this` the
+/// instance; a derived class's gets the instance from its superclass's at
+/// its `super(...)`, then defines its own fields.
 #[derive(Clone)]
 pub struct CtorInfo<'a> {
     /// The class's binding.
@@ -139,7 +143,24 @@ pub struct CtorInfo<'a> {
     pub span: Span,
     /// Index in `Outcome::classes`.
     pub class: usize,
+    /// The class of the instance made (`new.target`): `class`, or a
+    /// subclass whose constructor reaches this one through `super(...)`
+    /// (each such pair is a function of its own).
+    pub home: usize,
     pub fields: Vec<(String, Option<&'a Expression<'a>>)>,
+    /// Parameter properties (`constructor(public x: number)`): the field,
+    /// the parameter.
+    pub param_props: Vec<(String, SymbolId)>,
+    /// A derived class: its superclass.
+    pub parent: Option<usize>,
+    /// A derived class without a constructor: its parameters are its
+    /// superclass's (without their defaults), passed on.
+    pub forward: bool,
+    /// The constructor `new` calls (`home == class`) of a derived class:
+    /// the classes whose superclass must still be the one their
+    /// declaration names (each `(class, superclass)`), else the class is
+    /// constructed as interpreted code would.
+    pub checks: Vec<(usize, usize)>,
 }
 
 impl Candidate<'_> {
@@ -342,6 +363,7 @@ pub fn check<'a>(
             ir::specialize_fields(&mut module);
             ir::fold_new_instances(&mut module);
             ir::inline_calls(&mut module);
+            ir::fold_new_instances(&mut module);
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
             ir::virtualize_instances(&mut module);
@@ -428,6 +450,7 @@ fn collect_toplevel<'a>(
     let mut pure_prefix = true;
     let mut methods = Vec::new();
     let mut method_rejects = Vec::new();
+    let mut ctor_defs = Vec::new();
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
         if written(symbol) {
             let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false, callee: false };
@@ -556,7 +579,16 @@ fn collect_toplevel<'a>(
                     if c.decorators.is_empty() && !c.declare {
                         class_methods(c, &id.name, classes.len(), end, &mut methods, &mut method_rejects);
                         if !written(id.symbol_id.get().unwrap()) {
-                            class_ctor(c, id, classes.len(), interpreted, &mut methods, &mut method_rejects);
+                            class_ctor(
+                                c,
+                                id,
+                                classes.len(),
+                                interpreted,
+                                scoping,
+                                &mut ctor_defs,
+                                &mut methods,
+                                &mut method_rejects,
+                            );
                         }
                     }
                     let info = class_info(c, &id.name, classes);
@@ -843,22 +875,53 @@ fn class_methods<'a>(
     }
 }
 
-/// The constructor of a top-level base class, as a native function that
-/// makes the instance itself: for classes whose instances are plain
-/// objects with their public fields (no private names, accessors or
-/// computed keys) whose initializers cannot see the instance, and whose
-/// constructor returns nothing but the instance.
+/// A class whose constructor `class_ctor` compiles natively: what the
+/// constructors of its subclasses need of it.
+struct CtorDef<'a> {
+    symbol: SymbolId,
+    name: String,
+    span: Span,
+    index: usize,
+    node: FnNode<'a>,
+    params: Vec<Param<'a>>,
+    rest: bool,
+    fields: Vec<(String, Option<&'a Expression<'a>>)>,
+    param_props: Vec<(String, SymbolId)>,
+    /// Its superclass (index in the `CtorDef`s).
+    parent: Option<usize>,
+    forward: bool,
+}
+
+/// The constructor of a top-level class, as a native function that makes
+/// the instance itself: for classes whose instances are plain objects with
+/// their public fields (no private names, accessors or computed keys) whose
+/// initializers cannot see the instance, and whose constructor returns
+/// nothing but the instance. A derived class qualifies when its superclass
+/// (named by its binding) does, and its constructor starts with its only
+/// `super(...)` call (whose arguments, and the parameters' defaults, which
+/// run before it, are plain values) or is the default one. Its
+/// superclasses' constructors are then also compiled to make its instances
+/// (`CtorInfo::home`).
+#[allow(clippy::too_many_arguments)]
 fn class_ctor<'a>(
     c: &'a Class<'a>,
     id: &BindingIdentifier<'a>,
     index: usize,
     interpreted: &HashSet<u32>,
+    scoping: &Scoping,
+    defs: &mut Vec<CtorDef<'a>>,
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
 ) {
-    if c.heritage.is_some() {
-        return;
-    }
+    let parent = match &c.heritage {
+        None => None,
+        Some(h) => {
+            let Expression::Identifier(r) = h.expression.without_parentheses() else { return };
+            let Some(sym) = scoping.get_reference(r.reference_id()).symbol_id() else { return };
+            let Some(p) = defs.iter().position(|d| d.symbol == sym) else { return };
+            Some(p)
+        }
+    };
     let mut fields = Vec::new();
     let mut ctor = None;
     for el in &c.body.body {
@@ -884,7 +947,10 @@ fn class_ctor<'a>(
             _ => {}
         }
     }
-    let node = match ctor {
+    let name = id.name.to_string();
+    let mut param_props = Vec::new();
+    let mut forward = false;
+    let (node, params, rest) = match ctor {
         Some(m) => {
             let f = &m.value;
             if !m.decorators.is_empty() || f.body.is_none() || interpreted.contains(&f.span.start) {
@@ -895,40 +961,133 @@ fn class_ctor<'a>(
                 return;
             }
             // TS parameter properties assign the instance from the
-            // parameters.
-            if f.params.items.iter().any(|p| p.accessibility.is_some() || p.readonly || p.r#override) {
+            // parameters (an identifier each).
+            for p in &f.params.items {
+                if p.accessibility.is_some() || p.readonly || p.r#override {
+                    let BindingPattern::BindingIdentifier(b) = &p.pattern else { return };
+                    param_props.push((b.name.to_string(), b.symbol_id.get().unwrap()));
+                }
+            }
+            if parent.is_some() && !super_first(f) {
                 return;
             }
-            FnNode::Function(f)
-        }
-        // The default constructor: no parameters, nothing to run.
-        None => FnNode::Segment(c.span, &[]),
-    };
-    let name = id.name.to_string();
-    match header(node) {
-        Ok((mut params, rest, _)) => {
-            // Called only directly by native code, with JS values.
-            for p in &mut params {
-                p.ty = Ty::Any;
+            // Their fields come first, `undefined` until assigned.
+            fields.splice(0..0, param_props.iter().map(|(n, _)| (n.clone(), None)));
+            let node = FnNode::Function(f);
+            match header(node) {
+                Ok((params, rest, _)) => (node, params, rest),
+                Err(r) => {
+                    rejected.push((name, node.span(), r));
+                    return;
+                }
             }
-            out.push(Candidate {
-                name: name.clone(),
-                node,
-                symbol: None,
-                has_this: false,
-                site: Site::Ctor { class: name },
-                direct_callable: true,
-                params,
-                rest,
-                // (So that recursive constructors need no annotation.)
-                ret: Some(Ty::Any),
-                class: None,
-                cells: HashSet::new(),
-                ctor: Some(CtorInfo { symbol: id.symbol_id.get().unwrap(), span: c.span, class: index, fields }),
-            });
         }
-        Err(r) => rejected.push((name, node.span(), r)),
+        // The default constructor: no parameters, nothing to run; a derived
+        // class's passes its arguments on.
+        None => match parent {
+            None => (FnNode::Segment(c.span, &[]), Vec::new(), false),
+            Some(p) if !defs[p].rest => {
+                forward = true;
+                let params = defs[p].params.iter().map(|q| Param { default: None, ..q.clone() }).collect();
+                (FnNode::Segment(c.span, &[]), params, false)
+            }
+            Some(_) => return,
+        },
+    };
+    let def = CtorDef {
+        symbol: id.symbol_id.get().unwrap(),
+        name: name.clone(),
+        span: c.span,
+        index,
+        node,
+        params,
+        rest,
+        fields,
+        param_props,
+        parent,
+        forward,
+    };
+    // Its own (called by `new`), checking its superclasses, then its
+    // superclasses' (each called by `super(...)`).
+    let mut checks = Vec::new();
+    let mut at = &def;
+    while let Some(p) = at.parent {
+        checks.push((at.index, defs[p].index));
+        at = &defs[p];
     }
+    let mut make = |d: &CtorDef<'a>, checks: Vec<(usize, usize)>| {
+        let name = if d.index == index { name.clone() } else { format!("{} (constructing {name})", d.name) };
+        // Called only directly by native code, with JS values.
+        let params = d.params.iter().map(|p| Param { ty: Ty::Any, ..p.clone() }).collect();
+        out.push(Candidate {
+            name: name.clone(),
+            node: d.node,
+            symbol: None,
+            has_this: false,
+            site: Site::Ctor { class: name },
+            direct_callable: true,
+            params,
+            rest: d.rest,
+            // (So that recursive constructors need no annotation.)
+            ret: Some(Ty::Any),
+            class: None,
+            cells: HashSet::new(),
+            ctor: Some(CtorInfo {
+                symbol: d.symbol,
+                span: d.span,
+                class: d.index,
+                home: index,
+                fields: d.fields.clone(),
+                param_props: d.param_props.clone(),
+                parent: d.parent.map(|p| defs[p].index),
+                forward: d.forward,
+                checks,
+            }),
+        });
+    };
+    make(&def, checks);
+    let mut up = def.parent;
+    while let Some(p) = up {
+        make(&defs[p], Vec::new());
+        up = defs[p].parent;
+    }
+    defs.push(def);
+}
+
+/// Whether derived class constructor `f` starts with `super(args)`, its
+/// only `super(...)` call, with arguments that cannot see `this`, and
+/// parameters whose defaults are literals: nothing before the call can see
+/// the instance or reconfigure the classes it is made by.
+fn super_first(f: &Function) -> bool {
+    use oxc::ast_visit::{Visit, walk};
+    struct Supers(usize);
+    impl<'a> Visit<'a> for Supers {
+        fn visit_call_expression(&mut self, c: &CallExpression<'a>) {
+            if matches!(c.callee, Expression::Super(_)) {
+                self.0 += 1;
+            }
+            walk::walk_call_expression(self, c);
+        }
+    }
+    let plain = |e: &Expression| {
+        literal(e).is_some()
+            || matches!(e.without_parentheses(), Expression::StringLiteral(_) | Expression::NullLiteral(_))
+            || matches!(e.without_parentheses(), Expression::Identifier(i) if i.name == "undefined")
+    };
+    if f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(|d| !plain(d))) {
+        return false;
+    }
+    let body = f.body.as_ref().unwrap();
+    let Some(Statement::ExpressionStatement(s)) = body.statements.first() else { return false };
+    let Expression::CallExpression(call) = &s.expression else { return false };
+    if !matches!(call.callee, Expression::Super(_))
+        || call.arguments.iter().any(|a| a.as_expression().is_none_or(mentions_this))
+    {
+        return false;
+    }
+    let mut v = Supers(0);
+    v.visit_function_body(body);
+    v.0 == 1
 }
 
 /// Whether `this` appears in `e` outside nested non-arrow functions.
@@ -1292,6 +1451,8 @@ struct FnCx<'x, 'm, 'a> {
     /// it (`this`).
     ctor: Option<CtorInfo<'a>>,
     this_local: Option<ir::LocalId>,
+    /// A derived class's constructor, until its `super(...)` call.
+    derived: Option<CtorInfo<'a>>,
     /// What the type annotations of parameters and variables say they hold.
     sym_hints: HashMap<SymbolId, ir::Hint>,
     /// Enclosing `for`-`in` loops: their key variable and iterator.
@@ -1505,6 +1666,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             has_this: false,
             ctor: None,
             this_local: None,
+            derived: None,
             sym_hints: HashMap::new(),
             is_async: false,
             is_generator: false,
@@ -1541,7 +1703,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             FnNode::Segment(..) => None,
         };
         let ret_hint = match &self.ctor {
-            Some(c) => Some(ir::Hint::Class(c.class)),
+            Some(c) => Some(ir::Hint::Class(c.home)),
             None => {
                 annotated.and_then(|a| hint_name(&a.type_annotation)).and_then(|h| resolve_hint(&h, self.m.classes))
             }
@@ -1551,10 +1713,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mut abi = Vec::new();
         let mut prologue = Vec::new();
         let mut boxed_params = Vec::new();
+        // (A default derived constructor's parameters are only passed on.)
+        let forward = self.ctor.as_ref().is_some_and(|c| c.forward);
         for &(pat, ty, _) in &params {
             // A destructured parameter is a hidden local, bound below.
             let sym = match pat {
-                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+                BindingPattern::BindingIdentifier(id) if !forward => id.symbol_id.get(),
                 _ => None,
             };
             let local_ty = if sym.is_none_or(|s| self.widened.contains(&s)) { Ty::Any } else { ty };
@@ -1570,10 +1734,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if self.suspends() {
             self.ret_slot = Some(self.temp(Ty::Any));
         }
+        let mut param_props = Vec::new();
         if let Some(ctor) = self.ctor.take() {
-            // The instance, first: its fields' initializers run before the
-            // parameters' defaults.
-            prologue.extend(self.new_instance(&ctor)?);
+            prologue.extend(self.ctor_checks(&ctor, params.len())?);
+            if ctor.parent.is_some() {
+                // The instance comes from `super(...)`.
+                self.this_local = Some(self.temp(Ty::Any));
+                self.derived = Some(ctor);
+            } else {
+                // The instance, first: its fields' initializers run before
+                // the parameters' defaults.
+                prologue.extend(self.new_instance(&ctor)?);
+                param_props = ctor.param_props;
+            }
         }
         // Closures: locals bound to the captured boxes.
         if self.is_closure {
@@ -1597,7 +1770,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         }
         // Default values and destructuring, in order (each parameter may see
         // the previous ones).
-        for (i, &(pat, _, default)) in params.iter().enumerate() {
+        for (i, &(pat, _, default)) in params.iter().enumerate().filter(|_| !forward) {
             let l = match pat {
                 BindingPattern::BindingIdentifier(id) => self.sym_local[&id.symbol_id.get().unwrap()],
                 _ => i,
@@ -1622,6 +1795,16 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let v = self.local(i);
                 self.bind_pattern(pat, v, BindKind::Let, &mut prologue)?;
             }
+        }
+        // A base class's parameter properties are assigned first thing.
+        for (name, sym) in param_props {
+            let v = self.local(self.sym_local[&sym]);
+            prologue.push(self.param_prop(&name, v));
+        }
+        if forward {
+            let args = (0..params.len()).map(|l| self.local(l)).collect();
+            self.super_call(args, node.span())?;
+            prologue.append(&mut self.pre);
         }
         let body = match node {
             FnNode::Segment(_, stmts) => {
@@ -1664,6 +1847,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             },
         };
         let mut body = body;
+        // A derived class's `super(...)` statement: the instance made (and
+        // its fields) in the body itself, for `ir::fold_new_instances`.
+        if let Some(this) = self.this_local
+            && let Some(k) = body.iter().position(|s| {
+                matches!(s, Stmt::Block(b) if matches!(b.first(),
+                    Some(Stmt::Expr(Expr { kind: ExprKind::InitLocal(l, _), .. })) if *l == this))
+            })
+        {
+            let Stmt::Block(mut b) = body.remove(k) else { unreachable!() };
+            if matches!(b.last(), Some(Stmt::Expr(Expr { kind: ExprKind::Local(l), .. })) if *l == this) {
+                b.pop();
+            }
+            body.splice(k..k, b);
+        }
         if let Some(l) = self.this_local
             && completes_list(&body)
         {
@@ -2560,14 +2757,103 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             };
             fields.push((atom, v));
         }
-        if !self.m.homes_used.contains(&ctor.class) {
-            self.m.homes_used.push(ctor.class);
+        if !self.m.homes_used.contains(&ctor.home) {
+            self.m.homes_used.push(ctor.home);
         }
         let this = self.temp(Ty::Any);
         self.this_local = Some(this);
-        let inst = Expr::new(Ty::Any, ExprKind::NewInstance { class: ctor.class, fields });
+        let inst = Expr::new(Ty::Any, ExprKind::NewInstance { class: ctor.home, fields });
         out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(inst)))));
         Ok(out)
+    }
+
+    /// `this.name = v` for parameter property `name`.
+    fn param_prop(&mut self, name: &str, v: Expr) -> Stmt {
+        let atom = self.m.atom(name);
+        let this = self.local(self.this_local.unwrap());
+        Stmt::Expr(self.set_prop(this, atom, v))
+    }
+
+    /// A derived class's constructor called by `new`, first: that the
+    /// classes it is made by are still each other's superclasses, else
+    /// the class constructed with its arguments as interpreted code would
+    /// (`CtorInfo::checks`).
+    fn ctor_checks(&mut self, ctor: &CtorInfo<'a>, nparams: usize) -> R<Vec<Stmt>> {
+        let mut out = Vec::new();
+        for &(class, parent) in &ctor.checks {
+            for k in [class, parent] {
+                if !self.m.homes_used.contains(&k) {
+                    self.m.homes_used.push(k);
+                }
+            }
+            let cell = self.m.cell(ctor.symbol, ctor.span)?;
+            let callee = Box::new(Expr::new(Ty::Any, ExprKind::Cell(cell)));
+            let fixed = nparams - self.rest as usize;
+            let args: Vec<Expr> = (0..fixed).map(|l| self.local(l)).collect();
+            let construct = if self.rest {
+                let mut parts: Vec<ir::ArrPart> = args.into_iter().map(ir::ArrPart::Value).collect();
+                parts.push(ir::ArrPart::Spread(self.local(fixed)));
+                ExprKind::NewSpread(callee, Box::new(Expr::new(Ty::Any, ExprKind::ArrayParts(parts))))
+            } else {
+                ExprKind::New(callee, args)
+            };
+            self.returns.push(Ty::Any);
+            let ok = Expr::new(Ty::Bool, ExprKind::ProtoIs { class, parent });
+            out.push(Stmt::If(ok, Vec::new(), vec![Stmt::Return(Some(Expr::new(Ty::Any, construct)))]));
+        }
+        Ok(out)
+    }
+
+    /// A derived class constructor's `super(args)` (`args` evaluated into
+    /// `self.pre`'s statements): its superclass's constructor, compiled to
+    /// make an instance of the class being constructed, gives `this`;
+    /// then the class's fields are defined in order and its parameter
+    /// properties assigned. Evaluates to `this`.
+    fn super_call(&mut self, args: Vec<Expr>, span: Span) -> R<Expr> {
+        let call = self.super_ctor(|_, i| Ok(Some(Expr::new(Ty::Any, ExprKind::Call(i, args)))), span)?;
+        self.super_init(call)
+    }
+
+    /// The direct call of the superclass's constructor (`call` makes it,
+    /// given its index).
+    fn super_ctor(&mut self, call: impl FnOnce(&mut Self, usize) -> R<Option<Expr>>, span: Span) -> R<Expr> {
+        let ctor = self.derived.as_ref().unwrap();
+        let (parent, home) = (ctor.parent.unwrap(), ctor.home);
+        let Some(i) =
+            self.m.cands.iter().position(|c| c.ctor.as_ref().is_some_and(|k| k.class == parent && k.home == home))
+        else {
+            return reject(span, "the superclass constructor is not compiled natively");
+        };
+        match call(self, i)? {
+            Some(c) => Ok(c),
+            None => reject(span, "the superclass constructor cannot be called directly with these arguments"),
+        }
+    }
+
+    fn super_init(&mut self, call: Expr) -> R<Expr> {
+        let ctor = self.derived.take().unwrap();
+        let this = self.this_local.unwrap();
+        self.pre.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(call)))));
+        for (name, init) in &ctor.fields {
+            let atom = self.m.atom(name);
+            let v = match init {
+                None => undefined(),
+                Some(e) => {
+                    self.name_hint = Some(name.clone());
+                    let r = self.expr(e);
+                    self.name_hint = None;
+                    any(r?)
+                }
+            };
+            let obj = Box::new(self.local(this));
+            self.pre.push(Stmt::Expr(Expr::new(Ty::Void, ExprKind::DefineField(obj, atom, Box::new(v)))));
+        }
+        for (name, sym) in &ctor.param_props {
+            let v = self.local(self.sym_local[sym]);
+            let s = self.param_prop(name, v);
+            self.pre.push(s);
+        }
+        Ok(self.local(this))
     }
 
     /// A nested function, compiled natively as a closure over the boxes of
@@ -4499,6 +4785,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 self.order(&mut obj, mark);
                 let [obj] = obj;
                 self.call_method(obj, key, &c.arguments)
+            }
+            Expression::Super(_) if self.derived.is_some() => {
+                let call = self.super_ctor(|cx, i| cx.direct_call(i, &c.arguments, c.span, None), c.span)?;
+                self.super_init(call)
             }
             Expression::Super(_) => reject(c.span, "`super()` calls (in constructors) are not supported"),
             other => {

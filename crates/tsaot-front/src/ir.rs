@@ -469,6 +469,9 @@ pub enum ExprKind {
     GetProp(Box<Expr>, AtomId),
     /// Evaluates to the assigned value.
     SetProp(Box<Expr>, AtomId, Box<Expr>),
+    /// Define own property `obj.atom` (enumerable, writable, configurable)
+    /// as `value`, as a class field is: no setter runs. `Void`.
+    DefineField(Box<Expr>, AtomId, Box<Expr>),
     GetElem(Box<Expr>, Box<Expr>),
     SetElem(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `obj.length`, with inline paths for arrays, typed arrays and strings.
@@ -774,6 +777,12 @@ pub enum ExprKind {
         slot: u32,
         value: Box<Expr>,
         arith: bool,
+    },
+    /// Whether class `class` (home object `2 * class + 1`) still has class
+    /// `parent` as its prototype: its superclass. `Bool`.
+    ProtoIs {
+        class: usize,
+        parent: usize,
     },
     /// Whether the prototype of class `class` still has native function
     /// `func` as its own data property `method` (no getter runs). `Bool`.
@@ -1103,6 +1112,7 @@ macro_rules! visitor {
                 | IterCloseQuiet(_)
                 | SuperGetAtom(..)
                 | ProtoMethodIs { .. }
+                | ProtoIs { .. }
                 | SpecGuard { .. }
                 | ElemGuard { .. }
                 | ArrLen { .. }
@@ -1247,6 +1257,7 @@ macro_rules! visitor {
                 | AnyBinary(_, a, b)
                 | AnyCompare(_, a, b)
                 | SetProp(a, _, b)
+                | DefineField(a, _, b)
                 | GetElem(a, b)
                 | DeleteElem(a, b) => {
                     $name(a, f);
@@ -2862,6 +2873,9 @@ fn pure_value(e: &Expr, boxed: &[bool]) -> bool {
 /// `undefined` until then) put `v` in the instance as it is made, when `v`
 /// cannot run code; then `return this` right after returns the instance
 /// expression itself. So `new Vec(x, y)` inlines to an object expression.
+/// After inlining (`inline_calls`) the instance can be an inlined
+/// constructor's (a derived class's from its superclass's), whose fields
+/// that follow (`DefineField`) are then made with it too.
 pub fn fold_new_instances(m: &mut Module) {
     let nfuncs = m.funcs.len();
     for g in 0..nfuncs + m.closures.len() {
@@ -2873,65 +2887,106 @@ pub fn fold_new_instances(m: &mut Module) {
                 uses[l] += 1;
             }
         });
-        stmt_lists_mut(&mut f.body, &mut |list| {
-            let mut i = 0;
-            while i < list.len() {
-                let Stmt::Expr(Expr { kind: ExprKind::InitLocal(n, inst), .. }) = &list[i] else {
-                    i += 1;
-                    continue;
-                };
-                let n = *n;
-                if boxed[n] || !matches!(inst.kind, ExprKind::NewInstance { .. }) {
-                    i += 1;
-                    continue;
+        // (Inner instances fold first: a pass folds what the previous one
+        // made foldable.)
+        loop {
+            let mut changed = false;
+            stmt_lists_mut(&mut f.body, &mut |list| changed |= fold_list(list, &mut uses, &boxed));
+            visit_stmts_mut(&mut f.body, &mut |e| {
+                if let ExprKind::Inline { body, .. } = &mut e.kind {
+                    stmt_lists_mut(body, &mut |list| changed |= fold_list(list, &mut uses, &boxed));
                 }
-                // Fold the assignments that follow.
-                let mut j = i + 1;
-                let mut folded = 0;
-                while j < list.len() {
-                    let (o, a, v) = match &list[j] {
-                        Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) => (o, a, v),
-                        Stmt::Expr(Expr { kind: ExprKind::ShapeSet { obj, atom, value, .. }, .. }) => {
-                            (obj, atom, value)
-                        }
-                        _ => break,
-                    };
-                    let (a, v) = (*a, (**v).clone());
-                    if !matches!(o.kind, ExprKind::Local(l) if l == n) || !pure_value(&v, &boxed) {
-                        break;
-                    }
-                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = &mut list[i] else {
-                        unreachable!()
-                    };
-                    let ExprKind::NewInstance { fields, .. } = &mut inst.kind else { unreachable!() };
-                    let Some((_, slot)) =
-                        fields.iter_mut().find(|(b, x)| *b == a && matches!(x.kind, ExprKind::Undefined))
-                    else {
-                        break;
-                    };
-                    *slot = v;
-                    folded += 1;
-                    j += 1;
-                }
-                if folded > 0 {
-                    // (The `Local(n)` of each assignment is gone.)
-                    uses[n] -= folded;
-                    list.drain(i + 1..j);
-                }
-                // `return this` right after, its only other use.
-                if let Some(Stmt::Return(Some(Expr { kind: ExprKind::Local(r), .. }))) = list.get(i + 1)
-                    && *r == n
-                    && uses[n] == 1
-                {
-                    let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = list.remove(i) else {
-                        unreachable!()
-                    };
-                    list[i] = Stmt::Return(Some(*inst));
-                }
-                i += 1;
+            });
+            if !changed {
+                break;
             }
-        });
+        }
     }
+}
+
+/// The fields of the instance that `e` makes, if it is a `NewInstance`, or
+/// an inlined body that returns one only at its end.
+fn instance_fields(e: &mut Expr) -> Option<&mut Vec<(AtomId, Expr)>> {
+    match &mut e.kind {
+        ExprKind::NewInstance { fields, .. } => Some(fields),
+        ExprKind::Inline { body, .. } => {
+            let (last, rest) = body.split_last_mut()?;
+            let mut returns = false;
+            stmt_lists(rest, &mut |l| returns |= l.iter().any(|s| matches!(s, Stmt::Return(_))));
+            match last {
+                Stmt::Return(Some(x)) if !returns => instance_fields(x),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `fold_new_instances` in one statement list; whether it folded anything.
+fn fold_list(list: &mut Vec<Stmt>, uses: &mut [usize], boxed: &[bool]) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < list.len() {
+        let Stmt::Expr(Expr { kind: ExprKind::InitLocal(n, inst), .. }) = &mut list[i] else {
+            i += 1;
+            continue;
+        };
+        let n = *n;
+        if boxed[n] || instance_fields(inst).is_none() {
+            i += 1;
+            continue;
+        }
+        // Fold the assignments (and field definitions) that follow.
+        let mut j = i + 1;
+        let mut folded = 0;
+        while j < list.len() {
+            let (o, a, v, define) = match &list[j] {
+                Stmt::Expr(Expr { kind: ExprKind::SetProp(o, a, v), .. }) => (o, a, v, false),
+                Stmt::Expr(Expr { kind: ExprKind::ShapeSet { obj, atom, value, .. }, .. }) => (obj, atom, value, false),
+                Stmt::Expr(Expr { kind: ExprKind::DefineField(o, a, v), .. }) => (o, a, v, true),
+                _ => break,
+            };
+            let (a, v) = (*a, (**v).clone());
+            if !matches!(o.kind, ExprKind::Local(l) if l == n) || !pure_value(&v, boxed) {
+                break;
+            }
+            let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = &mut list[i] else { unreachable!() };
+            let fields = instance_fields(inst).unwrap();
+            if define {
+                // A new last field (else it is redefined in place).
+                if fields.iter().any(|(b, _)| *b == a) {
+                    break;
+                }
+                fields.push((a, v));
+            } else {
+                let Some((_, slot)) = fields.iter_mut().find(|(b, x)| *b == a && matches!(x.kind, ExprKind::Undefined))
+                else {
+                    break;
+                };
+                *slot = v;
+            }
+            folded += 1;
+            j += 1;
+        }
+        if folded > 0 {
+            // (The `Local(n)` of each assignment is gone.)
+            uses[n] -= folded;
+            list.drain(i + 1..j);
+            changed = true;
+        }
+        // `return this` right after, its only other use.
+        if let Some(Stmt::Return(Some(Expr { kind: ExprKind::Local(r), .. }))) = list.get(i + 1)
+            && *r == n
+            && uses[n] == 1
+        {
+            let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, inst), .. }) = list.remove(i) else { unreachable!() };
+            list[i] = Stmt::Return(Some(*inst));
+            uses[n] = 0;
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
 }
 
 /// IR nodes in a callback body that `inline_callbacks` inlines.

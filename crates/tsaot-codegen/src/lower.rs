@@ -2189,6 +2189,25 @@ impl Lower {
             }
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
             ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
+            ExprKind::ProtoIs { class, parent } => {
+                let (cp, ct) = self.table_value(self.env.homes, 2 * class + 1);
+                let (pp, pt) = self.table_value(self.env.homes, 2 * parent + 1);
+                let join = self.b.create_block();
+                let r = self.b.append_block_param(join, I8);
+                let objs = self.b.create_block();
+                let c_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ct, TAG_OBJECT);
+                let p_obj = self.b.ins().icmp_imm_s(IntCC::Equal, pt, TAG_OBJECT);
+                let both = self.b.ins().band(c_obj, p_obj);
+                let no = self.b.ins().iconst(I8, 0);
+                self.b.ins().brif(both, objs, &[], join, &[BlockArg::Value(no)]);
+                self.b.switch_to_block(objs);
+                let shape = self.b.ins().load(I64, M_HEADER, cp, layout::OBJ_SHAPE);
+                let proto = self.b.ins().load(I64, M_HEADER, shape, layout::SHAPE_PROTO);
+                let same = self.b.ins().icmp(IntCC::Equal, proto, pp);
+                self.b.ins().jump(join, &[BlockArg::Value(same)]);
+                self.b.switch_to_block(join);
+                V::Bool(r)
+            }
             ExprKind::Lazy(x) => self.expr(x),
             ExprKind::NumArith(op, x, y) => {
                 let a = self.expr(x);
@@ -3078,6 +3097,22 @@ impl Lower {
                 self.b.switch_to_block(join);
                 self.drop_operand(arr, owned);
                 V::Num(d)
+            }
+            ExprKind::DefineField(o, a, x) => {
+                let obj = self.expr(o);
+                self.hold(obj);
+                let v = self.expr(x);
+                let (vp, vt) = v.any();
+                let (p, t) = obj.any();
+                let atom = self.atom(*a);
+                // The property takes the value; JS_PROP_C_W_E.
+                let flags = self.b.ins().iconst(I32, PROP_THROW | 7);
+                let ctx = self.ctx;
+                let r = self.helper("JS_DefinePropertyValue", &[ctx, p, t, atom, vp, vt, flags]);
+                self.check_int(r[0]);
+                self.release(obj);
+                self.free_v(obj);
+                V::Void
             }
             ExprKind::DeleteProp(o, a) => {
                 let obj = self.expr(o);
@@ -4419,10 +4454,24 @@ impl Lower {
         self.b.switch_to_block(obj);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
-        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
+        let base = (record * RECORD_STRIDE) as i32;
+        let want = self.b.ins().load(I64, M_IC, table, base);
         let same = self.b.ins().icmp(IntCC::Equal, shape, want);
         let hit = self.b.create_block();
-        self.b.ins().brif(same, hit, &[], slow, &[]);
+        let others = self.b.create_block();
+        self.b.ins().brif(same, hit, &[], others, &[]);
+        // The record's other shapes (a subclass's objects).
+        self.b.switch_to_block(others);
+        let mut any = None;
+        for k in 1..RECORD_SHAPES {
+            let want = self.b.ins().load(I64, M_IC, table, base + (k * 8) as i32);
+            let same = self.b.ins().icmp(IntCC::Equal, shape, want);
+            any = Some(match any {
+                None => same,
+                Some(a) => self.b.ins().bor(a, same),
+            });
+        }
+        self.b.ins().brif(any.unwrap(), hit, &[], slow, &[]);
         self.b.switch_to_block(hit);
         let props = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
         self.b.ins().iadd_imm_s(props, (slot as usize * SIZE) as i64)
@@ -4542,7 +4591,7 @@ impl Lower {
         // Records whose objects (elements) have a class's prototype: their
         // shape's (once known; until then no element has it).
         for &(r, class) in g.protos {
-            let want = self.b.ins().load(I64, M_IC, table, (r * 8) as i32);
+            let want = self.b.ins().load(I64, M_IC, table, (r * RECORD_STRIDE) as i32);
             let known = self.b.ins().icmp_imm_s(IntCC::NotEqual, want, 0);
             let check = self.b.create_block();
             let next = self.b.create_block();
@@ -4870,7 +4919,8 @@ impl Lower {
         self.b.ins().brif(is_obj, next, &[], slow, &[]);
         self.b.switch_to_block(next);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
-        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
+        // (Regions take objects of the shape learned first.)
+        let want = self.b.ins().load(I64, M_IC, table, (record * RECORD_STRIDE) as i32);
         let same = self.b.ins().icmp(IntCC::Equal, shape, want);
         let next = self.b.create_block();
         self.b.ins().brif(same, next, &[], slow, &[]);
@@ -4926,11 +4976,16 @@ impl Lower {
         self.b.ins().select(is_int, fi, ff)
     }
 
-    /// While record `record`'s shape is unknown: learn it from `(p, t)`.
+    /// While record `record` has room for another shape (and learning has
+    /// not failed too often): learn one from `(p, t)`.
     fn record_learn(&mut self, p: Value, t: Value, record: usize) {
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
-        let want = self.b.ins().load(I64, M_IC, table, (record * 8) as i32);
-        let unknown = self.b.ins().icmp_imm_s(IntCC::Equal, want, 0);
+        let base = (record * RECORD_STRIDE) as i32;
+        let last = self.b.ins().load(I64, M_IC, table, base + ((RECORD_SHAPES - 1) * 8) as i32);
+        let tries = self.b.ins().load(I64, M_IC, table, base + (RECORD_SHAPES * 8) as i32);
+        let room = self.b.ins().icmp_imm_s(IntCC::Equal, last, 0);
+        let few = self.b.ins().icmp_imm_s(IntCC::UnsignedLessThan, tries, RECORD_TRIES);
+        let unknown = self.b.ins().band(room, few);
         let learn = self.b.create_block();
         let after = self.b.create_block();
         self.b.set_cold_block(learn);
@@ -7583,6 +7638,11 @@ impl V {
     }
 }
 
+/// Shapes per record in `tsaot_record_shapes` (`TSAOT_RECORD_SHAPES`),
+/// then a count of failed learning (stopping at `TSAOT_RECORD_TRIES`).
+const RECORD_SHAPES: usize = 4;
+const RECORD_TRIES: i64 = 64;
+pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 /// Size of a `TsaotIC` (an inline cache entry).
 pub(crate) const IC_SIZE: usize = 48;
 /// `TsaotIC.poly`.

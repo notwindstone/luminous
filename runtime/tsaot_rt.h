@@ -21,10 +21,17 @@ extern uint8_t tsaot_unwinding;
 extern JSValue tsaot_cells[];
 extern JSValue tsaot_strings[];
 extern JSAtom tsaot_atoms[];
-/* Record types (see ir::specialize_fields): per record, its shape once
- * learned (defined by the native code), and its fields (count, then atom
- * indices, from tsaot_record_index[r]). */
+/* Record types (see ir::specialize_fields): per record, the shapes of
+ * its objects once learned (TSAOT_RECORD_SHAPES of them, the first one
+ * learned first; native code reads all of them, regions only the first),
+ * then how many times learning failed (defined by the native code); and
+ * its fields (count, then atom indices, from tsaot_record_index[r]). */
 extern void *tsaot_record_shapes[] __attribute__((weak));
+#define TSAOT_RECORD_SHAPES 4
+/* Words per record in tsaot_record_shapes (lower::RECORD_STRIDE). */
+#define TSAOT_RECORD_STRIDE (TSAOT_RECORD_SHAPES + 1)
+/* Failed learning stops after this many tries. */
+#define TSAOT_RECORD_TRIES 64
 extern const int32_t tsaot_record_fields[] __attribute__((weak));
 extern const int32_t tsaot_record_index[] __attribute__((weak));
 extern const int32_t tsaot_nrecords __attribute__((weak));
@@ -115,10 +122,16 @@ typedef struct TsaotIC {
     /* Other kinds: the object's shape (referenced). Native code checks an
      * own data property (the usual hit) with one comparison. */
     void *alt_shape;
-    /* A polymorphic site's other entries (own and prototype data
-     * properties of other shapes), which the misses try before a lookup:
-     * up to TSAOT_POLY of them (an empty one has no shapes), or NULL. */
-    struct TsaotIC *poly;
+    union {
+        /* A polymorphic site's other entries (own and prototype data
+         * properties of other shapes), which the misses try before a
+         * lookup: up to TSAOT_POLY of them (an empty one has no shapes),
+         * or NULL. */
+        struct TsaotIC *poly;
+        /* Such an entry of a data property three prototypes up: the second
+         * prototype's shape (referenced), checked after mid_shape. */
+        void *mid2_shape;
+    };
 } TsaotIC;
 #define TSAOT_POLY 4
 #define TSAOT_IC_OWN 0

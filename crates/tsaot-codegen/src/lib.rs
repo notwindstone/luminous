@@ -381,6 +381,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_ToString", &[P, W, W], &[W, W]),
         ("JS_GetProperty", &[P, W, W, Int], &[W, W]),
         ("JS_SetProperty", &[P, W, W, Int, W, W], &[Int]),
+        ("JS_DefinePropertyValue", &[P, W, W, Int, W, W, Int], &[Int]),
         ("JS_GetPropertyValue", &[P, W, W, W, W], &[W, W]),
         ("JS_DeleteProperty", &[P, W, W, Int, Int], &[Int]),
         ("JS_CallConstructor", &[P, W, W, Int, P], &[W, W]),
@@ -621,7 +622,7 @@ impl Codegen {
         data.push(module.declare_data("tsaot_record_shapes", Linkage::Export, true));
         let nrec = m.records.len();
         let shapes = data[data.len() - 1];
-        module.define_data(shapes, mir::DataInit::Zeroed { size: nrec.max(1) * 8 }, 8);
+        module.define_data(shapes, mir::DataInit::Zeroed { size: nrec.max(1) * lower::RECORD_STRIDE }, 8);
         let mut fields: Vec<i32> = Vec::new();
         let mut index: Vec<i32> = Vec::new();
         for r in &m.records {
