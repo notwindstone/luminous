@@ -3,19 +3,19 @@
 //! available), and fully interpreted; all executables must print exactly the
 //! same output. `// @native a b` and `// @interpreted c` header lines pin down
 //! which functions the checker is expected to compile natively. `// @flags
-//! ...` passes options to the compiler. `TSAOT_BACKENDS=cranelift` (or
+//! ...` passes options to the compiler. `LUMINOUS_BACKENDS=cranelift` (or
 //! `llvm`) restricts the native builds to one backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn tsaot() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tsaot"));
+fn luminous() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_luminous"));
     // Link against the engine built with assertions, so that leaked objects
     // abort the program at exit (see scripts/build-quickjs.sh).
     let check = repo().join("build/quickjs-check");
     if check.join("libqjs.a").exists() {
-        cmd.env("TSAOT_QUICKJS_BUILD", check);
+        cmd.env("LUMINOUS_QUICKJS_BUILD", check);
     }
     cmd
 }
@@ -31,13 +31,13 @@ fn directive(src: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// The backends to test: `TSAOT_BACKENDS` (comma-separated), else Cranelift
+/// The backends to test: `LUMINOUS_BACKENDS` (comma-separated), else Cranelift
 /// and, if clang runs, LLVM.
 fn backends() -> Vec<String> {
-    if let Ok(list) = std::env::var("TSAOT_BACKENDS") {
+    if let Ok(list) = std::env::var("LUMINOUS_BACKENDS") {
         return list.split(',').map(str::trim).filter(|b| !b.is_empty()).map(str::to_string).collect();
     }
-    let clang = std::env::var("TSAOT_CLANG").unwrap_or_else(|_| "clang".into());
+    let clang = std::env::var("LUMINOUS_CLANG").unwrap_or_else(|_| "clang".into());
     let has_clang = Command::new(&clang).arg("--version").output().is_ok_and(|o| o.status.success());
     if !has_clang {
         eprintln!("note: {clang} not found, skipping the LLVM backend");
@@ -50,7 +50,7 @@ fn backends() -> Vec<String> {
 fn run_case(case: &Path, out_dir: &Path, backends: &[String]) -> Result<(), String> {
     let src = std::fs::read_to_string(case).unwrap();
     let flags = directive(&src, "flags");
-    let report = tsaot().arg("report").args(&flags).arg(case).output().unwrap();
+    let report = luminous().arg("report").args(&flags).arg(case).output().unwrap();
     if !report.status.success() {
         return Err(format!("report failed: {}", String::from_utf8_lossy(&report.stderr)));
     }
@@ -79,7 +79,7 @@ fn run_case(case: &Path, out_dir: &Path, backends: &[String]) -> Result<(), Stri
     let mut outputs = Vec::new();
     for (suffix, flags) in &builds {
         let exe = out_dir.join(format!("{stem}-{suffix}"));
-        let b = tsaot().arg("build").args(flags).args(&flags_all).arg(case).arg("-o").arg(&exe).output().unwrap();
+        let b = luminous().arg("build").args(flags).args(&flags_all).arg(case).arg("-o").arg(&exe).output().unwrap();
         if !b.status.success() {
             return Err(format!("build ({suffix}) failed: {}", String::from_utf8_lossy(&b.stderr)));
         }
@@ -136,7 +136,7 @@ fn differential() {
         .filter(|p| p.extension().is_some_and(|e| e == "ts"))
         .collect();
     cases.sort();
-    let filter = std::env::var("TSAOT_CASE").ok();
+    let filter = std::env::var("LUMINOUS_CASE").ok();
     let backends = backends();
     let mut failures = Vec::new();
     for case in &cases {
@@ -172,7 +172,7 @@ fn compile_errors() {
         let expected = src.lines().filter_map(|l| l.strip_prefix("// @error ")).collect::<Vec<_>>();
         assert!(!expected.is_empty(), "{name}: no `// @error` lines");
         let flags = directive(&src, "flags");
-        let out = tsaot().arg("report").args(&flags).arg(case).output().unwrap();
+        let out = luminous().arg("report").args(&flags).arg(case).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         let missing: Vec<_> = expected.iter().filter(|e| !stderr.contains(*e)).collect();
         if out.status.success() || !missing.is_empty() {

@@ -234,7 +234,7 @@ enum Resolved {
 
 /// Resolve a module specifier imported by `from`.
 fn resolve(from: &Path, spec: &str) -> Result<Resolved, String> {
-    if spec.starts_with("qjs:") || spec.starts_with("tsaot:") {
+    if spec.starts_with("qjs:") || spec.starts_with("luminous:") {
         return Ok(Resolved::External(spec.to_string()));
     }
     let dir = from.parent().unwrap_or(Path::new("."));

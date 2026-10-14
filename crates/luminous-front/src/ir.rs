@@ -36,7 +36,7 @@ pub enum Ty {
     /// A `JSValue` known to be an object of `aot type` layout `k` (see
     /// `Layout`; represented like `Any`).
     Struct(u32),
-    /// An array of objects of layout `k` (`TsaotStructArray`; like `Any`).
+    /// An array of objects of layout `k` (`LumStructArray`; like `Any`).
     StructArr(u32),
     /// An element of such an array: an object of layout `k` or `undefined`.
     StructOrUndef(u32),
@@ -1061,8 +1061,8 @@ impl MathFn {
     /// not lowered inline.
     pub fn symbol(self) -> Option<&'static str> {
         Some(match self {
-            MathFn::Round => "tsaot_round",
-            MathFn::Pow => "tsaot_pow",
+            MathFn::Round => "lum_round",
+            MathFn::Pow => "lum_pow",
             MathFn::Sin => "sin",
             MathFn::Cos => "cos",
             MathFn::Tan => "tan",
@@ -3898,7 +3898,7 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
     let mut ok = true;
     let mut virtual_uses = 0;
     let mut reason = String::new();
-    let debug = std::env::var_os("TSAOT_DEBUG_VIRT").is_some();
+    let debug = std::env::var_os("LUMINOUS_DEBUG_VIRT").is_some();
     let mut body = f.body.clone();
     visit_stmts_mut(&mut body, &mut |e| {
         if !ok {

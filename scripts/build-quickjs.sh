@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build QuickJS-NG with tsaot's engine patches into build/quickjs.
+# Build QuickJS-NG with luminous's engine patches into build/quickjs.
 #
 # vendor/quickjs stays pristine: its tree is exported to build/quickjs-src,
 # patches/*.patch are applied there, and that copy is built.

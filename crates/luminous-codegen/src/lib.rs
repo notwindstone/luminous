@@ -8,19 +8,19 @@
 //! which each backend translates.
 //!
 //! Every IR function `i` produces two symbols:
-//! - `tsaot_fn_<i>(JSContext *ctx, params...)`: the function itself. `number`
+//! - `lum_fn_<i>(JSContext *ctx, params...)`: the function itself. `number`
 //!   / `boolean` values are passed unboxed (`double` / zero-extended `uint8_t`),
 //!   other values as `JSValue`s (two 64-bit words, owned by the callee).
 //!   Native callers call this directly.
-//! - `tsaot_fast_<i>`: its entry from JS, a QuickJS-NG `JSCFunctionFast` that
+//! - `lum_fast_<i>`: its entry from JS, a QuickJS-NG `JSCFunctionFast` that
 //!   the interpreter's call opcodes invoke directly on their stack slots. The
 //!   type guard, unboxing and boxing are all inline machine code here.
 //!
 //! Exceptions propagate between native functions through the
-//! `tsaot_unwinding` flag: a function that exits with an exception sets it,
+//! `lum_unwinding` flag: a function that exits with an exception sets it,
 //! and every caller checks it after each native call. Stack overflow is just
 //! another exception (a `RangeError`, thrown when the stack pointer crosses
-//! `tsaot_stack_limit`).
+//! `lum_stack_limit`).
 
 mod clif;
 pub mod llvm;
@@ -35,16 +35,16 @@ use mir::{
     AbiParam, Block, BlockArg, DataId, FloatCC, FuncId, FuncRef, FunctionBuilder, IntCC, Linkage, MemFlags, SigRef,
     Signature, StackSlotData, StackSlotKind, Value,
 };
-use tsaot_front::ir::{self, Expr, ExprKind, MathFn, Stmt, Ty};
+use luminous_front::ir::{self, Expr, ExprKind, MathFn, Stmt, Ty};
 
 use lower::{Env, Exit, Exits, Lower, M_CONST, M_FLAG, M_HEADER, M_SLOT, M_STRUCT, V, clif_types, from_values};
 
 pub fn symbol_name(id: ir::FuncId) -> String {
-    format!("tsaot_fn_{id}")
+    format!("lum_fn_{id}")
 }
 
 pub fn fast_symbol_name(id: ir::FuncId) -> String {
-    format!("tsaot_fast_{id}")
+    format!("lum_fast_{id}")
 }
 
 /// Native stack available below the point where the runtime is initialized.
@@ -231,7 +231,7 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Output> {
     })
 }
 
-/// `tsaot_sort_<i>`'s signature: (ctx, values, room for half of them and
+/// `lum_sort_<i>`'s signature: (ctx, values, room for half of them and
 /// one more, count) -> 1 if the comparator threw, else 0.
 fn sorter_signature() -> Signature {
     Signature {
@@ -391,8 +391,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_NewObject", &[P], &[W, W]),
         ("JS_GetException", &[P], &[W, W]),
         ("JS_Throw", &[P, W, W], &[W, W]),
-        ("tsaot_set_elem", &[P, P], &[Int]),
-        ("tsaot_ic_get", &[P, W, W, Int, P], &[W, W]),
+        ("lum_set_elem", &[P, P], &[Int]),
+        ("lum_ic_get", &[P, W, W, Int, P], &[W, W]),
         ("JS_GetIteratorObject", &[P, W, W, Int], &[W, W]),
         ("JS_ForInIteratorObject", &[P, W, W], &[W, W]),
         ("JS_IteratorStep", &[P, W, W, W, W, Int, P, P], &[W, W]),
@@ -401,60 +401,60 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_ToObject", &[P, W, W], &[W, W]),
         ("JS_ToPropertyKey", &[P, W, W], &[W, W]),
         ("JS_NewArray", &[P], &[W, W]),
-        ("tsaot_array_push", &[P, W, W, W, W], &[Int]),
-        ("tsaot_array_hole", &[P, W, W], &[Int]),
-        ("tsaot_array_spread", &[P, W, W, W, W], &[Int]),
-        ("tsaot_apply", &[P, P], &[W, W]),
-        ("tsaot_construct", &[P, W, W, W, W], &[W, W]),
-        ("tsaot_rest", &[P, Int, P, Int], &[W, W]),
-        ("tsaot_object_rest", &[P, P, Int], &[W, W]),
-        ("tsaot_define_computed", &[P, P, W, W], &[Int]),
-        ("tsaot_object_spread", &[P, W, W, W, W], &[Int]),
-        ("tsaot_array_iter_close", &[P, W, W, Int, Int], &[Int]),
-        ("tsaot_array_iter_ok", &[P], &[Int]),
-        ("tsaot_regexp", &[P, Int, Int], &[W, W]),
-        ("tsaot_gen_iter_ok", &[P, W, W, W, W], &[Int]),
+        ("lum_array_push", &[P, W, W, W, W], &[Int]),
+        ("lum_array_hole", &[P, W, W], &[Int]),
+        ("lum_array_spread", &[P, W, W, W, W], &[Int]),
+        ("lum_apply", &[P, P], &[W, W]),
+        ("lum_construct", &[P, W, W, W, W], &[W, W]),
+        ("lum_rest", &[P, Int, P, Int], &[W, W]),
+        ("lum_object_rest", &[P, P, Int], &[W, W]),
+        ("lum_define_computed", &[P, P, W, W], &[Int]),
+        ("lum_object_spread", &[P, W, W, W, W], &[Int]),
+        ("lum_array_iter_close", &[P, W, W, Int, Int], &[Int]),
+        ("lum_array_iter_ok", &[P], &[Int]),
+        ("lum_regexp", &[P, Int, Int], &[W, W]),
+        ("lum_gen_iter_ok", &[P, W, W, W, W], &[Int]),
         ("JS_NativeGeneratorNext", &[P, W, W, P], &[W, W]),
         ("JS_ArrayAppendFast", &[P, W, W, W, W], &[Int]),
-        ("tsaot_for_in_get", &[P, P], &[W, W]),
+        ("lum_for_in_get", &[P, P], &[W, W]),
         ("JS_PrivateGet", &[P, W, W, W, W], &[W, W]),
-        ("tsaot_private_set", &[P, P, W, W], &[Int]),
+        ("lum_private_set", &[P, P, W, W], &[Int]),
         ("JS_PrivateCheckBrand", &[P, W, W, W, W], &[Int]),
         ("JS_PrivateIn", &[P, W, W, W, W], &[Int]),
-        ("tsaot_super_get", &[P, P], &[W, W]),
-        ("tsaot_super_set", &[P, P, W, W], &[Int]),
-        ("tsaot_gen_start", &[P, Int, Int, P], &[W, W]),
-        ("tsaot_gen_new", &[P, W, W, P], &[W, W]),
-        ("tsaot_async_gen_new", &[P, W, W, P], &[W, W]),
-        ("tsaot_async_yield_star", &[P, P, Int, P], &[W, W]),
-        ("tsaot_async_yield_star_result", &[P, W, W, P], &[W, W]),
-        ("tsaot_throw_iterator_throw", &[P], &[Int]),
-        ("tsaot_for_await_result", &[P, W, W, P], &[W, W]),
-        ("tsaot_check_object", &[P, W, W], &[Int]),
-        ("tsaot_iter_close_quiet", &[P, W, W], &[]),
-        ("tsaot_yield_star", &[P, P, Int, P], &[W, W]),
-        ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
-        ("tsaot_private_get_ic", &[P, W, W, W, W, P], &[W, W]),
-        ("tsaot_ic_get_proto", &[P, W, W, Int, P], &[W, W]),
-        ("tsaot_ic_poly_addr", &[P, P], &[P]),
-        ("tsaot_ic_set_proto", &[P, W, W, Int, W, W, P], &[Int]),
-        ("tsaot_call_getter", &[P, P, W, W], &[W, W]),
-        ("tsaot_define_accessor", &[P, P, Int, W, W, Int], &[Int]),
-        ("tsaot_new_object", &[P, P, Int, P, P], &[W, W]),
+        ("lum_super_get", &[P, P], &[W, W]),
+        ("lum_super_set", &[P, P, W, W], &[Int]),
+        ("lum_gen_start", &[P, Int, Int, P], &[W, W]),
+        ("lum_gen_new", &[P, W, W, P], &[W, W]),
+        ("lum_async_gen_new", &[P, W, W, P], &[W, W]),
+        ("lum_async_yield_star", &[P, P, Int, P], &[W, W]),
+        ("lum_async_yield_star_result", &[P, W, W, P], &[W, W]),
+        ("lum_throw_iterator_throw", &[P], &[Int]),
+        ("lum_for_await_result", &[P, W, W, P], &[W, W]),
+        ("lum_check_object", &[P, W, W], &[Int]),
+        ("lum_iter_close_quiet", &[P, W, W], &[]),
+        ("lum_yield_star", &[P, P, Int, P], &[W, W]),
+        ("lum_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
+        ("lum_private_get_ic", &[P, W, W, W, W, P], &[W, W]),
+        ("lum_ic_get_proto", &[P, W, W, Int, P], &[W, W]),
+        ("lum_ic_poly_addr", &[P, P], &[P]),
+        ("lum_ic_set_proto", &[P, W, W, Int, W, W, P], &[Int]),
+        ("lum_call_getter", &[P, P, W, W], &[W, W]),
+        ("lum_define_accessor", &[P, P, Int, W, W, Int], &[Int]),
+        ("lum_new_object", &[P, P, Int, P, P], &[W, W]),
         ("JS_NewObjectWithCachedShape", &[P, P, P], &[W, W]),
-        ("tsaot_global_get", &[P, Int, P], &[W, W]),
-        ("tsaot_struct_new", &[P, Int, Int], &[W, W]),
-        ("tsaot_struct_put", &[P, W, W, Int, W, W], &[Int]),
-        ("tsaot_struct_validate", &[P, W, W], &[Int]),
-        ("tsaot_struct_set", &[P, W, W, Int, W, W], &[Int]),
-        ("tsaot_struct_coerce", &[P, Int, Int, W, W], &[W, W]),
-        ("tsaot_sarr_from", &[P, Int, W, W], &[W, W]),
-        ("tsaot_sarr_push", &[P, W, W, W, W], &[W]),
-        ("tsaot_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
-        ("tsaot_call_setter", &[P, P, W, W, W, W], &[Int]),
-        ("tsaot_private_set_ic", &[P, P, W, W, P], &[Int]),
-        ("tsaot_delete_elem", &[P, P], &[Int]),
-        ("tsaot_call", &[P, P, Int, P], &[W, W]),
+        ("lum_global_get", &[P, Int, P], &[W, W]),
+        ("lum_struct_new", &[P, Int, Int], &[W, W]),
+        ("lum_struct_put", &[P, W, W, Int, W, W], &[Int]),
+        ("lum_struct_validate", &[P, W, W], &[Int]),
+        ("lum_struct_set", &[P, W, W, Int, W, W], &[Int]),
+        ("lum_struct_coerce", &[P, Int, Int, W, W], &[W, W]),
+        ("lum_sarr_from", &[P, Int, W, W], &[W, W]),
+        ("lum_sarr_push", &[P, W, W, W, W], &[W]),
+        ("lum_super_get_ic", &[P, W, W, W, W, Int, P], &[W, W]),
+        ("lum_call_setter", &[P, P, W, W, W, W], &[Int]),
+        ("lum_private_set_ic", &[P, P, W, W, P], &[Int]),
+        ("lum_delete_elem", &[P, P], &[Int]),
+        ("lum_call", &[P, P, Int, P], &[W, W]),
         ("JS_CallBuiltin", &[P, W, W, W, W, Int, P], &[W, W]),
         ("JS_IsStrictEqual", &[P, W, W, W, W], &[Int]),
         ("JS_ArrayPushFast", &[P, W, W, W, W], &[W, W]),
@@ -462,29 +462,29 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_TryGetElement", &[P, W, W, P, P], &[W, W]),
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
         ("JS_SortNative", &[P, W, W, P, Int], &[Int]),
-        ("tsaot_ic_own_data", &[P, W, W, Int, P], &[W, W]),
-        ("tsaot_record_learn", &[P, W, W, Int], &[]),
-        ("tsaot_char_code_at_ok", &[P], &[Int]),
-        ("tsaot_array_push_ok", &[P], &[Int]),
-        ("tsaot_region_push", &[P, W, W, W, W], &[Int]),
+        ("lum_ic_own_data", &[P, W, W, Int, P], &[W, W]),
+        ("lum_record_learn", &[P, W, W, Int], &[]),
+        ("lum_char_code_at_ok", &[P], &[Int]),
+        ("lum_array_push_ok", &[P], &[Int]),
+        ("lum_region_push", &[P, W, W, W, W], &[Int]),
         ("JS_CallStringFn", &[P, W, W, Int, Int, P], &[W, W]),
         ("JS_CallMapFn", &[P, W, W, Int, Int, P], &[W, W]),
         ("JS_ConcatStrings", &[P, P, Int], &[W, W]),
-        ("tsaot_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
-        ("tsaot_global_or_undefined", &[P, Int], &[W, W]),
-        ("tsaot_define_field", &[P, P, Int, W, W], &[Int]),
-        ("tsaot_new_array", &[P, Int, P], &[W, W]),
-        ("tsaot_throw_uninitialized", &[P, Int], &[]),
-        ("tsaot_stack_overflow", &[P], &[]),
-        ("tsaot_throw_uninitialized_atom", &[P, Int], &[]),
-        ("tsaot_box_new", &[P, P], &[W, W]),
-        ("tsaot_make_closure", &[P, Int, Int, P], &[W, W]),
-        ("tsaot_async_start", &[P, Int, Int, P, P], &[W, W]),
-        ("tsaot_async_step", &[P, P, Int, P, Int], &[]),
-        ("tsaot_await", &[P, P, W, W, Int], &[Int]),
-        ("tsaot_is_promise_resolve", &[W, W, W, W], &[Int]),
-        ("tsaot_pow", &[D, D], &[D]),
-        ("tsaot_toint32_slow", &[D], &[Int]),
+        ("lum_new_instance", &[P, P, W, W, Int, P, P], &[W, W]),
+        ("lum_global_or_undefined", &[P, Int], &[W, W]),
+        ("lum_define_field", &[P, P, Int, W, W], &[Int]),
+        ("lum_new_array", &[P, Int, P], &[W, W]),
+        ("lum_throw_uninitialized", &[P, Int], &[]),
+        ("lum_stack_overflow", &[P], &[]),
+        ("lum_throw_uninitialized_atom", &[P, Int], &[]),
+        ("lum_box_new", &[P, P], &[W, W]),
+        ("lum_make_closure", &[P, Int, Int, P], &[W, W]),
+        ("lum_async_start", &[P, Int, Int, P, P], &[W, W]),
+        ("lum_async_step", &[P, P, Int, P, Int], &[]),
+        ("lum_await", &[P, P, W, W, Int], &[Int]),
+        ("lum_is_promise_resolve", &[W, W, W, W], &[Int]),
+        ("lum_pow", &[D, D], &[D]),
+        ("lum_toint32_slow", &[D], &[Int]),
         ("fmod", &[D, D], &[D]),
     ]
 };
@@ -505,15 +505,15 @@ struct Codegen {
     module: mir::Module,
     funcs: Vec<FuncId>,
     /// Native `sort` comparators (by function): a copy whose JS-valued
-    /// parameters are borrowed (`tsaot_cmp_<i>`).
+    /// parameters are borrowed (`lum_cmp_<i>`).
     sort_cmps: HashMap<usize, FuncId>,
-    /// Their merge sorts (`tsaot_sort_<i>`: see `define_sorter`).
+    /// Their merge sorts (`lum_sort_<i>`: see `define_sorter`).
     sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
     data: [DataId; 12],
     fast_sig: SigRef,
-    /// Inline caches allocated so far (`tsaot_ics` entries).
+    /// Inline caches allocated so far (`lum_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
     closure_base: usize,
     /// Parameter types, by `FuncId`.
@@ -554,12 +554,12 @@ impl Codegen {
                     && !g.is_generator
                 {
                     let id =
-                        module.declare_function(&format!("tsaot_cmp_{func}"), Linkage::Local, &native_signature(g));
+                        module.declare_function(&format!("lum_cmp_{func}"), Linkage::Local, &native_signature(g));
                     sort_cmps.insert(func, id);
                     // (Its merge sort's calls run it inline.)
                     module.set_always_inline(id);
                     let id =
-                        module.declare_function(&format!("tsaot_sort_{func}"), Linkage::Local, &sorter_signature());
+                        module.declare_function(&format!("lum_sort_{func}"), Linkage::Local, &sorter_signature());
                     sorters.insert(func, id);
                 }
             });
@@ -604,24 +604,24 @@ impl Codegen {
         }
         let mut data = Vec::new();
         for name in [
-            "tsaot_stack_limit",
-            "tsaot_unwinding",
-            "tsaot_cells",
-            "tsaot_strings",
-            "tsaot_atoms",
-            "tsaot_shapes",
-            "tsaot_privates",
-            "tsaot_homes",
-            "tsaot_struct_class",
-            "tsaot_sarr_class",
+            "lum_stack_limit",
+            "lum_unwinding",
+            "lum_cells",
+            "lum_strings",
+            "lum_atoms",
+            "lum_shapes",
+            "lum_privates",
+            "lum_homes",
+            "lum_struct_class",
+            "lum_sarr_class",
         ] {
             data.push(module.declare_data(name, Linkage::Import, true));
         }
         // Defined here, once all sites are known (`define_ics`).
-        data.push(module.declare_data("tsaot_ics", Linkage::Export, true));
+        data.push(module.declare_data("lum_ics", Linkage::Export, true));
         // Record types: their shapes once learned, and their fields (per
         // record: the field count, then the fields' atom indices).
-        data.push(module.declare_data("tsaot_record_shapes", Linkage::Export, true));
+        data.push(module.declare_data("lum_record_shapes", Linkage::Export, true));
         let nrec = m.records.len();
         let shapes = data[data.len() - 1];
         module.define_data(shapes, mir::DataInit::Zeroed { size: nrec.max(1) * lower::RECORD_STRIDE }, 8);
@@ -637,11 +637,11 @@ impl Codegen {
             b.resize(b.len().max(4), 0);
             b
         };
-        let d = module.declare_data("tsaot_record_fields", Linkage::Export, false);
+        let d = module.declare_data("lum_record_fields", Linkage::Export, false);
         module.define_data(d, mir::DataInit::Bytes(ints(&fields)), 4);
-        let d = module.declare_data("tsaot_record_index", Linkage::Export, false);
+        let d = module.declare_data("lum_record_index", Linkage::Export, false);
         module.define_data(d, mir::DataInit::Bytes(ints(&index)), 4);
-        let d = module.declare_data("tsaot_nrecords", Linkage::Export, false);
+        let d = module.declare_data("lum_nrecords", Linkage::Export, false);
         module.define_data(d, mir::DataInit::Bytes((nrec as i32).to_le_bytes().to_vec()), 4);
         Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
@@ -719,9 +719,9 @@ impl Codegen {
         }
     }
 
-    /// Defines the inline cache table (`TsaotIC tsaot_ics[]`, `IC_SIZE` bytes per
-    /// entry, zeroed) and its length `tsaot_nics`.
-    /// Defines `tsaot_sort_<i>` (`id`, `sorter_signature`): the engine's
+    /// Defines the inline cache table (`LumIC lum_ics[]`, `IC_SIZE` bytes per
+    /// entry, zeroed) and its length `lum_nics`.
+    /// Defines `lum_sort_<i>` (`id`, `sorter_signature`): the engine's
     /// stable merge sort of `JS_SortNative` (insertion sorts of up to 8
     /// values, halves merged through `tmp`) with comparator `cmp` (`f`'s
     /// copy with borrowed parameters) called directly, for the backend to
@@ -896,11 +896,11 @@ impl Codegen {
     fn define_ics(&mut self) {
         let n = self.ics.get();
         self.module.define_data(self.data[10], mir::DataInit::Zeroed { size: n.max(1) * lower::IC_SIZE }, 8);
-        let count = self.module.declare_data("tsaot_nics", Linkage::Export, false);
+        let count = self.module.declare_data("lum_nics", Linkage::Export, false);
         self.module.define_data(count, mir::DataInit::Bytes((n as i32).to_le_bytes().to_vec()), 4);
     }
 
-    /// Defines `tsaot_fn_<index>`, the function itself, for native callers.
+    /// Defines `lum_fn_<index>`, the function itself, for native callers.
     fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
         if f.is_async || f.is_generator {
             return self.define_step(index, f);
@@ -949,7 +949,7 @@ impl Codegen {
     }
 
     /// Defines the step function of async function `index` (as
-    /// `tsaot_fn_<index>`): runs the body from the start (state 0) or from
+    /// `lum_fn_<index>`): runs the body from the start (state 0) or from
     /// the await it suspended at, until it completes or suspends again.
     fn define_step(&mut self, index: usize, f: &ir::Func) -> Result<()> {
         let ptr = I64;
@@ -1009,9 +1009,9 @@ impl Codegen {
         let fi = b.ins().iconst(I32, index as i64);
         let ns = b.ins().iconst(I32, nslots as i64);
         let start = if f.is_generator {
-            b.ins().call(env.helpers["tsaot_gen_start"], &[js_ctx, fi, ns, slots_addr])
+            b.ins().call(env.helpers["lum_gen_start"], &[js_ctx, fi, ns, slots_addr])
         } else {
-            b.ins().call(env.helpers["tsaot_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr])
+            b.ins().call(env.helpers["lum_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr])
         };
         let frame = b.inst_results(start).to_vec();
         let failed = b.ins().icmp_imm_s(IntCC::Equal, frame[1], jsvalue::TAG_EXCEPTION);
@@ -1032,7 +1032,7 @@ impl Codegen {
             let failed = b.create_block();
             b.set_cold_block(failed);
             let k = f.params.len() - 1;
-            params[k] = rest_arg(&mut b, env.helpers["tsaot_rest"], js_ctx, argc, argv, k, failed);
+            params[k] = rest_arg(&mut b, env.helpers["lum_rest"], js_ctx, argc, argv, k, failed);
             let cont = b.create_block();
             b.ins().jump(cont, &[]);
             b.switch_to_block(failed);
@@ -1083,7 +1083,7 @@ impl Codegen {
         if f.is_generator {
             // The generator object, which takes the frame (after binding
             // the parameters).
-            let new = if f.is_async { "tsaot_async_gen_new" } else { "tsaot_gen_new" };
+            let new = if f.is_async { "lum_async_gen_new" } else { "lum_gen_new" };
             let call = b.ins().call(env.helpers[new], &[js_ctx, frame[0], frame[1], data]);
             let r = b.inst_results(call).to_vec();
             b.ins().return_(&r);
@@ -1097,7 +1097,7 @@ impl Codegen {
             let vaddr = b.ins().stack_addr(ptr, undef_slot, 0);
             let st0 = b.ins().iconst(I32, 0);
             let no = b.ins().iconst(I32, 0);
-            b.ins().call(env.helpers["tsaot_async_step"], &[js_ctx, slots, st0, vaddr, no]);
+            b.ins().call(env.helpers["lum_async_step"], &[js_ctx, slots, st0, vaddr, no]);
             b.ins().call(env.helpers["JS_FreeValue"], &[js_ctx, frame[0], frame[1]]);
             let pp = b.ins().load(I64, mem, promise_addr, 0);
             let pt = b.ins().load(I64, mem, promise_addr, jsvalue::TAG_OFFSET);
@@ -1118,11 +1118,11 @@ impl Codegen {
         Ok(())
     }
 
-    /// Defines `tsaot_fast_<index>`, the JS-facing entry of native function
+    /// Defines `lum_fast_<index>`, the JS-facing entry of native function
     /// `index`, with the engine's `JSCFunctionFast` signature:
     ///
     /// ```c
-    /// JSValue tsaot_fast_i(JSContext *ctx, JSValueConst this_val, int argc,
+    /// JSValue lum_fast_i(JSContext *ctx, JSValueConst this_val, int argc,
     ///                      JSValueConst *argv, JSValueConst *func_data);
     /// ```
     ///
@@ -1179,7 +1179,7 @@ impl Codegen {
         // that failing to allocate it leaks nothing).
         if f.rest {
             let k = f.params.len() - 1;
-            params[k] = rest_arg(&mut b, env.helpers["tsaot_rest"], js_ctx, argc, argv, k, exception);
+            params[k] = rest_arg(&mut b, env.helpers["lum_rest"], js_ctx, argc, argv, k, exception);
         }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {
@@ -1445,7 +1445,7 @@ fn unbox_arg(
 }
 
 /// Whether object `p` is of `aot type` layout `k` (`struct_class`: the
-/// address of `tsaot_struct_class`). Its class first: the opaque of any
+/// address of `lum_struct_class`). Its class first: the opaque of any
 /// other object may be anything.
 pub(crate) fn struct_check(b: &mut FunctionBuilder, p: Value, k: u32, struct_class: Value) -> Value {
     let join = b.create_block();
@@ -1466,7 +1466,7 @@ pub(crate) fn struct_check(b: &mut FunctionBuilder, p: Value, k: u32, struct_cla
 }
 
 /// Whether object `p` is an array of objects of layout `k` (`sarr_class`:
-/// the address of `tsaot_sarr_class`).
+/// the address of `lum_sarr_class`).
 pub(crate) fn sarr_check(b: &mut FunctionBuilder, p: Value, k: u32, sarr_class: Value) -> Value {
     struct_check(b, p, k, sarr_class)
 }
@@ -1516,7 +1516,7 @@ fn all_math(m: &ir::Module) -> Vec<MathFn> {
     out
 }
 
-pub(crate) use tsaot_front::ir::visit as walk_expr;
+pub(crate) use luminous_front::ir::visit as walk_expr;
 
 /// Visit every expression in `body`.
 fn walk(body: &[Stmt], f: &mut impl FnMut(&Expr)) {

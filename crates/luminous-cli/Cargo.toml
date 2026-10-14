@@ -1,5 +1,5 @@
 [package]
-name = "tsaot-cli"
+name = "luminous-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-tsaot-codegen = { version = "0.1.0", path = "../tsaot-codegen" }
-tsaot-front = { version = "0.1.0", path = "../tsaot-front" }
+luminous-codegen = { version = "0.1.0", path = "../luminous-codegen" }
+luminous-front = { version = "0.1.0", path = "../luminous-front" }
 
 [[bin]]
-name = "tsaot"
+name = "luminous"
 path = "src/main.rs"

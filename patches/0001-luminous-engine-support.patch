@@ -18,18 +18,18 @@
  typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
  JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
                              JS_MarkFunc *mark_func);
-+/* tsaot: marks what the runtime cannot see (as values in C structures)
++/* luminous: marks what the runtime cannot see (as values in C structures)
 +   whenever it collects: `func(rt, opaque, mark_func)` marks them with
 +   JS_MarkValue. */
 +typedef void JS_GCMarkHookFunc(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func);
 +JS_EXTERN int JS_AddGCMarkHook(JSRuntime *rt, JS_GCMarkHookFunc *func, void *opaque);
 +JS_EXTERN void JS_RemoveGCMarkHook(JSRuntime *rt, JS_GCMarkHookFunc *func, void *opaque);
-+/* tsaot: `size` bytes, zeroed, holding JS values (and GC pointers) the
++/* luminous: `size` bytes, zeroed, holding JS values (and GC pointers) the
 +   collector finds anywhere in them while anything refers to them (a C
 +   local, or another such block): for temporary arrays of values.
 +   Freed with js_free. */
 +JS_EXTERN void *JS_MallocTraced(JSContext *ctx, size_t size);
-+/* tsaot: the write barrier, after a reference is stored in `cell` (an
++/* luminous: the write barrier, after a reference is stored in `cell` (an
 +   object, or a JS_MallocTraced block: the GC cell that holds it, its
 +   user data): when the cell has survived a collection, the next minor
 +   collection traces it. */
@@ -85,7 +85,7 @@
 +   its first, second and third prototypes in shapes[0..3]; else -1. */
 +JS_EXTERN int JS_CacheDeepProtoProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void **shapes);
 +JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
-+/* tsaot: String.prototype methods with a direct entry (JS_CallStringFn). */
++/* luminous: String.prototype methods with a direct entry (JS_CallStringFn). */
 +#define JS_STRING_FN_SLICE 0
 +#define JS_STRING_FN_SUBSTRING 1
 +#define JS_STRING_FN_INDEX_OF 2
@@ -93,28 +93,28 @@
 +#define JS_STRING_FN_STARTS_WITH 4
 +#define JS_STRING_FN_ENDS_WITH 5
 +JS_EXTERN JSValue JS_CallStringFn(JSContext *ctx, JSValueConst str, int which, int argc, JSValueConst *argv);
-+/* tsaot: Map.prototype.get, set, has, Set.prototype.add, has (in this
++/* luminous: Map.prototype.get, set, has, Set.prototype.add, has (in this
 +   order) with a direct entry, for a Map or Set `this` (argv: 2 values). */
 +JS_EXTERN JSValue JS_CallMapFn(JSContext *ctx, JSValueConst this_val, int which, int argc, JSValueConst *argv);
-+/* tsaot: the concatenation of parts[0..n) (all taken), each converted with
++/* luminous: the concatenation of parts[0..n) (all taken), each converted with
 +   ToString: strings, ropes and primitives. */
 +JS_EXTERN JSValue JS_ConcatStrings(JSContext *ctx, JSValue *parts, int n);
-+/* tsaot: a regular expression literal's object (a new one each time):
++/* luminous: a regular expression literal's object (a new one each time):
 +   pattern and flags borrowed, their bytecode in *bc, compiled into it the
 +   first time (while it is not a string; the caller keeps it alive). */
 +JS_EXTERN JSValue JS_NewRegExpLiteral(JSContext *ctx, JSValueConst pattern, JSValueConst flags, JSValue *bc);
-+/* tsaot: make a function of JS_NewCFunctionData* an ordinary function: a
++/* luminous: make a function of JS_NewCFunctionData* an ordinary function: a
 +   constructor (`this` an object of new.target's prototype) with a
 +   `prototype`. */
 +JS_EXTERN int JS_SetCFunctionDataConstructor(JSContext *ctx, JSValueConst func);
-+/* tsaot: `op1 + op2` (borrowed), with direct paths for strings and for a
++/* luminous: `op1 + op2` (borrowed), with direct paths for strings and for a
 +   string with an int32. */
 +JS_EXTERN JSValue JS_AddValues(JSContext *ctx, JSValueConst op1, JSValueConst op2);
-+/* tsaot: how native code allocates objects of cached shape `shape`
++/* luminous: how native code allocates objects of cached shape `shape`
 +   (JS_CachePlainShape) inline: their size class in the low 8 bits and the
 +   bytes the allocator accounts for each above, or 0 if they are too big. */
 +JS_EXTERN uint32_t JS_ShapeAllocInfo(JSRuntime *rt, void *shape);
-+/* tsaot: whether the bit fields JS_LAYOUT_* describe (JS_LAYOUT_OBJ_GC_BYTE,
++/* luminous: whether the bit fields JS_LAYOUT_* describe (JS_LAYOUT_OBJ_GC_BYTE,
 +   JS_LAYOUT_OBJ_PLAIN_FLAGS) are laid out as it says. */
 +JS_EXTERN bool JS_LayoutCheck(void);
 +/* Object literal allocation sites. If `obj` is a plain extensible object
@@ -243,7 +243,7 @@
 +#define JS_LAYOUT_OBJ_APPEND_MASK   0xffff0012 /* of the flags word: class id, fast_array, extensible */
 +#define JS_LAYOUT_OBJ_APPEND_FLAGS  0x20012 /* ... of an extensible fast array (JS_LayoutCheck) */
 +#define JS_LAYOUT_CTX_STD_ARRAY_PROTO 32 /* uint8_t: no index properties on the array prototypes */
-+/* Reading global variables inline (tsaot_global_get's cache). */
++/* Reading global variables inline (lum_global_get's cache). */
 +#define JS_LAYOUT_CTX_GLOBAL_OBJ    488  /* JSValue: the global object */
 +#define JS_LAYOUT_CTX_GLOBAL_VAR_OBJ 504 /* JSValue: the global let/const definitions */
 +#define JS_LAYOUT_SHAPE_PROP_COUNT  16   /* uint32_t */
@@ -324,11 +324,11 @@
  #include <time.h>
  #include <math.h>
 +#if defined(__unix__) || defined(__APPLE__)
-+#include <sys/mman.h> /* tsaot: the GC heap's chunks */
++#include <sys/mman.h> /* luminous: the GC heap's chunks */
 +#endif
-+#include <setjmp.h> /* tsaot: registers, for conservative stack scanning */
++#include <setjmp.h> /* luminous: registers, for conservative stack scanning */
 +#if defined(__linux__)
-+#include <pthread.h> /* tsaot: the native stack's extent */
++#include <pthread.h> /* luminous: the native stack's extent */
 +#endif
  
  #include "cutils.h"
@@ -338,7 +338,7 @@
  #endif
  
 -#ifndef NDEBUG
-+/* tsaot: not with assertions alone, which would change the layout of the
++/* luminous: not with assertions alone, which would change the layout of the
 +   strings that native code reads (JS_LAYOUT_STRING_DATA). */
 +#ifdef JS_ENABLE_DUMPS
  #define ENABLE_DUMPS
@@ -353,7 +353,7 @@
     JSMallocFunctions allocator, so the backing allocator (system malloc,
     mimalloc, ...) sees roughly one request per arena refill instead of one per
 -   object. */
-+   object. (tsaot: 64KB rather than 4KB arenas, whose blocks are handed out
++   object. (luminous: 64KB rather than 4KB arenas, whose blocks are handed out
 +   by a bump index before any is reused, and one empty arena kept per size
 +   class: allocation-heavy code otherwise keeps making and freeing arenas.) */
  
@@ -370,9 +370,9 @@
 -    uint8_t  gc_obj_type : 7; /* JSGCObjectTypeEnum for GC objects */
 -    uint8_t  mark : 1;        /* used by the cycle collector */
 +    uint8_t  gc_obj_type : 6; /* JSGCObjectTypeEnum for GC objects */
-+    /* tsaot: a GC cell in the collector's remembered set (see js_gc_wb) */
++    /* luminous: a GC cell in the collector's remembered set (see js_gc_wb) */
 +    uint8_t  gc_remembered : 1;
-+    /* tsaot: a GC cell that survived a collection (old); a context marked
++    /* luminous: a GC cell that survived a collection (old); a context marked
 +       by the collection running */
 +    uint8_t  mark : 1;
      int      ref_count;
@@ -386,7 +386,7 @@
      _Alignas(JS_ARENA_ALIGN) uint8_t blocks[];
  } JSArena;
  
-+/* tsaot: blocks freed recently, per size class, kept out of their arena
++/* luminous: blocks freed recently, per size class, kept out of their arena
 +   (which still counts them as used): the usual free / allocate pairs are a
 +   push and a pop. Up to this many bytes per size class: enough for the
 +   objects of a large structure freed at once (a tree, an array of
@@ -413,7 +413,7 @@
      _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
  } JSArenaState;
  
-+/* tsaot: the GC heap (see js_gc_alloc). */
++/* luminous: the GC heap (see js_gc_alloc). */
 +#define JS_GC_CHUNK_SHIFT 18
 +#define JS_GC_CHUNK_SIZE ((size_t)1 << JS_GC_CHUNK_SHIFT)
 +#define JS_GC_CHUNK_MASK (~(uintptr_t)(JS_GC_CHUNK_SIZE - 1))
@@ -561,9 +561,9 @@
      void *user_opaque;
      void *libc_opaque;
      JSRuntimeFinalizerState *finalizers;
-+    /* tsaot: GC cells */
++    /* luminous: GC cells */
 +    JSGCHeap gc_heap;
-+    /* tsaot: the heads of the objects' lists of weak references (see
++    /* luminous: the heads of the objects' lists of weak references (see
 +       JSObject.weak_index; entry 0 unused), and the free entries. */
 +    struct JSWeakRefRecord **weak_heads;
 +    uint32_t weak_heads_len, weak_heads_size;
@@ -576,7 +576,7 @@
      JS_GC_OBJ_TYPE_VAR_REF,
      JS_GC_OBJ_TYPE_ASYNC_FUNCTION,
      JS_GC_OBJ_TYPE_JS_CONTEXT,
-+    /* tsaot: the other GC cells (see js_gc_trace_children) */
++    /* luminous: the other GC cells (see js_gc_trace_children) */
 +    JS_GC_OBJ_TYPE_STRING,
 +    JS_GC_OBJ_TYPE_STRING_ROPE,
 +    JS_GC_OBJ_TYPE_BIG_INT,
@@ -587,7 +587,7 @@
  /* header for GC objects. GC objects are C data structures with a
     reference count that can reference other GC objects. JS Objects are
     a particular type of GC object. */
-+/* tsaot: empty. The type and the GC bits live in the allocator block
++/* luminous: empty. The type and the GC bits live in the allocator block
 +   header (js_rc(p), the 8 bytes before every allocation); the collector
 +   finds the cells through its chunks, with no list of them. */
  struct JSGCObjectHeader {
@@ -607,7 +607,7 @@
  #define JS_GC_TYPE(p)   (js_rc(p)->gc_obj_type)
  #define JS_GC_MARK(p)   (js_rc(p)->mark)
  
-+/* tsaot: the write barrier. An old cell (one that survived a collection)
++/* luminous: the write barrier. An old cell (one that survived a collection)
 +   given a reference that may be to a young cell joins the remembered set,
 +   which the next minor collection traces (see js_gc_collect). Called with
 +   the cell that holds the reference (an object for its properties and the
@@ -645,7 +645,7 @@
         - its prototype is Object.prototype
         - Object.prototype has no small index properties which are get/set or non writable
         - the prototype of Object.prototype is null (always true as it is immutable)
-+       (tsaot: a byte of its own, which native code reads)
++       (luminous: a byte of its own, which native code reads)
      */
 -    uint8_t std_array_prototype : 1;
 +    uint8_t std_array_prototype;
@@ -660,7 +660,7 @@
 -    bool empty; /* true if the record is deleted */
 +    int ref_count : 31; /* used during enumeration to avoid freeing the record */
 +    unsigned int empty : 1; /* true if the record is deleted */
-+    uint32_t hash; /* (tsaot) map_hash_key of the key */
++    uint32_t hash; /* (luminous) map_hash_key of the key */
      struct JSMapState *map;
      struct list_head link;
      struct list_head hash_link;
@@ -668,7 +668,7 @@
  
  typedef struct JSMapState {
      bool is_weak; /* true if WeakSet/WeakMap */
-+    struct JSObject *obj; /* (tsaot: the map, for the write barrier) */
++    struct JSObject *obj; /* (luminous: the map, for the write barrier) */
      struct list_head records; /* list of JSMapRecord.link */
      uint32_t record_count;
      struct list_head *hash_table;
@@ -676,7 +676,7 @@
      JS_STRING_KIND_NORMAL,
      JS_STRING_KIND_SLICE,
      JS_STRING_KIND_INDIRECT,
-+    /* tsaot: an append buffer (js_append_string): never a value, only the
++    /* luminous: an append buffer (js_append_string): never a value, only the
 +       parent of slices; its length is its capacity and hash_next the
 +       characters in use. */
 +    JS_STRING_KIND_BUFFER,
@@ -693,7 +693,7 @@
      JSStringSlice *slice;
      void **indirect;
  
-+    /* tsaot: the usual kind first (a switch tests it last). */
++    /* luminous: the usual kind first (a switch tests it last). */
 +    if (likely(p->kind == JS_STRING_KIND_NORMAL))
 +        return (void *)&p[1];
      switch (p->kind) {
@@ -714,10 +714,10 @@
      /* true if the shape is inserted in the shape hash table. If not,
         JSShape.hash is not valid */
      uint8_t is_hashed;
-+    /* tsaot: true if a property is, or was, not a plain data property
++    /* luminous: true if a property is, or was, not a plain data property
 +       (getter/setter, variable reference, lazy initializer) */
 +    uint8_t special_props;
-+    /* tsaot: an allocation site's cached shape, which compiled code gives
++    /* luminous: an allocation site's cached shape, which compiled code gives
 +       its objects without counting them: never released (and so never
 +       unique, and never changed in place) */
 +    uint8_t pinned;
@@ -740,7 +740,7 @@
      uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
      uint16_t class_id; /* see JS_CLASS_x */
 -    /* byte offsets: 16/24 */
-+    /* tsaot: the weak references to it are listed off the runtime:
++    /* luminous: the weak references to it are listed off the runtime:
 +       rt->weak_heads[weak_index] (0: none). */
 +    uint32_t weak_index;
      JSShape *shape; /* prototype and property names + flag */
@@ -748,7 +748,7 @@
 -    /* byte offsets: 24/40 */
 -    JSWeakRefRecord *first_weak_ref;
 -    /* byte offsets: 28/48 */
-+    /* tsaot: what a class keeps of its own. A plain object
++    /* luminous: what a class keeps of its own. A plain object
 +       (JS_CLASS_OBJECT) has none: its properties start here, in its own
 +       allocation (JS_PLAIN_OBJECT_SIZE), until they outgrow it. */
      union {
@@ -758,7 +758,7 @@
      /* byte sizes: 40/48/72 */
  };
  
-+/* tsaot: a plain object's size before its properties (see JSObject.u). */
++/* luminous: a plain object's size before its properties (see JSObject.u). */
 +#define JS_PLAIN_OBJECT_SIZE offsetof(JSObject, u)
 +
 +#if INTPTR_MAX == INT64_MAX
@@ -868,7 +868,7 @@
  }
  
 -static JSValue js_dup(JSValueConst v)
-+/* tsaot: values are not reference counted (the tracing collector frees
++/* luminous: values are not reference counted (the tracing collector frees
 +   what is unreachable), so a new reference is the value itself. */
 +static inline JSValue js_dup(JSValueConst v)
  {
@@ -896,7 +896,7 @@
 +static void js_gc_cell_iter_init(JSRuntime *rt, JSGCCellIter *it);
 +static JSGCObjectHeader *js_gc_next_cell(JSRuntime *rt, JSGCCellIter *it);
 +
-+/* tsaot: a collection when the heap has grown past the threshold (or, with
++/* luminous: a collection when the heap has grown past the threshold (or, with
 +   QJS_GC_STRESS=n, every n calls). */
  static void js_trigger_gc(JSRuntime *rt, size_t size)
  {
@@ -998,7 +998,7 @@
 +                rt->arena_state.spare[block_size_idx] = NULL;
 +        }
 +        {
-+            /* tsaot: this block, and up to JS_ARENA_REFILL - 1 more for
++            /* luminous: this block, and up to JS_ARENA_REFILL - 1 more for
 +               the (empty) cache: allocation bursts take blocks in batches. */
 +            void *first = NULL, *batch[JS_ARENA_REFILL];
 +            int k, take = ar->n_blocks - ar->n_used_blocks;
@@ -1083,7 +1083,7 @@
      if (!ptr)
          return 0;
      b = container_of(ptr, JSMallocBlockHeader, user_data);
-+    if (b->block_size_idx == JS_GC_CELL) /* tsaot: a GC cell */
++    if (b->block_size_idx == JS_GC_CELL) /* luminous: a GC cell */
 +        return ((JSGCChunk *)((uintptr_t)b & JS_GC_CHUNK_MASK))->cell_size - sizeof(*b);
      if (b->u.block_idx == JS_ARENA_FREE_NIL) {
          if (b == arena_zero_block(rt)) {
@@ -1092,7 +1092,7 @@
      return arena_calloc_large(rt, n);
  }
  
-+/* ---- tsaot: the GC heap ----
++/* ---- luminous: the GC heap ----
 +   GC cells (objects, strings and ropes, bigints, shapes, function
 +   bytecode, var refs, async function data) come from chunks of their own:
 +   JS_GC_CHUNK_SIZE bytes aligned to that size (a cell bigger than
@@ -1937,7 +1937,7 @@
 -    s->malloc_size -= free_size;
 -    js_arena_free(rt, ptr);
 +#endif
-+    /* tsaot: (a cached block when there is room, as js_free_rt_inline) */
++    /* luminous: (a cached block when there is room, as js_free_rt_inline) */
 +    js_free_rt_inline(rt, ptr);
  }
  
@@ -1947,7 +1947,7 @@
          return NULL;
      }
 +    if (js_is_gc_cell(ptr)) {
-+        /* tsaot: a GC cell (a string being built): in place while it fits,
++        /* luminous: a GC cell (a string being built): in place while it fits,
 +           else a new cell with its contents and header. */
 +        JSMallocBlockHeader *ob = container_of(ptr, JSMallocBlockHeader, user_data), *nb;
 +        void *np;
@@ -1977,7 +1977,7 @@
  }
  
  /* Throw out of memory in case of error */
-+/* tsaot: a GC cell (see js_gc_alloc_rt); throws out of memory. */
++/* luminous: a GC cell (see js_gc_alloc_rt); throws out of memory. */
 +static void *js_gc_alloc(JSContext *ctx, size_t size)
 +{
 +    void *ptr = js_gc_alloc_rt(ctx->rt, size);
@@ -2015,7 +2015,7 @@
      js_arena_init(rt);
 -    rt->malloc_gc_threshold = 256 * 1024;
 +    js_gc_init(rt);
-+    /* tsaot: 4MB rather than 256KB before the first collection. */
++    /* luminous: 4MB rather than 256KB before the first collection. */
 +    rt->malloc_gc_threshold = 4 * 1024 * 1024;
  
      init_list_head(&rt->context_list);
@@ -2112,7 +2112,7 @@
  }
  
 -static inline void js_free_string0(JSRuntime *rt, JSString *str)
-+/* same as JS_FreeValueRT() (tsaot: nothing, see js_dup) */
++/* same as JS_FreeValueRT() (luminous: nothing, see js_dup) */
 +static inline void js_free_string(JSRuntime *rt, JSString *str)
  {
 -    JSStringSlice *slice;
@@ -2192,7 +2192,7 @@
 -        }
 -        if (count != 0)
 -            printf("Secondary object leaks: %d\n", count);
-+    /* tsaot: everything is unreachable now: the finalizers run, then the
++    /* luminous: everything is unreachable now: the finalizers run, then the
 +       contexts go (their memory and the cells' with the heap, below). */
 +    js_gc_teardown(rt);
 +    while (rt->gc_heap.hooks) {
@@ -2229,7 +2229,7 @@
  
 +static void js_free_context_body(JSContext *ctx);
 +
-+/* tsaot: the count is of the references from the embedder and from what
++/* luminous: the count is of the references from the embedder and from what
 +   cells hold that is released by their finalizers (a function's realm),
 +   so it may stay above zero while nothing uses the context: then the
 +   context goes with the runtime. Released while sweeping, the context
@@ -2290,7 +2290,7 @@
          /* str is not NULL */
          if (str->atom_type == atom_type) {
 -            /* str is the atom, return its index */
-+            /* str is the atom, return its index (tsaot: a string's count
++            /* str is the atom, return its index (luminous: a string's count
 +               is of its atom references, values are not counted) */
              i = js_get_atom_index(rt, str);
 -            /* reduce string refcount and increase atom's unless constant */
@@ -2347,7 +2347,7 @@
      assert(rt->atom_count >= 0);
  }
  
-+/* tsaot: an atom no longer referenced as an atom stays in the table
++/* luminous: an atom no longer referenced as an atom stays in the table
 +   (found again by its name) until a collection finds its string or
 +   symbol unreachable as a value too (see js_gc_sweep_atoms). */
  static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
@@ -2366,7 +2366,7 @@
      atom = __JS_NewAtom(rt, p, atom_type);
      if (atom == JS_ATOM_NULL)
          return JS_ThrowOutOfMemory(ctx);
-+    /* (tsaot: a value, not an atom reference) */
++    /* (luminous: a value, not an atom reference) */
 +    JS_REF_COUNT(rt->atom_array[atom])--;
      return JS_MKPTR(JS_TAG_SYMBOL, rt->atom_array[atom]);
  }
@@ -2541,14 +2541,14 @@
 +    if (p2->len == 0)
          return op1;
 -    }
-+    /* (tsaot: never in place: other values may be p1) */
++    /* (luminous: never in place: other values may be p1) */
      ret = JS_ConcatString1(ctx, p1, p2);
 -    JS_FreeValue(ctx, op1);
 -    JS_FreeValue(ctx, op2);
      return ret;
  }
  
-+/* tsaot: n bytes copied, without a call for up to 32 (most parts of a
++/* luminous: n bytes copied, without a call for up to 32 (most parts of a
 +   concatenation). */
 +static inline __attribute__((always_inline)) void js_copy8(uint8_t *d, const uint8_t *s, uint32_t n)
 +{
@@ -2558,7 +2558,7 @@
 +        js_copy_short(d, s, n);
 +}
 +
-+/* tsaot: `p1 + p2` for a long string p1 and a short one p2, as a slice of
++/* luminous: `p1 + p2` for a long string p1 and a short one p2, as a slice of
 +   an append buffer: where p1 is the used part of one (a slice of it from
 +   its start, which nothing has appended to since), p2's characters are
 +   written after it there; else both are copied into a new buffer with
@@ -2633,7 +2633,7 @@
                      return JS_ConcatString2(ctx, op1, op2);
                  } else {
 -                    return js_new_string_rope(ctx, op1, op2);
-+                    /* (tsaot: rather than a rope) */
++                    /* (luminous: rather than a rope) */
 +                    return js_append_string(ctx, p1, p2);
                  }
              } else {
@@ -2642,11 +2642,11 @@
      return js_new_string_rope(ctx, op1, op2);
  }
  
-+/* tsaot: up to this many int32 parts of a concatenation are written as
++/* luminous: up to this many int32 parts of a concatenation are written as
 +   their digits directly (the others are converted to strings first). */
 +#define JS_CONCAT_INTS 8
 +
-+/* tsaot: the concatenation of parts[0..n) (n >= 1, all taken), each
++/* luminous: the concatenation of parts[0..n) (n >= 1, all taken), each
 +   converted with ToString: strings, ropes, and primitives (as a template
 +   literal makes it, or `+` once the first or second part is a string).
 +   Short 8-bit or 16-bit results are copied once into one string (an
@@ -2760,7 +2760,7 @@
 +    return r;
 +}
 +
-+/* tsaot: `op1 + op2` (borrowed) when they are not both numbers: a string
++/* luminous: `op1 + op2` (borrowed) when they are not both numbers: a string
 +   and a string or an int32 concatenated directly, else as the operator
 +   does. */
 +JSValue JS_AddValues(JSContext *ctx, JSValueConst op1, JSValueConst op2)
@@ -2829,7 +2829,7 @@
      return sh;
  }
  
-+/* tsaot: the finalization of a dead shape, while sweeping (its cell is
++/* luminous: the finalization of a dead shape, while sweeping (its cell is
 +   freed by the collector). */
  static void js_free_shape0(JSRuntime *rt, JSShape *sh)
  {
@@ -2851,7 +2851,7 @@
 -    js_free_rt(rt, get_alloc_from_shape(sh));
  }
  
-+/* tsaot: the count is of the references taken (and not all released: the
++/* luminous: the count is of the references taken (and not all released: the
 +   objects that die keep theirs), so it is never under the references
 +   held: a shape with a count of one has a single holder, which may
 +   change it in place. The collector frees the shape. */
@@ -2869,7 +2869,7 @@
  }
  
  /* make space to hold at least 'count' properties */
-+/* tsaot: the property array of a plain object starts in the object's own
++/* luminous: the property array of a plain object starts in the object's own
 +   allocation (see JS_NewObjectFromShape), and moves out when it grows. */
 +static inline bool js_inline_props(JSObject *p)
 +{
@@ -2887,7 +2887,7 @@
 +    np = js_malloc(ctx, sizeof(JSProperty) * new_count);
 +    if (np) {
 +        memcpy(np, p->prop, sizeof(JSProperty) * old_count);
-+        /* (tsaot: freed by its finalization) */
++        /* (luminous: freed by its finalization) */
 +        js_gc_set_fin(p);
 +    }
 +    return np;
@@ -3056,12 +3056,12 @@
              p->prop[i] = props[i];
 +    } else if (sh->prop_count > 0 && class_id != JS_CLASS_ARRAY &&
 +               class_id != JS_CLASS_C_FUNCTION) {
-+        /* (tsaot: the caller sets them, before anything that may collect,
++        /* (luminous: the caller sets them, before anything that may collect,
 +           but a collection now sees no stale values) */
 +        memset(p->prop, 0, sizeof(JSProperty) * sh->prop_count);
      }
 +    add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
-+    /* (tsaot: its property array, a class's data, are released by its
++    /* (luminous: its property array, a class's data, are released by its
 +       finalization) */
 +    if (class_id != JS_CLASS_OBJECT)
 +        js_gc_set_fin(p);
@@ -3100,7 +3100,7 @@
      uint8_t length;
      uint8_t data_len;
      uint16_t magic;
-+    /* tsaot: constructed as an ordinary function is (see
++    /* luminous: constructed as an ordinary function is (see
 +       JS_SetCFunctionDataConstructor) */
 +    uint8_t ordinary_ctor;
      JSValue data[];
@@ -3120,7 +3120,7 @@
      if (!s)
          return JS_EXCEPTION; // can't really happen
 +    if (unlikely(flags & JS_CALL_FLAG_CONSTRUCTOR) && s->ordinary_ctor) {
-+        /* tsaot: `this` an object of new.target's prototype, the result
++        /* luminous: `this` an object of new.target's prototype, the result
 +           unless the call returns an object (this_val: new.target). */
 +        JSValue obj = js_create_from_ctor(ctx, this_val, JS_CLASS_OBJECT);
 +        if (JS_IsException(obj))
@@ -3145,7 +3145,7 @@
      return ret;
  }
  
-+/* tsaot: make function `func` (of JS_NewCFunctionData*) an ordinary
++/* luminous: make function `func` (of JS_NewCFunctionData*) an ordinary
 +   function: a constructor, with a `prototype` made when first read, as a
 +   bytecode function has. */
 +int JS_SetCFunctionDataConstructor(JSContext *ctx, JSValueConst func)
@@ -3271,7 +3271,7 @@
 -    }
 -}
 -
-+/* tsaot: var refs, objects, strings, function bytecode and the other
++/* luminous: var refs, objects, strings, function bytecode and the other
 +   cells are freed by the collector (js_gc_collect) once unreachable, not
 +   when released. */
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
@@ -3326,7 +3326,7 @@
 +        mark_func(rt, &it->shape->header);
  }
  
-+/* tsaot: the finalization of a dead object (one with its fin bit: a class
++/* luminous: the finalization of a dead object (one with its fin bit: a class
 +   finalizer, a property array of its own or weak references), while
 +   sweeping: what it owns outside the GC heap is released; its memory and
 +   the cells it refers to the collector frees. */
@@ -3523,7 +3523,7 @@
  void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
  {
      if (JS_VALUE_HAS_REF_COUNT(val)) {
-+        /* tsaot: an old cell, which a minor collection does not trace */
++        /* luminous: an old cell, which a minor collection does not trace */
 +        if (rt->gc_heap.minor && mark_func == js_gc_trace_mark &&
 +            js_rc(JS_VALUE_GET_PTR(val))->mark)
 +            return;
@@ -3536,7 +3536,7 @@
 +        case JS_TAG_STRING_ROPE:
 +        case JS_TAG_BIG_INT:
 +        case JS_TAG_SYMBOL:
-+            /* tsaot: GC cells too, which the tracer marks (the cycle
++            /* luminous: GC cells too, which the tracer marks (the cycle
 +               collector does not count them) */
 +            if (rt->gc_heap.tracing)
 +                mark_func(rt, JS_VALUE_GET_PTR(val));
@@ -3549,7 +3549,7 @@
              /* mark all the fields */
              prs = get_shape_prop(sh);
 +            if (likely(!sh->special_props)) {
-+                /* tsaot: data properties only (a deleted one holds
++                /* luminous: data properties only (a deleted one holds
 +                   undefined). */
 +                for(i = 0; i < sh->prop_count; i++)
 +                    JS_MarkValue(rt, p->prop[i].u.value, mark_func);
@@ -3584,7 +3584,7 @@
  }
  
 -static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
-+/* ---- tsaot: the collector ----
++/* ---- luminous: the collector ----
 +   Mark-sweep, not moving. Marks what is reachable from the roots: the
 +   contexts, the pending exception and jobs, the atoms referenced as atoms,
 +   the runtime's mark hooks (values in C structures) and, conservatively,
@@ -4859,7 +4859,7 @@
          atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
 +    } else if (tag == JS_TAG_STRING &&
 +               JS_VALUE_GET_STRING(val)->atom_type == JS_ATOM_TYPE_STRING) {
-+        /* tsaot: an atom's own string (a literal): its atom, found by its
++        /* luminous: an atom's own string (a literal): its atom, found by its
 +           hash, without hashing the characters again. */
 +        atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, JS_VALUE_GET_STRING(val)));
      } else {
@@ -4902,7 +4902,7 @@
          return -1;
      }
 -    new_size = max_uint32(new_len, new_size);
-+    /* tsaot: room for 8 elements at least (small arrays grew 1, 2, 3...) */
++    /* luminous: room for 8 elements at least (small arrays grew 1, 2, 3...) */
 +    new_size = max_uint32(new_len, max_uint32(new_size, 8));
      new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
      if (!new_array_prop)
@@ -5065,7 +5065,7 @@
      return ret;
  }
  
-+/* tsaot: defining element `idx` of a fast array that has `idx` elements,
++/* luminous: defining element `idx` of a fast array that has `idx` elements,
 +   as an enumerable, writable, configurable data property (as builtins
 +   making arrays do: map, filter, ...), appends it. */
 +static inline JSObject *js_appendable(JSValueConst obj, int64_t idx, int flags)
@@ -5104,7 +5104,7 @@
                                         int64_t idx, JSValue val, int flags)
  {
 -    return JS_DefinePropertyValueValue(ctx, this_obj, js_int64(idx),
-+    /* tsaot: (the next element of a fast array: appended) */
++    /* luminous: (the next element of a fast array: appended) */
 +    return JS_DefinePropertyValueInt64(ctx, this_obj, idx,
                                         val, flags | JS_PROP_CONFIGURABLE |
                                         JS_PROP_ENUMERABLE | JS_PROP_WRITABLE);
@@ -5170,7 +5170,7 @@
      TON_FLAG_NUMERIC,
  } JSToNumberHintEnum;
  
-+/* tsaot: a decimal integer of 1 to 9 digits after an optional sign at
++/* luminous: a decimal integer of 1 to 9 digits after an optional sign at
 +   the start of 8-bit string `s` (at its end too if `whole`), not -0: its
 +   value; else false (the caller converts as usual). */
 +static bool js_string_small_int(JSValueConst s, bool whole, bool hex_prefix, int32_t *pres)
@@ -5216,7 +5216,7 @@
              size_t len;
 +            int32_t v;
  
-+            /* tsaot: a small decimal integer, directly */
++            /* luminous: a small decimal integer, directly */
 +            if (js_string_small_int(val, true, false, &v)) {
 +                JS_FreeValue(ctx, val);
 +                return js_int32(v);
@@ -5228,7 +5228,7 @@
  
  JSValue JS_ToString(JSContext *ctx, JSValueConst val)
  {
-+    /* tsaot: (strings first) */
++    /* luminous: (strings first) */
 +    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
 +        return js_dup(val);
      return JS_ToStringInternal(ctx, val, /*flags*/0);
@@ -5288,7 +5288,7 @@
          /* not compatible with IEEE 754 */
          d = NAN;
 +    } else if (b == 2) {
-+        /* tsaot: the correctly rounded square, as native code computes it
++        /* luminous: the correctly rounded square, as native code computes it
 +           (libm's pow may be off by a fraction of an ulp). */
 +        d = a * a;
      } else {
@@ -5793,7 +5793,7 @@
      return ret_val;
  }
  
-+/* tsaot: through JS_CallFast, so that builtins calling back (sort
++/* luminous: through JS_CallFast, so that builtins calling back (sort
 +   comparators, map callbacks, ...) enter native functions directly. */
  JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                  int argc, JSValueConst *argv)
@@ -5817,7 +5817,7 @@
      alloc_size = sizeof(JSValue) * max_int(local_count, 1) +
          sizeof(JSVarRef *) * b->var_ref_count;
 -    sf->arg_buf = js_malloc(ctx, alloc_size);
-+    /* tsaot: traced (a running coroutine's frame is held by the native
++    /* luminous: traced (a running coroutine's frame is held by the native
 +       stack only) */
 +    sf->arg_buf = JS_MallocTraced(ctx, alloc_size);
      if (!sf->arg_buf)
@@ -5827,7 +5827,7 @@
      sf = &s->frame;
      JS_MarkValue(rt, sf->cur_func, mark_func);
      JS_MarkValue(rt, s->this_val, mark_func);
-+    /* (tsaot: the frame, a traced block) */
++    /* (luminous: the frame, a traced block) */
 +    if (sf->arg_buf)
 +        mark_func(rt, (JSGCObjectHeader *)sf->arg_buf);
      if (sf->cur_sp) {
@@ -5851,7 +5851,7 @@
 +    ret = JS_CallInternal(ctx, func_obj, s->this_val, JS_UNDEFINED,
 +                          s->argc, vc(s->frame.arg_buf),
 +                          JS_CALL_FLAG_GENERATOR);
-+    /* (tsaot: the frame, written while it ran) */
++    /* (luminous: the frame, written while it ran) */
 +    if (s->frame.arg_buf)
 +        js_gc_wb(ctx->rt, s->frame.arg_buf);
 +    return ret;
@@ -5968,7 +5968,7 @@
      JSGeneratorData *s;
  
 -    s = js_mallocz(ctx, sizeof(*s));
-+    /* (tsaot: a traced block, its frame seen through it until the
++    /* (luminous: a traced block, its frame seen through it until the
 +       generator object holds it) */
 +    s = JS_MallocTraced(ctx, sizeof(*s));
      if (!s)
@@ -5984,7 +5984,7 @@
 +    JSGeneratorData *s;
 +    JSValue obj;
 +
-+    /* (tsaot: a traced block, its frame seen through it until the
++    /* (luminous: a traced block, its frame seen through it until the
 +       generator object holds it) */
 +    s = JS_MallocTraced(ctx, sizeof(*s));
 +    if (!s) {
@@ -6051,7 +6051,7 @@
 -    js_free_rt(rt, s);
 -}
 -
-+/* (tsaot: freed by the collector, its finalization terminating it) */
++/* (luminous: freed by the collector, its finalization terminating it) */
  static void js_async_function_free(JSRuntime *rt, JSAsyncFunctionData *s)
  {
 -    if (--JS_REF_COUNT(s) == 0) {
@@ -6086,7 +6086,7 @@
          return JS_EXCEPTION;
      }
      s->is_active = true;
-+    /* (tsaot: the frame, made after s) */
++    /* (luminous: the frame, made after s) */
 +    js_gc_wb(ctx->rt, s);
      /* the body runs immediately (up to the first await), so the frame must
         already know its owning coroutine to root captured locals */
@@ -6095,7 +6095,7 @@
      JSAsyncGeneratorStateEnum state;
      JSAsyncFunctionState func_state;
      struct list_head queue; /* list of JSAsyncGeneratorRequest.link */
-+    /* native body (tsaot): a step function over a frame, instead of
++    /* native body (luminous): a step function over a frame, instead of
 +       func_state; and how to resume it (GEN_MAGIC_x, value) */
 +    JSNativeGeneratorStep *native_step;
 +    JSValue native_frame;
@@ -6273,7 +6273,7 @@
      JSAsyncGeneratorData *s;
  
 -    s = js_mallocz(ctx, sizeof(*s));
-+    /* (tsaot: a traced block, its frame seen through it until the
++    /* (luminous: a traced block, its frame seen through it until the
 +       generator object holds it) */
 +    s = JS_MallocTraced(ctx, sizeof(*s));
      if (!s)
@@ -6293,7 +6293,7 @@
 +    JSAsyncGeneratorData *s;
 +    JSValue obj;
 +
-+    /* (tsaot: a traced block, its frame seen through it until the
++    /* (luminous: a traced block, its frame seen through it until the
 +       generator object holds it) */
 +    s = JS_MallocTraced(ctx, sizeof(*s));
 +    if (!s) {
@@ -6402,7 +6402,7 @@
 -    } else {
 -        js_free_rt(rt, b);
 -    }
-+    /* (tsaot: its finalization, while sweeping: the cell is freed by the
++    /* (luminous: its finalization, while sweeping: the cell is freed by the
 +       collector) */
  }
  
@@ -6411,7 +6411,7 @@
              is_strict_mode = true;
          }
      }
-+    /* (tsaot: no collection while the compiler holds values in its
++    /* (luminous: no collection while the compiler holds values in its
 +       structures) */
 +    ctx->rt->gc_heap.disabled++;
      fd = js_new_function_def(ctx, NULL, true, false, filename, line, 1);
@@ -6454,7 +6454,7 @@
          s->first_atom = JS_ATOM_END;
      else
          s->first_atom = 1;
-+    /* (tsaot: no collection while the reader holds values in its
++    /* (luminous: no collection while the reader holds values in its
 +       structures) */
 +    ctx->rt->gc_heap.disabled++;
      if (JS_ReadObjectAtoms(s)) {
@@ -6489,7 +6489,7 @@
      return js_dup(this_val);
  }
  
-+/* (tsaot: `*fresh`, when not NULL, is set if the Array constructor made the
++/* (luminous: `*fresh`, when not NULL, is set if the Array constructor made the
 +   result itself, so that no other code holds it.) */
  static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
 -                                     JSValueConst len_val)
@@ -6562,7 +6562,7 @@
 +        ret = JS_ArraySpeciesCreate(ctx, obj, js_int64(len), NULL);
          if (JS_IsException(ret))
              goto exception;
-+        /* tsaot: the result of mapping a dense array gets room for all
++        /* luminous: the result of mapping a dense array gets room for all
 +           its elements at once (appended in place below). */
 +        if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT &&
 +            JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_ARRAY &&
@@ -6583,7 +6583,7 @@
      }
      n = 0;
  
-+    /* tsaot: a callback with a native fast entry is entered directly, and
++    /* luminous: a callback with a native fast entry is entered directly, and
 +       the elements of a fast array read in place. */
 +    JSCFunctionDataRecord *fast_rec = NULL;
 +    if (!(special & special_TA) && js_is_c_function_data(func)) {
@@ -6629,7 +6629,7 @@
                  break;
              case special_map:
 +                {
-+                    /* tsaot: appended in place (inside the length) */
++                    /* luminous: appended in place (inside the length) */
 +                    JSObject *rp = js_appendable(ret, k, JS_PROP_C_W_E);
 +                    if (rp && k < rp->u.array.u1.size &&
 +                        JS_VALUE_GET_TAG(rp->prop[0].u.value) == JS_TAG_INT &&
@@ -6647,7 +6647,7 @@
              }
          }
      }
-+    /* tsaot: as in js_array_every. */
++    /* luminous: as in js_array_every. */
 +    JSCFunctionDataRecord *fast_rec = NULL;
 +    if (!(special & special_TA) && js_is_c_function_data(func)) {
 +        fast_rec = JS_VALUE_GET_OBJ(func)->u.c_function_data_record;
@@ -6823,12 +6823,12 @@
      int exception;
      int has_method;
      JSValueConst method;
-+    /* tsaot: the method's native fast entry, if it has one (see
++    /* luminous: the method's native fast entry, if it has one (see
 +       js_sort_fast_entry). */
 +    JSCFunctionDataRecord *fast_rec;
  };
  
-+/* tsaot: a comparator with a native fast entry is called directly, after
++/* luminous: a comparator with a native fast entry is called directly, after
 +   one stack check (as js_array_every does). */
 +static int js_sort_fast_entry(JSContext *ctx, struct array_sort_context *psc)
 +{
@@ -6866,7 +6866,7 @@
      return 0;
  }
  
-+/* tsaot: `arr.sort(cmp)` with `cmp` a natively compiled comparator, the
++/* luminous: `arr.sort(cmp)` with `cmp` a natively compiled comparator, the
 +   sort itself compiled with it (see JS_SortNative). */
 +typedef int JSNativeSorter(JSContext *ctx, JSValue *a, JSValue *tmp, int64_t n);
 +
@@ -7013,7 +7013,7 @@
      int32_t radix;
      JSValue ret;
  
-+    /* tsaot: small decimal integers (radix 10, or none), directly */
++    /* luminous: small decimal integers (radix 10, or none), directly */
 +    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING) {
 +        int32_t v;
 +        bool none = JS_IsUndefined(argv[1]);
@@ -7034,7 +7034,7 @@
 -                    return i;
 -            }
 +        if ((c & ~0xff) == 0 && from < len) {
-+            /* tsaot: memchr (vectorized) rather than a byte loop. */
++            /* luminous: memchr (vectorized) rather than a byte loop. */
 +            const uint8_t *s8 = str8(p), *q = memchr(s8 + from, c, len - from);
 +            return q ? q - s8 : -1;
          }
@@ -7062,7 +7062,7 @@
      if (len2 == 0)
          return from;
 +    if (!p1->is_wide_char && !p2->is_wide_char) {
-+        /* tsaot: the first character with memchr, among the positions a
++        /* luminous: the first character with memchr, among the positions a
 +           match can start at, then the rest. */
 +        const uint8_t *s = str8(p1), *t = str8(p2), *q;
 +        int last = len1 - len2;
@@ -7091,7 +7091,7 @@
      ret = -1;
 -    if (len >= v_len && inc * (stop - start) >= 0) {
 +    if (inc > 0) {
-+        /* tsaot: forward, by the first character (string_indexof). */
++        /* luminous: forward, by the first character (string_indexof). */
 +        if (len >= v_len && start <= stop)
 +            ret = string_indexof(p, p1, start);
 +    } else if (len >= v_len && inc * (stop - start) >= 0) {
@@ -7102,7 +7102,7 @@
      return ret;
  }
  
-+/* tsaot: a String.prototype method on string `str`, its `argc` (<= 2)
++/* luminous: a String.prototype method on string `str`, its `argc` (<= 2)
 +   arguments in argv[0..2) (undefined past argc), all borrowed: what the
 +   builtin returns, without the call's frame; slice and substring take
 +   int32 bounds directly. */
@@ -7168,7 +7168,7 @@
      JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, re->pattern));
  }
  
-+/* (tsaot: the strings are cells the collector must see) */
++/* (luminous: the strings are cells the collector must see) */
 +static void js_regexp_mark(JSRuntime *rt, JSValueConst val,
 +                           JS_MarkFunc *mark_func)
 +{
@@ -7187,7 +7187,7 @@
          JSString *p = JS_VALUE_GET_STRING(ret);
          p->kind = JS_STRING_KIND_INDIRECT;
          p->len = re_bytecode_len;
-+        /* (tsaot: the bytecode is freed by its finalization) */
++        /* (luminous: the bytecode is freed by its finalization) */
 +        js_gc_set_fin(p);
      }
      return ret;
@@ -7196,7 +7196,7 @@
      return JS_EXCEPTION;
  }
  
-+/* tsaot: a regular expression literal's object: pattern and flags (borrowed
++/* luminous: a regular expression literal's object: pattern and flags (borrowed
 +   strings), their bytecode in *bc (compiled into it the first time, while
 +   it is not a string; the caller keeps it alive). */
 +JSValue JS_NewRegExpLiteral(JSContext *ctx, JSValueConst pattern, JSValueConst flags, JSValue *bc)
@@ -7226,7 +7226,7 @@
  
  /* delete portions of a string that match a given regex */
 -static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue arg)
-+/* (tsaot: each match replaced by `rep`, a string without `$`, or deleted
++/* (luminous: each match replaced by `rep`, a string without `$`, or deleted
 +   when it is NULL) */
 +static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue arg, JSString *rep)
  {
@@ -7258,7 +7258,7 @@
 -        /* use faster version for simple cases */
 -        res = JS_RegExpDelete(ctx, rx, str);
 -        goto done;
-+    /* (tsaot: also a replacement without `$`, which is inserted as is;
++    /* (luminous: also a replacement without `$`, which is inserted as is;
 +       an exception while checking is one) */
 +    if (rp && is_global && string_indexof_char(rp, '$', 0) < 0) {
 +        int standard = js_is_standard_regexp(ctx, rx);
@@ -7287,7 +7287,7 @@
              }
          }
 -        if (flags & JS_PROP_HAS_WRITABLE) {
-+        /* tsaot: (as ECMA-262 10.5.6 step 16.c) a non-configurable,
++        /* luminous: (as ECMA-262 10.5.6 step 16.c) a non-configurable,
 +           writable data property of the target cannot be reported made
 +           non-writable; anything else compatible can be. */
 +        if ((flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE) {
@@ -7301,7 +7301,7 @@
 +static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
 +                          int argc, JSValueConst *argv, int magic);
 +
-+/* tsaot: whether `new Map(arr)` / `new Set(arr)` (`magic`) may take the
++/* luminous: whether `new Map(arr)` / `new Set(arr)` (`magic`) may take the
 +   elements of `arr` directly and call `adder` as js_map_set: `arr` is an
 +   array of the initial shape (no own properties but `length`), iterated
 +   by the original Array.prototype[Symbol.iterator] and array iterator
@@ -7359,7 +7359,7 @@
 -            goto fail;
 -        next_method = JS_GetProperty(ctx, iter, JS_ATOM_next);
 -        if (JS_IsException(next_method))
-+        /* tsaot: an array's elements taken as its iterator would take
++        /* luminous: an array's elements taken as its iterator would take
 +           them, and the builtin adder called directly, while the array
 +           stays a fast array of the initial shape (a Map entry's getters
 +           could change it): then its iterator from where this stopped. */
@@ -7438,7 +7438,7 @@
 -    case JS_TAG_STRING:
 -        h = hash_string(JS_VALUE_GET_STRING(key), 0);
 +    case JS_TAG_STRING: {
-+        /* tsaot: a string that is not an atom keeps its hash in hash_next
++        /* luminous: a string that is not an atom keeps its hash in hash_next
 +           (0 until computed; cleared where it grows in place). */
 +        JSString *p = JS_VALUE_GET_STRING(key);
 +        if (p->atom_type == 0) {
@@ -7458,7 +7458,7 @@
          break;
      }
 -    return h ^ ctx->hash_seed ^ hash32(tag);
-+    /* tsaot: mixed (murmur3's finalizer), as the table takes the low bits:
++    /* luminous: mixed (murmur3's finalizer), as the table takes the low bits:
 +       a small integer's double differs from another's in the high bits
 +       only, and a pointer is aligned, so that without it they all fell
 +       into a few buckets. */
@@ -7473,7 +7473,7 @@
  
 -static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
 -                                    JSValueConst key)
-+/* (tsaot) The record of `key`, of hash `h`: records of other hashes are
++/* (luminous) The record of `key`, of hash `h`: records of other hashes are
 +   passed over without comparing keys, and the same value (bits and tag)
 +   matches without one. */
 +static JSMapRecord *map_find_record_hash(JSContext *ctx, JSMapState *s,
@@ -7538,7 +7538,7 @@
  
 -static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
 -                                   JSValueConst key)
-+/* (tsaot) After a record of `s` is given a key or value: a WeakMap's
++/* (luminous) After a record of `s` is given a key or value: a WeakMap's
 +   values are traced from their keys. */
 +static void js_map_record_wb(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
 +{
@@ -7650,7 +7650,7 @@
      return js_bool(mr != NULL);
  }
  
-+/* tsaot: see quickjs.h (no call frame: as JS_CallStringFn). */
++/* luminous: see quickjs.h (no call frame: as JS_CallStringFn). */
 +JSValue JS_CallMapFn(JSContext *ctx, JSValueConst this_val, int which, int argc, JSValueConst *argv)
 +{
 +    switch (which) {
@@ -8173,7 +8173,7 @@
 +    mark_func(rt, &((JSShape *)shape)->header);
 +}
 +
-+/* ---- for natively compiled code (tsaot) ---- */
++/* ---- for natively compiled code (luminous) ---- */
 +
 +JSValue JS_GetIteratorObject(JSContext *ctx, JSValueConst obj, bool is_async)
 +{
@@ -8530,7 +8530,7 @@
 -                if (p->free_mark || JS_GC_MARK(p))
 -                    enqueue = false;
 -            }
-+            /* tsaot: (while sweeping) unless the callback or the held
++            /* luminous: (while sweeping) unless the callback or the held
 +               value is unreachable too, the callback is queued after the
 +               sweep (see js_gc_after_sweep). */
 +            bool enqueue = !rt->in_free && js_gc_value_traced(fre->cb) &&
@@ -8572,14 +8572,14 @@
      /* Add the weak reference */
      wr->next_weak_ref = *pwr;
      *pwr = wr;
-+    /* (tsaot: the records are released by its finalization; a symbol's
++    /* (luminous: the records are released by its finalization; a symbol's
 +       when it leaves the atom table) */
 +    if (JS_VALUE_GET_TAG(target) == JS_TAG_OBJECT)
 +        js_gc_set_fin(JS_VALUE_GET_OBJ(target));
 +    return 0;
 +}
 +
-+/* tsaot: the entry of rt->weak_heads listing the weak references to `p`,
++/* luminous: the entry of rt->weak_heads listing the weak references to `p`,
 +   made if it has none (-1 when out of memory). */
 +static int js_weak_index_new(JSContext *ctx, JSObject *p)
 +{
@@ -8630,7 +8630,7 @@
      js_free_rt(rt, ts);
  }
  
-+/* tsaot: the values the lists hold, for the collector (which does not
++/* luminous: the values the lists hold, for the collector (which does not
 +   see this state otherwise). */
 +static void js_std_mark(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func)
 +{
@@ -8680,7 +8680,7 @@
      }
  
 +    {
-+        /* tsaot: an unanchored search (the loop lre_compile puts first)
++        /* luminous: an unanchored search (the loop lre_compile puts first)
 +           whose body starts with a character, case-sensitively: the body
 +           is tried only where that character is, found by memchr (or a
 +           scan of 16-bit units), as the loop would try it at every

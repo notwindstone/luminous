@@ -10,25 +10,25 @@
 //! ```
 //! becomes
 //! ```js
-//! import "tsaot:native"; import { __tsaot_bind, ... } from "tsaot:native";
-//! const fib = __tsaot_bind(0, __tsaot_fb_fib);      // first statement
-//! let count = __tsaot_init(0, 0);                    // cell initialized
-//! function __tsaot_fb_fib(n) { ... }                 // the fallback
-//! const sq = __tsaot_bind(1, (x) => x * x);
-//! class P { norm() { ... } };__tsaot_method(2, P, 0, "norm");
-//! __tsaot_m.count++;                                 // through the cell
+//! import "luminous:native"; import { __lum_bind, ... } from "luminous:native";
+//! const fib = __lum_bind(0, __lum_fb_fib);      // first statement
+//! let count = __lum_init(0, 0);                    // cell initialized
+//! function __lum_fb_fib(n) { ... }                 // the fallback
+//! const sq = __lum_bind(1, (x) => x * x);
+//! class P { norm() { ... } };__lum_method(2, P, 0, "norm");
+//! __lum_m.count++;                                 // through the cell
 //! ```
-//! - `__tsaot_bind(i, fallback)` creates the function object of native
+//! - `__lum_bind(i, fallback)` creates the function object of native
 //!   function `i`, which calls `fallback` when the arguments do not match the
 //!   declared types. Declarations are bound in the first statement of the
 //!   module body, so no code can observe them before they are initialized.
-//! - `__tsaot_method` replaces a class method the same way.
-//! - Module bindings that native code uses live in cells: `__tsaot_init`
+//! - `__lum_method` replaces a class method the same way.
+//! - Module bindings that native code uses live in cells: `__lum_init`
 //!   stores the value when the declaration runs, and bindings that are
-//!   reassigned are accessed through `__tsaot_m` everywhere.
+//!   reassigned are accessed through `__lum_m` everywhere.
 //!
 //! The bare import is emitted even without native functions: initializing
-//! the `tsaot:native` module is what locks the `Math` and `Number` builtins.
+//! the `luminous:native` module is what locks the `Math` and `Number` builtins.
 
 use std::path::Path;
 
@@ -44,19 +44,19 @@ use std::collections::HashMap;
 
 use crate::{Analysis, CellInitSite, IntWrapKind, NativeSite};
 
-pub const NATIVE_MODULE: &str = "tsaot:native";
-pub const BIND_FN: &str = "__tsaot_bind";
+pub const NATIVE_MODULE: &str = "luminous:native";
+pub const BIND_FN: &str = "__lum_bind";
 
 pub fn fallback_name(name: &str) -> String {
-    format!("__tsaot_fb_{name}")
+    format!("__lum_fb_{name}")
 }
 
-pub const INIT_FN: &str = "__tsaot_init";
-pub const CELLS_OBJ: &str = "__tsaot_m";
-pub const METHOD_FN: &str = "__tsaot_method";
-pub const CLASS_FN: &str = "__tsaot_class";
-pub const STRUCT_FN: &str = "__tsaot_struct";
-pub const SARR_FN: &str = "__tsaot_sarr";
+pub const INIT_FN: &str = "__lum_init";
+pub const CELLS_OBJ: &str = "__lum_m";
+pub const METHOD_FN: &str = "__lum_method";
+pub const CLASS_FN: &str = "__lum_class";
+pub const STRUCT_FN: &str = "__lum_struct";
+pub const SARR_FN: &str = "__lum_sarr";
 
 /// A JS string literal for `s`.
 fn js_string(s: &str) -> String {

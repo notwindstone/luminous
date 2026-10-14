@@ -154,20 +154,20 @@ pub enum Region {
     Header,
     /// Typed array elements.
     Elem,
-    /// `aot type` objects' storage, and arrays' of them (`TsaotStruct`,
-    /// `TsaotStructArray`, not their items).
+    /// `aot type` objects' storage, and arrays' of them (`LumStruct`,
+    /// `LumStructArray`, not their items).
     Struct,
-    /// The inline caches (`tsaot_ics`), which native code only reads.
+    /// The inline caches (`lum_ics`), which native code only reads.
     Ic,
     /// Tables that only the runtime writes while native code runs
-    /// (`tsaot_privates`, `tsaot_homes`).
+    /// (`lum_privates`, `lum_homes`).
     Table,
     /// Tables filled before any native code runs and never written again
-    /// (`tsaot_atoms`, `tsaot_strings`, `tsaot_shapes`, the class ids).
+    /// (`lum_atoms`, `lum_strings`, `lum_shapes`, the class ids).
     Const,
-    /// `tsaot_unwinding`.
+    /// `lum_unwinding`.
     Flag,
-    /// `tsaot_stack_limit`.
+    /// `lum_stack_limit`.
     Limit,
     /// The allocator's state that native code allocating objects inline
     /// reads and writes: the runtime's counters and free-block caches, the

@@ -6,7 +6,7 @@
 //! either store, pass on to a callee that takes ownership, or free.
 //!
 //! Exceptions: helpers report them by returning `JS_EXCEPTION` (or a negative
-//! int); native callees by setting `tsaot_unwinding`. Either way control goes
+//! int); native callees by setting `lum_unwinding`. Either way control goes
 //! to an exception edge, which frees the owned temporaries that are live at
 //! that point (`Lower::temps`) and jumps to the innermost handler: a `catch`
 //! or `finally` block, or the function's exception exit, which frees all
@@ -19,7 +19,7 @@ use crate::mir::{
     Block, BlockArg, FloatCC, FuncRef, FunctionBuilder, GlobalValue, Ins, IntCC, MemFlags, Region, SigRef, StackSlot,
     StackSlotData, StackSlotKind, Type, Value, Variable,
 };
-use tsaot_front::ir::{
+use luminous_front::ir::{
     self, AnyBinOp, AnyCmpOp, AnyUnOp, ArrKind, BinOp, CmpOp, Expr, ExprKind, Key, LogicalOp, LoopKind,
     MAYBE_F64_UNDEFINED, MathFn, Stmt, Ty, UnOp,
 };
@@ -167,7 +167,7 @@ enum LVar {
 #[derive(Clone, Copy)]
 pub(crate) enum Exit {
     /// Return from the IR function (on exception: set
-    /// `tsaot_unwinding` and return placeholder values).
+    /// `lum_unwinding` and return placeholder values).
     Return,
     /// Jump to a block: for `ret`, with the return value as its parameters;
     /// for `unwind`, without parameters.
@@ -218,7 +218,7 @@ impl Method {
     }
 }
 
-/// Indices in `tsaot_shapes` (see `tsaot_rt.h`).
+/// Indices in `lum_shapes` (see `luminous_rt.h`).
 /// The shape of a fresh array (`[]`): `length` writable, own properties
 /// none else, the original prototype.
 const SHAPE_ARRAY: i32 = 12;
@@ -234,7 +234,7 @@ const PIN_ARRAY_SORT: i32 = 34;
 const PIN_STRING_FNS: i32 = 35;
 /// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
 const PIN_MAP_FNS: i32 = 41;
-/// `TSAOT_IC_STRING`: a method of String.prototype read from a string.
+/// `LUM_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
 pub(crate) struct Env {
@@ -248,20 +248,20 @@ pub(crate) struct Env {
     pub cells: GlobalValue,
     pub strings: GlobalValue,
     pub atoms: GlobalValue,
-    /// `tsaot_shapes`: the shapes of a pristine typed array (by kind), then
+    /// `lum_shapes`: the shapes of a pristine typed array (by kind), then
     /// of a pristine array.
     pub shapes: GlobalValue,
-    /// `tsaot_ics`: inline caches, and the next free one.
+    /// `lum_ics`: inline caches, and the next free one.
     pub ics: GlobalValue,
-    /// `tsaot_privates` / `tsaot_homes`: private name values and home objects
+    /// `lum_privates` / `lum_homes`: private name values and home objects
     /// of classes (see `ir::Module`).
     pub privates: GlobalValue,
     pub homes: GlobalValue,
-    /// `tsaot_struct_class`: the class of `aot type` objects.
+    /// `lum_struct_class`: the class of `aot type` objects.
     pub struct_class: GlobalValue,
-    /// `tsaot_sarr_class`: the class of arrays of `aot type` objects.
+    /// `lum_sarr_class`: the class of arrays of `aot type` objects.
     pub sarr_class: GlobalValue,
-    /// `tsaot_record_shapes`: per record type, its shape once learned.
+    /// `lum_record_shapes`: per record type, its shape once learned.
     pub record_shapes: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
@@ -276,7 +276,7 @@ pub(crate) struct Env {
     pub methods: std::rc::Rc<HashMap<ir::AtomId, Method>>,
     /// Per function: it can neither throw nor call (see `nothrow_leaf`).
     pub nothrow: std::rc::Rc<Vec<bool>>,
-    /// JS entries (`tsaot_fast_<i>`), by `FuncId`.
+    /// JS entries (`lum_fast_<i>`), by `FuncId`.
     pub fast: Vec<FuncRef>,
     /// Return types, by `FuncId`.
     pub rets: std::rc::Rc<Vec<Ty>>,
@@ -713,7 +713,7 @@ impl Lower {
         self.b.switch_to_block(throw);
         let atom = self.atom(self.names[l].expect("boxed locals are named"));
         let ctx = self.ctx;
-        self.helper("tsaot_throw_uninitialized_atom", &[ctx, atom]);
+        self.helper("lum_throw_uninitialized_atom", &[ctx, atom]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(cont);
@@ -729,7 +729,7 @@ impl Lower {
             let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let out_addr = self.b.ins().stack_addr(self.ptr, out, 0);
             let ctx = self.ctx;
-            let r = self.helper("tsaot_box_new", &[ctx, out_addr]);
+            let r = self.helper("lum_box_new", &[ctx, out_addr]);
             self.check_value(r[1]);
             let new_slot = self.b.ins().stack_load(self.ptr, I64, out, 0);
             self.b.def_var(op, r[0]);
@@ -903,7 +903,7 @@ impl Lower {
         self.b.ins().brif(overflow, throw, &[], body, &[]);
         self.b.switch_to_block(throw);
         let ctx = self.ctx;
-        self.helper("tsaot_stack_overflow", &[ctx]);
+        self.helper("lum_stack_overflow", &[ctx]);
         let target = self.exc_exit;
         self.b.ins().jump(target, &[]);
         self.b.switch_to_block(body);
@@ -1875,7 +1875,7 @@ impl Lower {
                 let index = self.b.ins().iconst(I32, (self.env.closure_base + cid) as i64);
                 let n = self.b.ins().iconst(I32, vals.len() as i64);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_make_closure", &[ctx, index, n, data]);
+                let r = self.helper("lum_make_closure", &[ctx, index, n, data]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -1944,7 +1944,7 @@ impl Lower {
                 let ctx = self.ctx;
                 let k = self.b.ins().iconst(I32, *layout as i64);
                 let m = self.b.ins().iconst(I32, *mask as i64);
-                let r = self.helper("tsaot_struct_new", &[ctx, k, m]);
+                let r = self.helper("lum_struct_new", &[ctx, k, m]);
                 self.check_value(r[1]);
                 let obj = V::Any(r[0], r[1]);
                 self.hold(obj);
@@ -1956,7 +1956,7 @@ impl Lower {
                 let l = &self.env.layouts[*layout as usize];
                 let check = l.members.len() > 1 && fields.iter().any(|&(fi, _)| !l.fields[fi as usize].simple);
                 if check {
-                    let ok = self.helper("tsaot_struct_validate", &[ctx, r[0], r[1]]);
+                    let ok = self.helper("lum_struct_validate", &[ctx, r[0], r[1]]);
                     self.check_int(ok[0]);
                 }
                 self.release(obj);
@@ -1966,7 +1966,7 @@ impl Lower {
                 let (p, t) = self.expr(x).any();
                 let ctx = self.ctx;
                 let kv = self.b.ins().iconst(I32, *k as i64);
-                let r = self.helper("tsaot_sarr_from", &[ctx, kv, p, t]);
+                let r = self.helper("lum_sarr_from", &[ctx, kv, p, t]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -2050,7 +2050,7 @@ impl Lower {
                 let kv = self.boxed(key);
                 let slot = self.values_slot(&[(op_, ot), kv, (vp, vt)]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_set_elem", &[ctx, slot]);
+                let r = self.helper("lum_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -2065,7 +2065,7 @@ impl Lower {
                 let v = self.expr(x);
                 let (vp, vt) = self.boxed(v);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_sarr_push", &[ctx, p, t, vp, vt]);
+                let r = self.helper("lum_sarr_push", &[ctx, p, t, vp, vt]);
                 let failed = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
                 self.branch_throw(failed);
                 let d = self.int_f64(r[0]);
@@ -2137,7 +2137,7 @@ impl Lower {
                 let ctx = self.ctx;
                 let kv = self.b.ins().iconst(I32, *k as i64);
                 let fv = self.b.ins().iconst(I32, *fi as i64);
-                let r = self.helper("tsaot_struct_coerce", &[ctx, kv, fv, bp, bt]);
+                let r = self.helper("lum_struct_coerce", &[ctx, kv, fv, bp, bt]);
                 self.check_value(r[1]);
                 let args: Vec<BlockArg> = match storage {
                     ir::Storage::Int32 => {
@@ -2395,7 +2395,7 @@ impl Lower {
                 let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
                 let argc = self.b.ins().iconst(I32, held.len() as i64);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
                 self.check_value(r[1]);
                 self.release(fv);
                 self.free_v(fv);
@@ -2447,7 +2447,7 @@ impl Lower {
                 let ctx = self.ctx;
                 let p = self.b.ins().iconst(I32, *pattern as i64);
                 let f = self.b.ins().iconst(I32, *flags as i64);
-                let r = self.helper("tsaot_regexp", &[ctx, p, f]);
+                let r = self.helper("lum_regexp", &[ctx, p, f]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -2485,7 +2485,7 @@ impl Lower {
                 let (p, t) = v.any();
                 let ctx = self.ctx;
                 let done_addr = self.done_slot();
-                let r = self.helper("tsaot_for_await_result", &[ctx, p, t, done_addr]);
+                let r = self.helper("lum_for_await_result", &[ctx, p, t, done_addr]);
                 self.check_value(r[1]);
                 self.release(v);
                 self.free_v(v);
@@ -2499,7 +2499,7 @@ impl Lower {
                 self.hold(v);
                 let (p, t) = v.any();
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_check_object", &[ctx, p, t]);
+                let r = self.helper("lum_check_object", &[ctx, p, t]);
                 self.check_int(r[0]);
                 self.release(v);
                 self.free_v(v);
@@ -2508,7 +2508,7 @@ impl Lower {
             ExprKind::IterCloseQuiet(l) => {
                 let (p, t) = self.use_local(*l).any();
                 let ctx = self.ctx;
-                self.helper("tsaot_iter_close_quiet", &[ctx, p, t]);
+                self.helper("lum_iter_close_quiet", &[ctx, p, t]);
                 self.konst(0, TAG_UNDEFINED)
             }
             ExprKind::IntOf(x) => {
@@ -2655,7 +2655,7 @@ impl Lower {
                 let ic = self.new_ic();
                 // While there are no global let/const definitions, an own
                 // data property of the global object (cached as an own
-                // property read's, by `tsaot_global_get`).
+                // property read's, by `lum_global_get`).
                 let join = self.b.create_block();
                 let rp = self.b.append_block_param(join, I64);
                 let rt = self.b.append_block_param(join, I64);
@@ -2679,7 +2679,7 @@ impl Lower {
                 self.dup((vp, vt));
                 self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
                 self.b.switch_to_block(slow);
-                let r = self.helper("tsaot_global_get", &[ctx, atom, ic]);
+                let r = self.helper("lum_global_get", &[ctx, atom, ic]);
                 self.check_value(r[1]);
                 self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
                 self.b.switch_to_block(join);
@@ -2688,7 +2688,7 @@ impl Lower {
             ExprKind::GlobalOrUndefined(a) => {
                 let atom = self.atom(*a);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_global_or_undefined", &[ctx, atom]);
+                let r = self.helper("lum_global_or_undefined", &[ctx, atom]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -2855,7 +2855,7 @@ impl Lower {
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(grow);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_region_push", &[ctx, ap, at, vp, vt]);
+                let r = self.helper("lum_region_push", &[ctx, ap, at, vp, vt]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -2979,7 +2979,7 @@ impl Lower {
                 self.b.switch_to_block(appended);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
-                // Anything else: tsaot_set_elem takes the key and one
+                // Anything else: lum_set_elem takes the key and one
                 // reference to the value.
                 self.b.switch_to_block(slow);
                 let kv = self.boxed(key);
@@ -2988,7 +2988,7 @@ impl Lower {
                 self.release(key);
                 self.hold(v);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_set_elem", &[ctx, slot]);
+                let r = self.helper("lum_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -3110,7 +3110,7 @@ impl Lower {
                 let vv = self.box_number(d);
                 let slot = self.values_slot(&[(p, t), kv, vv]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_set_elem", &[ctx, slot]);
+                let r = self.helper("lum_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -3153,7 +3153,7 @@ impl Lower {
                 self.hold(key);
                 let slot = self.values_slot(&[obj.any(), key.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_delete_elem", &[ctx, slot]);
+                let r = self.helper("lum_delete_elem", &[ctx, slot]);
                 self.check_int(r[0]);
                 self.release(key);
                 self.release(obj);
@@ -3282,13 +3282,13 @@ impl Lower {
                     .collect();
                 let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
                 let slot = self.values_slot(&vals);
-                // tsaot_new_array takes ownership of the elements.
+                // lum_new_array takes ownership of the elements.
                 for v in held.into_iter().rev() {
                     self.release(v);
                 }
                 let n = self.b.ins().iconst(I32, elems.len() as i64);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_new_array", &[ctx, n, slot]);
+                let r = self.helper("lum_new_array", &[ctx, n, slot]);
                 self.check_value(r[1]);
                 V::Any(r[0], r[1])
             }
@@ -3303,18 +3303,18 @@ impl Lower {
                         ir::ArrPart::Value(x) => {
                             // Takes ownership of the value.
                             let (p, t) = self.expr(x).any();
-                            self.helper("tsaot_array_push", &[ctx, a[0], a[1], p, t])
+                            self.helper("lum_array_push", &[ctx, a[0], a[1], p, t])
                         }
                         ir::ArrPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);
                             let (p, t) = v.any();
-                            let r = self.helper("tsaot_array_spread", &[ctx, a[0], a[1], p, t]);
+                            let r = self.helper("lum_array_spread", &[ctx, a[0], a[1], p, t]);
                             self.release(v);
                             self.free_v(v);
                             r
                         }
-                        ir::ArrPart::Hole => self.helper("tsaot_array_hole", &[ctx, a[0], a[1]]),
+                        ir::ArrPart::Hole => self.helper("lum_array_hole", &[ctx, a[0], a[1]]),
                     };
                     self.check_int(r[0]);
                 }
@@ -3333,7 +3333,7 @@ impl Lower {
                             let (p, t) = self.expr(x).any();
                             let slot = self.values_slot(&[(o[0], o[1])]);
                             let atom = self.atom(*a);
-                            let r = self.helper("tsaot_define_field", &[ctx, slot, atom, p, t]);
+                            let r = self.helper("lum_define_field", &[ctx, slot, atom, p, t]);
                             self.check_int(r[0]);
                         }
                         ir::ObjPart::Computed(k, x) => {
@@ -3348,7 +3348,7 @@ impl Lower {
                             self.hold(key);
                             let (p, t) = self.expr(x).any();
                             let slot = self.values_slot(&[(o[0], o[1]), key.any()]);
-                            let r = self.helper("tsaot_define_computed", &[ctx, slot, p, t]);
+                            let r = self.helper("lum_define_computed", &[ctx, slot, p, t]);
                             self.check_int(r[0]);
                             self.release(key);
                             self.free_v(key);
@@ -3358,14 +3358,14 @@ impl Lower {
                             let slot = self.values_slot(&[(o[0], o[1])]);
                             let atom = self.atom(*a);
                             let s = self.b.ins().iconst(I32, *setter as i64);
-                            let r = self.helper("tsaot_define_accessor", &[ctx, slot, atom, p, t, s]);
+                            let r = self.helper("lum_define_accessor", &[ctx, slot, atom, p, t, s]);
                             self.check_int(r[0]);
                         }
                         ir::ObjPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);
                             let (p, t) = v.any();
-                            let r = self.helper("tsaot_object_spread", &[ctx, o[0], o[1], p, t]);
+                            let r = self.helper("lum_object_spread", &[ctx, o[0], o[1], p, t]);
                             self.check_int(r[0]);
                             self.release(v);
                             self.free_v(v);
@@ -3384,7 +3384,7 @@ impl Lower {
                 self.hold(av);
                 let slot = self.values_slot(&[fv.any(), tv.any(), av.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_apply", &[ctx, slot]);
+                let r = self.helper("lum_apply", &[ctx, slot]);
                 self.check_value(r[1]);
                 for v in [av, tv, fv] {
                     self.release(v);
@@ -3399,7 +3399,7 @@ impl Lower {
                 self.hold(av);
                 let ((fp, ft), (ap, at)) = (fv.any(), av.any());
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_construct", &[ctx, fp, ft, ap, at]);
+                let r = self.helper("lum_construct", &[ctx, fp, ft, ap, at]);
                 self.check_value(r[1]);
                 for v in [av, fv] {
                     self.release(v);
@@ -3432,7 +3432,7 @@ impl Lower {
                 self.b.switch_to_block(slow);
                 let (np, nt) = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_private_get_ic", &[ctx, op_, ot, np, nt, ic]);
+                let r = self.helper("lum_private_get_ic", &[ctx, op_, ot, np, nt, ic]);
                 self.check_value(r[1]);
                 self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
                 self.b.switch_to_block(join);
@@ -3463,7 +3463,7 @@ impl Lower {
                 let (np, nt) = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
                 let slot = self.values_slot(&[(op_, ot), (np, nt)]);
-                let r = self.helper("tsaot_private_set_ic", &[ctx, slot, vp, vt, ic]);
+                let r = self.helper("lum_private_set_ic", &[ctx, slot, vp, vt, ic]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -3482,7 +3482,7 @@ impl Lower {
                     let slot = self.values_slot(&[(fp, ft), (op_, ot)]);
                     let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
                     let argc = self.b.ins().iconst(I32, 0);
-                    let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                    let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
                     self.check_value(r[1]);
                     V::Any(r[0], r[1])
                 } else {
@@ -3505,7 +3505,7 @@ impl Lower {
                 let slot = self.values_slot(&[(fp, ft), (op_, ot), (vp, vt)]);
                 let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
                 let argc = self.b.ins().iconst(I32, 1);
-                let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
                 self.check_value(r[1]);
                 self.free((r[0], r[1]));
                 self.release(v);
@@ -3535,7 +3535,7 @@ impl Lower {
                 let this = self.this.expect("`super` in a method");
                 let slot = self.values_slot(&[h, this, key.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_super_get", &[ctx, slot]);
+                let r = self.helper("lum_super_get", &[ctx, slot]);
                 self.check_value(r[1]);
                 self.release(key);
                 self.free_v(key);
@@ -3553,7 +3553,7 @@ impl Lower {
                 let this = self.this.expect("`super` in a method");
                 let slot = self.values_slot(&[h, this, key.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_super_set", &[ctx, slot, vp, vt]);
+                let r = self.helper("lum_super_set", &[ctx, slot, vp, vt]);
                 self.check_int(r[0]);
                 self.release(v);
                 self.release(key);
@@ -3566,7 +3566,7 @@ impl Lower {
                 let it = self.use_local(*iter).any();
                 let slot = self.values_slot(&[it, obj.any(), key.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_for_in_get", &[ctx, slot]);
+                let r = self.helper("lum_for_in_get", &[ctx, slot]);
                 self.check_value(r[1]);
                 self.drop_operand(key, key_owned);
                 self.drop_operand(obj, owned);
@@ -3578,7 +3578,7 @@ impl Lower {
                 let (p, t) = self.expr(x).any();
                 let (ap, at) = self.use_local(*arr).any();
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_array_push", &[ctx, ap, at, p, t]);
+                let r = self.helper("lum_array_push", &[ctx, ap, at, p, t]);
                 self.check_int(r[0]);
                 self.konst(0, TAG_UNDEFINED)
             }
@@ -3600,7 +3600,7 @@ impl Lower {
                 let slot = self.values_slot(&vals);
                 let n = self.b.ins().iconst(I32, keys.len() as i64);
                 let ctx = self.ctx;
-                let r = self.helper("tsaot_object_rest", &[ctx, slot, n]);
+                let r = self.helper("lum_object_rest", &[ctx, slot, n]);
                 self.check_value(r[1]);
                 for v in held.into_iter().rev() {
                     self.release(v);
@@ -3612,7 +3612,7 @@ impl Lower {
     }
 
     /// The address of field `fi` of layout `k` in object `p` (of that
-    /// layout): past its `TsaotStruct` header (layout, mask).
+    /// layout): past its `LumStruct` header (layout, mask).
     fn struct_field_addr(&mut self, k: u32, fi: u32, p: Value) -> Value {
         let s = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
         let off = 8 + self.env.layouts[k as usize].fields[fi as usize].offset;
@@ -3744,7 +3744,7 @@ impl Lower {
         let (bp, bt) = self.boxed(v);
         let ctx = self.ctx;
         let fv = self.b.ins().iconst(I32, fi as i64);
-        let name = if fresh { "tsaot_struct_put" } else { "tsaot_struct_set" };
+        let name = if fresh { "lum_struct_put" } else { "lum_struct_set" };
         let r = self.helper(name, &[ctx, p, t, fv, bp, bt]);
         self.check_int(r[0]);
         self.b.ins().jump(join, &[]);
@@ -3955,10 +3955,10 @@ impl Lower {
         let atoms = self.b.ins().stack_addr(self.ptr, atoms, 0);
         let count = self.b.ins().iconst(I32, n as i64);
         let r = match class {
-            None => self.helper("tsaot_new_object", &[ctx, ic, count, atoms, values]),
+            None => self.helper("lum_new_object", &[ctx, ic, count, atoms, values]),
             Some(k) => {
                 let (pp, pt) = self.table_value(self.env.homes, 2 * k);
-                self.helper("tsaot_new_instance", &[ctx, ic, pp, pt, count, atoms, values])
+                self.helper("lum_new_instance", &[ctx, ic, pp, pt, count, atoms, values])
             }
         };
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
@@ -4154,7 +4154,7 @@ impl Lower {
             let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
             let argc = self.b.ins().iconst(I32, 3);
             let (gp, gt) = self.call_linked((cp, ct), undef, 3, argv, false, |l| {
-                let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+                let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
                 (r[0], r[1])
             });
             self.check_value(gt);
@@ -4303,7 +4303,7 @@ impl Lower {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
         let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         self.check_value(gt);
@@ -4362,7 +4362,7 @@ impl Lower {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
         let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         self.check_value(gt);
@@ -4405,7 +4405,7 @@ impl Lower {
         self.b.switch_to_block(miss);
         let ctx = self.ctx;
         let atom = self.atom(method);
-        let r = self.helper("tsaot_ic_own_data", &[ctx, pp, pt, atom, ic]);
+        let r = self.helper("lum_ic_own_data", &[ctx, pp, pt, atom, ic]);
         // (Still referenced by the prototype.)
         self.free((r[0], r[1]));
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
@@ -4441,7 +4441,7 @@ impl Lower {
         let argv = self.values_slot(&[(vp, vt)]);
         let (sp, st) = self.call_or_inline(&pred, (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
             l.dup((vp, vt));
-            let r = l.helper("tsaot_call_setter", &[ctx, setter, p, t, vp, vt]);
+            let r = l.helper("lum_call_setter", &[ctx, setter, p, t, vp, vt]);
             let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
             let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
             let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
@@ -4464,7 +4464,7 @@ impl Lower {
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let ctx = self.ctx;
-        let r = self.helper("tsaot_ic_set_proto", &[ctx, p, t, atom, vp, vt, ic]);
+        let r = self.helper("lum_ic_set_proto", &[ctx, p, t, atom, vp, vt, ic]);
         self.check_int(r[0]);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
@@ -4502,7 +4502,7 @@ impl Lower {
         self.b.ins().iadd_imm_s(props, (slot as usize * SIZE) as i64)
     }
 
-    /// A speculative region (see `tsaot_front::spec`): its guard, then
+    /// A speculative region (see `luminous_front::spec`): its guard, then
     /// `fast` where it holds, else `slow`. `fast` is lowered twice: for
     /// when every value checked is a float, reading the fields as doubles
     /// and storing floats as the interpreter's float arithmetic does, and
@@ -4529,7 +4529,7 @@ impl Lower {
         }
         if g.char_code_at {
             let ctx = self.ctx;
-            let ok = self.helper("tsaot_char_code_at_ok", &[ctx])[0];
+            let ok = self.helper("lum_char_code_at_ok", &[ctx])[0];
             let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
             let next = self.b.create_block();
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
@@ -4540,7 +4540,7 @@ impl Lower {
         // changes them: they stay so).
         if !g.appends.is_empty() {
             let ctx = self.ctx;
-            let ok = self.helper("tsaot_array_push_ok", &[ctx])[0];
+            let ok = self.helper("lum_array_push_ok", &[ctx])[0];
             let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
             let next = self.b.create_block();
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
@@ -5018,7 +5018,7 @@ impl Lower {
         self.b.switch_to_block(learn);
         let ctx = self.ctx;
         let r = self.b.ins().iconst(I32, record as i64);
-        self.helper("tsaot_record_learn", &[ctx, p, t, r]);
+        self.helper("lum_record_learn", &[ctx, p, t, r]);
         self.b.ins().jump(after, &[]);
         self.b.switch_to_block(after);
     }
@@ -5080,7 +5080,7 @@ impl Lower {
             }
         }
         let (gp, gt) = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         for v in lazy.into_iter().rev() {
@@ -5120,7 +5120,7 @@ impl Lower {
         let ctx = self.ctx;
         let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
         let (rp, rt) = self.call_or_inline(&pred, f.any(), this.any(), &js_args, argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         self.check_value(rt);
@@ -5241,7 +5241,7 @@ impl Lower {
             self.dup((fp, ft));
         }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         if borrowed {
@@ -5315,7 +5315,7 @@ impl Lower {
             self.dup((fp, ft));
         }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         if borrowed {
@@ -5409,7 +5409,7 @@ impl Lower {
             self.dup((fp, ft));
         }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), n, argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         if borrowed {
@@ -5528,7 +5528,7 @@ impl Lower {
             self.dup((fp, ft));
         }
         let (gp, gt) = self.call_linked((fp, ft), (sp, st), 1, argv, false, |l| {
-            let r = l.helper("tsaot_call", &[ctx, slot, argc, argv]);
+            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
         if borrowed {
@@ -5669,7 +5669,7 @@ impl Lower {
         self.b.switch_to_block(throw);
         let kv = self.b.ins().iconst(I32, k as i64);
         let ctx = self.ctx;
-        self.helper("tsaot_throw_uninitialized", &[ctx, kv]);
+        self.helper("lum_throw_uninitialized", &[ctx, kv]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(cont);
@@ -6267,7 +6267,7 @@ impl Lower {
             BinOp::Rem => self.rem(a, c),
             // (Exactly `pow`'s correctly rounded square.)
             BinOp::Pow if self.b.f64_value(c) == Some(2.0) => self.b.ins().fmul(a, a),
-            BinOp::Pow => self.call_helper("tsaot_pow", &[a, c]),
+            BinOp::Pow => self.call_helper("lum_pow", &[a, c]),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Sar | BinOp::Shr => {
                 let x = self.toint32(a);
                 let y = self.toint32(c);
@@ -6497,7 +6497,7 @@ impl Lower {
         // ...while array iteration is the original one.
         self.b.switch_to_block(check);
         let ctx = self.ctx;
-        let ok = self.helper("tsaot_array_iter_ok", &[ctx]);
+        let ok = self.helper("lum_array_iter_ok", &[ctx]);
         self.b.ins().brif(ok[0], fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         self.set_local(iter, V::Any(p, t));
@@ -6520,7 +6520,7 @@ impl Lower {
         self.set_local(next, V::Any(m[0], m[1]));
         // A native generator with the original `next`: resumed directly
         // (`next` becomes `true`).
-        let ok = self.helper("tsaot_gen_iter_ok", &[ctx, it[0], it[1], m[0], m[1]]);
+        let ok = self.helper("lum_gen_iter_ok", &[ctx, it[0], it[1], m[0], m[1]]);
         let generator = self.b.create_block();
         self.b.ins().brif(ok[0], generator, &[], join, &[]);
         self.b.switch_to_block(generator);
@@ -6694,7 +6694,7 @@ impl Lower {
         self.b.ins().brif(direct, array, &[], protocol, &[]);
         self.b.switch_to_block(array);
         let idx = self.b.ins().ireduce(I32, np);
-        let a = self.helper("tsaot_array_iter_close", &[ctx, p, t, idx, pending]);
+        let a = self.helper("lum_array_iter_close", &[ctx, p, t, idx, pending]);
         self.b.ins().jump(closed, &[BlockArg::Value(a[0])]);
         self.b.switch_to_block(protocol);
         let c = self.helper("JS_IteratorCloseCompletion", &[ctx, p, t, pending]);
@@ -6852,7 +6852,7 @@ impl Lower {
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let ctx = self.ctx;
-        let r = self.helper("tsaot_ic_get", &[ctx, p, t, atom, get_ic]);
+        let r = self.helper("lum_ic_get", &[ctx, p, t, atom, get_ic]);
         self.check_value(r[1]);
         let (np, nt) = match step {
             PropStep::Unary(op) => self.unary_any(op, (r[0], r[1])),
@@ -6874,7 +6874,7 @@ impl Lower {
             self.dup((np, nt));
         }
         let atom = self.atom(a);
-        let r = self.helper("tsaot_ic_set", &[ctx, p, t, atom, np, nt, ic]);
+        let r = self.helper("lum_ic_set", &[ctx, p, t, atom, np, nt, ic]);
         self.check_int(r[0]);
         if want {
             self.release(v);
@@ -6893,7 +6893,7 @@ impl Lower {
     }
 
     /// `prop_get` for a method call: its cache also serves strings, whose
-    /// methods it reads from String.prototype (`TSAOT_IC_STRING`).
+    /// methods it reads from String.prototype (`LUM_IC_STRING`).
     fn method_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
         self.prop_get_from(p, t, None, a, Vec::new(), true)
     }
@@ -7040,13 +7040,13 @@ impl Lower {
             let tag = self.b.ins().iconst(I64, TAG_OBJECT);
             let none = self.b.ins().iconst(I64, 0);
             self.call_or_inline(&pred, (g, tag), (thp, tht), &[], none, true, |l| {
-                let r = l.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
+                let r = l.helper("lum_call_getter", &[ctx, g, thp, tht]);
                 (r[0], r[1])
             })
         } else {
             // (A getter nothing predicts: called by the runtime, keeping
             // every property read small.)
-            let r = self.helper("tsaot_call_getter", &[ctx, g, thp, tht]);
+            let r = self.helper("lum_call_getter", &[ctx, g, thp, tht]);
             (r[0], r[1])
         };
         self.check_value(gt);
@@ -7054,7 +7054,7 @@ impl Lower {
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(slow);
         if receiver.is_none() {
-            // A polymorphic site's other entries (`TsaotIC.poly`): the
+            // A polymorphic site's other entries (`LumIC.poly`): the
             // property's address, without a lookup.
             let at = if poly { self.ic_poly_inline(p, t, ic) } else { self.ic_poly_addr(p, t, ic) };
             let found = self.b.create_block();
@@ -7072,8 +7072,8 @@ impl Lower {
         }
         let atom = self.atom(a);
         let r = match receiver {
-            Some((rp_, rt_)) => self.helper("tsaot_super_get_ic", &[ctx, p, t, rp_, rt_, atom, ic]),
-            None => self.helper("tsaot_ic_get_proto", &[ctx, p, t, atom, ic]),
+            Some((rp_, rt_)) => self.helper("lum_super_get_ic", &[ctx, p, t, rp_, rt_, atom, ic]),
+            None => self.helper("lum_ic_get_proto", &[ctx, p, t, atom, ic]),
         };
         self.check_value(r[1]);
         let ja = args(self, r[0], r[1], true);
@@ -7083,7 +7083,7 @@ impl Lower {
     }
 
     /// A field of an `aot type` object (`p`) cached in `ic`
-    /// (`TSAOT_IC_STRUCT`), as a new JS value: if `p` is of the cached layout
+    /// (`LUM_IC_STRUCT`), as a new JS value: if `p` is of the cached layout
     /// and has the field, else go to `slow`.
     fn struct_ic_read(&mut self, p: Value, kind: Value, ic: Value, slow: Block) -> (Value, Value) {
         let class = self.b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
@@ -7184,7 +7184,7 @@ impl Lower {
     }
 
     /// Where the primary entry of `ic` misses: the address of the property
-    /// of `(p, t)` that one of its polymorphic entries (`TsaotIC.poly`)
+    /// of `(p, t)` that one of its polymorphic entries (`LumIC.poly`)
     /// holds, else 0.
     fn ic_poly_addr(&mut self, p: Value, t: Value, ic: Value) -> Value {
         let join = self.b.create_block();
@@ -7197,7 +7197,7 @@ impl Lower {
         let call = self.b.create_block();
         self.b.ins().brif(probe, call, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(call);
-        let r = self.helper("tsaot_ic_poly_addr", &[ic, p])[0];
+        let r = self.helper("lum_ic_poly_addr", &[ic, p])[0];
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
         at
@@ -7273,7 +7273,7 @@ impl Lower {
             self.b.ins().jump(join, &[BlockArg::Value(a)]);
             self.b.switch_to_block(next);
         }
-        let r = self.helper("tsaot_ic_poly_addr", &[ic, p])[0];
+        let r = self.helper("lum_ic_poly_addr", &[ic, p])[0];
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
         at
@@ -7343,7 +7343,7 @@ impl Lower {
         self.b.switch_to_block(ok);
     }
 
-    /// The address of a new inline cache (a `TsaotIC`).
+    /// The address of a new inline cache (a `LumIC`).
     fn new_ic(&mut self) -> Value {
         let i = self.env.next_ic.get();
         self.env.next_ic.set(i + 1);
@@ -7662,7 +7662,7 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
-        let r = self.call_helper("tsaot_toint32_slow", &[x]);
+        let r = self.call_helper("lum_toint32_slow", &[x]);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
         res
@@ -7747,18 +7747,18 @@ impl V {
     }
 }
 
-/// Shapes per record in `tsaot_record_shapes` (`TSAOT_RECORD_SHAPES`),
-/// then a count of failed learning (stopping at `TSAOT_RECORD_TRIES`).
+/// Shapes per record in `lum_record_shapes` (`LUM_RECORD_SHAPES`),
+/// then a count of failed learning (stopping at `LUM_RECORD_TRIES`).
 const RECORD_SHAPES: usize = 4;
 const RECORD_TRIES: i64 = 64;
 pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
-/// Size of a `TsaotIC` (an inline cache entry).
+/// Size of a `LumIC` (an inline cache entry).
 pub(crate) const IC_SIZE: usize = 48;
-/// `TsaotIC.poly`.
+/// `LumIC.poly`.
 const IC_POLY: i32 = 40;
-/// `TSAOT_POLY`: the entries `TsaotIC.poly` points to.
+/// `LUM_POLY`: the entries `LumIC.poly` points to.
 const POLY_ENTRIES: usize = 4;
-/// `TSAOT_IC_STRUCT`: a cached field of an `aot type` object.
+/// `LUM_IC_STRUCT`: a cached field of an `aot type` object.
 const IC_STRUCT: i64 = 7;
 
 /// Frame layout of an async function: per local, its first slot (boxed
@@ -8227,7 +8227,7 @@ impl Lower {
         // Only locals survive a suspension.
         debug_assert!(self.temps.is_empty(), "values held across an await");
         // Takes ownership of the value.
-        let r = self.helper("tsaot_await", &[ctx, slots, p, t, st]);
+        let r = self.helper("lum_await", &[ctx, slots, p, t, st]);
         self.check_int(r[0]);
         self.spill_locals();
         let z = self.b.ins().iconst(I64, 0);
@@ -8273,7 +8273,7 @@ impl Lower {
         let ctx = self.ctx;
         let atom = self.atom(g);
         let ic = self.new_ic();
-        let pr = self.helper("tsaot_global_get", &[ctx, atom, ic]);
+        let pr = self.helper("lum_global_get", &[ctx, atom, ic]);
         self.check_value(pr[1]);
         let promise = V::Any(pr[0], pr[1]);
         self.hold(promise);
@@ -8283,7 +8283,7 @@ impl Lower {
         let x = self.expr(&args[0]);
         self.hold(x);
         let (xp, xt) = x.any();
-        let same = self.helper("tsaot_is_promise_resolve", &[pr[0], pr[1], mp, mt]);
+        let same = self.helper("lum_is_promise_resolve", &[pr[0], pr[1], mp, mt]);
         // Both paths consume `x`.
         self.release(x);
         let join = self.b.create_block();
@@ -8296,7 +8296,7 @@ impl Lower {
         let slot = self.values_slot(&[(mp, mt), (pr[0], pr[1]), (xp, xt)]);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
-        let r = self.helper("tsaot_call", &[ctx, slot, argc, argv]);
+        let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
         self.free((xp, xt));
         self.check_value(r[1]);
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
@@ -8475,7 +8475,7 @@ impl Lower {
         let (np, nt) = self.use_local(next).any();
         let slot = self.values_slot(&[(ip, itag), (np, nt), (rp, rt)]);
         let kind_addr = self.done_slot();
-        let r = self.helper("tsaot_yield_star", &[ctx, slot, mode, kind_addr]);
+        let r = self.helper("lum_yield_star", &[ctx, slot, mode, kind_addr]);
         self.check_value(r[1]);
         let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
         let yield_blk = self.b.create_block();
@@ -8568,7 +8568,7 @@ impl Lower {
             let slot = self.values_slot(&[(ip, itag), (np, nt), received]);
             let kind_addr = self.done_slot();
             let mv = self.b.ins().iconst(I32, m);
-            let r = self.helper("tsaot_async_yield_star", &[ctx, slot, mv, kind_addr]);
+            let r = self.helper("lum_async_yield_star", &[ctx, slot, mv, kind_addr]);
             self.check_value(r[1]);
             let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
             let call_result = self.b.create_block();
@@ -8586,7 +8586,7 @@ impl Lower {
                 // then throw.
                 let (cp, ct) = self.await_value((r[0], r[1]));
                 self.free((cp, ct));
-                let e = self.helper("tsaot_throw_iterator_throw", &[ctx]);
+                let e = self.helper("lum_throw_iterator_throw", &[ctx]);
                 self.check_int(e[0]);
                 self.b.ins().trap();
             } else {
@@ -8596,7 +8596,7 @@ impl Lower {
             self.b.switch_to_block(call_result);
             let (ap, at) = self.await_value((r[0], r[1]));
             let done_addr = self.done_slot();
-            let val = self.helper("tsaot_async_yield_star_result", &[ctx, ap, at, done_addr]);
+            let val = self.helper("lum_async_yield_star_result", &[ctx, ap, at, done_addr]);
             self.check_value(val[1]);
             let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
             let finished = self.b.create_block();

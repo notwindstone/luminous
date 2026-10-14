@@ -13,10 +13,10 @@ benches=("$@")
 read -r -a backends <<< "${BACKENDS:-cranelift llvm}"
 for ts in "${benches[@]}"; do
   name=$(basename "$ts" .ts)
-  ./target/release/tsaot build --no-native "$ts" -o "$out/$name-interp"
+  ./target/release/luminous build --no-native "$ts" -o "$out/$name-interp"
   cmds=(-n "$name (interpreted)" "$out/$name-interp")
   for b in "${backends[@]}"; do
-    ./target/release/tsaot build --backend "$b" "$ts" -o "$out/$name-$b"
+    ./target/release/luminous build --backend "$b" "$ts" -o "$out/$name-$b"
     if ! diff <("$out/$name-$b" | grep -v elapsed) <("$out/$name-interp" | grep -v elapsed) >/dev/null; then
       echo "$name: $b and interpreted outputs differ!" >&2
       exit 1

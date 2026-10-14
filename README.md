@@ -1,6 +1,6 @@
-# typescript-aot
+# Luminous
 
-An ahead-of-time compiler for strict TypeScript, built on
+Luminous is an ahead-of-time compiler for strict TypeScript, built on
 [QuickJS-NG](https://github.com/quickjs-ng/quickjs). Functions are compiled to
 machine code with [Cranelift](https://cranelift.dev), or with
 [LLVM](https://llvm.org) for code that should run as fast as possible
@@ -13,11 +13,14 @@ Whatever the compiler does not handle (`eval`, classes inside functions,
 and every function it cannot compile) keeps running in the QuickJS
 interpreter, linked into the same executable.
 
+Luminous is the compiler only. Beyond, the runtime built on it (web-interoperable
+WinterTC APIs, a build API, and so on), is a separate project.
+
 ```console
-$ tsaot report bench/primes.ts
+$ luminous report bench/primes.ts
 bench/primes.ts:1: native       isPrime
 bench/primes.ts:10: native       countPrimes
-$ tsaot build bench/primes.ts -o primes && ./primes
+$ luminous build bench/primes.ts -o primes && ./primes
 primes below 2e6: 148933
 elapsed: 905 ms         # 4.4x faster than the same program interpreted
 ```
@@ -47,7 +50,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
      stays interpreted. A module binding that only its run uses is a native
      local; one that other code uses lives in a cell (see 6).
 
-   The checker (`crates/tsaot-front/src/check.rs`) lowers each one to a typed
+   The checker (`crates/luminous-front/src/check.rs`) lowers each one to a typed
    IR, together with the functions nested in it, which become native closures.
    It does this only if every construct has exact, known JS semantics; otherwise
    it records why and leaves the function to the interpreter.
@@ -61,7 +64,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 
    Everything else is a `JSValue`, and operations on it go through inline fast
    paths and then the engine's own implementation.
-3. **Native code.** `crates/tsaot-codegen` lowers the IR to a small
+3. **Native code.** `crates/luminous-codegen` lowers the IR to a small
    backend-neutral SSA IR, which Cranelift or LLVM compiles (see
    [Backends](#backends)). Calls between native functions are direct machine
    calls. Exceptions propagate through native frames, freeing their
@@ -73,10 +76,10 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
    re-pointed at a function object whose entry is native code. The original
    function is kept as its *fallback*:
    ```js
-   import { __tsaot_bind, __tsaot_method, ... } from "tsaot:native";
-   const f = __tsaot_bind(0, __tsaot_fb_f);    // first statement of the module
-   const g = __tsaot_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
-   class P { norm() { … } };__tsaot_method(2, P, 0, "norm");
+   import { __lum_bind, __lum_method, ... } from "luminous:native";
+   const f = __lum_bind(0, __lum_fb_f);    // first statement of the module
+   const g = __lum_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
+   class P { norm() { … } };__lum_method(2, P, 0, "norm");
    ```
 5. **JS entries (the "deopt" point).** Interpreted code can pass a string
    where `number` is declared. Each native function has a generated entry that
@@ -85,7 +88,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
    the original semantics.
 6. **Shared state.** Module-level bindings that native code uses live in
    *cells*, which both sides access. Interpreted references to reassigned
-   bindings are rewritten to go through an accessor object (`__tsaot_m.count`).
+   bindings are rewritten to go through an accessor object (`__lum_m.count`).
    Variables captured by native closures live in GC-visible boxes. Native
    code takes and drops references for free: the engine's collector traces
    what is reachable, native frames included (see
@@ -102,7 +105,7 @@ machine code:
   into `JS_CallInternal` and without pushing a stack frame. Other callers
   (`f.call`, `Array.prototype.map`, …) reach it from the generic
   C-function path.
-- **Inline guard and unboxing.** `tsaot_fast_<i>` reads the argument tags and
+- **Inline guard and unboxing.** `lum_fast_<i>` reads the argument tags and
   payloads straight from the interpreter's `JSValue` slots.
 - **Inlined body.** Unless a function is large, its body is compiled straight
   into its JS entry.
@@ -126,7 +129,7 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/0001-tsaot-engine-support.patch` and builds the engine without
+`patches/0001-luminous-engine-support.patch` and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -307,8 +310,8 @@ unreachable, and never moves anything.
 
 ## Backends
 
-`--backend cranelift` (the default) or `--backend llvm` (or `TSAOT_BACKEND`)
-picks the code generator of `tsaot build` / `tsaot run`. Both translate the
+`--backend cranelift` (the default) or `--backend llvm` (or `LUMINOUS_BACKEND`)
+picks the code generator of `luminous build` / `luminous run`. Both translate the
 same backend-neutral IR (`mir.rs`), which the lowering builds, with the same
 semantics: wrapping integer arithmetic, shift amounts modulo the width,
 saturating float-to-integer conversions, NaN-propagating `fmin` / `fmax`.
@@ -317,7 +320,7 @@ The differential tests run every case with both.
 - **Cranelift** compiles in process, in milliseconds. It optimizes little
   beyond what the lowering does itself.
 - **LLVM** emits LLVM IR (text) and compiles it with `clang -O3
-  -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `TSAOT_CLANG`;
+  -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `LUMINOUS_CLANG`;
   `--march` picks another CPU, e.g. `x86-64-v3` for portable executables).
   Compiling takes seconds, and the code is optimized much further:
   - the functions that only native code calls are internal to the LLVM
@@ -656,7 +659,7 @@ whose superclass is not compiled natively or that run code before
 `super(...)` (which stay interpreted), computed method and accessor names in object
 literals, classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
-call it through its binding). `tsaot report file.ts` says, for every
+call it through its binding). `luminous report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.
 
 ### Forcing native compilation: `aot` (or `compiled`)
@@ -765,7 +768,7 @@ Known observable differences:
 
 ## Modules
 
-A program can be several modules: `tsaot build main.ts` follows the
+A program can be several modules: `luminous build main.ts` follows the
 `import`s of `main.ts` (and theirs) and merges the modules into one
 (scope hoisting, as bundlers do), which the compiler then sees whole:
 calls between modules are direct calls that can be inlined, and a class
@@ -816,7 +819,7 @@ instructions.
 `type int = number` declares an integer type that the compiler checks:
 an `int` variable, parameter or return value always holds an int32 (never
 `-0`). TypeScript sees a plain `number`, so the program runs unchanged with
-`tsc`, Bun or Node; tsaot keeps `int`s in machine registers.
+`tsc`, Bun or Node; Luminous keeps `int`s in machine registers.
 
 ```ts
 type int = number;
@@ -947,12 +950,12 @@ nix develop
 scripts/build-quickjs.sh          # patches/ applied to vendor/quickjs, built into build/quickjs
 cargo build --release
 
-./target/release/tsaot run bench/fib.ts
-./target/release/tsaot build bench/mandelbrot.ts -o mandelbrot
-./target/release/tsaot build --backend llvm bench/nbody_aot.ts -o nbody
-./target/release/tsaot report tests/cases/rejected.ts
-./target/release/tsaot emit-js bench/fib.ts       # what the interpreter runs
-./target/release/tsaot ir bench/fib.ts            # typed IR of native functions
+./target/release/luminous run bench/fib.ts
+./target/release/luminous build bench/mandelbrot.ts -o mandelbrot
+./target/release/luminous build --backend llvm bench/nbody_aot.ts -o nbody
+./target/release/luminous report tests/cases/rejected.ts
+./target/release/luminous emit-js bench/fib.ts       # what the interpreter runs
+./target/release/luminous ir bench/fib.ts            # typed IR of native functions
 cargo test                                        # differential tests (leak-checking engine), both backends
 bench/run.sh                                      # hyperfine: interpreted vs Cranelift vs LLVM
 ```
@@ -987,7 +990,7 @@ and bun 1.4.2, on a 4-core x86-64 cloud VM. Timings there drift by 10–20%
 between runs (primes, which allocates nothing, measured 1.00× bun in one
 run and 1.19× in this one); memory is stable.
 
-| benchmark    | tsaot          | node            | bun            | time / bun | memory / bun |
+| benchmark    | Luminous          | node            | bun            | time / bun | memory / bun |
 |--------------|---------------:|----------------:|---------------:|-----------:|-------------:|
 | hello world  |   –  /  5.7 MB |    –  /  43 MB  |   –  /  11 MB  |          – |        0.50× |
 | fib          |  12 ms / 5.8 MB |   42 ms / 48 MB |  24 ms / 22 MB |      0.50× |        0.27× |
@@ -1065,9 +1068,9 @@ what would come next:
 ## Layout
 
 ```
-crates/tsaot-front    oxc front end: module graph (bundle.rs), checker, typed IR, type erasure, `aot` marker
-crates/tsaot-codegen  lowering to a backend-neutral SSA IR (mir.rs); Cranelift (clif.rs) and LLVM (llvm.rs) backends
-crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + clang + cc driver; differential tests
+crates/luminous-front    oxc front end: module graph (bundle.rs), checker, typed IR, type erasure, `aot` marker
+crates/luminous-codegen  lowering to a backend-neutral SSA IR (mir.rs); Cranelift (clif.rs) and LLVM (llvm.rs) backends
+crates/luminous-cli      `luminous` binary: glue generation, qjsc + clang + cc driver; differential tests
 runtime/              C runtime linked into every program (helpers, boxes, async frames, cells)
 vendor/quickjs        QuickJS-NG (git submodule, kept pristine)
 patches/              engine patch applied by scripts/build-quickjs.sh

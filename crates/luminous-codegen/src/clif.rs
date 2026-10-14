@@ -29,7 +29,7 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
     let isa = cranelift_native::builder()
         .map_err(|e| anyhow!("unsupported host: {e}"))?
         .finish(settings::Flags::new(flags))?;
-    let builder = ObjectBuilder::new(isa, "tsaot", cranelift_module::default_libcall_names())?;
+    let builder = ObjectBuilder::new(isa, "luminous", cranelift_module::default_libcall_names())?;
     let mut module = ObjectModule::new(builder);
 
     let mut funcs = Vec::new();

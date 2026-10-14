@@ -49,7 +49,7 @@ pub struct NativeDecl {
 }
 
 /// A class that hands data to native code when it is defined: a static
-/// block calls `__tsaot_class(index, this, (o) => { ... })`, where the arrow
+/// block calls `__lum_class(index, this, (o) => { ... })`, where the arrow
 /// references private names so that their values can be read from it.
 #[derive(Debug, Clone)]
 pub struct ClassDecl {

@@ -1,7 +1,7 @@
 // Cost of crossing from interpreted code into native code, per call.
 // Build twice and compare:
-//   tsaot run bench/micro/crossing.ts               (id/lerp native)
-//   tsaot run --no-native bench/micro/crossing.ts   (everything interpreted)
+//   luminous run bench/micro/crossing.ts               (id/lerp native)
+//   luminous run --no-native bench/micro/crossing.ts   (everything interpreted)
 // The loops themselves stay interpreted ("use no aot"), so "call - base"
 // is what one call costs, including the native work.
 function id(x: number): number {

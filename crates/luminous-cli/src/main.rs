@@ -5,16 +5,16 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use tsaot_codegen::{Backend, Output};
-use tsaot_front::Analysis;
-use tsaot_front::bundle::Bundle;
-use tsaot_front::erase::NATIVE_MODULE;
+use luminous_codegen::{Backend, Output};
+use luminous_front::Analysis;
+use luminous_front::bundle::Bundle;
+use luminous_front::erase::NATIVE_MODULE;
 
-const RT_C: &str = include_str!("../../../runtime/tsaot_rt.c");
-const RT_H: &str = include_str!("../../../runtime/tsaot_rt.h");
+const RT_C: &str = include_str!("../../../runtime/luminous_rt.c");
+const RT_H: &str = include_str!("../../../runtime/luminous_rt.h");
 
 #[derive(Parser)]
-#[command(name = "tsaot", about = "Ahead-of-time compiler for a strict TypeScript subset, on QuickJS-NG")]
+#[command(name = "luminous", about = "Ahead-of-time compiler for a strict TypeScript subset, on QuickJS-NG")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -66,18 +66,18 @@ struct BuildOpts {
     /// Print the native/interpreted report while building.
     #[arg(short, long)]
     verbose: bool,
-    /// QuickJS-NG source directory (headers). Default: $TSAOT_QUICKJS_DIR.
+    /// QuickJS-NG source directory (headers). Default: $LUMINOUS_QUICKJS_DIR.
     #[arg(long)]
     quickjs_dir: Option<PathBuf>,
-    /// QuickJS-NG build directory (qjsc, libqjs.a). Default: $TSAOT_QUICKJS_BUILD.
+    /// QuickJS-NG build directory (qjsc, libqjs.a). Default: $LUMINOUS_QUICKJS_BUILD.
     #[arg(long)]
     quickjs_build: Option<PathBuf>,
     /// Code generator for the native functions: `cranelift` (compiles fast)
-    /// or `llvm` (optimizes further; needs clang). Default: $TSAOT_BACKEND,
+    /// or `llvm` (optimizes further; needs clang). Default: $LUMINOUS_BACKEND,
     /// else cranelift.
     #[arg(long)]
     backend: Option<Backend>,
-    /// The clang used by the LLVM backend. Default: $TSAOT_CLANG, else clang.
+    /// The clang used by the LLVM backend. Default: $LUMINOUS_CLANG, else clang.
     #[arg(long)]
     clang: Option<PathBuf>,
     /// The CPU the LLVM backend compiles for, as clang's `-march` (e.g.
@@ -88,16 +88,16 @@ struct BuildOpts {
 
 impl BuildOpts {
     fn backend(&self) -> Result<Backend> {
-        match (&self.backend, std::env::var("TSAOT_BACKEND")) {
+        match (&self.backend, std::env::var("LUMINOUS_BACKEND")) {
             (Some(b), _) => Ok(*b),
             (None, Ok(b)) if !b.is_empty() => b.parse().map_err(anyhow::Error::msg),
             _ => Ok(Backend::Cranelift),
         }
     }
 
-    fn codegen(&self) -> Result<tsaot_codegen::Options> {
-        let mut o = tsaot_codegen::Options { backend: self.backend()?, ..Default::default() };
-        if let Some(c) = self.clang.clone().or_else(|| std::env::var_os("TSAOT_CLANG").map(PathBuf::from)) {
+    fn codegen(&self) -> Result<luminous_codegen::Options> {
+        let mut o = luminous_codegen::Options { backend: self.backend()?, ..Default::default() };
+        if let Some(c) = self.clang.clone().or_else(|| std::env::var_os("LUMINOUS_CLANG").map(PathBuf::from)) {
             o.llvm.clang = c;
         }
         if let Some(m) = &self.march {
@@ -114,7 +114,7 @@ fn main() {
         if msg.contains('\n') {
             eprintln!("{msg}")
         } else {
-            eprintln!("tsaot: {msg}")
+            eprintln!("luminous: {msg}")
         }
         std::process::exit(1);
     }
@@ -122,7 +122,7 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let fopts = tsaot_front::Options { int_wrapping: !cli.no_int_wrapping };
+    let fopts = luminous_front::Options { int_wrapping: !cli.no_int_wrapping };
     match cli.cmd {
         Cmd::Build { input, output, opts } => {
             let output = output.unwrap_or_else(|| input.with_extension(""));
@@ -148,13 +148,13 @@ fn real_main() -> Result<()> {
             if no_native {
                 disable_native(&mut analysis);
             }
-            print!("{}", tsaot_front::erased_js(&input, &analysis).map_err(anyhow::Error::msg)?);
+            print!("{}", luminous_front::erased_js(&input, &analysis).map_err(anyhow::Error::msg)?);
             Ok(())
         }
         Cmd::Ir { input } => {
             let (_, analysis) = analyze(&input, &fopts)?;
             for (i, f) in analysis.module.funcs.iter().enumerate() {
-                println!("// tsaot_fn_{i}\n{f:#?}\n");
+                println!("// lum_fn_{i}\n{f:#?}\n");
             }
             for (i, f) in analysis.module.closures.iter().enumerate() {
                 println!("// closure {i}\n{f:#?}\n");
@@ -164,11 +164,11 @@ fn real_main() -> Result<()> {
     }
 }
 
-/// The program's modules (merged into one; see `tsaot_front::bundle`),
+/// The program's modules (merged into one; see `luminous_front::bundle`),
 /// analyzed.
-fn analyze(input: &Path, fopts: &tsaot_front::Options) -> Result<(Bundle, Analysis)> {
-    let bundle = tsaot_front::bundle::bundle(input).map_err(anyhow::Error::msg)?;
-    let analysis = tsaot_front::analyze_bundle(&bundle, fopts).map_err(anyhow::Error::msg)?;
+fn analyze(input: &Path, fopts: &luminous_front::Options) -> Result<(Bundle, Analysis)> {
+    let bundle = luminous_front::bundle::bundle(input).map_err(anyhow::Error::msg)?;
+    let analysis = luminous_front::analyze_bundle(&bundle, fopts).map_err(anyhow::Error::msg)?;
     Ok((bundle, analysis))
 }
 
@@ -207,7 +207,7 @@ fn print_report(bundle: &Bundle, a: &Analysis) {
 fn tempdir() -> Result<PathBuf> {
     let base = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos();
-    let dir = base.join(format!("tsaot-{}-{nanos}", std::process::id()));
+    let dir = base.join(format!("luminous-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -223,18 +223,18 @@ fn quickjs(opts: &BuildOpts) -> Result<QuickJs> {
         arg.clone().or_else(|| std::env::var_os(var).map(PathBuf::from)).unwrap_or(default)
     };
     let q = QuickJs {
-        src: pick(&opts.quickjs_dir, "TSAOT_QUICKJS_DIR", repo.join("build/quickjs-src")),
-        build: pick(&opts.quickjs_build, "TSAOT_QUICKJS_BUILD", repo.join("build/quickjs")),
+        src: pick(&opts.quickjs_dir, "LUMINOUS_QUICKJS_DIR", repo.join("build/quickjs-src")),
+        build: pick(&opts.quickjs_build, "LUMINOUS_QUICKJS_BUILD", repo.join("build/quickjs")),
     };
     if !q.src.join("quickjs.h").exists() {
         bail!(
-            "QuickJS-NG sources not found at {} (run scripts/build-quickjs.sh, or set TSAOT_QUICKJS_DIR)",
+            "QuickJS-NG sources not found at {} (run scripts/build-quickjs.sh, or set LUMINOUS_QUICKJS_DIR)",
             q.src.display()
         );
     }
     for f in ["qjsc", "libqjs.a", "libqjs-libc.a"] {
         if !q.build.join(f).exists() {
-            bail!("{} not found in {} (build QuickJS-NG, or set TSAOT_QUICKJS_BUILD)", f, q.build.display());
+            bail!("{} not found in {} (build QuickJS-NG, or set LUMINOUS_QUICKJS_BUILD)", f, q.build.display());
         }
     }
     Ok(q)
@@ -253,7 +253,7 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Options) -> Result<()> {
+fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
     let (bundle, mut analysis) = analyze(input, fopts)?;
     if opts.no_native {
@@ -262,7 +262,7 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Opt
     if opts.verbose {
         print_report(&bundle, &analysis);
     }
-    let js = tsaot_front::erased_js(input, &analysis).map_err(anyhow::Error::msg)?;
+    let js = luminous_front::erased_js(input, &analysis).map_err(anyhow::Error::msg)?;
 
     let tmp = match &opts.keep {
         Some(d) => {
@@ -277,7 +277,7 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Opt
         std::fs::write(&js_path, &js)?;
 
         let has_native = !analysis.module.funcs.is_empty();
-        // The tsaot:native module is always linked: its initialization locks
+        // The luminous:native module is always linked: its initialization locks
         // the Math and Number builtins, in native and --no-native builds alike.
         let mut qjsc = Command::new(q.build.join("qjsc"));
         qjsc.arg("-e").arg("-m").arg("-n").arg(&script_name).arg("-o").arg(tmp.join("main.c"));
@@ -288,21 +288,21 @@ fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &tsaot_front::Opt
             tmp.join("glue.c"),
             glue::generate(&analysis.module, &mutable_cells(&analysis), &analysis.classes, fopts.int_wrapping),
         )?;
-        std::fs::write(tmp.join("tsaot_rt.c"), RT_C)?;
-        std::fs::write(tmp.join("tsaot_rt.h"), RT_H)?;
+        std::fs::write(tmp.join("luminous_rt.c"), RT_C)?;
+        std::fs::write(tmp.join("luminous_rt.h"), RT_H)?;
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
         let mut link = Command::new(cc);
         link.args(["-O2", "-w"]).arg("-I").arg(&q.src).arg("-I").arg(&tmp);
-        link.arg(tmp.join("main.c")).arg(tmp.join("glue.c")).arg(tmp.join("tsaot_rt.c"));
+        link.arg(tmp.join("main.c")).arg(tmp.join("glue.c")).arg(tmp.join("luminous_rt.c"));
         if has_native {
             let cg = opts.codegen()?;
             let obj = tmp.join("native.o");
-            match tsaot_codegen::compile(&analysis.module, &cg)? {
+            match luminous_codegen::compile(&analysis.module, &cg)? {
                 Output::Object(bytes) => std::fs::write(&obj, bytes)?,
                 Output::LlvmIr(ir) => {
                     let ll = tmp.join("native.ll");
                     std::fs::write(&ll, ir)?;
-                    tsaot_codegen::llvm::compile(&ll, &obj, &cg.llvm)?;
+                    luminous_codegen::llvm::compile(&ll, &obj, &cg.llvm)?;
                 }
             }
             link.arg(&obj);

@@ -1,6 +1,6 @@
 //! The `Math` and `Number` builtins that native code relies on are locked:
 //! the runtime makes them non-writable and non-configurable before any JS
-//! runs (see `runtime/tsaot_rt.c`), so patching them throws a `TypeError`.
+//! runs (see `runtime/luminous_rt.c`), so patching them throws a `TypeError`.
 //! This pass turns the patches that are visible in the source into compile
 //! errors instead.
 
@@ -104,7 +104,7 @@ impl Lint<'_> {
         self.errors.push(
             OxcDiagnostic::error(msg)
                 .with_label(span)
-                .with_help("tsaot locks the `Math` and `Number` builtins so that compiled code can rely on them"),
+                .with_help("luminous locks the `Math` and `Number` builtins so that compiled code can rely on them"),
         );
     }
 }

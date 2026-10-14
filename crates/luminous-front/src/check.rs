@@ -209,7 +209,7 @@ pub struct Binding {
 pub enum CellInit {
     /// In the module header (hoisted functions, imports, native functions).
     Header,
-    /// By wrapping the declarator's initializer: `x = __tsaot_init(k, init)`.
+    /// By wrapping the declarator's initializer: `x = __lum_init(k, init)`.
     Wrap(Span),
     /// After the declaring statement.
     After(u32),

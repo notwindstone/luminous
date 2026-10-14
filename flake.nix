@@ -11,7 +11,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
         # clang as the C compiler/linker driver for QuickJS and the generated glue,
-        # and as the LLVM backend (`tsaot build --backend llvm`)
+        # and as the LLVM backend (`luminous build --backend llvm`)
         mkShell = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; };
       in
       {
@@ -35,9 +35,9 @@
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
           shellHook = ''
-            export TSAOT_ROOT="$PWD"
-            export TSAOT_QUICKJS_DIR="$PWD/build/quickjs-src"
-            export TSAOT_QUICKJS_BUILD="$PWD/build/quickjs"
+            export LUMINOUS_ROOT="$PWD"
+            export LUMINOUS_QUICKJS_DIR="$PWD/build/quickjs-src"
+            export LUMINOUS_QUICKJS_BUILD="$PWD/build/quickjs"
           '';
         };
       });
