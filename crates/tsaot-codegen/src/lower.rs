@@ -6965,6 +6965,23 @@ impl Lower {
         let ja = args(self, gp, gt, true);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(slow);
+        if receiver.is_none() {
+            // A polymorphic site's other entries (`TsaotIC.poly`): the
+            // property's address, without a lookup.
+            let at = self.ic_poly_addr(p, t, ic);
+            let found = self.b.create_block();
+            let miss = self.b.create_block();
+            self.b.ins().brif(at, found, &[], miss, &[]);
+            self.b.switch_to_block(found);
+            let vp = self.b.ins().load(I64, M_SLOT, at, 0);
+            let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+            if !borrow {
+                self.dup((vp, vt));
+            }
+            let ja = args(self, vp, vt, false);
+            self.b.ins().jump(join, &ja);
+            self.b.switch_to_block(miss);
+        }
         let atom = self.atom(a);
         let r = match receiver {
             Some((rp_, rt_)) => self.helper("tsaot_super_get_ic", &[ctx, p, t, rp_, rt_, atom, ic]),
@@ -7076,6 +7093,26 @@ impl Lower {
         self.b.ins().jump(hit, &[BlockArg::Value(k)]);
         self.b.switch_to_block(hit);
         (shape, kind)
+    }
+
+    /// Where the primary entry of `ic` misses: the address of the property
+    /// of `(p, t)` that one of its polymorphic entries (`TsaotIC.poly`)
+    /// holds, else 0.
+    fn ic_poly_addr(&mut self, p: Value, t: Value, ic: Value) -> Value {
+        let join = self.b.create_block();
+        let at = self.b.append_block_param(join, I64);
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let poly = self.b.ins().load(I64, M_IC, ic, IC_POLY);
+        let zero = self.b.ins().iconst(I64, 0);
+        let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, poly, 0);
+        let probe = self.b.ins().band(is_obj, has);
+        let call = self.b.create_block();
+        self.b.ins().brif(probe, call, &[], join, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(call);
+        let r = self.helper("tsaot_ic_poly_addr", &[ic, p])[0];
+        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(join);
+        at
     }
 
     /// The address of the cached own property of `p`.
@@ -7547,7 +7584,9 @@ impl V {
 }
 
 /// Size of a `TsaotIC` (an inline cache entry).
-pub(crate) const IC_SIZE: usize = 40;
+pub(crate) const IC_SIZE: usize = 48;
+/// `TsaotIC.poly`.
+const IC_POLY: i32 = 40;
 /// `TSAOT_IC_STRUCT`: a cached field of an `aot type` object.
 const IC_STRUCT: i64 = 7;
 

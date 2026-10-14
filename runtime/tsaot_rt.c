@@ -423,6 +423,22 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
         if (tsaot_ics[i].alt_shape)
             JS_FreeCachedShape(rt, tsaot_ics[i].alt_shape);
         tsaot_ics[i].alt_shape = NULL;
+        if (tsaot_ics[i].poly) {
+            int k;
+            for (k = 0; k < TSAOT_POLY; k++) {
+                TsaotIC *e = &tsaot_ics[i].poly[k];
+                if (e->shape)
+                    JS_FreeCachedShape(rt, e->shape);
+                if (e->alt_shape)
+                    JS_FreeCachedShape(rt, e->alt_shape);
+                if (e->proto_shape)
+                    JS_FreeCachedShape(rt, e->proto_shape);
+                if (e->mid_shape)
+                    JS_FreeCachedShape(rt, e->mid_shape);
+            }
+            js_free_rt(rt, tsaot_ics[i].poly);
+            tsaot_ics[i].poly = NULL;
+        }
     }
 }
 
@@ -469,6 +485,20 @@ static void tsaot_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
             JS_MarkCachedShape(rt, tsaot_ics[i].mid_shape, mark_func);
         if (tsaot_ics[i].alt_shape)
             JS_MarkCachedShape(rt, tsaot_ics[i].alt_shape, mark_func);
+        if (tsaot_ics[i].poly) {
+            int k;
+            for (k = 0; k < TSAOT_POLY; k++) {
+                TsaotIC *e = &tsaot_ics[i].poly[k];
+                if (e->shape)
+                    JS_MarkCachedShape(rt, e->shape, mark_func);
+                if (e->alt_shape)
+                    JS_MarkCachedShape(rt, e->alt_shape, mark_func);
+                if (e->proto_shape)
+                    JS_MarkCachedShape(rt, e->proto_shape, mark_func);
+                if (e->mid_shape)
+                    JS_MarkCachedShape(rt, e->mid_shape, mark_func);
+            }
+        }
     }
 }
 
@@ -695,11 +725,120 @@ static int tsaot_ic_count(void)
     return &tsaot_nics ? tsaot_nics : 0;
 }
 
-/* Point the cache at a new entry (taking the shape references). */
+/* Whether the polymorphic entries of a site (TsaotIC.poly) may keep entry
+   `e`: an own data property, or a data property of a prototype. */
+static bool tsaot_ic_polymorphic(const TsaotIC *e)
+{
+    return e->shape || (e->alt_shape && e->kind == TSAOT_IC_PROTO_DATA);
+}
+
+/* The address of the property that cache entry `e` holds for object `p`
+   of shape `shape`, or NULL (another shape, or a holder that changed): as
+   native code finds it. */
+static JSValue *tsaot_ic_entry_slot(const TsaotIC *e, char *p, void *shape)
+{
+    char *holder = p;
+    if (e->shape != shape) {
+        if (e->alt_shape != shape || e->kind != TSAOT_IC_PROTO_DATA)
+            return NULL;
+        holder = *(char **)((char *)shape + JS_LAYOUT_SHAPE_PROTO);
+        if (e->mid_shape) {
+            void *first = *(void **)(holder + JS_LAYOUT_OBJ_SHAPE);
+            if (first != e->mid_shape)
+                return NULL;
+            holder = *(char **)((char *)first + JS_LAYOUT_SHAPE_PROTO);
+        }
+        if (*(void **)(holder + JS_LAYOUT_OBJ_SHAPE) != e->proto_shape)
+            return NULL;
+    }
+    return (JSValue *)*(char **)(holder + JS_LAYOUT_OBJ_PROP) + e->slot;
+}
+
+/* The polymorphic entry of `ic` holding obj's property, else NULL. */
+static inline JSValue *tsaot_ic_poly_slot(TsaotIC *ic, JSValueConst obj)
+{
+    char *p;
+    void *shape;
+    int k;
+    if (!ic->poly || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_PTR(obj);
+    shape = *(void **)(p + JS_LAYOUT_OBJ_SHAPE);
+    for (k = 0; k < TSAOT_POLY; k++) {
+        JSValue *at = tsaot_ic_entry_slot(&ic->poly[k], p, shape);
+        if (at)
+            return at;
+    }
+    return NULL;
+}
+
+/* For native code, where the primary entry of `ic` misses on object `p`:
+   the address of the property one of its polymorphic entries holds, else
+   NULL. */
+JSValue *tsaot_ic_poly_addr(TsaotIC *ic, void *p)
+{
+    return tsaot_ic_poly_slot(ic, JS_MKPTR(JS_TAG_OBJECT, p));
+}
+
+/* obj.prop = val (val taken) through a polymorphic entry of write site
+   `ic` holding obj's own (writable) data property; whether there was one. */
+static bool tsaot_ic_poly_set(JSContext *ctx, TsaotIC *ic, JSValueConst obj, JSValue val)
+{
+    char *p;
+    void *shape;
+    int k;
+    if (!ic->poly || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return false;
+    p = JS_VALUE_GET_PTR(obj);
+    shape = *(void **)(p + JS_LAYOUT_OBJ_SHAPE);
+    for (k = 0; k < TSAOT_POLY; k++) {
+        if (ic->poly[k].shape == shape) {
+            JSValue *at = (JSValue *)*(char **)(p + JS_LAYOUT_OBJ_PROP) + ic->poly[k].slot;
+            JSValue old = *at;
+            *at = val;
+            JS_FreeValue(ctx, old);
+            if (JS_VALUE_HAS_REF_COUNT(val))
+                JS_GCWriteBarrier(JS_GetRuntime(ctx), p);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether a polymorphic site has no room for another shape: it caches
+   none then (its misses do not evict each other). */
+static bool tsaot_ic_full(const TsaotIC *ic)
+{
+    int k;
+    if (!ic->poly || !tsaot_ic_polymorphic(ic))
+        return false;
+    for (k = 0; k < TSAOT_POLY; k++) {
+        if (!tsaot_ic_polymorphic(&ic->poly[k]))
+            return false;
+    }
+    return true;
+}
+
+/* Point the cache at a new entry (taking the shape references). An own or
+   prototype data property it held for another shape moves to its
+   polymorphic entries, if there is room. */
 static void tsaot_ic_store(JSContext *ctx, TsaotIC *ic, void *shape, void *proto_shape, void *mid_shape,
                            int slot, int kind)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
+    if (shape && tsaot_ic_polymorphic(ic) && (ic->shape ? ic->shape : ic->alt_shape) != shape) {
+        int k;
+        if (!ic->poly)
+            ic->poly = js_mallocz_rt(rt, TSAOT_POLY * sizeof(TsaotIC));
+        for (k = 0; ic->poly && k < TSAOT_POLY; k++) {
+            if (!tsaot_ic_polymorphic(&ic->poly[k])) {
+                ic->poly[k] = *ic;
+                ic->poly[k].poly = NULL;
+                ic->shape = ic->alt_shape = ic->proto_shape = ic->mid_shape = NULL;
+                break;
+            }
+        }
+    }
     if (ic->shape)
         JS_FreeCachedShape(rt, ic->shape);
     if (ic->proto_shape)
@@ -806,6 +945,14 @@ int tsaot_region_push(JSContext *ctx, JSValue arr, JSValue v)
  * it is not one. */
 JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
+    JSValue *at = tsaot_ic_poly_slot(ic, obj);
+    if (at)
+        return JS_DupValue(ctx, *at);
+    if (tsaot_ic_full(ic)) {
+        uint32_t hint = 0;
+        JSValue v = JS_GetOwnDataHint(ctx, obj, prop, &hint);
+        return JS_IsUninitialized(v) ? JS_UNDEFINED : v;
+    }
     if (!tsaot_ic_fill(ctx, obj, prop, 0, ic))
         return JS_UNDEFINED;
     return JS_GetProperty(ctx, obj, prop);
@@ -814,8 +961,12 @@ JSValue tsaot_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 /* A cache miss reading obj.prop (obj borrowed). */
 JSValue tsaot_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic)
 {
-    JSValue v = JS_GetProperty(ctx, obj, prop);
-    if (!JS_IsException(v))
+    JSValue *at = tsaot_ic_poly_slot(ic, obj);
+    JSValue v;
+    if (at)
+        return JS_DupValue(ctx, *at);
+    v = JS_GetProperty(ctx, obj, prop);
+    if (!JS_IsException(v) && !tsaot_ic_full(ic))
         tsaot_ic_fill(ctx, obj, prop, 0, ic);
     return v;
 }
@@ -827,10 +978,13 @@ int tsaot_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, TsaotIC 
 {
     void *before = NULL;
     int r;
+    if (tsaot_ic_poly_set(ctx, ic, obj, val))
+        return 0;
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
         before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
     r = JS_SetProperty(ctx, obj, prop, val);
-    if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
+    if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
+        !tsaot_ic_full(ic))
         tsaot_ic_fill(ctx, obj, prop, 1, ic);
     return r;
 }
@@ -1444,7 +1598,7 @@ int tsaot_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, TsaotIC *ic)
 /* ---- inline caches of prototype properties ---- */
 
 /* Codegen reads entries at these offsets (lower::IC_SIZE). */
-_Static_assert(sizeof(TsaotIC) == 40 && offsetof(TsaotIC, slot) == 8 && offsetof(TsaotIC, kind) == 12 &&
+_Static_assert(sizeof(TsaotIC) == 48 && offsetof(TsaotIC, slot) == 8 && offsetof(TsaotIC, kind) == 12 &&
                    offsetof(TsaotIC, proto_shape) == 16 && offsetof(TsaotIC, mid_shape) == 24 &&
                    offsetof(TsaotIC, alt_shape) == 32,
                "TsaotIC layout");
@@ -1507,7 +1661,14 @@ JSValue tsaot_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, TsaotIC *ic
             return v;
         return JS_GetProperty(ctx, obj, prop);
     }
+    {
+        JSValue *at = tsaot_ic_poly_slot(ic, obj);
+        if (at)
+            return JS_DupValue(ctx, *at);
+    }
     v = JS_GetProperty(ctx, obj, prop);
+    if (tsaot_ic_full(ic))
+        return v;
     if (!JS_IsException(v) && !tsaot_ic_fill(ctx, obj, prop, 0, ic) &&
         !tsaot_ic_fill(ctx, obj, prop, 2, ic) &&
         !tsaot_ic_fill_proto(ctx, obj, prop, TSAOT_IC_PROTO_DATA, ic) &&
@@ -1522,10 +1683,12 @@ int tsaot_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, Ts
 {
     void *before = NULL;
     int r;
+    if (tsaot_ic_poly_set(ctx, ic, obj, val))
+        return 0;
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
         before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
     r = JS_SetProperty(ctx, obj, prop, val);
-    if (r >= 0 && before && !tsaot_ic_gave_up(ic) &&
+    if (r >= 0 && before && !tsaot_ic_gave_up(ic) && !tsaot_ic_full(ic) &&
         before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
         !tsaot_ic_fill(ctx, obj, prop, 1, ic) &&
         !tsaot_ic_fill(ctx, obj, prop, 3, ic) &&

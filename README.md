@@ -352,7 +352,10 @@ The differential tests run every case with both.
     second field), then a load or store. A cache also covers the object's own
     getters and setters, methods, getters and setters found on the first
     or second prototype (checking the shapes on the way), and private
-    fields and `super.name`. Sites that never cache stop trying;
+    fields and `super.name`. A site that sees objects of several shapes
+    (a class hierarchy) keeps up to four more own or prototype data
+    properties, which its misses check before a lookup; sites that never
+    cache stop trying;
   - object literals: each site caches the literal's final shape, and
     later objects are made with it directly (as JSC's allocation profiles
     do), allocated inline: a block popped from the allocator's cache for

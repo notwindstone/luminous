@@ -433,6 +433,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("tsaot_ic_set", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_private_get_ic", &[P, W, W, W, W, P], &[W, W]),
         ("tsaot_ic_get_proto", &[P, W, W, Int, P], &[W, W]),
+        ("tsaot_ic_poly_addr", &[P, P], &[P]),
         ("tsaot_ic_set_proto", &[P, W, W, Int, W, W, P], &[Int]),
         ("tsaot_call_getter", &[P, P, W, W], &[W, W]),
         ("tsaot_define_accessor", &[P, P, Int, W, W, Int], &[Int]),

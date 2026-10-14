@@ -115,7 +115,12 @@ typedef struct TsaotIC {
     /* Other kinds: the object's shape (referenced). Native code checks an
      * own data property (the usual hit) with one comparison. */
     void *alt_shape;
+    /* A polymorphic site's other entries (own and prototype data
+     * properties of other shapes), which the misses try before a lookup:
+     * up to TSAOT_POLY of them (an empty one has no shapes), or NULL. */
+    struct TsaotIC *poly;
 } TsaotIC;
+#define TSAOT_POLY 4
 #define TSAOT_IC_OWN 0
 #define TSAOT_IC_PROTO_DATA 1
 #define TSAOT_IC_PROTO_GETTER 2
