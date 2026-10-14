@@ -784,8 +784,22 @@ instructions.
   Other specifiers are packages, from the nearest `node_modules` up: a
   package's `exports` (subpaths and `*` patterns; the `import`, `module`
   and `default` conditions), else its `module` or `main` field, else its
-  `index`. Their JavaScript is compiled like TypeScript without types.
-  The engine's modules (`qjs:os`, `qjs:std`) stay imports.
+  `index`. Their JavaScript is compiled like TypeScript without types
+  (types come from the package's `.d.ts` files, which the build does not
+  read: an imported name or `ns.Name` that only they declare is a type,
+  erased). The engine's modules (`qjs:os`, `qjs:std`) stay imports.
+- **Packages.** `node_modules` as `bun install` (or npm, pnpm) lays it
+  out works: ESM packages such as `zod`, `valibot`, `date-fns` and
+  `lodash-es` build and print what Bun prints. A module whose package says
+  it has no side effects (`"sideEffects": false`, or a list of the files
+  that have) is part of the program only if the program uses something it
+  declares (a binding, or a namespace object that holds one), as bundlers
+  do: a package's `index` that re-exports all of its modules brings only
+  those used (`date-fns`: 69 native functions rather than 714). CommonJS
+  packages (`module.exports`, `require`) are an error for now, and
+  packages that need Node's APIs (`node:fs`, `Buffer`, `process`) need a
+  runtime that provides them (Beyond). A large program builds much faster
+  with the Cranelift backend than with LLVM (`zod`: 18 s against 141 s).
 - **Semantics.** Each module's top-level names stay its own: a name two
   modules declare, or that a global another module uses has, is renamed
   in one of them (where no scope that refers to it declares the new name),

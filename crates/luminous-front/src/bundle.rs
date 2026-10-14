@@ -129,6 +129,9 @@ struct Import {
     target: Target,
     /// Local binding and what it imports.
     bindings: Vec<(SymbolId, Name)>,
+    /// Whether each binding is a type only (`type`, or only used so): a
+    /// JavaScript module need not have it (its types are elsewhere).
+    types: Vec<bool>,
 }
 
 /// What a module's file holds.
@@ -157,6 +160,13 @@ struct Unit<'a> {
     default_expr: Option<DefaultExport>,
     /// Why the module cannot be part of a program of several modules.
     unsupported: Option<String>,
+    /// A CommonJS module (no `import` or `export`, and `module`, `exports`
+    /// or `require` not declared): for the error that importing it is.
+    commonjs: bool,
+    /// Whether its package says it has no side effects (`"sideEffects"` in
+    /// the nearest `package.json`): it is then part of the program only if
+    /// the program uses what it declares.
+    pure: bool,
     /// `export { a } from`: where, the module and the name it re-exports
     /// (which must resolve, used or not).
     reexports: Vec<(Span, usize, String)>,
@@ -259,6 +269,56 @@ enum Anon {
 enum Resolved {
     File(PathBuf),
     External(String),
+}
+
+/// Whether the `package.json` nearest to module `path` says that it has no
+/// side effects: `"sideEffects": false`, or a list of the files that have
+/// (patterns as webpack's: one without a `/` matches a file name).
+fn side_effect_free(path: &Path, packages: &mut HashMap<PathBuf, Option<serde_json::Value>>) -> bool {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        let manifest = packages
+            .entry(d.to_path_buf())
+            .or_insert_with(|| {
+                let text = std::fs::read_to_string(d.join("package.json")).ok()?;
+                serde_json::from_str::<serde_json::Value>(&text).ok()
+            })
+            .clone();
+        if let Some(m) = manifest {
+            let rel = path.strip_prefix(d).unwrap_or(path).to_string_lossy().replace('\\', "/");
+            return match m.get("sideEffects") {
+                Some(serde_json::Value::Bool(false)) => true,
+                Some(serde_json::Value::Array(files)) => !files.iter().filter_map(|f| f.as_str()).any(|f| {
+                    let f = f.strip_prefix("./").unwrap_or(f);
+                    if f.contains('/') {
+                        glob(f, &rel)
+                    } else {
+                        glob(f, rel.rsplit('/').next().unwrap_or(&rel)) || glob(&format!("**/{f}"), &rel)
+                    }
+                }),
+                _ => false,
+            };
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+/// Whether `text` matches glob `pattern` (`*`: any characters but `/`;
+/// `**`: any).
+fn glob(pattern: &str, text: &str) -> bool {
+    fn go(p: &[u8], t: &[u8]) -> bool {
+        match p {
+            [] => t.is_empty(),
+            [b'*', b'*', b'/', rest @ ..] => go(rest, t) || (!t.is_empty() && go(p, &t[1..])),
+            [b'*', b'*', rest @ ..] => (0..=t.len()).any(|i| go(rest, &t[i..])),
+            [b'*', rest @ ..] => {
+                (0..=t.len()).take_while(|&i| i == 0 || t[i - 1] != b'/').any(|i| go(rest, &t[i..]))
+            }
+            [c, rest @ ..] => t.first() == Some(c) && go(rest, &t[1..]),
+        }
+    }
+    go(pattern.as_bytes(), text.as_bytes())
 }
 
 /// Resolve a module specifier imported by `from`.
@@ -461,7 +521,8 @@ fn records(
                 // none, or an unused binding, runs the module).
                 let runtime = !d.import_kind.is_type() && (types.is_empty() || types.iter().any(|t| !t));
                 deps.push((target.clone(), runtime));
-                imports.push(Import { span: d.span, target, bindings });
+                let types = types.into_iter().map(|t| t || d.import_kind.is_type()).collect();
+                imports.push(Import { span: d.span, target, bindings, types });
             }
             Statement::ExportDeclaration(e) => {
                 let decl = e.declaration.span();
@@ -614,6 +675,12 @@ fn records(
             return Err(format!("{}: duplicate export `{name}`", unit.path.display()));
         }
     }
+    let unresolved = scoping.root_unresolved_references();
+    let commonjs = imports.is_empty()
+        && exports.is_empty()
+        && stars.is_empty()
+        && ["module", "exports", "require"].iter().any(|n| unresolved.contains_key(*n));
+    unit.commonjs = commonjs;
     unit.imports = imports;
     unit.exports = exports;
     unit.stars = stars;
@@ -780,6 +847,7 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
     let allocator = Allocator::default();
     let mut units: Vec<Unit> = Vec::new();
     let mut index: HashMap<(PathBuf, Kind), usize> = HashMap::new();
+    let mut packages: HashMap<PathBuf, Option<serde_json::Value>> = HashMap::new();
     let mut queue = vec![(entry.to_path_buf(), Kind::Script)];
     index.insert((entry.to_path_buf(), Kind::Script), 0);
     // (The entry's own path, canonical, is its index too.)
@@ -813,6 +881,8 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
             deletions: Vec::new(),
             default_expr: None,
             unsupported: None,
+            commonjs: false,
+            pure: side_effect_free(&path, &mut packages),
             reexports: Vec::new(),
             errors,
             dynamic: Vec::new(),
@@ -1040,11 +1110,25 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     for (m, u) in units.iter().enumerate() {
         for imp in &u.imports {
             let Target::Module(t) = imp.target else { continue };
-            for (sym, name) in &imp.bindings {
+            for (k, (sym, name)) in imp.bindings.iter().enumerate() {
                 let b = match name {
                     Name::Namespace => Binding::Namespace(t),
                     Name::Named(n) => match resolve_export(units, t, n, &mut Vec::new()) {
                         Some(b) => b,
+                        // (A type of a JavaScript module: its references are
+                        // types, which are erased.)
+                        None if imp.types[k] => continue,
+                        None if units[t].commonjs => {
+                            fail(
+                                m,
+                                format!(
+                                    "{}: `{}` is a CommonJS module (`module.exports`, `require`), which is not supported yet",
+                                    loc(&u.path, &u.original, imp.span.start),
+                                    units[t].path.display()
+                                ),
+                            )?;
+                            continue;
+                        }
                         None => {
                             fail(
                                 m,
@@ -1089,9 +1173,21 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         warnings.push(format!("{e}: `import()` of `{}` rejects", units[m].path.display()));
     }
     warnings.sort();
+    // Modules whose package says they have no side effects run only if the
+    // program uses what they declare (a binding, or the namespace object
+    // that holds it): as bundlers do, a package's `index` that re-exports
+    // all of its modules brings only those the program uses.
+    let keep = used_modules(units, &order, &lazy_order, &resolved);
+    order.retain(|&m| keep[m]);
+    lazy_order.retain(|&m| keep[m]);
+    for (m, l) in lazy.iter_mut().enumerate() {
+        *l &= keep[m];
+    }
     let running: Vec<usize> = order.iter().chain(&lazy_order).copied().collect();
-    // Modules imported for their types only: their type declarations.
-    let typed_only: Vec<usize> = (0..units.len()).filter(|&m| state[m] == 0).collect();
+    // Modules imported for their types only: their type declarations (as
+    // of those that are dropped).
+    let typed_only: Vec<usize> =
+        (0..units.len()).filter(|&m| state[m] == 0 || (!keep[m] && !broken.contains_key(&m))).collect();
     // (Lazy modules first: what they declare is in place when an `import()`
     // runs.)
     let all: Vec<usize> = typed_only.iter().chain(&lazy_order).chain(&order).copied().collect();
@@ -1145,8 +1241,14 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     // than as `ns.x` (with their references' scopes), those `import()`
     // returns, and those they hold.
     let mut ns_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
+    // (And where `ns.x` stands for a binding: a scope there must not have
+    // the binding's name.)
+    let mut member_sites: HashMap<Binding, Vec<(usize, ScopeId)>> = HashMap::new();
     let mut writes: Vec<(usize, SymbolId)> = Vec::new();
     for (&(m, sym), &b) in &resolved {
+        if !keep[m] {
+            continue;
+        }
         let u = &units[m];
         for r in u.sem.scoping().get_resolved_references(sym) {
             if r.flags().is_write() && !writes.contains(&(m, sym)) {
@@ -1155,7 +1257,7 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             let Binding::Namespace(t) = b else { continue };
             match member_of_namespace(units, u.sem.nodes(), r.node_id(), t) {
                 Some((_, Binding::Namespace(k))) => ns_sites.entry(k).or_default().push((m, u.ref_scope(r.node_id()))),
-                Some(_) => {}
+                Some((_, b)) => member_sites.entry(b).or_default().push((m, u.ref_scope(r.node_id()))),
                 None => ns_sites.entry(t).or_default().push((m, u.ref_scope(r.node_id()))),
             }
         }
@@ -1222,6 +1324,7 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     };
     let sites_of = |b: Binding, own: Vec<(usize, ScopeId)>| -> Vec<(usize, ScopeId)> {
         let mut v = own;
+        v.extend(member_sites.get(&b).into_iter().flatten().copied());
         for &(m, sym) in importers.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
             let u = &units[m];
             v.extend(u.sem.scoping().get_resolved_references(sym).map(|r| (m, u.ref_scope(r.node_id()))));
@@ -1520,6 +1623,76 @@ fn file_url(path: &Path) -> String {
         }
     }
     url
+}
+
+/// Which modules the program keeps: those that run (`order`, `lazy_order`)
+/// but have no side effects (`Unit::pure`) and declare nothing the kept
+/// modules use, nor anything of a namespace object they use, are dropped.
+fn used_modules(
+    units: &[Unit],
+    order: &[usize],
+    lazy_order: &[usize],
+    resolved: &HashMap<(usize, SymbolId), Binding>,
+) -> Vec<bool> {
+    let mut keep = vec![false; units.len()];
+    let mut work = Vec::new();
+    for &m in order.iter().chain(lazy_order) {
+        if m == 0 || !units[m].pure {
+            keep[m] = true;
+            work.push(m);
+        }
+    }
+    let mut materialized = HashSet::new();
+    fn mark(k: usize, keep: &mut [bool], work: &mut Vec<usize>) {
+        if !keep[k] {
+            keep[k] = true;
+            work.push(k);
+        }
+    }
+    // (A namespace object holds every export of its module.)
+    fn materialize(t: usize, units: &[Unit], keep: &mut [bool], work: &mut Vec<usize>, done: &mut HashSet<usize>) {
+        if !done.insert(t) {
+            return;
+        }
+        for n in export_names(units, t) {
+            match resolve_export(units, t, &n, &mut Vec::new()) {
+                Some(Binding::Symbol(k, _) | Binding::Default(k)) => mark(k, keep, work),
+                Some(Binding::Namespace(k)) => materialize(k, units, keep, work, done),
+                None => {}
+            }
+        }
+    }
+    while let Some(m) = work.pop() {
+        let u = &units[m];
+        for d in &u.dynamic {
+            if let DynTo::Module(t) = d.to {
+                mark(t, &mut keep, &mut work);
+                materialize(t, units, &mut keep, &mut work, &mut materialized);
+            }
+        }
+        let scoping = u.sem.scoping();
+        for imp in &u.imports {
+            for (sym, _) in &imp.bindings {
+                let Some(&b) = resolved.get(&(m, *sym)) else { continue };
+                for r in scoping.get_resolved_references(*sym) {
+                    if !r.flags().is_value() && !r.flags().is_write() {
+                        continue;
+                    }
+                    match b {
+                        Binding::Symbol(k, _) | Binding::Default(k) => mark(k, &mut keep, &mut work),
+                        Binding::Namespace(t) => match member_of_namespace(units, u.sem.nodes(), r.node_id(), t) {
+                            Some((_, Binding::Symbol(k, _) | Binding::Default(k))) => mark(k, &mut keep, &mut work),
+                            Some((_, Binding::Namespace(k))) => {
+                                materialize(k, units, &mut keep, &mut work, &mut materialized)
+                            }
+                            None => materialize(t, units, &mut keep, &mut work, &mut materialized),
+                        },
+                    }
+                }
+            }
+        }
+    }
+    keep
 }
 
 /// The layout of lazily evaluated module `m` (see `LazyPlan`).
@@ -1935,6 +2108,10 @@ fn edits(
             // An import binding: its references are to the binding it
             // resolves to (assignments: through an accessor that throws).
             for r in scoping.get_resolved_references(sym) {
+                // (A module of types only keeps none of its code.)
+                if typed_only && !r.flags().is_type() {
+                    continue;
+                }
                 let node = r.node_id();
                 let span = nodes.get_node(node).kind().span();
                 if r.flags().is_write() {
@@ -1951,12 +2128,8 @@ fn edits(
                             out.push((whole, new));
                             continue;
                         }
-                        None if r.flags().is_type() => {
-                            return Err(format!(
-                                "{}: this use of a namespace import is not supported yet",
-                                loc(&u.path, text, span.start)
-                            ));
-                        }
+                        // (A type the module's JavaScript does not have: erased.)
+                        None if r.flags().is_type() => continue,
                         None => format!("{}()", names.of[&target]),
                     },
                     b => names.of[&b].clone(),
