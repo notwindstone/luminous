@@ -822,12 +822,15 @@ instructions.
   the first time. `import.meta` has `url`, `filename`, `dirname` and
   `main`.
 - **Conformance.** test262's module tests (`language/module-code`,
-  `language/import`, `language/export`): 611 of 722 pass, as many as
-  with the engine's own module loader (QuickJS-NG), though not the same:
-  JSON and text imports pass here only, dynamic `import()` (not supported
-  yet) and an async module that runs while a sibling waits there only.
-  Most of the rest are proposals the engine lacks (`import defer`,
-  immutable `bytes` buffers, source phase imports).
+  `language/import`, `language/export`): 622 of 722 pass, against 611 with
+  the engine's own module loader (QuickJS-NG); JSON and text imports pass
+  here only, and an async module that runs while a sibling waits there
+  only. Most of the rest are proposals the engine lacks (`import defer`,
+  immutable `bytes` buffers, source phase imports). `import()` and
+  `import.meta` (`expressions/dynamic-import`, `expressions/import.meta`,
+  all run as modules): 776 of 964, against 757; one test of an async
+  cycle whose root throws fails here only (its other members do not
+  record the root's error).
 - **Not yet:** CommonJS (`require`, `module.exports`), `export =`. In a
   lazily evaluated module, a variable that a statement declares is
   `undefined`, not uninitialized, before the module runs, and a class that
