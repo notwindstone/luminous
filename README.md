@@ -269,7 +269,13 @@ unreachable, and never moves anything.
   collection stays remembered. The young generation starts at 4MB and
   grows, up to 32MB, while much of it survives; a major collection traces
   everything (and makes it old) once the old cells have doubled. Aging
-  took binary_trees from 89MB to 63MB, and made it faster.
+  took binary_trees from 89MB to 63MB, and made it faster. Where the
+  young generation cannot grow any more and most of what aging kept young
+  survives again anyway (what the program keeps outlives a small young
+  generation), aging would only trace it twice: minor collections then
+  make cells old the first time, for two collections, before trying
+  again. A shape (shared, hot) is checked old by its header rather than
+  its chunk's bits.
 - **Sweeping.** Dead cells are not visited, but for those with something
   to release (class finalizers, property arrays of their own, weak
   references, shapes, function bytecode), whose finalizers run before any
