@@ -1,21 +1,26 @@
-# typescript-aot
+# Luminous
 
-An ahead-of-time compiler for strict TypeScript, built on
+Luminous is an ahead-of-time compiler for strict TypeScript, built on
 [QuickJS-NG](https://github.com/quickjs-ng/quickjs). Functions are compiled to
-machine code with [Cranelift](https://cranelift.dev):
+machine code with [Cranelift](https://cranelift.dev), or with
+[LLVM](https://llvm.org) for code that should run as fast as possible
+(`--backend llvm`, see [Backends](#backends)):
 - numbers, booleans and typed arrays use unboxed machine representations;
 - all other values (objects, strings, arrays, closures, class instances,
   promises) are QuickJS values, with exact JS semantics.
 
-Whatever the compiler does not handle (`eval`, class constructors, and every
-function it cannot compile) keeps running in the QuickJS interpreter, linked
-into the same executable.
+Whatever the compiler does not handle (`eval`, classes inside functions,
+and every function it cannot compile) keeps running in the QuickJS
+interpreter, linked into the same executable.
+
+Luminous is the compiler only. Beyond, the runtime built on it (web-interoperable
+WinterTC APIs, a build API, and so on), is a separate project.
 
 ```console
-$ tsaot report bench/primes.ts
+$ luminous report bench/primes.ts
 bench/primes.ts:1: native       isPrime
 bench/primes.ts:10: native       countPrimes
-$ tsaot build bench/primes.ts -o primes && ./primes
+$ luminous build bench/primes.ts -o primes && ./primes
 primes below 2e6: 148933
 elapsed: 905 ms         # 4.4x faster than the same program interpreted
 ```
@@ -25,7 +30,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 ```
              ┌──────────── oxc parser + semantic analysis
  foo.ts ─────┤
-             ├─ checker ── typed IR ── Cranelift ── native.o ───────────────────┐
+             ├─ checker ── typed IR ── SSA IR ── Cranelift or LLVM ── native.o ─┐
              │   (per function; rejects anything it cannot prove)               │
              │                                                                  ├─ cc ─> foo
              └─ rewrite + type erasure ── foo.js ── qjsc ── bytecode + main.c ──┤
@@ -45,7 +50,7 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
      stays interpreted. A module binding that only its run uses is a native
      local; one that other code uses lives in a cell (see 6).
 
-   The checker (`crates/tsaot-front/src/check.rs`) lowers each one to a typed
+   The checker (`crates/luminous-front/src/check.rs`) lowers each one to a typed
    IR, together with the functions nested in it, which become native closures.
    It does this only if every construct has exact, known JS semantics; otherwise
    it records why and leaves the function to the interpreter.
@@ -59,18 +64,22 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 
    Everything else is a `JSValue`, and operations on it go through inline fast
    paths and then the engine's own implementation.
-3. **Native code.** `crates/tsaot-codegen` lowers the IR with Cranelift. Calls
-   between native functions are direct machine calls. Exceptions propagate
-   through native frames, freeing their temporaries.
+3. **Native code.** `crates/luminous-codegen` lowers the IR to a small
+   backend-neutral SSA IR, which Cranelift or LLVM compiles (see
+   [Backends](#backends)). Calls between native functions are direct machine
+   calls. Exceptions propagate through native frames, freeing their
+   temporaries. What a loop body declares (`const`, `let`) is released when
+   its iteration ends, as the interpreter does, so two iterations' data are
+   never alive at once.
 4. **Interpreted code.** The whole module is type-erased (oxc transformer) and
    compiled by `qjsc` to bytecode. Each native function's binding is
    re-pointed at a function object whose entry is native code. The original
    function is kept as its *fallback*:
    ```js
-   import { __tsaot_bind, __tsaot_method, ... } from "tsaot:native";
-   const f = __tsaot_bind(0, __tsaot_fb_f);    // first statement of the module
-   const g = __tsaot_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
-   class P { norm() { … } };__tsaot_method(2, P, 0, "norm");
+   import { __lum_bind, __lum_method, ... } from "luminous:native";
+   const f = __lum_bind(0, __lum_fb_f);    // first statement of the module
+   const g = __lum_bind(1, (x) => x * 2);    // `const g = (x: number) => x * 2`
+   class P { norm() { … } };__lum_method(2, P, 0, "norm");
    ```
 5. **JS entries (the "deopt" point).** Interpreted code can pass a string
    where `number` is declared. Each native function has a generated entry that
@@ -79,11 +88,11 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
    the original semantics.
 6. **Shared state.** Module-level bindings that native code uses live in
    *cells*, which both sides access. Interpreted references to reassigned
-   bindings are rewritten to go through an accessor object (`__tsaot_m.count`).
-   Variables captured by native closures live in GC-visible boxes. Every
-   reference in native code is counted exactly like the interpreter's. The
-   test suite runs on an engine built with assertions, which aborts if any
-   object leaks.
+   bindings are rewritten to go through an accessor object (`__lum_m.count`).
+   Variables captured by native closures live in GC-visible boxes. Native
+   code takes and drops references for free: the engine's collector traces
+   what is reachable, native frames included (see
+   [Memory](#memory-a-generational-tracing-collector)).
 
 ### Crossing from interpreted to native code
 
@@ -96,7 +105,7 @@ machine code:
   into `JS_CallInternal` and without pushing a stack frame. Other callers
   (`f.call`, `Array.prototype.map`, …) reach it from the generic
   C-function path.
-- **Inline guard and unboxing.** `tsaot_fast_<i>` reads the argument tags and
+- **Inline guard and unboxing.** `lum_fast_<i>` reads the argument tags and
   payloads straight from the interpreter's `JSValue` slots.
 - **Inlined body.** Unless a function is large, its body is compiled straight
   into its JS entry.
@@ -120,8 +129,11 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/0001-tsaot-engine-support.patch`, which adds API and a few
-fast paths that keep the engine's semantics:
+`patches/0001-luminous-engine-support.patch` and builds the engine without
+the stack protector, semantic interposition and CET markers distribution
+compilers default to (it is linked statically: its exported functions
+inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
+engine's semantics:
 
 - `JSCFunctionFast` and `JS_NewCFunctionDataFast`, the call hook above;
 - `JS_BinaryOperator` / `JS_UnaryOperator`: every JS operator, with exactly
@@ -144,8 +156,8 @@ fast paths that keep the engine's semantics:
 - `JS_NewNativeAsyncGenerator`: the same for async generators. The step
   function also reports awaits; the engine keeps the request queue, awaits,
   and resumes it with the settled value;
-- `JS_LAYOUT_*`: the object layout that inline fast paths read (reference
-  counts, array elements, typed array storage, string length). It is
+- `JS_LAYOUT_*`: the object layout that inline fast paths read (cell
+  headers, array elements, typed array storage, string length). It is
   statically asserted in the engine, and again in the generated glue.
 - `JS_CachePlainShape` / `JS_NewObjectWithCachedShape` and
   `JS_NewCFunctionDataShaped`: objects and native closures made directly
@@ -162,7 +174,188 @@ fast paths that keep the engine's semantics:
   `JS_DupObjectShape` for caching their shape;
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
-  at the index where the property was last found first.
+  at the index where the property was last found first;
+- `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
+  `Array.prototype`, `Map.prototype`, …) shared shapes once their lazily
+  created members exist, so that inline caches can hold their methods;
+  prototype caches also accept arrays, which are exotic only for their
+  indices and `length`;
+- `JS_CallBuiltin`: calls a builtin (a C function object) without the
+  interpreter's call path, and `JS_Call` (which builtins use to call back:
+  `sort` comparators, `map` callbacks) enters native functions' fast
+  entries first;
+- `JS_ArrayPushFast`: `push`'s own fast path, for native code;
+- for native array loops: `JS_ArraySpeciesCreateRoom` (a `map` result with
+  room for every element), `JS_TryGetElement`, `JS_DefineElement` (appends
+  in place), and `JS_SortNative`, which sorts a fast array's elements
+  with a merge sort compiled with the native comparator;
+- faster engine internals that every program benefits from, interpreted
+  or not: 64KB allocator arenas handed out by a bump index, with one empty
+  arena kept per size class (allocation-heavy code used to create and free
+  an arena every few dozen objects), and recently freed blocks cached per
+  size class, up to 64MB each (a free and the next allocation are a push
+  and a pop); plain objects made from an allocation site's shape in one
+  short function; an empty size-class cache refilled 32 blocks at a time,
+  in address order; strings allocated from the cache inline, in a path
+  that makes no calls (so it saves no registers); pieces of 8-bit strings
+  up to 32 bytes (`slice`, `substring`, `split`) copied with a few
+  overlapping moves into a cell taken inline; plain objects
+  that keep their property array in their own allocation until it grows;
+  defining the next element of a fast array (`map`, `filter`, `split`,
+  `Array.from`, …) appends it, and a growing array makes room for 8
+  elements at least; `map`,
+  `filter`, `forEach`, `some`, `every`, `reduce` and `sort` read the
+  elements of fast arrays in place and call a native callback's fast entry
+  directly; forward `indexOf` searches by its first character with
+  `memchr` (8-bit strings: only where a match can start), and native
+  code's `indexOf`, `includes`, `startsWith` and `endsWith` with a string
+  argument skip the conversions; 8-bit strings of up to 16 characters
+  compared for equality (`===`, `Map` keys) with a few word loads, and
+  native code compares a string with a short constant (`switch` cases,
+  `=== "user"`) by length, then by its characters as immediates; a
+  string that is not an atom keeps its hash once a `Map` or `Set` has
+  computed it; `Map` and `Set` keys are hashed with a final mix (small
+  integers and pointers spread over the buckets) and each entry keeps its
+  key's hash, compared before the key; native code calls
+  `Map.prototype.get`, `set`, `has` and `Set.prototype.add`, `has` on a
+  Map or Set directly while they are the builtins, and `new Set(array)` /
+  `new Map(entries)` take an array's elements without its iterator while
+  the array and its iteration are the builtin ones; `+` on a string and a
+  string or an int32 concatenates directly (an int32's digits written
+  into the result), and `s += x` onto a string longer than 8KB appends
+  into a buffer with room for as much again, of which the strings are
+  slices (one that is no longer the end of its buffer is copied when
+  appended to), rather than making a rope; a regular expression search whose pattern starts with
+  a character (not under `i` or `y`) tries the pattern only where
+  `memchr` finds that character, and a global `replace` by a string
+  without `$` on a standard RegExp loops over the matches without
+  building their result arrays; global variables
+  (`parseInt`, `String`) are read through an inline cache of the global
+  object's property (while there are no global `let`/`const`
+  definitions); `parseInt`, `Number(s)` and `+s` read small decimal integers
+  directly; `x ** 2` is the correctly rounded square (as native code
+  computes it);
+- `console.info` and `console.debug` (to stdout, as `console.log`),
+  `console.warn` and `console.error` (to stderr), as Node's and Bun's.
+
+### Memory: a generational, tracing collector
+
+The patch replaces the engine's reference counting and cycle collector.
+Values are not counted, so taking or dropping a reference costs nothing,
+in native code and in the engine; a mark-sweep collector frees what is
+unreachable, and never moves anything.
+
+- **Heap.** Objects, strings, ropes, bigints, shapes, function bytecode,
+  closure variables and async function states are *cells* in 256KB chunks,
+  one cell size per chunk, with a bit per cell for allocated, marked and
+  to-finalize. Allocation bumps a pointer through a run of free cells,
+  counted allocated as a whole when the run begins (which is where a
+  collection starts); native code allocates objects inline the same way,
+  a compare, a bump and the header stores. QuickJS's list of GC objects
+  is gone, and with it 16 bytes of every object; a plain object's
+  properties start where other classes keep their own part, and the
+  weak references to an object are listed off the runtime (the object
+  keeps a 32-bit index in what was padding): a plain object is 24 bytes
+  and its properties, and `{ left, right }` with its 8-byte cell header
+  fills one 64-byte cache line (it took 112 bytes). Memory traffic is
+  what allocation-heavy code waits on: 32 more bytes per object cost a
+  binary-trees run 14%. A chunk's pages are made resident as allocation
+  runs reach them (all of a run's at once, rather than a fault each), so
+  that the chunks of the cell sizes a small program barely uses stay
+  mostly unmapped: hello world peaks at 5.6MB (it was 11.5MB with whole
+  regions populated up front).
+- **Tracing.** A cell is marked by its chunk's bit alone, without reading
+  it (the bit also tells an old cell from a young one); its header and
+  body are read when it is traced, a few cells later, prefetched in the
+  meantime, as marking waits on memory more than anything.
+- **Roots.** The contexts, the job queue, the pending exception, the atoms
+  referenced as atoms, mark hooks for values that C structures hold (the
+  native runtime's state and inline caches, libc's timers), and the native
+  stack and registers, scanned conservatively: a word pointing into a cell
+  keeps it. Native code needs no stack maps: what its registers and stack
+  slots hold is found.
+- **Generations.** A cell that survives two minor collections is old (a
+  bit in its header) and keeps its mark. The first time, it stays young:
+  an age bit in its chunk records it, and its mark is cleared after the
+  sweep, so that what dies shortly after a collection (a tree being
+  built, an array being mapped) dies young instead of filling the old
+  generation until a major collection. A minor collection traces from the
+  roots and from the old cells given references since the last
+  collection, which a write barrier (an inline test of that bit, in the
+  engine and in native code) remembers; the old cells are kept without
+  being traced. An old cell that still holds young ones after a minor
+  collection stays remembered. The young generation starts at 4MB and
+  grows, up to 32MB, while much of it survives; a major collection traces
+  everything (and makes it old) once the old cells have doubled. Aging
+  took binary_trees from 89MB to 63MB, and made it faster. Where the
+  young generation cannot grow any more and most of what aging kept young
+  survives again anyway (what the program keeps outlives a small young
+  generation), aging would only trace it twice: minor collections then
+  make cells old the first time, for two collections, before trying
+  again. A shape (shared, hot) is checked old by its header rather than
+  its chunk's bits.
+- **Sweeping.** Dead cells are not visited, but for those with something
+  to release (class finalizers, property arrays of their own, weak
+  references, shapes, function bytecode), whose finalizers run before any
+  cell is freed: plain objects, arrays, strings and closures die without
+  being touched. A minor collection sweeps only the chunks with young
+  cells.
+- **Weak references.** Strings referenced only as values leave the atom
+  table once unreachable, shapes the shape hash; WeakMap entries, WeakRefs
+  and FinalizationRegistry callbacks are processed when their targets die.
+- **Checking it.** `QJS_GC_STRESS=n` collects every n allocations;
+  `QJS_GC_VERIFY=1` poisons dead cells and keeps them for a collection
+  (aborting on a reference to one), and after each minor collection checks
+  that everything reachable is marked, naming the holder of a reference
+  whose barrier is missing. The test suite runs with both;
+  `QJS_GC_STATS=1` prints the counts at exit.
+
+## Backends
+
+`--backend cranelift` (the default) or `--backend llvm` (or `LUMINOUS_BACKEND`)
+picks the code generator of `luminous build` / `luminous run`. Both translate the
+same backend-neutral IR (`mir.rs`), which the lowering builds, with the same
+semantics: wrapping integer arithmetic, shift amounts modulo the width,
+saturating float-to-integer conversions, NaN-propagating `fmin` / `fmax`.
+The differential tests run every case with both.
+
+- **Cranelift** compiles in process, in milliseconds. It optimizes little
+  beyond what the lowering does itself.
+- **LLVM** emits LLVM IR (text) and compiles it with `clang -O3
+  -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `LUMINOUS_CLANG`;
+  `--march` picks another CPU, e.g. `x86-64-v3` for portable executables).
+  Compiling takes seconds, and the code is optimized much further:
+  - the functions that only native code calls are internal to the LLVM
+    module, so LLVM inlines them anywhere in the program (recursive `fib` is
+    partly inlined into itself), drops the unused ones and picks their
+    calling convention;
+  - every load and store carries its alias region as type-based alias
+    analysis metadata: cell headers, `JSValue` slots (properties,
+    elements, cells, frames), the engine's object headers, typed array
+    elements, `aot type` storage, inline caches, constant tables. Values
+    then stay in registers across stores to other regions, and dead
+    stores go;
+  - addresses derived from globals, stack slots and loaded pointers stay
+    pointers (`getelementptr`), and the tables filled before any native code
+    runs (atoms, strings, shapes) are invariant loads, hoisted out of loops
+    and across calls;
+  - slow and exception paths become branch weights (laid out of line), and
+    the register allocator charges for a function's first callee-saved
+    register, so values live across the calls of slow paths are spilled
+    there rather than held in registers every call saves and restores;
+  - libm and the runtime's numeric helpers are declared pure, so their
+    results are reused and hoisted;
+  - and the usual pipeline applies: GVN, LICM, induction variable
+    simplification, unrolling, vectorization where JS semantics allow it
+    (the `x`, `y` differences of `bench/nbody_aot.ts` are computed as one
+    vector; floating point sums keep their order, so `dot` stays scalar).
+
+  On x86-64, each libm call is followed by an empty `asm` statement that
+  marks the vector registers as written: LLVM 18 does not count a call's
+  clobbers, and would otherwise convert an integer to a double into a
+  register the callee wrote last, a false dependency that serializes
+  independent libm calls in a loop (`fill` in `bench/arrays.ts` ran almost
+  twice as long).
 
 ## What compiles natively
 
@@ -184,19 +377,34 @@ fast paths that keep the engine's semantics:
 - **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
 - **JS values**: `let` / `const` / `var` holding anything, plus:
-  - string, template, object and array literals;
+  - string, template, object, array and regular expression literals (a
+    template's parts, and a chain of `+` whose first or second operand
+    is a string and whose others are strings or primitives, such as
+    `a + ":" + b`, are concatenated by one engine call that copies each
+    once and writes int32s as digits, rather than one `+` at a time; a
+    regular expression's pattern is compiled once, and each evaluation
+    makes a new object of it);
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
-    check, then a load or store. A cache also covers the object's own
+    check (one comparison: other kinds of entries keep their shape in a
+    second field), then a load or store. A cache also covers the object's own
     getters and setters, methods, getters and setters found on the first
     or second prototype (checking the shapes on the way), and private
-    fields and `super.name`. Sites that never cache stop trying;
+    fields and `super.name`. A site that sees objects of several shapes
+    (a class hierarchy) keeps up to four more own or prototype data
+    properties (methods up to the third prototype: a class two superclasses
+    up), which its misses check before a lookup; sites that never cache
+    stop trying;
   - object literals: each site caches the literal's final shape, and
     later objects are made with it directly (as JSC's allocation profiles
-    do);
+    do), allocated inline: a block popped from the allocator's cache for
+    the shape's size class and the object's fields stored in place
+    (`JS_ShapeAllocInfo`; the engine call otherwise);
   - `typeof`, `in`, `instanceof`, `new`;
   - calls to any function: native functions directly (small ones without
-    loops or closures are inlined, as JIT compilers inline them); a callee only known
+    loops or closures are inlined, as JIT compilers inline them; a small
+    one that calls itself has its own body inlined once, so that each call
+    does two levels of the recursion: `fib`, tree walks); a callee only known
     at run time (a method, a getter, a callback) is checked for being a
     native function and then entered through its native entry, skipping
     the engine's call path; interpreted ones through the engine; where
@@ -207,6 +415,11 @@ fast paths that keep the engine's semantics:
   - `-`, `*`, `/`, `%` and `**` between a number and a JS value: the JS
     value is converted inline, and the result is a number (a BigInt
     throws, as mixing it with a number does);
+  - arithmetic between JS values (untyped property values, untyped
+    locals): numbers take an inline path, and a boxed result carries its
+    double along (through joins and in an extra variable of each untyped
+    local), so the next operation uses it directly and the boxing goes
+    unused unless the value is stored or passed on;
   - globals.
 
   Unboxed values are boxed where they meet JS values.
@@ -220,10 +433,201 @@ fast paths that keep the engine's semantics:
   captured by value: no box is allocated for it. Closures of one function
   share a shape. Side effects on module-level bindings (`count++`) are shared with
   interpreted code.
+- **Ordinary functions** (`function` declarations and expressions, not
+  methods or arrows) are constructors, as in JS: a native one has a
+  `prototype` (made when first read), and `new f()` makes an object of
+  it, runs `f` and returns the object unless `f` returns one (so
+  `function Foo() {}` with `Foo.prototype.m = ...`, older JavaScript's
+  classes, works).
 - **Class methods, getters and setters** (`this` included; static ones
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
   `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
+- **Class constructors** of classes whose instances are plain objects
+  with public fields (no private names, accessors or computed keys,
+  initializers that do not use `this`, a constructor that returns nothing
+  but the instance), TS parameter properties (`constructor(public x:
+  number)`) included. Native `new C(args)` calls the native constructor
+  directly (after reading `C`, which may be in its TDZ): the instance is
+  made with the class's fields, initializers evaluated first, through an
+  allocation site that caches the instance's final shape, then the body
+  runs. A constructor that only assigns its fields (`this.x = x`, values
+  that run no code) makes the instance with them directly, so an inlined
+  `new V(a, b)` is an object expression. Interpreted code keeps the
+  class's own constructor.
+- **Constructors of derived classes** (`class B extends A`, `A` a class
+  with a native constructor) that start with their only `super(...)` call
+  (arguments that cannot see `this`, parameter defaults that are
+  literals), or have none (the default one passes its arguments on). Each
+  superclass constructor is also compiled once per subclass to make that
+  subclass's instances (`new.target` known), so `super(...)` is a direct
+  call that returns the instance; the subclass's fields are then defined
+  (never through a setter) and its parameter properties assigned. After
+  inlining, a whole chain of such constructors makes the instance with
+  all its fields in one allocation. `new B()` first checks that each
+  class of the chain still has its declared superclass as its prototype
+  (`Object.setPrototypeOf(B, X)`): if not, the class is constructed as
+  interpreted code would.
+- **Class instances that do not escape** (scalar replacement, as JIT
+  compilers' escape analysis): a local holding a new instance (`new V()`,
+  or the result of an inlined or predicted method that makes one, such as
+  `a.sub(b)`) and only used for its fields, its class's methods and as an
+  argument of predicted methods keeps its fields in locals of its own while
+  a flag says it is virtual. Field reads and writes use them; its methods
+  run inline over them behind a check that the class's prototype still has
+  the method; a method of another object that receives it reads them
+  through its parameter. Where the object itself is needed (a method that
+  changed, a prediction that fails, a call that is not inlined) it is made
+  then ("materialized", as deoptimization does), and later uses work on
+  it, so identity and mutations stay right.
+- **Predictions from type annotations**: where an annotation names a
+  top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
+  method or function returning `Vec3`, `Node | null`), calls on those
+  values are predicted to reach that class's native methods, as for
+  `this`: a small method is inlined behind a check that the method reached
+  is that one. Annotations are never trusted otherwise: a wrong one only
+  costs the check. What an annotation says follows the values: the
+  elements of an annotated array (`xs[i]`, `for (const x of xs)`, the
+  parameters of arrow functions passed to `xs.map`, `filter`, `forEach`,
+  `sort`, `reduce`, ...), and what `slice`, `filter`, `sort` or `find`
+  return.
+- **Polymorphic call sites**: where such a receiver (or `this`) may be an
+  instance of the class or of its subclasses, which have methods of their
+  own (`s: Shape` with `Circle` and `Rect` overriding `area`), each of the
+  methods is predicted in turn (up to four): the method the receiver
+  reaches is read through the site's inline cache, whose other shapes'
+  entries are checked inline there, and compared with each; the one it is
+  runs inline, any other is called. A derived class's records list its
+  superclasses' fields then its own, so the inlined methods read fields of
+  subclass instances at fixed slots too.
+- **Fields of annotated object types**: where an annotation names an
+  object type alias, an interface or a class with plain public fields
+  (`b: Body`, `bs: Body[]`, a field `pos: Body`), its fields are read and
+  written at fixed slots. The first objects of the type seen with the
+  declared fields first, in order, as writable data properties give the
+  type's shapes (up to four: a class's own instances and its
+  subclasses'); each access then compares the object's shape with the
+  first one (one load and one comparison, shared by all the type's sites),
+  then the others, and loads or stores the slot. Any other object (fields
+  in another order, missing ones, accessors, frozen) goes through the
+  site's inline cache.
+- **Speculative numeric regions**, as JIT compilers speculate on what
+  fields hold: a run of statements that only does arithmetic on fields
+  annotated `number` (of locals holding such objects), numbers and untyped
+  locals (`const dx = a.x - b.x; ... a.vx -= dx * b.m * f;`) gets a second
+  version where all of these are doubles. One guard before it checks the
+  objects' shapes, that they are distinct objects if fields are written,
+  and that every field and untyped local it reads holds a number (each tag
+  compared with the float tag in turn, then one OR of the tags for
+  int32s); the run then reads the fields as doubles where it uses them,
+  computes in registers, and stores the fields it changed at its end (as
+  floats, as the interpreter's float arithmetic makes them, leaving their
+  float tags in place; a copy for when some held int32s stores int32s
+  where the results are). Nothing in the run can call or run code, so
+  what the guard checked holds throughout. When it fails (a string, a BigInt, the
+  same object twice, a getter), the statements run as before. Runs may
+  contain `if`, `?:`, `&&`, `||`, comparisons, `return`, loops (with
+  `break` and `continue`), calls of leaf functions on numbers, and
+  `s.charCodeAt(i)` / `s.length` of strings in locals: the guard then also
+  checks that those are flat strings and that `charCodeAt` is the builtin,
+  so a scanning loop such as `while (i < n && isDigit(s.charCodeAt(i)))
+  i++` runs as integer code. Methods take part: `this` is guarded as
+  locals are, objects held by guarded objects' fields (`this.center`)
+  are guarded too, a predicted call of a class's method runs its body in
+  the region (the guard checks that the receiver's prototype is the
+  class's and still has the method, and that the class binding is
+  initialized), and the vectors such methods return (scalar-replaced, see
+  below) keep their fields in float locals, so `origin.sub(this.center)
+  .dot(dir)` is float code throughout (a method body with an early
+  `return` runs inline too). A run that stores no field needs enough
+  arithmetic (or a loop) to be worth its guard. Untyped locals that hold
+  int32s are converted once and do not keep the fields' float code from
+  running.
+  A loop over the objects of an array (`for (let j = i + 1; j < n; j++) {
+  const bj = bodies[j]; ... }`, `spheres[i].center.dot(dir)`) can be a
+  region as a whole: the guard checks once what the iterations share (the
+  array is a dense fast array, so `arr.length` is its element count and
+  stays so; the other objects; the methods), and each iteration starts by
+  checking its element: its shape, that the fields the loop uses hold
+  numbers, the objects its fields hold, and that it is none of the
+  objects whose fields the region keeps in registers. Elements' fields are
+  read and written in place: an iteration has two copies, one where they
+  all hold floats (read as doubles, their tags left in place) and one
+  where some hold int32s. Where an element is not what
+  the region needs (another shape, a string field, a hole, the same object
+  as another), the region stores what it changed and the original loop
+  goes on from that iteration (what each iteration declares afresh, its
+  own locals and the fields of the vectors it makes, needs nothing from
+  the guard). With methods passing their parameters on to other inlined
+  methods (`oc.dot(dir)`), the ray tracer's whole sphere loop
+  (`spheres[i].hit(origin, dir)`) is one region.
+  A loop in such a loop's body may read elements too (`const bi =
+  bodies[i]; for (let j = i + 1; j < n; j++) { const bj = bodies[j]; ...
+  }`): the whole nest is one region, the outer element checked once per
+  outer iteration, the inner one in each inner iteration (and checked not
+  to be the outer one where the iteration writes elements' fields). Where
+  an inner element is not what the region needs, the original code goes
+  on from that inner iteration: the outer iteration's elements named
+  again, the rest of the inner loop, the rest of the outer iteration, the
+  outer loop from its next iteration. An n-body step is one region.
+  A jump out of a region from inside its loops (`break` or `continue` of an
+  enclosing loop, `return`) stores every field the region keeps in a
+  local and every local it may have assigned, in this iteration or in an
+  earlier one (those the guard loads first).
+  A loop's elements may be numbers too: `s += xs[i]` over a `number[]`
+  checks in each iteration that the element is an int32 or a float (else
+  the original loop goes on from it), and reads it as a double. Typed
+  arrays need no such check: with a pristine shape, a typed array's
+  `length` is its element count, the iteration checks that its index is
+  inside the arrays it reads, and reads them in place (so a write earlier
+  in the iteration, through any view of the buffer, is seen); writes check
+  their index and do nothing outside the array, as the engine does, and
+  the guard checks that the buffer is not immutable. A sieve's inner
+  loop, `dot` over two `Float64Array`s and `sum` over a `number[]` run as
+  plain loops over doubles.
+  A region may append numbers, or object literals of numbers, to arrays
+  in locals (`tokens.push({ kind: 1, start, end: i })`): the guard checks
+  that each is an extensible fast array of a fresh array's shape whose
+  `length` is its element count, that `Array.prototype.push` is the
+  builtin and that the array prototypes have no index properties (as the
+  engine's fast path); the region then stores each value directly (the
+  array growing through the engine when it is full), so a tokenizer's
+  whole scanning loop is one region. Such a region keeps no field's value
+  in a local and is not inside `try`, so an allocation that throws (out
+  of memory) leaves nothing undone that anything could see.
+- **Builtins**: method calls on strings read `String.prototype`'s methods
+  through their inline caches; `s.charCodeAt(i)` runs inline,
+  `arr.push(x)` appends inline to an extensible fast array of a fresh
+  array's shape with room for it (else takes the engine's fast path),
+  and `s.slice`, `substring`,
+  `indexOf`, `includes`, `startsWith` and `endsWith` on a string call the
+  engine's implementation directly (no call frame; int32 bounds taken
+  as they are) while they are the original builtins (checked at each
+  call); `===`, `!==` and `switch` against
+  string constants compare pointers, then lengths, before characters; a
+  direct call with a JS value for a `number` or `boolean` parameter checks
+  it at the call instead of going through the callee's JS entry. Where the
+  arguments cannot run code, the method is read without taking a
+  reference.
+- **Array callbacks as native loops**: `xs.forEach(cb)`, `map`, `filter`,
+  `some`, `every`, `find` and `findIndex` with an arrow function written at
+  the call become a loop with the arrow's body inline (its captured
+  variables are the caller's own), as JIT compilers inline the builtin and
+  its callback; it runs while `xs` is an array without holes and the
+  method is the original builtin, reading each element afresh (the
+  callback may change the array), and calls the builtin otherwise. The
+  results of `map` and `filter` are appended to inline: when the Array
+  constructor made the result itself (no species constructor ran), no
+  other code holds it, so an element is stored wherever there is room,
+  with no other check.
+  `xs.sort((a, b) => ...)` with an arrow that captures nothing is sorted
+  by a merge sort compiled per comparator (the engine's stable algorithm:
+  insertion sorts of up to 8 elements, halves merged), which runs a copy
+  of the comparator inline at each comparison; the engine takes the
+  elements out of the array and puts them back.
+- **Leaf functions** that can neither throw nor call (only unboxed numbers
+  and booleans) skip the stack check, and their callers the exception
+  check after the call.
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering
@@ -252,11 +656,12 @@ fast paths that keep the engine's semantics:
   generator and async methods too; `super` in them
   is not supported yet).
 
-Not yet: `super()` and class constructors
-(which stay interpreted), computed method and accessor names in object
+Not yet: constructors of classes with private names, of derived classes
+whose superclass is not compiled natively or that run code before
+`super(...)` (which stay interpreted), computed method and accessor names in object
 literals, classes inside functions, `arguments`, and `this` in arrow functions. A
 function using one of these stays interpreted (and functions that call it
-call it through its binding). `tsaot report file.ts` says, for every
+call it through its binding). `luminous report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.
 
 ### Forcing native compilation: `aot` (or `compiled`)
@@ -305,8 +710,8 @@ formatters reject it. Use `"use aot"` where that matters.
 
 A nested function can be marked when its enclosing function (or module
 code) is compiled, so `xs.map(aot (x) => …)` works at the top level too.
-Functions in code that always stays interpreted (class constructors and field
-initializers) cannot be marked.
+Functions in class constructors and field initializers cannot be marked:
+interpreted code constructing the class runs them interpreted.
 
 ### Keeping a function interpreted: `interpreted`
 
@@ -363,12 +768,119 @@ Known observable differences:
   static block first in its body (handing them to native code), which shows
   in the class's `toString()`.
 
+## Modules
+
+A program can be several modules: `luminous build main.ts` follows the
+`import`s of `main.ts` (and theirs) and merges the modules into one
+(scope hoisting, as bundlers do), which the compiler then sees whole:
+calls between modules are direct calls that can be inlined, and a class
+imported from another module has its native constructor and fixed field
+slots. Splitting `bench/raytracer.ts` into three modules runs the same
+instructions.
+
+- **Resolution.** Relative and absolute specifiers name files as
+  TypeScript resolves them: as written, a `.js` specifier's `.ts` file,
+  with `.ts`, `.mts`, `.js` or `.mjs` added, or a directory's `index`.
+  Other specifiers are packages, from the nearest `node_modules` up: a
+  package's `exports` (subpaths and `*` patterns; the `import`, `module`
+  and `default` conditions), else its `module` or `main` field, else its
+  `index`. Their JavaScript is compiled like TypeScript without types
+  (types come from the package's `.d.ts` files, which the build does not
+  read: an imported name or `ns.Name` that only they declare is a type,
+  erased). The engine's modules (`qjs:os`, `qjs:std`) stay imports.
+- **Packages.** `node_modules` as `bun install` (or npm, pnpm) lays it
+  out works: ESM packages such as `zod`, `valibot`, `date-fns` and
+  `lodash-es` build and print what Bun prints. A module whose package says
+  it has no side effects (`"sideEffects": false`, or a list of the files
+  that have) is part of the program only if the program uses something it
+  declares (a binding, or a namespace object that holds one), as bundlers
+  do: a package's `index` that re-exports all of its modules brings only
+  those used (`date-fns`: 69 native functions rather than 714). CommonJS
+  packages (`module.exports`, `require`) are an error for now, and
+  packages that need Node's APIs (`node:fs`, `Buffer`, `process`) need a
+  runtime that provides them (Beyond). A large program builds much faster
+  with the Cranelift backend than with LLVM (`zod`: 18 s against 141 s).
+- **Semantics.** Each module's top-level names stay its own: a name two
+  modules declare, or that a global another module uses has, is renamed
+  in one of them (where no scope that refers to it declares the new name),
+  so imports are the exporting module's own bindings, live. Modules run in
+  ESM's order (dependencies first, in the order of the `import`s; in a
+  cycle, the module that started evaluating is not waited for, and its
+  `let` bindings throw until it runs). Default exports (an anonymous
+  function or class named `default`), namespace imports, `export *`,
+  `export * as ns` and `export { a as b } from` resolve as in ESM, and a
+  re-export that does not resolve (missing, ambiguous through `export *`,
+  circular) is an error, as are duplicate export names and the module's
+  other early errors. Assigning to an import binding throws a TypeError.
+  `ns.x` is the binding itself where it is read; `ns` as a value is a
+  module namespace object (a Proxy with its semantics: live, throwing
+  while a binding is uninitialized, not writable, no prototype). An
+  import whose bindings are used only as types is elided, as TypeScript
+  does: a module imported only so does not run (an import of a value it
+  does not use still runs it). `with { type: "json" }` (or a `.json`
+  file), `"text"` and `"bytes"` import a file's content as `default`.
+- **`import()` and `import.meta`.** A module that `import()` imports
+  with a string specifier is part of the program, compiled with the
+  others. One that only `import()` imports (with its own dependencies) is
+  evaluated lazily: when an `import()` of it runs, in a later job, once (a
+  module that throws rejects every import of it with its error; one that
+  awaits at the top level is awaited). Its top-level declarations that run
+  no code (functions, classes that run no code when defined, variables of
+  literals or functions) stay top-level declarations of the program,
+  compiled as those of the other modules; its other top-level statements
+  become functions that its evaluation calls. `import()` of a module that
+  runs anyway returns its namespace object. A specifier that is computed,
+  or that does not resolve when the program is built, is left to run time:
+  the build warns, and the engine loads the module (relative to the
+  importing module's file) and interprets it, which `console.warn` reports
+  the first time. `import.meta` has `url`, `filename`, `dirname` and
+  `main`.
+- **Conformance.** test262's module tests (`language/module-code`,
+  `language/import`, `language/export`): 622 of 722 pass, against 611 with
+  the engine's own module loader (QuickJS-NG); JSON and text imports pass
+  here only, and an async module that runs while a sibling waits there
+  only. Most of the rest are proposals the engine lacks (`import defer`,
+  immutable `bytes` buffers, source phase imports). `import()` and
+  `import.meta` (`expressions/dynamic-import`, `expressions/import.meta`,
+  all run as modules): 776 of 964, against 757; one test of an async
+  cycle whose root throws fails here only (its other members do not
+  record the root's error).
+- **Not yet:** CommonJS (`require`, `module.exports`), `export =`. In a
+  lazily evaluated module, a variable that a statement declares is
+  `undefined`, not uninitialized, before the module runs, and a class that
+  runs code when it is defined (or extends a class of a module that is not
+  lazily evaluated) is a class expression, which stays interpreted. Errors
+  point into the module they are in; stack traces of interpreted code show
+  the merged program's lines.
+
+## Embedding: runtimes built on Luminous
+
+A runtime (Beyond) builds programs with its own modules, native code and
+event loop. `luminous build` (and the `luminous_cli` library: `build` with
+`BuildOpts::embed`) takes:
+
+- `--prelude FILE`: a module that runs before the program's entry, as if the
+  entry imported it first (where a runtime installs its globals);
+- `--module-dir PREFIX=DIR`: specifiers that start with `PREFIX` name the
+  modules of `DIR` (`--module-dir beyond:=lib`: `beyond:http` is
+  `lib/http.ts`), compiled with the program;
+- `--c-module SPECIFIER=FUNCTION`: a native module, made by
+  `JSModuleDef *FUNCTION(JSContext *, const char *)` (with the engine's
+  `JS_NewCModule`); its imports stay imports;
+- `--init-fn FUNCTION`: `int FUNCTION(JSContext *, int argc, char **argv)`,
+  called before the program runs;
+- `--loop-fn FUNCTION`: `int FUNCTION(JSContext *)`, the event loop that runs
+  after the program's module code, instead of the engine's;
+- `--link ARG`: an object file, static library or linker argument.
+
+`tests/embed` is an example, built by `crates/luminous-cli/tests/embed.rs`.
+
 ## The `int` type
 
 `type int = number` declares an integer type that the compiler checks:
 an `int` variable, parameter or return value always holds an int32 (never
 `-0`). TypeScript sees a plain `number`, so the program runs unchanged with
-`tsc`, Bun or Node; tsaot keeps `int`s in machine registers.
+`tsc`, Bun or Node; Luminous keeps `int`s in machine registers.
 
 ```ts
 type int = number;
@@ -489,6 +1001,8 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
 ## Getting started
 
 Requires Nix with flakes (or rustc ≥ 1.88, clang, cmake and ninja on `PATH`).
+The LLVM backend runs clang (≥ 15) at compile time; the Cranelift backend
+needs only a C compiler, for linking.
 
 ```sh
 git clone --recursive https://github.com/notwindstone/typescript-aot
@@ -497,13 +1011,14 @@ nix develop
 scripts/build-quickjs.sh          # patches/ applied to vendor/quickjs, built into build/quickjs
 cargo build --release
 
-./target/release/tsaot run bench/fib.ts
-./target/release/tsaot build bench/mandelbrot.ts -o mandelbrot
-./target/release/tsaot report tests/cases/rejected.ts
-./target/release/tsaot emit-js bench/fib.ts       # what the interpreter runs
-./target/release/tsaot ir bench/fib.ts            # typed IR of native functions
-cargo test                                        # differential tests (leak-checking engine)
-bench/run.sh                                      # hyperfine: native vs interpreted
+./target/release/luminous run bench/fib.ts
+./target/release/luminous build bench/mandelbrot.ts -o mandelbrot
+./target/release/luminous build --backend llvm bench/nbody_aot.ts -o nbody
+./target/release/luminous report tests/cases/rejected.ts
+./target/release/luminous emit-js bench/fib.ts       # what the interpreter runs
+./target/release/luminous ir bench/fib.ts            # typed IR of native functions
+cargo test                                        # differential tests (leak-checking engine), both backends
+bench/run.sh                                      # hyperfine: interpreted vs Cranelift vs LLVM
 ```
 
 `scripts/build-quickjs.sh` also builds `build/quickjs-check`, an engine with
@@ -527,22 +1042,96 @@ the same program built with `--no-native`, i.e. plain QuickJS-NG bytecode.
 
 In `boundary`, the interpreted loop around the calls dominates.
 
+### Against node and bun
+
+Median wall time of 7 interleaved runs (the program's own `elapsed`) and
+peak memory (maximum resident set size), LLVM backend with `--march
+x86-64-v3`, against the same program's erased JavaScript under node 22.22
+and bun 1.4.2, on a 4-core x86-64 cloud VM. Timings there drift by 10–20%
+between runs (primes, which allocates nothing, measured 1.00× bun in one
+run and 1.19× in this one); memory is stable.
+
+| benchmark    | Luminous          | node            | bun            | time / bun | memory / bun |
+|--------------|---------------:|----------------:|---------------:|-----------:|-------------:|
+| hello world  |   –  /  5.7 MB |    –  /  43 MB  |   –  /  11 MB  |          – |        0.50× |
+| fib          |  12 ms / 5.8 MB |   42 ms / 48 MB |  24 ms / 22 MB |      0.50× |        0.27× |
+| xorshift     |  53 ms / 5.6 MB |  136 ms / 50 MB |  80 ms / 23 MB |      0.66× |        0.25× |
+| raytracer    |  33 ms / 10 MB  |   76 ms / 52 MB |  43 ms / 39 MB |      0.77× |        0.27× |
+| binary_trees | 345 ms / 63 MB  |  363 ms / 96 MB | 418 ms / 58 MB |      0.83× |        1.09× |
+| integrate    | 210 ms / 5.9 MB |  378 ms / 51 MB | 248 ms / 24 MB |      0.85× |        0.25× |
+| mandelbrot   |  29 ms / 5.6 MB |   50 ms / 50 MB |  31 ms / 23 MB |      0.94× |        0.24× |
+| logparser    | 930 ms / 181 MB | 1519 ms / 251 MB| 960 ms / 227 MB|      0.97× |        0.80× |
+| objects      | 496 ms / 71 MB  | 1204 ms / 183 MB| 490 ms / 92 MB |      1.01× |        0.77× |
+| arrays       | 190 ms / 43 MB  |  243 ms / 80 MB | 187 ms / 78 MB |      1.02× |        0.55× |
+| nbody        | 156 ms / 6.1 MB |  151 ms / 51 MB | 152 ms / 26 MB |      1.03× |        0.24× |
+| tokenizer    | 279 ms / 170 MB |  562 ms / 208 MB| 267 ms / 197 MB|      1.04× |        0.86× |
+| records      | 736 ms / 64 MB  | 1179 ms / 131 MB| 669 ms / 69 MB |      1.10× |        0.92× |
+| primes       | 224 ms / 5.6 MB |  257 ms / 49 MB | 188 ms / 23 MB |      1.19× |        0.25× |
+| shapes       | 230 ms / 28 MB  |  262 ms / 100 MB| 116 ms / 49 MB |      1.98× |        0.58× |
+
+`bun --smol` changes little here (within a few percent of plain bun but
+for raytracer: 32MB, 61ms). The collector can be held to a smaller
+young generation (`QJS_GC_YOUNG_MAX`, in KB): at 2MB, objects peaks at
+36MB (bun: 92MB) and tokenizer at 92MB (bun: 197MB), taking about twice
+as long.
+
 ## Roadmap
 
 - **`int` fields and elements**: `{ value: int }`, `int[]` (checked reads),
   and `int` parameters of closures.
-- Shapes for class instances (inline property access), and calls to methods
-  of known classes without the engine.
-- **Multi-module programs** (`import` between `.ts` files).
+- **Modules**: dynamic `import()` of the program's modules (evaluated when
+  first imported), `import.meta`, CommonJS packages, `tsconfig.json`
+  `paths`.
 - **Position-preserving type stripping**, so interpreter stack traces point
   at the original `.ts` lines.
+
+### Open performance work
+
+Five open-ended lines of work, each left at a finished, tested point, with
+what would come next:
+
+- **LLVM code quality.** Most of the benchmarks above already run faster
+  than bun; what remains is in code the compiler cannot specialize yet.
+  Method calls on receivers of several classes (`for (const s of shapes)
+  s.area()`) now dispatch on the method the receiver reaches and run each
+  class's method inline, with no runtime lookups left in `bench/shapes.ts`'s
+  loop (about 1.2× bun's time). Next: keep numbers unboxed across such
+  calls and their returns, and drop the method check where no class of the
+  hierarchy can be changed at run time.
+- **Engine fast paths: allocation, strings, builtins.** Objects, class
+  instances and arrays are allocated inline by native code; `+` on strings,
+  template literals and `+` chains build their result with one engine call
+  (int32s written as digits), regular expression literals are compiled
+  once and searched from their first character, `Map`/`Set` keys hash and
+  compare cheaply, and `+=` onto a long string appends in place, so
+  `bench/maps.ts` and `bench/strbuild.ts` run faster than under bun.
+  Next: `Map`/`Set` entries in an open-addressing table rather than linked
+  records (fewer pointer chases, smaller entries), substrings that share
+  their parent's characters at shorter lengths (most of
+  `bench/logparser.ts`'s slices are copies), and native paths for the
+  other builtins that profiles of real programs show.
+- **Float code (nbody, raytracer).** Speculative regions read and write
+  `number` fields as doubles, and non-escaping class instances become
+  locals, so both run faster than bun. Next: scalar replacement through
+  calls that are not inlined (a `Vec` passed to and returned from a
+  method), and SIMD for the pair loop of nbody-like code.
+- **Numeric regions in methods.** Regions cover `this` fields in methods
+  and the bodies of inlined methods. Next: regions that span calls to
+  small methods of other objects (predicted and guarded), and regions over
+  loops that call such methods.
+- **Garbage collector.** The engine's reference counting is replaced by a
+  tracing, non-moving mark-sweep collector with generations (sticky mark
+  bits and a write barrier), conservative stack roots and inline bump
+  allocation. Next: parallel marking, lazy (incremental) sweeping, and a
+  copying young generation, which needs the objects that conservative
+  roots reach to be pinned (as mostly-copying collectors do).
 
 ## Layout
 
 ```
-crates/tsaot-front    oxc front end, checker, typed IR, type erasure, `aot` marker
-crates/tsaot-codegen  Cranelift backend (IR -> object file)
-crates/tsaot-cli      `tsaot` binary: glue generation, qjsc + cc driver; differential tests
+crates/luminous-front    oxc front end: module graph (bundle.rs), checker, typed IR, type erasure, `aot` marker
+crates/luminous-codegen  lowering to a backend-neutral SSA IR (mir.rs); Cranelift (clif.rs) and LLVM (llvm.rs) backends
+crates/luminous-cli      `luminous` binary: glue generation, qjsc + clang + cc driver; differential tests
 runtime/              C runtime linked into every program (helpers, boxes, async frames, cells)
 vendor/quickjs        QuickJS-NG (git submodule, kept pristine)
 patches/              engine patch applied by scripts/build-quickjs.sh

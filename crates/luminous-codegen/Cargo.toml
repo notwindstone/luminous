@@ -1,0 +1,15 @@
+[package]
+name = "luminous-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+cranelift-codegen = "0.136.2"
+cranelift-frontend = "0.136.2"
+cranelift-module = "0.136.2"
+cranelift-native = "0.136.2"
+cranelift-object = "0.136.2"
+target-lexicon = "0.13.5"
+luminous-front = { version = "0.1.0", path = "../luminous-front" }

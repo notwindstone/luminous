@@ -1,0 +1,9 @@
+[package]
+name = "luminous-front"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxc = { version = "0.153.0", features = ["transformer", "codegen", "semantic", "ast_visit"] }
+serde_json = "1"

@@ -1,0 +1,19 @@
+[package]
+name = "luminous-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+luminous-codegen = { version = "0.1.0", path = "../luminous-codegen" }
+luminous-front = { version = "0.1.0", path = "../luminous-front" }
+
+[lib]
+name = "luminous_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "luminous"
+path = "src/main.rs"

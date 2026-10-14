@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build QuickJS-NG with tsaot's engine patches into build/quickjs.
+# Build QuickJS-NG with luminous's engine patches into build/quickjs.
 #
 # vendor/quickjs stays pristine: its tree is exported to build/quickjs-src,
 # patches/*.patch are applied there, and that copy is built.
@@ -13,11 +13,17 @@ for p in patches/*.patch; do
   echo "applying $p"
   patch -d build/quickjs-src -p1 --quiet < "$p"
 done
-cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release
+# No stack protector, semantic interposition or CET markers (distribution
+# compilers' defaults): the engine is linked statically, so its exported
+# functions can be inlined into each other, and its hot paths keep no
+# canaries. No straight-line vectorization either: it packs the
+# allocator's counters into vector registers on every free.
+FLAGS="-fno-stack-protector -fno-semantic-interposition -fcf-protection=none -fno-tree-slp-vectorize"
+cmake -S build/quickjs-src -B build/quickjs -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$FLAGS"
 ninja -C build/quickjs qjsc qjs qjs_exe
 
 # Variant with assertions enabled (no NDEBUG), used by the test suite: the
 # engine then aborts at exit if any object leaked, which catches reference
 # counting bugs in generated code.
-cmake -S build/quickjs-src -B build/quickjs-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-O1
+cmake -S build/quickjs-src -B build/quickjs-check -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_C_FLAGS_RELEASE=-O1
 ninja -C build/quickjs-check qjsc qjs qjs-libc
