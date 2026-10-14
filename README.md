@@ -241,7 +241,11 @@ unreachable, and never moves anything.
   and its properties, and `{ left, right }` with its 8-byte cell header
   fills one 64-byte cache line (it took 112 bytes). Memory traffic is
   what allocation-heavy code waits on: 32 more bytes per object cost a
-  binary-trees run 14%.
+  binary-trees run 14%. A chunk's pages are made resident as allocation
+  runs reach them (all of a run's at once, rather than a fault each), so
+  that the chunks of the cell sizes a small program barely uses stay
+  mostly unmapped: hello world peaks at 5.6MB (it was 11.5MB with whole
+  regions populated up front).
 - **Tracing.** A cell is marked by its chunk's bit alone, without reading
   it (the bit also tells an old cell from a young one); its header and
   body are read when it is traced, a few cells later, prefetched in the
@@ -252,14 +256,20 @@ unreachable, and never moves anything.
   stack and registers, scanned conservatively: a word pointing into a cell
   keeps it. Native code needs no stack maps: what its registers and stack
   slots hold is found.
-- **Generations.** A cell that survives a collection is old (a bit in its
-  header) and keeps its mark. A minor collection traces from the roots and
-  from the old cells given references since the last collection, which a
-  write barrier (an inline test of that bit, in the engine and in native
-  code) remembers; the old cells are kept without being traced. The young
-  generation starts at 4MB and grows, up to 64MB, while much of it
-  survives; a major collection traces everything once the old cells have
-  doubled.
+- **Generations.** A cell that survives two minor collections is old (a
+  bit in its header) and keeps its mark. The first time, it stays young:
+  an age bit in its chunk records it, and its mark is cleared after the
+  sweep, so that what dies shortly after a collection (a tree being
+  built, an array being mapped) dies young instead of filling the old
+  generation until a major collection. A minor collection traces from the
+  roots and from the old cells given references since the last
+  collection, which a write barrier (an inline test of that bit, in the
+  engine and in native code) remembers; the old cells are kept without
+  being traced. An old cell that still holds young ones after a minor
+  collection stays remembered. The young generation starts at 4MB and
+  grows, up to 32MB, while much of it survives; a major collection traces
+  everything (and makes it old) once the old cells have doubled. Aging
+  took binary_trees from 89MB to 63MB, and made it faster.
 - **Sweeping.** Dead cells are not visited, but for those with something
   to release (class finalizers, property arrays of their own, weak
   references, shapes, function bytecode), whose finalizers run before any
