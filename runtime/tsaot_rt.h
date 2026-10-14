@@ -102,6 +102,7 @@ int tsaot_is_promise_resolve(JSValue promise, JSValue resolve);
 int tsaot_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue tsaot_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
 int tsaot_array_iter_ok(JSContext *ctx);
+JSValue tsaot_regexp(JSContext *ctx, int pattern, int flags);
 extern JSValue tsaot_pins[];
 /* The shapes of the pristine objects (up to TSAOT_SHAPE_ARRAY), then the
  * pointers of the other pins. */

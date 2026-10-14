@@ -211,9 +211,19 @@ engine's semantics:
   native code compares a string with a short constant (`switch` cases,
   `=== "user"`) by length, then by its characters as immediates; a
   string that is not an atom keeps its hash once a `Map` or `Set` has
-  computed it; native code calls
+  computed it; `Map` and `Set` keys are hashed with a final mix (small
+  integers and pointers spread over the buckets) and each entry keeps its
+  key's hash, compared before the key; native code calls
   `Map.prototype.get`, `set`, `has` and `Set.prototype.add`, `has` on a
-  Map or Set directly while they are the builtins; global variables
+  Map or Set directly while they are the builtins, and `new Set(array)` /
+  `new Map(entries)` take an array's elements without its iterator while
+  the array and its iteration are the builtin ones; `+` on a string and a
+  string or an int32 concatenates directly (an int32's digits written
+  into the result); a regular expression search whose pattern starts with
+  a character (not under `i` or `y`) tries the pattern only where
+  `memchr` finds that character, and a global `replace` by a string
+  without `$` on a standard RegExp loops over the matches without
+  building their result arrays; global variables
   (`parseInt`, `String`) are read through an inline cache of the global
   object's property (while there are no global `let`/`const`
   definitions); `parseInt`, `Number(s)` and `+s` read small decimal integers
@@ -359,9 +369,13 @@ The differential tests run every case with both.
 - **Control flow**: `if`, `while`, `do`-`while`, `for`, labelled `break` /
   `continue`, `switch`, `try` / `catch` / `finally`, `throw`.
 - **JS values**: `let` / `const` / `var` holding anything, plus:
-  - string, template, object and array literals (a template's parts are
-    concatenated by one engine call that copies each once, rather than
-    one `+` at a time);
+  - string, template, object, array and regular expression literals (a
+    template's parts, and a chain of `+` whose first or second operand
+    is a string and whose others are strings or primitives, such as
+    `a + ":" + b`, are concatenated by one engine call that copies each
+    once and writes int32s as digits, rather than one `+` at a time; a
+    regular expression's pattern is compiled once, and each evaluation
+    makes a new object of it);
   - property and element access, assignment and `delete`. Own data
     properties are read and written through per-site inline caches: a shape
     check (one comparison: other kinds of entries keep their shape in a
@@ -954,22 +968,26 @@ Five open-ended lines of work, each left at a finished, tested point, with
 what would come next:
 
 - **LLVM code quality.** Most of the benchmarks above already run faster
-  than bun; what remains is in code the compiler cannot specialize yet. A
-  method call on a receiver of several classes (`for (const s of shapes)
-  s.area()`) goes through the site's inline cache and the callee's generic
-  native entry: about 100 instructions per call in `bench/shapes.ts`,
-  which runs at about 1.6× bun's time. Next: dispatch on the receiver's
-  shape at the call site and call (or inline) each class's method
-  directly, as JIT compilers' polymorphic inlining does; keep numbers
-  unboxed across such calls.
+  than bun; what remains is in code the compiler cannot specialize yet.
+  Method calls on receivers of several classes (`for (const s of shapes)
+  s.area()`) now dispatch on the method the receiver reaches and run each
+  class's method inline, with no runtime lookups left in `bench/shapes.ts`'s
+  loop (about 1.2× bun's time). Next: keep numbers unboxed across such
+  calls and their returns, and drop the method check where no class of the
+  hierarchy can be changed at run time.
 - **Engine fast paths: allocation, strings, builtins.** Objects, class
-  instances and arrays are allocated inline by native code, but string
-  building (`+=` in loops, `join`, template literals), `Map`/`Set` and
-  most builtins still go through the engine's C entry points. Next: a
-  string builder for `+=` chains, inline `Map`/`Set` lookups of string and
-  small-integer keys, and native paths for the builtins that profiles of
-  real programs show (closure-heavy and graph-traversal test programs
-  measured at about 1.25–1.5× bun's time).
+  instances and arrays are allocated inline by native code; `+` on strings,
+  template literals and `+` chains build their result with one engine call
+  (int32s written as digits), regular expression literals are compiled
+  once and searched from their first character, and `Map`/`Set` keys hash
+  and compare cheaply, so `bench/maps.ts` and `bench/strbuild.ts` run
+  faster than under bun. Next: `+=` onto a long string (a rope) without
+  rebalancing it every 60 levels (about a fifth of `bench/strbuild.ts`),
+  `Map`/`Set` entries in an open-addressing table rather than linked
+  records (fewer pointer chases, smaller entries), substrings that share
+  their parent's characters at shorter lengths (most of
+  `bench/logparser.ts`'s slices are copies), and native paths for the
+  other builtins that profiles of real programs show.
 - **Float code (nbody, raytracer).** Speculative regions read and write
   `number` fields as doubles, and non-escaping class instances become
   locals, so both run faster than bun. Next: scalar replacement through

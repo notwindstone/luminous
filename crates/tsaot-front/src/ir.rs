@@ -453,6 +453,9 @@ pub enum ExprKind {
     Undefined,
     Null,
     Str(StrId),
+    /// A regular expression literal (its pattern and flags): a new RegExp
+    /// object each time, of a pattern compiled once.
+    RegExp(StrId, StrId),
     /// `F64` or `Bool` as a JS value.
     Box(Box<Expr>),
     AnyUnary(AnyUnOp, Box<Expr>),
@@ -1106,6 +1109,7 @@ macro_rules! visitor {
                 | Undefined
                 | Null
                 | Str(_)
+                | RegExp(..)
                 | Cell(_)
                 | Global(_)
                 | GlobalOrUndefined(_)

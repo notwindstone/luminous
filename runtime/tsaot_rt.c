@@ -364,6 +364,13 @@ static int tsaot_fn_cache_count(void)
     return &tsaot_nfn_caches ? tsaot_nfn_caches : 0;
 }
 
+/* The bytecode of regular expression literals, by the string constant of
+   their pattern (with the flags of the first one evaluated: another
+   literal of that pattern is compiled each time): compiled when first
+   evaluated. */
+static JSValue *tsaot_regexp_bc;
+static int *tsaot_regexp_flags;
+
 static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
@@ -383,6 +390,12 @@ static void tsaot_state_finalizer(JSRuntime *rt, JSValueConst val)
     for (i = 0; i < tsaot_nstrings; i++) {
         JS_FreeValueRT(rt, tsaot_strings[i]);
         tsaot_strings[i] = JS_UNDEFINED;
+    }
+    if (tsaot_regexp_bc) {
+        js_free_rt(rt, tsaot_regexp_bc);
+        js_free_rt(rt, tsaot_regexp_flags);
+        tsaot_regexp_bc = NULL;
+        tsaot_regexp_flags = NULL;
     }
     for (i = 0; i < tsaot_nprivates; i++) {
         JS_FreeValueRT(rt, tsaot_privates[i]);
@@ -2675,13 +2688,38 @@ static int tsaot_sarr_init(JSContext *ctx)
     return 0;
 }
 
-/* The string constants (atoms' strings) and the `aot type` literal
-   strings. */
+/* A regular expression literal's new object. */
+JSValue tsaot_regexp(JSContext *ctx, int pattern, int flags)
+{
+    JSValue bc = JS_UNDEFINED;
+    if (!tsaot_regexp_bc) {
+        tsaot_regexp_bc = js_mallocz(ctx, sizeof(JSValue) * tsaot_nstrings);
+        tsaot_regexp_flags = js_mallocz(ctx, sizeof(int) * tsaot_nstrings);
+        if (!tsaot_regexp_bc || !tsaot_regexp_flags)
+            return JS_EXCEPTION;
+        for (int i = 0; i < tsaot_nstrings; i++)
+            tsaot_regexp_bc[i] = JS_UNDEFINED;
+    }
+    if (JS_IsUndefined(tsaot_regexp_bc[pattern])) {
+        tsaot_regexp_flags[pattern] = flags;
+        return JS_NewRegExpLiteral(ctx, tsaot_strings[pattern], tsaot_strings[flags], &tsaot_regexp_bc[pattern]);
+    }
+    if (tsaot_regexp_flags[pattern] == flags)
+        return JS_NewRegExpLiteral(ctx, tsaot_strings[pattern], tsaot_strings[flags], &tsaot_regexp_bc[pattern]);
+    return JS_NewRegExpLiteral(ctx, tsaot_strings[pattern], tsaot_strings[flags], &bc);
+}
+
+/* The string constants (atoms' strings), the `aot type` literal strings
+   and the regular expression literals' bytecode. */
 static void tsaot_mark_strings(JSRuntime *rt, JS_MarkFunc *mark_func)
 {
     int i;
     for (i = 0; i < tsaot_nstrings; i++)
         JS_MarkValue(rt, tsaot_strings[i], mark_func);
+    if (tsaot_regexp_bc) {
+        for (i = 0; i < tsaot_nstrings; i++)
+            JS_MarkValue(rt, tsaot_regexp_bc[i], mark_func);
+    }
     if (tsaot_struct_lit_values) {
         for (i = 0; i < tsaot_nstruct_lits; i++)
             JS_MarkValue(rt, tsaot_struct_lit_values[i], mark_func);

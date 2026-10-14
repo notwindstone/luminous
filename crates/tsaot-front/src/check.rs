@@ -3558,6 +3558,26 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 Expr::new(Ty::Any, ExprKind::Str(id))
             }
             Expression::NullLiteral(_) => Expr::new(Ty::Any, ExprKind::Null),
+            Expression::RegExpLiteral(r) => {
+                let pattern = self.m.string(r.regex.pattern.text.as_str());
+                let flags: String = "dgimsuvy"
+                    .chars()
+                    .zip([
+                        RegExpFlags::D,
+                        RegExpFlags::G,
+                        RegExpFlags::I,
+                        RegExpFlags::M,
+                        RegExpFlags::S,
+                        RegExpFlags::U,
+                        RegExpFlags::V,
+                        RegExpFlags::Y,
+                    ])
+                    .filter(|(_, f)| r.regex.flags.contains(*f))
+                    .map(|(c, _)| c)
+                    .collect();
+                let flags = self.m.string(&flags);
+                Expr::new(Ty::Any, ExprKind::RegExp(pattern, flags))
+            }
             Expression::TemplateLiteral(t) => self.template(t)?,
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             Expression::Identifier(id) => self.ident(id)?,

@@ -2443,6 +2443,14 @@ impl Lower {
                 self.dup((p, t));
                 V::Any(p, t)
             }
+            ExprKind::RegExp(pattern, flags) => {
+                let ctx = self.ctx;
+                let p = self.b.ins().iconst(I32, *pattern as i64);
+                let f = self.b.ins().iconst(I32, *flags as i64);
+                let r = self.helper("tsaot_regexp", &[ctx, p, f]);
+                self.check_value(r[1]);
+                V::Any(r[0], r[1])
+            }
             ExprKind::Box(x) => match self.expr(x) {
                 V::Num(d) if x.ty == Ty::MaybeF64 => {
                     let (p, t) = self.box_maybe(d);
@@ -2518,13 +2526,14 @@ impl Lower {
                 V::Any(p, t)
             }
             ExprKind::AnyBinary(AnyBinOp::Add, ..) if concat_parts(e).is_some() => {
-                // A template literal: its strings, concatenated by one call
-                // that copies each once.
+                // A template literal (or a chain of `+` on strings and
+                // primitives): its parts, concatenated by one call that
+                // copies each once.
                 let parts = concat_parts(e).unwrap();
                 let vals: Vec<V> = parts
                     .iter()
                     .map(|x| {
-                        let v = self.expr(x);
+                        let v = self.expr(concat_operand(x));
                         self.hold(v);
                         v
                     })
@@ -5922,9 +5931,14 @@ impl Lower {
             AnyBinOp::BitOr => op::OR,
             AnyBinOp::BitXor => op::XOR,
         };
-        let code = self.b.ins().iconst(I32, code);
         let ctx = self.ctx;
-        let r = self.helper("JS_BinaryOperator", &[ctx, code, a.0, a.1, c.0, c.1]);
+        let r = if op == AnyBinOp::Add {
+            // (Strings, and a string with an int32, directly.)
+            self.helper("JS_AddValues", &[ctx, a.0, a.1, c.0, c.1])
+        } else {
+            let code = self.b.ins().iconst(I32, code);
+            self.helper("JS_BinaryOperator", &[ctx, code, a.0, a.1, c.0, c.1])
+        };
         self.check_value(r[1]);
         self.free(c);
         self.free(a);
@@ -8664,6 +8678,26 @@ fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
     }
     parts.push(e);
     parts.reverse();
+    // Once the first or second part is a string, every `+` concatenates,
+    // converting a primitive with ToString (an object's ToPrimitive could
+    // differ, so only strings and primitives).
     let string = |x: &&Expr| matches!(x.kind, ExprKind::Str(_) | ExprKind::AnyUnary(AnyUnOp::ToStr, _));
-    (parts.len() >= 2 && parts.iter().all(string)).then_some(parts)
+    let primitive = |x: &&Expr| {
+        string(x)
+            || matches!(&x.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool))
+    };
+    (parts.len() >= 2 && parts[..2].iter().any(string) && parts.iter().all(primitive)).then_some(parts)
+}
+
+/// A part of a concatenation as `JS_ConcatStrings` takes it: a number's
+/// ToString is left to it (an int32 is written as its digits).
+fn concat_operand(x: &Expr) -> &Expr {
+    match &x.kind {
+        ExprKind::AnyUnary(AnyUnOp::ToStr, inner)
+            if matches!(&inner.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool)) =>
+        {
+            inner
+        }
+        _ => x,
+    }
 }
