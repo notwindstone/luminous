@@ -556,7 +556,9 @@ fn collect_toplevel<'a>(
                         continue;
                     };
                     if kind != BindingKind::Const {
-                        pure_prefix = false;
+                        if !pure_init(init) {
+                            pure_prefix = false;
+                        }
                         continue;
                     }
                     let site = Site::ConstInit { init: init.span() };
@@ -572,6 +574,7 @@ fn collect_toplevel<'a>(
                             Some(val) if pure_prefix => {
                                 consts.insert(symbol, val);
                             }
+                            _ if pure_init(init) => {}
                             _ => pure_prefix = false,
                         },
                     }
@@ -599,7 +602,21 @@ fn collect_toplevel<'a>(
                     let info = class_info(c, &id.name, classes);
                     classes.push(info);
                 }
-                pure_prefix = false;
+                // (An earlier top-level class is initialized while the
+                // prefix is pure.)
+                let earlier_class = |id: &IdentifierReference| {
+                    id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id()).is_some_and(|s| {
+                        scoping.symbol_flags(s).is_class()
+                            && scoping.symbol_scope_id(s) == scoping.root_scope_id()
+                            && scoping.symbol_span(s).end <= c.span.start
+                    })
+                };
+                let global = |id: &IdentifierReference| {
+                    id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none())
+                };
+                if !pure_class(c, &earlier_class, &global) {
+                    pure_prefix = false;
+                }
             }
             // Pure type-level declarations; enums and namespaces emit code but
             // nothing that can call into this module.
@@ -1118,6 +1135,82 @@ fn mentions_this(e: &Expression) -> bool {
     let mut f = Finder(false);
     f.visit_expression(e);
     f.0
+}
+
+/// Whether evaluating `e` runs no code of the program and reads no binding
+/// (which could be uninitialized): literals, functions, and arrays and
+/// objects of those. A declaration initialized so keeps a module's prefix
+/// pure (see `collect_toplevel`); the bundler also evaluates such
+/// declarations of lazily evaluated modules early.
+pub(crate) fn pure_init(e: &Expression) -> bool {
+    let primitive = |e: &Expression| {
+        matches!(
+            e.without_parentheses(),
+            Expression::NumericLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::BooleanLiteral(_)
+                | Expression::NullLiteral(_)
+                | Expression::BigIntLiteral(_)
+        )
+    };
+    match e.without_parentheses() {
+        e if primitive(e) => true,
+        Expression::RegExpLiteral(_) | Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
+        Expression::TemplateLiteral(t) => t.expressions.is_empty(),
+        Expression::UnaryExpression(u) => u.operator != UnaryOperator::Delete && primitive(&u.argument),
+        Expression::ArrayExpression(a) => a.elements.iter().all(|el| match el {
+            ArrayExpressionElement::SpreadElement(_) => false,
+            ArrayExpressionElement::Elision(_) => true,
+            el => el.as_expression().is_some_and(pure_init),
+        }),
+        Expression::ObjectExpression(o) => o.properties.iter().all(|p| match p {
+            ObjectPropertyKind::ObjectProperty(p) => !p.computed && !p.shorthand && pure_init(&p.value),
+            ObjectPropertyKind::SpreadProperty(_) => false,
+        }),
+        Expression::TSAsExpression(e) => pure_init(&e.expression),
+        Expression::TSSatisfiesExpression(e) => pure_init(&e.expression),
+        Expression::TSTypeAssertion(e) => pure_init(&e.expression),
+        Expression::TSNonNullExpression(e) => pure_init(&e.expression),
+        _ => false,
+    }
+}
+
+/// Whether evaluating class `c` runs no code of the program: no
+/// decorators, static blocks or static initializers but pure ones, keys
+/// that are names, literals or `Symbol.<name>` (of the global `Symbol`),
+/// and no superclass but one `earlier_class` accepts.
+pub(crate) fn pure_class(
+    c: &Class,
+    earlier_class: &dyn Fn(&IdentifierReference) -> bool,
+    global: &dyn Fn(&IdentifierReference) -> bool,
+) -> bool {
+    let key = |k: &PropertyKey, computed: bool| {
+        !computed
+            || match k {
+                PropertyKey::StringLiteral(_) | PropertyKey::NumericLiteral(_) => true,
+                PropertyKey::StaticMemberExpression(m) => {
+                    matches!(&m.object, Expression::Identifier(id) if id.name == "Symbol" && global(id))
+                }
+                _ => false,
+            }
+    };
+    c.decorators.is_empty()
+        && match c.heritage.as_ref().map(|h| h.expression.without_parentheses()) {
+            None => true,
+            Some(Expression::Identifier(id)) => earlier_class(id),
+            Some(_) => false,
+        }
+        && c.body.body.iter().all(|el| match el {
+            ClassElement::StaticBlock(_) => false,
+            ClassElement::MethodDefinition(m) => m.decorators.is_empty() && key(&m.key, m.computed),
+            ClassElement::PropertyDefinition(p) => {
+                p.decorators.is_empty() && key(&p.key, p.computed) && (!p.r#static || p.value.as_ref().is_none_or(pure_init))
+            }
+            ClassElement::AccessorProperty(p) => {
+                p.decorators.is_empty() && key(&p.key, p.computed) && (!p.r#static || p.value.as_ref().is_none_or(pure_init))
+            }
+            ClassElement::TSIndexSignature(_) => true,
+        })
 }
 
 fn literal(e: &Expression) -> Option<ConstVal> {
@@ -2620,7 +2713,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 self.name_hint = Some(id.name.to_string());
                 let init = match &d.init {
                     Some(init) => self.expr(init)?,
-                    None if is_var => continue,
+                    // (A `var` is undefined until assigned: its cell, which
+                    // interpreted code may be all that uses, is.)
+                    None if is_var => {
+                        self.m.cell(sym, d.span)?;
+                        continue;
+                    }
                     None => undefined(),
                 };
                 self.name_hint = None;

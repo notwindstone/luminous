@@ -8626,7 +8626,68 @@
  /* CallSite */
 --- a/quickjs-libc.c
 +++ b/quickjs-libc.c
-@@ -4656,6 +4656,38 @@
+@@ -4562,8 +4562,9 @@
+ 
+ /**********************************************************/
+ 
+-static JSValue js_print(JSContext *ctx, JSValueConst this_val,
+-                        int argc, JSValueConst *argv)
++/* luminous: what console.log (stdout) and console.warn (stderr) print. */
++static JSValue js_print_to(JSContext *ctx, int argc, JSValueConst *argv,
++                           FILE *fp)
+ {
+ #ifdef _WIN32
+     HANDLE handle;
+@@ -4593,6 +4594,12 @@
+         }
+     }
+     dbuf_putc(&b, '\n');
++    if (fp != stdout) {
++        fflush(stdout);
++        fwrite(b.buf, 1, b.size, fp);
++        fflush(fp);
++        goto done;
++    }
+ #ifdef _WIN32
+     // use WriteConsoleA with CP_UTF8 for better Unicode handling vis-a-vis
+     // the mangling that happens when going through msvcrt's stdio layer,
+@@ -4621,6 +4628,18 @@
+     return JS_UNDEFINED;
+ }
+ 
++static JSValue js_print(JSContext *ctx, JSValueConst this_val,
++                        int argc, JSValueConst *argv)
++{
++    return js_print_to(ctx, argc, argv, stdout);
++}
++
++static JSValue js_print_err(JSContext *ctx, JSValueConst this_val,
++                            int argc, JSValueConst *argv)
++{
++    return js_print_to(ctx, argc, argv, stderr);
++}
++
+ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
+ {
+     JSValue global_obj, console, args;
+@@ -4632,6 +4651,16 @@
+     console = JS_NewObject(ctx);
+     JS_SetPropertyStr(ctx, console, "log",
+                       JS_NewCFunction(ctx, js_print, "log", 1));
++    /* luminous: as Node's and Bun's, info and debug print to stdout, warn
++       and error to stderr. */
++    JS_SetPropertyStr(ctx, console, "info",
++                      JS_NewCFunction(ctx, js_print, "info", 1));
++    JS_SetPropertyStr(ctx, console, "debug",
++                      JS_NewCFunction(ctx, js_print, "debug", 1));
++    JS_SetPropertyStr(ctx, console, "warn",
++                      JS_NewCFunction(ctx, js_print_err, "warn", 1));
++    JS_SetPropertyStr(ctx, console, "error",
++                      JS_NewCFunction(ctx, js_print_err, "error", 1));
+     JS_SetPropertyStr(ctx, global_obj, "console", console);
+ 
+     /* same methods as the mozilla JS shell */
+@@ -4656,6 +4685,38 @@
      js_free_rt(rt, ts);
  }
  
@@ -8665,7 +8726,7 @@
  void js_std_init_handlers(JSRuntime *rt)
  {
      JSThreadState *ts;
-@@ -4675,6 +4707,7 @@
+@@ -4675,6 +4736,7 @@
  
      js_set_thread_state(rt, ts);
      JS_AddRuntimeFinalizer(rt, js_std_finalize, ts);

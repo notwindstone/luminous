@@ -956,6 +956,9 @@ impl Lower {
         self.free_all_locals();
         if is_async {
             // The exception is pending; the runtime rejects the promise.
+            // (The returned tag says so: a native callee's flag is not left
+            // set for the next native call to find.)
+            self.clear_flag();
             let z = self.b.ins().iconst(I64, 0);
             let t = self.b.ins().iconst(I64, TAG_EXCEPTION);
             self.b.ins().return_(&[z, t]);

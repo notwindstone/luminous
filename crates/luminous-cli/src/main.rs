@@ -168,6 +168,9 @@ fn real_main() -> Result<()> {
 /// analyzed.
 fn analyze(input: &Path, fopts: &luminous_front::Options) -> Result<(Bundle, Analysis)> {
     let bundle = luminous_front::bundle::bundle(input).map_err(anyhow::Error::msg)?;
+    for w in &bundle.warnings {
+        eprintln!("warning: {w}");
+    }
     let analysis = luminous_front::analyze_bundle(&bundle, fopts).map_err(anyhow::Error::msg)?;
     Ok((bundle, analysis))
 }

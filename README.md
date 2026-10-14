@@ -234,7 +234,9 @@ engine's semantics:
   object's property (while there are no global `let`/`const`
   definitions); `parseInt`, `Number(s)` and `+s` read small decimal integers
   directly; `x ** 2` is the correctly rounded square (as native code
-  computes it).
+  computes it);
+- `console.info` and `console.debug` (to stdout, as `console.log`),
+  `console.warn` and `console.error` (to stderr), as Node's and Bun's.
 
 ### Memory: a generational, tracing collector
 
@@ -803,6 +805,22 @@ instructions.
   does: a module imported only so does not run (an import of a value it
   does not use still runs it). `with { type: "json" }` (or a `.json`
   file), `"text"` and `"bytes"` import a file's content as `default`.
+- **`import()` and `import.meta`.** A module that `import()` imports
+  with a string specifier is part of the program, compiled with the
+  others. One that only `import()` imports (with its own dependencies) is
+  evaluated lazily: when an `import()` of it runs, in a later job, once (a
+  module that throws rejects every import of it with its error; one that
+  awaits at the top level is awaited). Its top-level declarations that run
+  no code (functions, classes that run no code when defined, variables of
+  literals or functions) stay top-level declarations of the program,
+  compiled as those of the other modules; its other top-level statements
+  become functions that its evaluation calls. `import()` of a module that
+  runs anyway returns its namespace object. A specifier that is computed,
+  or that does not resolve when the program is built, is left to run time:
+  the build warns, and the engine loads the module (relative to the
+  importing module's file) and interprets it, which `console.warn` reports
+  the first time. `import.meta` has `url`, `filename`, `dirname` and
+  `main`.
 - **Conformance.** test262's module tests (`language/module-code`,
   `language/import`, `language/export`): 611 of 722 pass, as many as
   with the engine's own module loader (QuickJS-NG), though not the same:
@@ -810,9 +828,13 @@ instructions.
   yet) and an async module that runs while a sibling waits there only.
   Most of the rest are proposals the engine lacks (`import defer`,
   immutable `bytes` buffers, source phase imports).
-- **Not yet:** dynamic `import()`, `import.meta`, CommonJS (`require`,
-  `module.exports`), `export =`. Errors point into the module they are
-  in; stack traces of interpreted code show the merged program's lines.
+- **Not yet:** CommonJS (`require`, `module.exports`), `export =`. In a
+  lazily evaluated module, a variable that a statement declares is
+  `undefined`, not uninitialized, before the module runs, and a class that
+  runs code when it is defined (or extends a class of a module that is not
+  lazily evaluated) is a class expression, which stays interpreted. Errors
+  point into the module they are in; stack traces of interpreted code show
+  the merged program's lines.
 
 ## The `int` type
 

@@ -69,6 +69,8 @@ pub struct Bundle {
     pub source: String,
     /// In the order of the source.
     pub modules: Vec<ModuleSource>,
+    /// What the program's build should warn of.
+    pub warnings: Vec<String>,
 }
 
 impl Bundle {
@@ -160,13 +162,40 @@ struct Unit<'a> {
     reexports: Vec<(Span, usize, String)>,
     /// Its early errors (parse and semantic).
     errors: Vec<OxcDiagnostic>,
-    /// `import(...)` expressions: where, and the module of a string
-    /// specifier that resolves (else it stays the engine's).
-    dynamic: Vec<(Span, Option<Target>)>,
-    /// Where `import.meta` is.
-    metas: Vec<Span>,
+    /// Its `import(...)` expressions.
+    dynamic: Vec<DynImport>,
+    /// Where `import.meta` is, and the scope there.
+    metas: Vec<(Span, ScopeId)>,
     /// Whether its code awaits at the top level.
     tla: bool,
+    /// What it is warned of (`import()`s left to the engine).
+    warnings: Vec<String>,
+    /// The modules the engine provides that its `import()`s import (which
+    /// the program then links).
+    dyn_externals: Vec<String>,
+}
+
+/// An `import(...)` expression.
+struct DynImport {
+    span: Span,
+    /// `import(`: what a call of the run-time loader replaces.
+    head: Span,
+    /// The scope it is in.
+    scope: ScopeId,
+    to: DynTo,
+}
+
+/// What an `import(...)` imports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynTo {
+    /// A module of the program.
+    Module(usize),
+    /// What the engine loads and interprets at run time (a specifier that
+    /// is computed, or that does not resolve when the program is built).
+    Fallback,
+    /// A module the engine provides, or a source or deferred import: the
+    /// engine's own.
+    Leave,
 }
 
 impl Unit<'_> {
@@ -536,18 +565,48 @@ fn records(
     }
     let mut dynamic = Dynamic::default();
     dynamic.visit_program(program);
-    unit.dynamic = dynamic
+    let nodes = unit.sem.nodes();
+    let mut warnings = Vec::new();
+    let mut dyn_externals = Vec::new();
+    let dynamic_imports: Vec<DynImport> = dynamic
         .imports
         .into_iter()
-        .map(|(span, spec)| {
-            // (One that does not resolve rejects when it runs, as the
-            // engine's does.)
-            let t = spec.and_then(|(s, ty)| resolve_target(&s, ty).ok()).filter(|t| matches!(t, Target::Module(_)));
-            (span, t)
+        .map(|d| {
+            let to = if d.phase {
+                DynTo::Leave
+            } else {
+                match &d.spec {
+                    Some((s, ty)) => match resolve_target(s, ty.clone()) {
+                        Ok(Target::Module(k)) => DynTo::Module(k),
+                        Ok(Target::External(e)) => {
+                            dyn_externals.push(e);
+                            DynTo::Leave
+                        }
+                        Err(e) => {
+                            warnings.push(format!("{}: {e}: `import(\"{s}\")` is left to run time", at(d.span)));
+                            DynTo::Fallback
+                        }
+                    },
+                    None => {
+                        warnings.push(format!(
+                            "{}: `import()` of a computed specifier: the module is loaded and interpreted at run time",
+                            at(d.span)
+                        ));
+                        DynTo::Fallback
+                    }
+                }
+            };
+            let paren = unit.original[d.span.start as usize..d.source_start as usize].rfind('(').unwrap_or(6);
+            DynImport {
+                span: d.span,
+                head: Span::new(d.span.start, d.span.start + paren as u32 + 1),
+                scope: nodes.get_node(d.node).scope_id(),
+                to,
+            }
         })
         .collect();
-    unit.metas = dynamic.metas;
-    unit.tla = dynamic.tla;
+    let metas: Vec<(Span, ScopeId)> =
+        dynamic.metas.into_iter().map(|(span, node)| (span, nodes.get_node(node).scope_id())).collect();
     // An export name declared twice is an early error.
     let mut seen = HashSet::new();
     for (name, _) in &exports {
@@ -562,18 +621,30 @@ fn records(
     unit.deletions = deletions;
     unit.default_expr = default_expr;
     unit.reexports = reexports;
+    unit.dynamic = dynamic_imports;
+    unit.metas = metas;
+    unit.tla = program.body.iter().any(has_tla);
+    unit.warnings = warnings;
+    unit.dyn_externals = dyn_externals;
     Ok(())
 }
 
-/// A module's `import(...)` expressions (string specifiers, and a `type`
-/// in `{ with: { type } }`), `import.meta`, and whether it awaits at the
-/// top level.
+/// A module's `import(...)` expressions and `import.meta`s.
 #[derive(Default)]
 struct Dynamic {
-    imports: Vec<(Span, Option<(String, Option<String>)>)>,
-    metas: Vec<Span>,
-    tla: bool,
-    depth: u32,
+    imports: Vec<DynSite>,
+    metas: Vec<(Span, NodeId)>,
+}
+
+struct DynSite {
+    span: Span,
+    node: NodeId,
+    source_start: u32,
+    /// A string specifier, and the `type` of `{ with: { type } }` (none
+    /// when the options are anything else: then it is left to run time).
+    spec: Option<(String, Option<String>)>,
+    /// `import.source(...)` or `import.defer(...)`.
+    phase: bool,
 }
 
 impl<'a> Visit<'a> for Dynamic {
@@ -585,63 +656,99 @@ impl<'a> Visit<'a> for Dynamic {
             }
             _ => None,
         };
-        let ty = it.options.as_ref().and_then(|o| {
-            let Expression::ObjectExpression(o) = o.without_parentheses() else { return None };
-            o.properties.iter().find_map(|p| {
-                let ObjectPropertyKind::ObjectProperty(p) = p else { return None };
-                if p.key.static_name().as_deref() != Some("with") {
+        // Options other than `{ with: { type: "..." } }` (string values):
+        // left to run time.
+        let ty = match &it.options {
+            None => Some(None),
+            Some(o) => (|| {
+                let Expression::ObjectExpression(o) = o.without_parentheses() else { return None };
+                let [ObjectPropertyKind::ObjectProperty(p)] = o.properties.as_slice() else { return None };
+                if p.computed || p.method || p.key.static_name().as_deref() != Some("with") {
                     return None;
                 }
                 let Expression::ObjectExpression(w) = p.value.without_parentheses() else { return None };
-                w.properties.iter().find_map(|q| {
+                let mut ty = None;
+                for q in &w.properties {
                     let ObjectPropertyKind::ObjectProperty(q) = q else { return None };
-                    match (&q.key.static_name().as_deref(), &q.value) {
-                        (Some("type"), Expression::StringLiteral(v)) => Some(v.value.to_string()),
-                        _ => None,
+                    let (false, false, Expression::StringLiteral(v)) = (q.computed, q.method, &q.value) else { return None };
+                    if q.key.static_name().as_deref() == Some("type") {
+                        ty = Some(v.value.to_string());
                     }
-                })
-            })
+                }
+                Some(ty)
+            })(),
+        };
+        self.imports.push(DynSite {
+            span: it.span,
+            node: it.node_id.get(),
+            source_start: it.source.span().start,
+            spec: spec.zip(ty),
+            phase: it.phase.is_some(),
         });
-        self.imports.push((it.span, spec.map(|s| (s, ty))));
         walk::walk_import_expression(self, it);
     }
 
     fn visit_import_meta(&mut self, it: &ImportMeta) {
-        self.metas.push(it.span);
+        self.metas.push((it.span, it.node_id.get()));
     }
+}
 
-    fn visit_await_expression(&mut self, it: &AwaitExpression<'a>) {
-        if self.depth == 0 {
-            self.tla = true;
+/// Whether statement `stmt` (of a module's top level) awaits at the top
+/// level.
+fn has_tla(stmt: &Statement) -> bool {
+    #[derive(Default)]
+    struct Tla {
+        found: bool,
+        depth: u32,
+    }
+    impl<'a> Visit<'a> for Tla {
+        fn visit_await_expression(&mut self, it: &AwaitExpression<'a>) {
+            self.found |= self.depth == 0;
+            walk::walk_await_expression(self, it);
         }
-        walk::walk_await_expression(self, it);
-    }
-
-    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
-        if it.r#await && self.depth == 0 {
-            self.tla = true;
+        fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+            self.found |= it.r#await && self.depth == 0;
+            walk::walk_for_of_statement(self, it);
         }
-        walk::walk_for_of_statement(self, it);
+        fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
+            self.found |= it.kind == VariableDeclarationKind::AwaitUsing && self.depth == 0;
+            walk::walk_variable_declaration(self, it);
+        }
+        fn visit_function(&mut self, it: &Function<'a>, flags: oxc::syntax::scope::ScopeFlags) {
+            self.depth += 1;
+            walk::walk_function(self, it, flags);
+            self.depth -= 1;
+        }
+        fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+            self.depth += 1;
+            walk::walk_arrow_function_expression(self, it);
+            self.depth -= 1;
+        }
+        fn visit_class(&mut self, it: &Class<'a>) {
+            // (Field initializers and static blocks are functions of their
+            // own; computed keys and the heritage are not.)
+            for d in &it.decorators {
+                self.visit_decorator(d);
+            }
+            if let Some(h) = &it.heritage {
+                self.visit_expression(&h.expression);
+            }
+            for el in &it.body.body {
+                let key = match el {
+                    ClassElement::MethodDefinition(m) if m.computed => Some(&m.key),
+                    ClassElement::PropertyDefinition(p) if p.computed => Some(&p.key),
+                    ClassElement::AccessorProperty(p) if p.computed => Some(&p.key),
+                    _ => None,
+                };
+                if let Some(k) = key {
+                    self.visit_property_key(k);
+                }
+            }
+        }
     }
-
-    fn visit_function(&mut self, it: &Function<'a>, flags: oxc::syntax::scope::ScopeFlags) {
-        self.depth += 1;
-        walk::walk_function(self, it, flags);
-        self.depth -= 1;
-    }
-
-    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        self.depth += 1;
-        walk::walk_arrow_function_expression(self, it);
-        self.depth -= 1;
-    }
-
-    fn visit_class(&mut self, it: &Class<'a>) {
-        // (Field initializers and static blocks are functions of their own.)
-        self.depth += 1;
-        walk::walk_class(self, it);
-        self.depth -= 1;
-    }
+    let mut v = Tla::default();
+    v.visit_statement(stmt);
+    v.found
 }
 
 /// The source of a module of JSON, text or bytes: its content as a default
@@ -711,6 +818,8 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
             dynamic: Vec::new(),
             metas: Vec::new(),
             tla: false,
+            warnings: Vec::new(),
+            dyn_externals: Vec::new(),
         };
         let mut resolve_target = |spec: &str, attr: Option<String>| -> Result<Target, String> {
             Ok(match resolve(&path, spec)? {
@@ -743,22 +852,20 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
     // One module: as written (the compiler reports its errors).
     if units.len() == 1
         && units[0].imports.iter().all(|i| matches!(i.target, Target::External(_)))
-        && units[0].dynamic.iter().all(|d| d.1.is_none())
+        && units[0].dynamic.iter().all(|d| d.to == DynTo::Leave)
+        && units[0].dyn_externals.is_empty()
+        && units[0].metas.is_empty()
     {
         let u = units.pop().unwrap();
         return Ok(single(&u.path, u.original));
     }
-    for u in &mut units {
-        if !u.errors.is_empty() {
-            return Err(crate::erase::render(std::mem::take(&mut u.errors), &u.original, &u.path));
-        }
+    let mut b = link(&units)?;
+    if std::env::var_os("LUMINOUS_DEBUG_BUNDLE").is_some() {
+        eprintln!("{}", b.source);
     }
-    for u in &units {
-        if let Some(e) = &u.unsupported {
-            return Err(e.clone());
-        }
-    }
-    link(&units)
+    let link_warnings = std::mem::take(&mut b.warnings);
+    b.warnings = units.iter().flat_map(|u| u.warnings.iter().cloned()).chain(link_warnings).collect();
+    Ok(b)
 }
 
 fn single(path: &Path, original: String) -> Bundle {
@@ -766,6 +873,7 @@ fn single(path: &Path, original: String) -> Bundle {
     Bundle {
         source: original.clone(),
         modules: vec![ModuleSource { path: path.to_path_buf(), original, start: 0, end, first_line: 1, map: Vec::new() }],
+        warnings: Vec::new(),
     }
 }
 
@@ -801,7 +909,39 @@ struct Names {
     /// Import bindings that are assigned to: the function that returns an
     /// object whose `v` reads the binding and throws when set.
     writes: HashMap<(usize, SymbolId), String>,
+    /// Modules `import()` imports: the function that evaluates the module
+    /// (if it is lazy) and returns a promise of its namespace object.
+    loads: HashMap<usize, String>,
+    /// Lazily evaluated modules: the function that evaluates one, and the
+    /// functions of its runs (see `LazyPlan`).
+    inits: HashMap<usize, String>,
+    runs: HashMap<usize, Vec<String>>,
+    /// Modules with `import.meta`: the function that returns it.
+    metas: HashMap<usize, String>,
+    /// The function that has the engine load what `import()` imports at run
+    /// time (warning that it does).
+    fallback: Option<String>,
 }
+
+/// How a lazily evaluated module (one that `import()` imports, not
+/// otherwise run) is laid out: its top-level statements that run no code
+/// (declarations of functions, of classes that run no code, of variables
+/// with literals or functions as values, of types...) stay declarations of
+/// the program, evaluated when it starts, so they are compiled as those of
+/// the other modules; runs of the others become functions that the
+/// module's evaluation calls, the variables and classes they declare
+/// declared before them (`let x;`, and `x = ...` in their place).
+struct LazyPlan {
+    /// The run each top-level statement is in (none: it stays a declaration
+    /// of the program).
+    run_of: Vec<Option<usize>>,
+    /// Each run: its first and last statement, and whether it awaits.
+    runs: Vec<(usize, usize, bool)>,
+}
+
+/// What a run of a lazily evaluated module declares before it: `let` or
+/// `var`, the name, and the type annotation's span.
+type Hoist = (&'static str, String, Option<Span>);
 
 /// The JavaScript globals the code this adds refers to: no module's
 /// top-level binding may take their names.
@@ -825,19 +965,72 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     let mut state = vec![0u8; units.len()];
     let mut order = Vec::new();
     visit(0, units, &mut state, &mut order);
-    // Modules imported for their types only: their type declarations.
-    let typed_only: Vec<usize> = (0..units.len()).filter(|&m| state[m] == 0).collect();
-    let all: Vec<usize> = typed_only.iter().copied().chain(order.iter().copied()).collect();
+    // Modules that an `import()` of a running module imports, and their
+    // dependencies, not run otherwise: evaluated lazily (in the same depth
+    // first order) when an `import()` of one runs.
+    let mut lazy_order = Vec::new();
+    let mut i = 0;
+    while i < order.len() + lazy_order.len() {
+        let m = if i < order.len() { order[i] } else { lazy_order[i - order.len()] };
+        i += 1;
+        for d in &units[m].dynamic {
+            if let DynTo::Module(t) = d.to
+                && state[t] == 0
+            {
+                visit(t, units, &mut state, &mut lazy_order);
+            }
+        }
+    }
+    let mut lazy = vec![false; units.len()];
+    for &m in &lazy_order {
+        lazy[m] = true;
+    }
+
+    // A module's errors (early errors, and imports or re-exports that do not
+    // resolve, below) are the program's; but those of a lazy module (and of
+    // the lazy modules that import it) make `import()`s of it reject.
+    let mut broken: HashMap<usize, String> = HashMap::new();
+    let mut warnings = Vec::new();
+    for (m, u) in units.iter().enumerate() {
+        let err = match u.errors.first() {
+            Some(d) => {
+                let pos = d.labels.first().map_or(0, |l| l.offset() as u32);
+                Some(format!("{}: {}", loc(&u.path, &u.original, pos), d.message))
+            }
+            None => u.unsupported.clone(),
+        };
+        match err {
+            Some(e) if lazy[m] => {
+                broken.insert(m, e);
+            }
+            Some(_) if !u.errors.is_empty() => {
+                return Err(crate::erase::render(u.errors.clone(), &u.original, &u.path));
+            }
+            Some(e) => return Err(e),
+            None => {}
+        }
+    }
+    let mut fail = |m: usize, e: String| -> Result<(), String> {
+        if lazy[m] {
+            broken.entry(m).or_insert(e);
+            Ok(())
+        } else {
+            Err(e)
+        }
+    };
 
     // `export { a } from` must resolve, used or not (as ESM links them).
-    for u in units {
+    for (m, u) in units.iter().enumerate() {
         for (span, t, name) in &u.reexports {
             if resolve_export(units, *t, name, &mut Vec::new()).is_none() {
-                return Err(format!(
-                    "{}: module `{}` has no export `{name}` (or more than one through `export *`)",
-                    loc(&u.path, &u.original, span.start),
-                    units[*t].path.display()
-                ));
+                fail(
+                    m,
+                    format!(
+                        "{}: module `{}` has no export `{name}` (or more than one through `export *`)",
+                        loc(&u.path, &u.original, span.start),
+                        units[*t].path.display()
+                    ),
+                )?;
             }
         }
     }
@@ -850,21 +1043,107 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             for (sym, name) in &imp.bindings {
                 let b = match name {
                     Name::Namespace => Binding::Namespace(t),
-                    Name::Named(n) => resolve_export(units, t, n, &mut Vec::new()).ok_or_else(|| {
-                        format!(
-                            "{}: module `{}` has no export `{n}` (or more than one through `export *`)",
-                            loc(&u.path, &u.original, imp.span.start),
-                            units[t].path.display()
-                        )
-                    })?,
+                    Name::Named(n) => match resolve_export(units, t, n, &mut Vec::new()) {
+                        Some(b) => b,
+                        None => {
+                            fail(
+                                m,
+                                format!(
+                                    "{}: module `{}` has no export `{n}` (or more than one through `export *`)",
+                                    loc(&u.path, &u.original, imp.span.start),
+                                    units[t].path.display()
+                                ),
+                            )?;
+                            continue;
+                        }
+                    },
                 };
                 resolved.insert((m, *sym), b);
             }
         }
     }
+    // (A module that imports a broken one is.)
+    loop {
+        let mut changed = false;
+        for &m in &lazy_order {
+            if broken.contains_key(&m) {
+                continue;
+            }
+            let dep = units[m].deps.iter().find_map(|(t, _)| match t {
+                Target::Module(d) => broken.get(d).cloned(),
+                _ => None,
+            });
+            if let Some(e) = dep {
+                broken.insert(m, e);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    resolved.retain(|&(m, _), _| !broken.contains_key(&m));
+    lazy_order.retain(|m| !broken.contains_key(m));
+    for (&m, e) in &broken {
+        lazy[m] = false;
+        warnings.push(format!("{e}: `import()` of `{}` rejects", units[m].path.display()));
+    }
+    warnings.sort();
+    let running: Vec<usize> = order.iter().chain(&lazy_order).copied().collect();
+    // Modules imported for their types only: their type declarations.
+    let typed_only: Vec<usize> = (0..units.len()).filter(|&m| state[m] == 0).collect();
+    // (Lazy modules first: what they declare is in place when an `import()`
+    // runs.)
+    let all: Vec<usize> = typed_only.iter().chain(&lazy_order).chain(&order).copied().collect();
+
+    // How lazy modules are laid out, and which of them are async (they or
+    // their lazy dependencies await at the top level).
+    let mut plans: HashMap<usize, LazyPlan> = HashMap::new();
+    let mut top_classes: HashSet<(usize, SymbolId)> = HashSet::new();
+    for &m in &lazy_order {
+        plans.insert(m, lazy_plan(units, m, &resolved, &mut top_classes)?);
+    }
+    let mut is_async = vec![false; units.len()];
+    for &m in &lazy_order {
+        is_async[m] = units[m].tla;
+    }
+    loop {
+        let mut changed = false;
+        for &m in &lazy_order {
+            if !is_async[m]
+                && units[m].deps.iter().any(|(t, rt)| *rt && matches!(t, Target::Module(d) if lazy[*d] && is_async[*d]))
+            {
+                is_async[m] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // The modules `import()`s import, and the scopes of those `import()`s;
+    // those left to run time.
+    let mut loads: Vec<usize> = Vec::new();
+    let mut load_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
+    let mut fallback_sites: Vec<(usize, ScopeId)> = Vec::new();
+    for &m in &running {
+        for d in &units[m].dynamic {
+            match d.to {
+                DynTo::Module(t) => {
+                    if !loads.contains(&t) {
+                        loads.push(t);
+                    }
+                    load_sites.entry(t).or_default().push((m, d.scope));
+                }
+                DynTo::Fallback => fallback_sites.push((m, d.scope)),
+                DynTo::Leave => {}
+            }
+        }
+    }
 
     // Namespace objects that are needed: of namespace imports used other
-    // than as `ns.x` (with their references' scopes), and those they hold.
+    // than as `ns.x` (with their references' scopes), those `import()`
+    // returns, and those they hold.
     let mut ns_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
     let mut writes: Vec<(usize, SymbolId)> = Vec::new();
     for (&(m, sym), &b) in &resolved {
@@ -883,6 +1162,11 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     }
     writes.sort();
     let mut needed: Vec<usize> = ns_sites.keys().copied().collect();
+    for &t in &loads {
+        if !needed.contains(&t) && !broken.contains_key(&t) {
+            needed.push(t);
+        }
+    }
     for &(m, sym) in &writes {
         if let Binding::Namespace(t) = resolved[&(m, sym)]
             && !needed.contains(&t)
@@ -910,6 +1194,12 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     // added) use, and not that of a binding in a scope where a reference to
     // it is.
     let mut taken: HashSet<String> = GLOBALS_USED.iter().map(|s| s.to_string()).collect();
+    if loads.iter().any(|t| broken.contains_key(t)) {
+        taken.insert("SyntaxError".into());
+    }
+    if !fallback_sites.is_empty() {
+        taken.extend(["console", "Set", "JSON"].map(String::from));
+    }
     for u in units {
         for name in u.sem.scoping().root_unresolved_references().keys() {
             taken.insert(name.to_string());
@@ -938,7 +1228,15 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         }
         v
     };
-    let mut names = Names { of: HashMap::new(), writes: HashMap::new() };
+    let mut names = Names {
+        of: HashMap::new(),
+        writes: HashMap::new(),
+        loads: HashMap::new(),
+        inits: HashMap::new(),
+        runs: HashMap::new(),
+        metas: HashMap::new(),
+        fallback: None,
+    };
     // `type int = number` in several modules is one alias (the checker
     // knows `int` by its name).
     let mut int_aliases: Vec<(usize, SymbolId)> = Vec::new();
@@ -994,6 +1292,38 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         taken.insert(n.clone());
         n
     });
+    for &m in &lazy_order {
+        let s = stem(&units[m].path);
+        let n = pick(&format!("{s}_init"), &[], &taken);
+        taken.extend([format!("{n}$s"), format!("{n}$e"), format!("{n}$p"), n.clone()]);
+        names.inits.insert(m, n);
+        let mut runs = Vec::new();
+        for k in 0..plans[&m].runs.len() {
+            let n = pick(&format!("{s}_run{}", k + 1), &[], &taken);
+            taken.insert(n.clone());
+            runs.push(n);
+        }
+        names.runs.insert(m, runs);
+    }
+    for &t in &loads {
+        let n = pick(&format!("{}_load", stem(&units[t].path)), &load_sites[&t], &taken);
+        taken.insert(n.clone());
+        names.loads.insert(t, n);
+    }
+    for &m in &running {
+        let u = &units[m];
+        if !u.metas.is_empty() {
+            let sites: Vec<(usize, ScopeId)> = u.metas.iter().map(|&(_, s)| (m, s)).collect();
+            let n = pick(&format!("{}_meta", stem(&u.path)), &sites, &taken);
+            taken.extend([format!("{n}$"), n.clone()]);
+            names.metas.insert(m, n);
+        }
+    }
+    if !fallback_sites.is_empty() {
+        let n = pick("__luminous_import", &fallback_sites, &taken);
+        taken.extend([format!("{n}$w"), n.clone()]);
+        names.fallback = Some(n);
+    }
 
     // The text of each module, edited, in order; what must run before any
     // of them (`.name` of anonymous default functions, which are hoisted)
@@ -1002,6 +1332,14 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     let mut modules = Vec::new();
     let mut line = 1u32;
     let mut prelude = String::new();
+    // (A module the engine provides is linked when a static import imports
+    // it.)
+    let mut externals: Vec<&String> = running.iter().flat_map(|&m| &units[m].dyn_externals).collect();
+    externals.sort();
+    externals.dedup();
+    for e in externals {
+        prelude.push_str(&format!("import {}; ", serde_json::to_string(e).unwrap()));
+    }
     for &m in &all {
         let u = &units[m];
         let typed = typed_only.contains(&m);
@@ -1019,9 +1357,10 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     source.push_str(&prelude);
     for &m in &all {
         let u = &units[m];
-        let mut edits = edits(units, m, &resolved, &names, typed_only.contains(&m), &int_aliases)?;
-        // (An edit inside a removed span is dropped: the longer first.)
-        edits.sort_by_key(|e| (e.0.start, std::cmp::Reverse(e.0.end)));
+        let mut edits = edits(units, m, &resolved, &names, typed_only.contains(&m), &int_aliases, plans.get(&m))?;
+        // (An edit inside a removed span is dropped: the longer first, an
+        // insertion before what starts where it is.)
+        edits.sort_by_key(|e| (e.0.start, e.0.end != e.0.start, std::cmp::Reverse(e.0.end)));
         let start = source.len() as u32;
         let mut map = Vec::new();
         let mut pos = 0usize;
@@ -1091,7 +1430,185 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             "var {name}$; function {name}() {{ return {name}$ || ({name}$ = {{ get v() {{ return {target}; }}, set v(_) {{ throw new TypeError(\"Assignment to constant variable.\"); }} }}); }}\n"
         ));
     }
-    Ok(Bundle { source, modules })
+    // `import()` of a module of the program: a promise of its namespace
+    // object, once it is evaluated (in a later job, as the engine's).
+    // (An async function's promise is the intrinsic one, whatever the
+    // global `Promise` is.)
+    for &t in &loads {
+        let body = match (broken.get(&t), names.inits.get(&t)) {
+            (Some(e), _) => format!("throw new SyntaxError({});", serde_json::to_string(e).unwrap()),
+            (None, Some(init)) => format!("await null; await {init}(); return {}();", names.of[&Binding::Namespace(t)]),
+            (None, None) => format!("await null; return {}();", names.of[&Binding::Namespace(t)]),
+        };
+        source.push_str(&format!("function {}() {{ return (async () => {{ {body} }})(); }}\n", names.loads[&t]));
+    }
+    // The evaluation of a lazy module: its lazy dependencies', then its
+    // runs, once (an error is that of every later evaluation; one in a cycle
+    // that is being evaluated returns). (No initializers: an `import()` can
+    // run before the end of the program is reached.)
+    for &m in &lazy_order {
+        let init = &names.inits[&m];
+        let mut deps: Vec<usize> = Vec::new();
+        for (t, runtime) in &units[m].deps {
+            if let (Target::Module(d), true) = (t, runtime)
+                && lazy[*d]
+                && !deps.contains(d)
+            {
+                deps.push(*d);
+            }
+        }
+        let mut calls = String::new();
+        for d in deps {
+            let aw = if is_async[d] { "await " } else { "" };
+            calls.push_str(&format!("{aw}{}(); ", names.inits[&d]));
+        }
+        for (k, run) in names.runs[&m].iter().enumerate() {
+            let aw = if plans[&m].runs[k].2 { "await " } else { "" };
+            calls.push_str(&format!("{aw}{run}(); "));
+        }
+        if is_async[m] {
+            source.push_str(&format!(
+                "var {init}$s, {init}$p; function {init}() {{ if ({init}$p) return {init}$p; if ({init}$s) return; {init}$s = 1; \
+                 return {init}$p = (async () => {{ {calls}}})(); }}\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "var {init}$s, {init}$e; function {init}() {{ if ({init}$s) {{ if ({init}$s === 3) throw {init}$e; return; }} {init}$s = 1; \
+                 try {{ {calls}}} catch (e) {{ {init}$s = 3; {init}$e = e; throw e; }} {init}$s = 2; }}\n"
+            ));
+        }
+    }
+    // `import.meta`: an object with a null prototype, made on first use.
+    for (&m, name) in &names.metas {
+        let path = units[m].path.canonicalize().unwrap_or_else(|_| units[m].path.clone());
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let json = |s: String| serde_json::to_string(&s).unwrap();
+        source.push_str(&format!(
+            "var {name}$; function {name}() {{ return {name}$ || ({name}$ = Object.assign(Object.create(null), \
+             {{ url: {}, filename: {}, dirname: {}, main: {} }})); }}\n",
+            json(file_url(&path)),
+            json(path.display().to_string()),
+            json(dir.display().to_string()),
+            m == 0
+        ));
+    }
+    // `import()` left to run time: the engine loads (and interprets) the
+    // module, relative specifiers resolved against the importing module's
+    // directory; the first of each specifier is warned of.
+    if let Some(f) = &names.fallback {
+        source.push_str(&format!(
+            "var {f}$w; function {f}(base, specifier, options) {{ \
+             let key; try {{ key = `${{specifier}}`; }} catch (e) {{ return (async () => {{ throw e; }})(); }} \
+             if (!({f}$w || ({f}$w = new Set())).has(key)) {{ {f}$w.add(key); \
+             console.warn(\"Luminous: import(\" + JSON.stringify(key) + \") is not part of the compiled program: \
+             the module is loaded and interpreted at run time\"); }} \
+             if (key.startsWith(\"./\") || key.startsWith(\"../\")) key = base + key; \
+             return import(key, options); }}\n"
+        ));
+    }
+    Ok(Bundle { source, modules, warnings })
+}
+
+/// The `file:` URL of an absolute path.
+fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for b in path.display().to_string().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// The layout of lazily evaluated module `m` (see `LazyPlan`).
+/// `top_classes`: the classes of earlier lazy modules (and then of this
+/// one) that stay declarations, which a class that stays one may extend.
+fn lazy_plan(
+    units: &[Unit],
+    m: usize,
+    resolved: &HashMap<(usize, SymbolId), Binding>,
+    top_classes: &mut HashSet<(usize, SymbolId)>,
+) -> Result<LazyPlan, String> {
+    let u = &units[m];
+    let scoping = u.sem.scoping();
+    let at = |span: Span| loc(&u.path, &u.original, span.start);
+    let global = |id: &IdentifierReference| id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none());
+    let class_top = |c: &Class, top_classes: &mut HashSet<(usize, SymbolId)>| -> Result<bool, String> {
+        if c.declare {
+            return Ok(true);
+        }
+        if !c.decorators.is_empty() {
+            return Err(format!("{}: decorators in a module that `import()` imports are not supported yet", at(c.span)));
+        }
+        let earlier = |id: &IdentifierReference| {
+            let Some(sym) = id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id()) else { return false };
+            let b = resolved.get(&(m, sym)).copied().unwrap_or(Binding::Symbol(m, sym));
+            matches!(b, Binding::Symbol(k, s) if top_classes.contains(&(k, s)))
+        };
+        let top = crate::check::pure_class(c, &earlier, &global);
+        if top && let Some(id) = &c.id {
+            top_classes.insert((m, id.symbol_id()));
+        }
+        Ok(top)
+    };
+    let decl_top = |d: &Declaration, top_classes: &mut HashSet<(usize, SymbolId)>| -> Result<bool, String> {
+        Ok(match d {
+            Declaration::VariableDeclaration(v) if v.declare => true,
+            Declaration::VariableDeclaration(v) => {
+                if matches!(v.kind, VariableDeclarationKind::Using | VariableDeclarationKind::AwaitUsing) {
+                    return Err(format!(
+                        "{}: `using` at the top level of a module that `import()` imports is not supported yet",
+                        at(v.span)
+                    ));
+                }
+                v.declarations.iter().all(|d| {
+                    matches!(d.id, BindingPattern::BindingIdentifier(_)) && d.init.as_ref().is_none_or(crate::check::pure_init)
+                })
+            }
+            Declaration::ClassDeclaration(c) => class_top(c, top_classes)?,
+            _ => true,
+        })
+    };
+    let mut run_of = Vec::new();
+    let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+    for (i, stmt) in u.program.body.iter().enumerate() {
+        let top = match stmt {
+            Statement::ExportDeclaration(e) => decl_top(&e.declaration, top_classes)?,
+            Statement::ExportDefaultDeclaration(e) => match &e.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(_) | ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => true,
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => class_top(c, top_classes)?,
+                other => {
+                    other.as_expression().is_some_and(crate::check::pure_init)
+                        && u.default_expr.is_some_and(|d| d.anonymous == Anon::No)
+                }
+            },
+            Statement::ImportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::ExportAllDeclaration(_)
+            | Statement::EmptyStatement(_) => true,
+            s => match s.as_declaration() {
+                Some(d) => decl_top(d, top_classes)?,
+                None => false,
+            },
+        };
+        if top {
+            run_of.push(None);
+            continue;
+        }
+        let tla = has_tla(stmt);
+        match runs.last_mut() {
+            Some((_, last, a)) if *last + 1 == i => {
+                *last = i;
+                *a |= tla;
+            }
+            _ => runs.push((i, i, tla)),
+        }
+        run_of.push(Some(runs.len() - 1));
+    }
+    Ok(LazyPlan { run_of, runs })
 }
 
 /// A module namespace object (after `function <name>`): a Proxy over a
@@ -1276,6 +1793,7 @@ fn edits(
     names: &Names,
     typed_only: bool,
     int_aliases: &[(usize, SymbolId)],
+    plan: Option<&LazyPlan>,
 ) -> Result<Vec<(Span, String)>, String> {
     let u = &units[m];
     let scoping = u.sem.scoping();
@@ -1296,18 +1814,60 @@ fn edits(
     for &d in &u.deletions {
         out.push(blank(d));
     }
+    // (A hashbang but at the start of the program is an error.)
+    if let Some(h) = &program.hashbang {
+        out.push(blank(h.span));
+    }
+    if !typed_only {
+        for d in &u.dynamic {
+            match d.to {
+                DynTo::Module(t) => out.push((d.span, format!("{}()", names.loads[&t]))),
+                DynTo::Fallback => {
+                    let path = u.path.canonicalize().unwrap_or_else(|_| u.path.clone());
+                    let mut base = path.parent().unwrap_or(Path::new("/")).display().to_string();
+                    if !base.ends_with('/') {
+                        base.push('/');
+                    }
+                    let f = names.fallback.as_ref().unwrap();
+                    out.push((d.head, format!("{f}({}, ", serde_json::to_string(&base).unwrap())));
+                }
+                DynTo::Leave => {}
+            }
+        }
+        for &(span, _) in &u.metas {
+            out.push((span, format!("{}()", names.metas[&m])));
+        }
+    }
+    // A lazy module's runs: what each declares before it.
+    let mut hoists: Vec<Vec<Hoist>> = plan.map(|p| vec![Vec::new(); p.runs.len()]).unwrap_or_default();
+    let run_at = |pos: u32| -> Option<usize> {
+        let p = plan?;
+        p.runs.iter().position(|&(a, b, _)| program.body[a].span().start <= pos && pos < program.body[b].span().end)
+    };
     if let Some(d) = u.default_expr
         && !typed_only
     {
         let name = &names.of[&Binding::Default(m)];
         let mut after = String::new();
-        match d.name_at {
-            Some(at) => {
+        // (In a run of a lazy module: assigned to the binding declared
+        // before the run.)
+        let run = run_at(d.prefix.start);
+        if let Some(r) = run {
+            hoists[r].push(("let", name.clone(), None));
+        }
+        match (d.name_at, run) {
+            (Some(at), None) => {
                 out.push(blank(d.prefix));
                 out.push((Span::new(at, at), format!(" {name}")));
             }
-            None => {
-                out.push((d.prefix, format!("const {name} = ")));
+            (Some(at), Some(_)) => {
+                out.push((d.prefix, format!(";{name} = ")));
+                out.push((Span::new(at, at), format!(" {name}")));
+                after.push(';');
+            }
+            (None, run) => {
+                let decl = if run.is_some() { ";" } else { "const " };
+                out.push((d.prefix, format!("{decl}{name} = ")));
                 if !text[..d.end as usize].trim_end().ends_with(';') {
                     after.push(';');
                 }
@@ -1424,5 +1984,143 @@ fn edits(
             rename_at(&mut out, nodes.get_node(node).kind().span(), old, new, shorthand_ref(node));
         }
     }
+    if let Some(plan) = plan {
+        lazy_edits(u, m, names, plan, &mut hoists, &mut out)?;
+    }
     Ok(out)
+}
+
+/// The edits that lay lazily evaluated module `m` out as `plan` says: the
+/// variables (top-level ones, and `var`s anywhere at the top level) and
+/// classes that runs declare are declared before the run, and assigned
+/// where they were declared; each run is a function.
+fn lazy_edits(
+    u: &Unit,
+    m: usize,
+    names: &Names,
+    plan: &LazyPlan,
+    hoists: &mut [Vec<Hoist>],
+    out: &mut Vec<(Span, String)>,
+) -> Result<(), String> {
+    let scoping = u.sem.scoping();
+    let nodes = u.sem.nodes();
+    let body = &u.program.body;
+    let text = &u.original;
+    let root = u.root();
+    let run_spans: Vec<Span> = plan.runs.iter().map(|&(a, b, _)| Span::new(body[a].span().start, body[b].span().end)).collect();
+    let run_at = |span: Span| run_spans.iter().position(|r| r.start <= span.start && span.end <= r.end);
+    let name_of = |sym: SymbolId| names.of.get(&Binding::Symbol(m, sym)).cloned().unwrap_or_else(|| scoping.symbol_name(sym).to_string());
+    for node in nodes.iter() {
+        let AstKind::VariableDeclaration(v) = node.kind() else { continue };
+        let Some(r) = run_at(v.span) else { continue };
+        let Some(first) = v.declarations.first().and_then(|d| d.id.get_binding_identifiers().into_iter().next()) else { continue };
+        if v.declare || scoping.symbol_scope_id(first.symbol_id()) != root {
+            continue;
+        }
+        let (kw, hoist_kw) = match v.kind {
+            VariableDeclarationKind::Var => (3, "var"),
+            VariableDeclarationKind::Let => (3, "let"),
+            VariableDeclarationKind::Const => (5, "let"),
+            _ => return Err(format!("{}: `using` here is not supported yet", loc(&u.path, text, v.span.start))),
+        };
+        enum Ctx {
+            List,
+            Single,
+            ForInit,
+            ForLeft,
+        }
+        let ctx = match nodes.parent_kind(node.id()) {
+            AstKind::Program(_) | AstKind::BlockStatement(_) | AstKind::SwitchCase(_) | AstKind::ExportDeclaration(_) => Ctx::List,
+            AstKind::ForStatement(_) => Ctx::ForInit,
+            AstKind::ForInStatement(_) | AstKind::ForOfStatement(_) => Ctx::ForLeft,
+            _ => Ctx::Single,
+        };
+        // (A `;` first: what follows might continue the line before.)
+        let lead = if matches!(ctx, Ctx::List) { ";" } else { "" };
+        out.push((Span::new(v.span.start, v.span.start + kw), lead.to_string()));
+        for d in &v.declarations {
+            let id_end = d.id.span().end;
+            if let Some(t) = &d.type_annotation {
+                out.push((Span::new(id_end, t.span.end), String::new()));
+            } else if d.definite {
+                out.push((Span::new(id_end, id_end + 1), String::new()));
+            }
+            let annotation = match d.id {
+                BindingPattern::BindingIdentifier(_) => d.type_annotation.as_ref().map(|t| t.span),
+                _ => None,
+            };
+            for id in d.id.get_binding_identifiers() {
+                hoists[r].push((hoist_kw, name_of(id.symbol_id()), annotation));
+            }
+            match (&d.init, &ctx) {
+                (_, Ctx::ForLeft) => {}
+                (None, _) => out.push((d.span, "void 0".into())),
+                (Some(_), _) if !matches!(d.id, BindingPattern::BindingIdentifier(_)) => {
+                    out.push((Span::new(d.span.start, d.span.start), "(".into()));
+                    out.push((Span::new(d.span.end, d.span.end), ")".into()));
+                }
+                (Some(_), _) => {}
+            }
+        }
+    }
+    // Classes: assigned a class expression.
+    for (i, stmt) in body.iter().enumerate() {
+        let Some(r) = plan.run_of[i] else { continue };
+        let class = match stmt {
+            Statement::ClassDeclaration(c) => Some(c),
+            Statement::ExportDeclaration(e) => match &e.declaration {
+                Declaration::ClassDeclaration(c) => Some(c),
+                _ => None,
+            },
+            Statement::ExportDefaultDeclaration(e) => match &e.declaration {
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(c) = class
+            && let Some(id) = &c.id
+            && !c.declare
+        {
+            let name = name_of(id.symbol_id());
+            out.push((Span::new(c.span.start, c.span.start), format!(";{name} = ")));
+            out.push((Span::new(c.span.end, c.span.end), ";".into()));
+            hoists[r].push(("let", name, None));
+        }
+    }
+    // The runs: what they declare (types as edited), then the function.
+    let render = |span: Span, out: &[(Span, String)]| -> String {
+        let mut es: Vec<&(Span, String)> = out.iter().filter(|(s, _)| span.start <= s.start && s.end <= span.end).collect();
+        es.sort_by_key(|e| (e.0.start, e.0.end != e.0.start, std::cmp::Reverse(e.0.end)));
+        let mut res = String::new();
+        let mut pos = span.start as usize;
+        for (s, rep) in es {
+            if (s.start as usize) < pos {
+                continue;
+            }
+            res.push_str(&text[pos..s.start as usize]);
+            res.push_str(rep);
+            pos = s.end as usize;
+        }
+        res.push_str(&text[pos..span.end as usize]);
+        res
+    };
+    for (r, span) in run_spans.iter().enumerate() {
+        let mut head = String::new();
+        let mut seen = HashSet::new();
+        for (kw, name, annotation) in &hoists[r] {
+            // (A `var` declared again: once.)
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let ty = annotation.map(|a| render(a, out)).unwrap_or_default();
+            head.push_str(&format!("{kw} {name}{ty}; "));
+        }
+        let asy = if plan.runs[r].2 { "async " } else { "" };
+        head.push_str(&format!("{asy}function {}() {{ ", names.runs[&m][r]));
+        // (Before what else is inserted there.)
+        out.insert(0, (Span::new(span.start, span.start), head));
+        out.push((Span::new(span.end, span.end), " }".into()));
+    }
+    Ok(())
 }
