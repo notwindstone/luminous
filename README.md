@@ -900,27 +900,36 @@ In `boundary`, the interpreted loop around the calls dominates.
 
 ### Against node and bun
 
-Median wall time of 7 runs (the program's own `elapsed`), LLVM backend
-with `--march x86-64-v3`, against the same program's erased JavaScript
-under node 22.22 and bun 1.4.2, on a 4-core x86-64 cloud VM (timings
-there vary by about ±10%):
+Median wall time of 7 interleaved runs (the program's own `elapsed`) and
+peak memory (maximum resident set size), LLVM backend with `--march
+x86-64-v3`, against the same program's erased JavaScript under node 22.22
+and bun 1.4.2, on a 4-core x86-64 cloud VM. Timings there drift by 10–20%
+between runs (primes, which allocates nothing, measured 1.00× bun in one
+run and 1.19× in this one); memory is stable.
 
-| benchmark    | tsaot  | node    | bun    | tsaot / bun |
-|--------------|-------:|--------:|-------:|------------:|
-| fib          |  10 ms |   47 ms |  20 ms |       0.50× |
-| xorshift     |  49 ms |  137 ms |  72 ms |       0.68× |
-| raytracer    |  30 ms |   63 ms |  41 ms |       0.73× |
-| mandelbrot   |  24 ms |   45 ms |  29 ms |       0.83× |
-| objects      | 398 ms | 1066 ms | 440 ms |       0.90× |
-| logparser    | 920 ms | 1364 ms | 1026 ms |       0.90× |
-| tokenizer    | 254 ms |  580 ms | 267 ms |       0.95× |
-| binary_trees | 347 ms |  344 ms | 363 ms |       0.96× |
-| integrate    | 225 ms |  361 ms | 235 ms |       0.96× |
-| arrays       | 132 ms |  185 ms | 136 ms |       0.97× |
-| nbody        | 141 ms |  127 ms | 145 ms |       0.97× |
-| primes       | 203 ms |  310 ms | 203 ms |       1.00× |
-| records      | 611 ms | 1043 ms | 597 ms |       1.02× |
-| shapes       | 196 ms |  258 ms | 125 ms |       1.57× |
+| benchmark    | tsaot          | node            | bun            | time / bun | memory / bun |
+|--------------|---------------:|----------------:|---------------:|-----------:|-------------:|
+| hello world  |   –  /  5.7 MB |    –  /  43 MB  |   –  /  11 MB  |          – |        0.50× |
+| fib          |  12 ms / 5.8 MB |   42 ms / 48 MB |  24 ms / 22 MB |      0.50× |        0.27× |
+| xorshift     |  53 ms / 5.6 MB |  136 ms / 50 MB |  80 ms / 23 MB |      0.66× |        0.25× |
+| raytracer    |  33 ms / 10 MB  |   76 ms / 52 MB |  43 ms / 39 MB |      0.77× |        0.27× |
+| binary_trees | 345 ms / 63 MB  |  363 ms / 96 MB | 418 ms / 58 MB |      0.83× |        1.09× |
+| integrate    | 210 ms / 5.9 MB |  378 ms / 51 MB | 248 ms / 24 MB |      0.85× |        0.25× |
+| mandelbrot   |  29 ms / 5.6 MB |   50 ms / 50 MB |  31 ms / 23 MB |      0.94× |        0.24× |
+| logparser    | 930 ms / 181 MB | 1519 ms / 251 MB| 960 ms / 227 MB|      0.97× |        0.80× |
+| objects      | 496 ms / 71 MB  | 1204 ms / 183 MB| 490 ms / 92 MB |      1.01× |        0.77× |
+| arrays       | 190 ms / 43 MB  |  243 ms / 80 MB | 187 ms / 78 MB |      1.02× |        0.55× |
+| nbody        | 156 ms / 6.1 MB |  151 ms / 51 MB | 152 ms / 26 MB |      1.03× |        0.24× |
+| tokenizer    | 279 ms / 170 MB |  562 ms / 208 MB| 267 ms / 197 MB|      1.04× |        0.86× |
+| records      | 736 ms / 64 MB  | 1179 ms / 131 MB| 669 ms / 69 MB |      1.10× |        0.92× |
+| primes       | 224 ms / 5.6 MB |  257 ms / 49 MB | 188 ms / 23 MB |      1.19× |        0.25× |
+| shapes       | 230 ms / 28 MB  |  262 ms / 100 MB| 116 ms / 49 MB |      1.98× |        0.58× |
+
+`bun --smol` changes little here (within a few percent of plain bun but
+for raytracer: 32MB, 61ms). The collector can be held to a smaller
+young generation (`QJS_GC_YOUNG_MAX`, in KB): at 2MB, objects peaks at
+36MB (bun: 92MB) and tokenizer at 92MB (bun: 197MB), taking about twice
+as long.
 
 ## Roadmap
 
