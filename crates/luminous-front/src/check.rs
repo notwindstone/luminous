@@ -935,21 +935,45 @@ fn class_ctor<'a>(
     out: &mut Vec<Candidate<'a>>,
     rejected: &mut Vec<(String, Span, Reject)>,
 ) {
+    let name = id.name.to_string();
+    // Why the constructor stays interpreted (reported at the class's name).
+    let mut give_up = |span: Span, msg: String| {
+        rejected.push((name.clone(), id.span, Reject { span, msg, retry: false, callee: false }));
+    };
     let parent = match &c.heritage {
         None => None,
         Some(h) => {
-            let Expression::Identifier(r) = h.expression.without_parentheses() else { return };
-            let Some(sym) = scoping.get_reference(r.reference_id()).symbol_id() else { return };
-            let Some(p) = defs.iter().position(|d| d.symbol == sym) else { return };
+            let found = match h.expression.without_parentheses() {
+                Expression::Identifier(r) => scoping
+                    .get_reference(r.reference_id())
+                    .symbol_id()
+                    .and_then(|sym| defs.iter().position(|d| d.symbol == sym)),
+                _ => None,
+            };
+            let Some(p) = found else {
+                give_up(
+                    h.span(),
+                    match h.expression.without_parentheses() {
+                        Expression::Identifier(r) => format!("its superclass `{}` has no native constructor", r.name),
+                        _ => "its superclass is not named by a binding".into(),
+                    },
+                );
+                return;
+            };
             Some(p)
         }
+    };
+    let private = |k: &PropertyKey| match k {
+        PropertyKey::PrivateIdentifier(p) => Some(format!("private member `#{}` (use a plain field)", p.name)),
+        _ => None,
     };
     let mut fields = Vec::new();
     let mut ctor = None;
     for el in &c.body.body {
         match el {
             ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => ctor = Some(m),
-            ClassElement::MethodDefinition(m) if !m.r#static && matches!(m.key, PropertyKey::PrivateIdentifier(_)) => {
+            ClassElement::MethodDefinition(m) if !m.r#static && private(&m.key).is_some() => {
+                give_up(m.span, private(&m.key).unwrap());
                 return;
             }
             ClassElement::PropertyDefinition(p) if p.r#static || p.declare => {}
@@ -958,18 +982,28 @@ fn class_ctor<'a>(
             ClassElement::PropertyDefinition(p) => {
                 let key = match &p.key {
                     PropertyKey::StaticIdentifier(k) if !p.computed => k.name.to_string(),
-                    _ => return,
+                    k => {
+                        give_up(p.span, private(k).unwrap_or_else(|| "field with a computed name".into()));
+                        return;
+                    }
                 };
-                if !p.decorators.is_empty() || p.value.as_ref().is_some_and(|v| mentions_this(v)) {
+                if !p.decorators.is_empty() {
+                    give_up(p.span, "decorated field".into());
+                    return;
+                }
+                if p.value.as_ref().is_some_and(|v| mentions_this(v)) {
+                    give_up(p.span, "field initializer uses `this`".into());
                     return;
                 }
                 fields.push((key, p.value.as_ref()));
             }
-            ClassElement::AccessorProperty(a) if !a.r#static => return,
+            ClassElement::AccessorProperty(a) if !a.r#static => {
+                give_up(a.span, "`accessor` field".into());
+                return;
+            }
             _ => {}
         }
     }
-    let name = id.name.to_string();
     let mut param_props = Vec::new();
     let mut forward = false;
     let (node, params, rest) = match ctor {
@@ -991,6 +1025,11 @@ fn class_ctor<'a>(
                 }
             }
             if parent.is_some() && !super_first(f) {
+                give_up(
+                    f.span,
+                    "the constructor does not start with `super(...)` (with arguments that are plain values)"
+                        .into(),
+                );
                 return;
             }
             // Their fields come first, `undefined` until assigned.

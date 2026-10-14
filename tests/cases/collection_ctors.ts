@@ -1,5 +1,5 @@
 // @native fromArrays holes growing subclass failures
-// @interpreted patchIterator restoreIterator patchAdd restoreAdd patchNext restoreNext
+// @interpreted Tracked Plain patchIterator restoreIterator patchAdd restoreAdd patchNext restoreNext
 // `new Set(array)` and `new Map(entries)` take an array's elements directly
 // and call the builtin `add` / `set` without a call frame while the array
 // has no other own property than `length`, Array.prototype[Symbol.iterator]
