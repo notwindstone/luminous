@@ -93,6 +93,13 @@ pub mod layout {
     pub const FDATA_DATA: i32 = 32;
     pub const CLASS_C_FUNCTION_DATA: i64 = 15;
     pub const OBJ_OPAQUE: i32 = 24;
+    // Making closures inline (see `JS_CFunctionDataTemplate`).
+    pub const FDATA_SELF: i32 = 16;
+    pub const OBJ_CLASS_SIZE: i32 = 48;
+    pub const FTMPL_FLAGS: i32 = 0;
+    pub const FTMPL_SHAPE: i32 = 8;
+    pub const FTMPL_PROPS: i32 = 16;
+    pub const FTMPL_RECORD: i32 = 48;
     pub const CLASS_C_FUNCTION: i64 = 12;
     pub const STRING_KIND: i32 = 4;
     pub const STRING_DATA: i32 = 24;
@@ -138,6 +145,12 @@ pub mod layout {
         ("FDATA_DATA", FDATA_DATA as i64),
         ("CLASS_C_FUNCTION_DATA", CLASS_C_FUNCTION_DATA),
         ("OBJ_OPAQUE", OBJ_OPAQUE as i64),
+        ("FDATA_SELF", FDATA_SELF as i64),
+        ("OBJ_CLASS_SIZE", OBJ_CLASS_SIZE as i64),
+        ("FTMPL_FLAGS", FTMPL_FLAGS as i64),
+        ("FTMPL_SHAPE", FTMPL_SHAPE as i64),
+        ("FTMPL_PROPS", FTMPL_PROPS as i64),
+        ("FTMPL_RECORD", FTMPL_RECORD as i64),
         ("CLASS_C_FUNCTION", CLASS_C_FUNCTION),
         ("STRING_KIND", STRING_KIND as i64),
         ("STRING_DATA", STRING_DATA as i64),
@@ -160,6 +173,9 @@ pub mod layout {
         ("GC_CELL_WORD", GC_CELL_WORD),
     ];
 }
+
+/// The index of `lum_ics` among `Codegen::data`.
+const DATA_ICS: usize = 11;
 
 /// Which code generator compiles the native functions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -516,7 +532,7 @@ struct Codegen {
     sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 13],
+    data: [DataId; 14],
     fast_sig: SigRef,
     /// Inline caches allocated so far (`lum_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
@@ -619,10 +635,12 @@ impl Codegen {
             "lum_homes",
             "lum_struct_class",
             "lum_sarr_class",
+            "lum_fn_caches",
         ] {
             data.push(module.declare_data(name, Linkage::Import, true));
         }
         // Defined here, once all sites are known (`define_ics`).
+        assert_eq!(data.len(), DATA_ICS);
         data.push(module.declare_data("lum_ics", Linkage::Export, true));
         // Record types: their shapes once learned, and their fields (per
         // record: the field count, then the fields' atom indices).
@@ -691,6 +709,7 @@ impl Codegen {
             homes,
             struct_class,
             sarr_class,
+            fn_caches,
             ics,
             record_shapes,
             proto_epoch,
@@ -709,6 +728,7 @@ impl Codegen {
             homes,
             struct_class,
             sarr_class,
+            fn_caches,
             ics,
             record_shapes,
             proto_epoch,
@@ -904,7 +924,7 @@ impl Codegen {
 
     fn define_ics(&mut self) {
         let n = self.ics.get();
-        self.module.define_data(self.data[10], mir::DataInit::Zeroed { size: n.max(1) * lower::IC_SIZE }, 8);
+        self.module.define_data(self.data[DATA_ICS], mir::DataInit::Zeroed { size: n.max(1) * lower::IC_SIZE }, 8);
         let count = self.module.declare_data("lum_nics", Linkage::Export, false);
         self.module.define_data(count, mir::DataInit::Bytes((n as i32).to_le_bytes().to_vec()), 4);
     }

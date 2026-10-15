@@ -198,18 +198,27 @@ static LumFrame *lum_frame_of(JSValue *slots)
     return (LumFrame *)((char *)slots - offsetof(LumFrame, slots));
 }
 
-static void lum_frame_finalizer(JSRuntime *rt, JSValueConst val)
+/* A new frame object for function `fn`, its slots `undefined`: the frame
+ * in the object's own cell (one allocation, nothing to finalize, and no
+ * zeroing of slots that are then made `undefined`). */
+static JSValue lum_frame_new(JSContext *ctx, int fn, int nslots, LumFrame **pf)
 {
-    LumFrame *f = JS_GetOpaque(val, lum_frame_class);
+    void *data;
+    JSValue obj = JS_NewObjectClassData(ctx, lum_frame_class, sizeof(LumFrame) + nslots * sizeof(JSValue), true, &data);
+    LumFrame *f = data;
     int i;
-    if (!f)
-        return;
-    JS_FreeValueRT(rt, f->promise);
-    JS_FreeValueRT(rt, f->on_settled[0]);
-    JS_FreeValueRT(rt, f->on_settled[1]);
-    for (i = 0; i < f->nslots; i++)
-        JS_FreeValueRT(rt, f->slots[i]);
-    js_free_rt(rt, f);
+    if (JS_IsException(obj))
+        return obj;
+    f->self = JS_VALUE_GET_PTR(obj);
+    f->promise = JS_UNDEFINED;
+    f->on_settled[0] = f->on_settled[1] = JS_UNDEFINED;
+    f->fn = fn;
+    f->nslots = nslots;
+    f->state = 0;
+    for (i = 0; i < nslots; i++)
+        f->slots[i] = JS_UNDEFINED;
+    *pf = f;
+    return obj;
 }
 
 /* While the step function runs, it has moved the locals out of the slots
@@ -230,24 +239,10 @@ static void lum_frame_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
 /* A new frame for async function `fn` (returned), its promise and slots. */
 JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots)
 {
-    LumFrame *f = js_mallocz(ctx, sizeof(*f) + nslots * sizeof(JSValue));
-    JSValue obj;
-    int i;
-    if (!f)
-        return JS_EXCEPTION;
-    f->fn = fn;
-    f->nslots = nslots;
-    f->promise = JS_UNDEFINED;
-    f->on_settled[0] = f->on_settled[1] = JS_UNDEFINED;
-    for (i = 0; i < nslots; i++)
-        f->slots[i] = JS_UNDEFINED;
-    obj = JS_NewObjectClass(ctx, lum_frame_class);
-    if (JS_IsException(obj)) {
-        js_free(ctx, f);
+    LumFrame *f;
+    JSValue obj = lum_frame_new(ctx, fn, nslots, &f);
+    if (JS_IsException(obj))
         return obj;
-    }
-    JS_SetOpaque(obj, f);
-    f->self = JS_VALUE_GET_PTR(obj);
     /* (No resolving functions: only the frame settles it.) */
     *promise = JS_NewPendingPromise(ctx);
     if (JS_IsException(*promise)) {
@@ -323,7 +318,7 @@ int lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
         if (!JS_IsUndefined(f->on_settled[i]))
             continue;
         self = JS_MKPTR(JS_TAG_OBJECT, f->self);
-        f->on_settled[i] = lum_new_closure(ctx, &lum_resume_cache, NULL, lum_async_resume, "", 1, i, 1, &self);
+        f->on_settled[i] = lum_new_closure(ctx, &lum_resume_cache, NULL, lum_async_resume, "", 1, i, 1, &self, -1);
         if (JS_IsException(f->on_settled[i])) {
             f->on_settled[i] = JS_UNDEFINED;
             goto done;
@@ -380,6 +375,7 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
         if (lum_fn_caches[i].shape)
             JS_FreeCachedShape(rt, lum_fn_caches[i].shape);
         lum_fn_caches[i].shape = NULL;
+        lum_fn_caches[i].info = 0;
         if (lum_fn_caches[i].name != JS_ATOM_NULL)
             JS_FreeAtomRT(rt, lum_fn_caches[i].name);
         lum_fn_caches[i].name = JS_ATOM_NULL;
@@ -618,7 +614,7 @@ int lum_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *
             return -1;
     }
     {
-        JSClassDef frame_def = { "LumFrame", .finalizer = lum_frame_finalizer, .gc_mark = lum_frame_mark };
+        JSClassDef frame_def = { "LumFrame", .gc_mark = lum_frame_mark };
         JS_NewClassID(rt, &lum_frame_class);
         if (JS_NewClass(rt, lum_frame_class, &frame_def) < 0)
             return -1;
@@ -1379,23 +1375,10 @@ int lum_array_iter_ok(JSContext *ctx)
 /* A new frame for generator function `fn` (returned) and its slots. */
 JSValue lum_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots)
 {
-    LumFrame *f = js_mallocz(ctx, sizeof(*f) + nslots * sizeof(JSValue));
-    JSValue obj;
-    int i;
-    if (!f)
-        return JS_EXCEPTION;
-    f->fn = fn;
-    f->nslots = nslots;
-    f->promise = JS_UNDEFINED;
-    for (i = 0; i < nslots; i++)
-        f->slots[i] = JS_UNDEFINED;
-    obj = JS_NewObjectClass(ctx, lum_frame_class);
-    if (JS_IsException(obj)) {
-        js_free(ctx, f);
+    LumFrame *f;
+    JSValue obj = lum_frame_new(ctx, fn, nslots, &f);
+    if (JS_IsException(obj))
         return obj;
-    }
-    JS_SetOpaque(obj, f);
-    f->self = JS_VALUE_GET_PTR(obj);
     *slots = f->slots;
     return obj;
 }
@@ -2043,18 +2026,30 @@ static JSValue lum_new_object_proto(JSContext *ctx, LumIC *ic, JSValue obj, int 
     return obj;
 }
 
+/* Codegen reads these (lower::FN_CACHE_SIZE). */
+_Static_assert(sizeof(LumFnCache) == 96 && offsetof(LumFnCache, info) == 12 && offsetof(LumFnCache, tmpl) == 16,
+               "LumFnCache layout");
+
 /* A closure of a native function (data borrowed): made with the shape of
  * the function's first closure, as JSC allocates functions with a known
- * structure. */
+ * structure. Of `kind` 0 (an arrow function or method) or 1 (async: of
+ * AsyncFunction.prototype), its closures stay as made (no `prototype` of
+ * their own), and native code makes the next ones inline; of another
+ * kind, lum_function_kind finishes it (-1: neither, not made inline). */
 JSValue lum_new_closure(JSContext *ctx, LumFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
-                          const char *name, int length, int magic, int n, JSValue *data)
+                          const char *name, int length, int magic, int n, JSValue *data, int kind)
 {
+    JSValue f;
     if (c->name == JS_ATOM_NULL) {
         c->name = JS_NewAtom(ctx, name);
         if (c->name == JS_ATOM_NULL)
             return JS_EXCEPTION;
     }
-    return JS_NewCFunctionDataShaped(ctx, fast, slow, c->name, length, magic, n, (JSValueConst *)data, &c->shape);
+    f = JS_NewCFunctionDataShaped(ctx, fast, slow, c->name, length, magic, n, (JSValueConst *)data,
+                                  kind == 1 ? lum_pins[LUM_PIN_ASYNC_FUNCTION_PROTO] : JS_UNDEFINED, &c->shape);
+    if ((kind == 0 || kind == 1) && !c->info && c->shape && !JS_IsException(f))
+        c->info = JS_CFunctionDataTemplate(ctx, fast, slow, c->name, length, magic, n, c->shape, &c->tmpl);
+    return f;
 }
 
 /* Whether `promise.resolve` was the intrinsic Promise.resolve (both

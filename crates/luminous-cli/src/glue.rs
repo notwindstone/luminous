@@ -206,10 +206,10 @@ static JSValue lum_closure_slow(JSContext *ctx, JSValueConst this_val, int argc,
 /* A closure of native function `fn` over `data` (borrowed). */
 JSValue lum_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
 {{
-    return lum_function_kind(ctx, lum_new_closure(ctx, &lum_fn_caches[fn], lum_table[fn].fast,
-                                                      lum_closure_slow, lum_table[fn].name,
-                                                      lum_table[fn].length, fn, n, data),
-                               JS_UNDEFINED, lum_table[fn].kind);
+    int kind = lum_table[fn].kind;
+    JSValue f = lum_new_closure(ctx, &lum_fn_caches[fn], lum_table[fn].fast, lum_closure_slow,
+                                lum_table[fn].name, lum_table[fn].length, fn, n, data, kind);
+    return kind <= 1 ? f : lum_function_kind(ctx, f, JS_UNDEFINED, kind);
 }}
 
 /* {METHOD_FN}(i, Class, is_static, key, accessor): replace a class method

@@ -193,7 +193,11 @@ engine's semantics:
   its private methods given), for native constructors; and a native
   closure's data (`JS_NewCFunctionDataShaped`) in the function object's
   own cell, after its properties, rather than a separate allocation its
-  finalization freed (`0006`);
+  finalization freed, made of a given prototype, and
+  `JS_CFunctionDataTemplate`, what native code makes the next ones
+  inline from; a new object's flags, class id and weak index set in one
+  store (they were set a bit field at a time, or zeroed then set)
+  (`0006`);
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first;
@@ -497,7 +501,14 @@ The differential tests run every case with both.
   their creator and capture loop variables (one binding per iteration, as in
   JS). A captured variable never assigned after its declaration is
   captured by value: no box is allocated for it. Closures of one function
-  share a shape. Side effects on module-level bindings (`count++`) are shared with
+  share a shape, and after the first one native code makes them inline as
+  it makes object literals: one cell bumped off its size class's run,
+  holding the function object, its `length` and `name`, its record and
+  its captured values, stored from a template the first one left
+  (`JS_CFunctionDataTemplate`; 10M closures in 145 ms, 350 ms through the
+  engine). Async arrows and methods are made of AsyncFunction.prototype
+  from the start, in one shared shape (they were given it one by one,
+  each then with a shape of its own), and inline too. Side effects on module-level bindings (`count++`) are shared with
   interpreted code. An arrow function's `this` is the `this` of the method,
   constructor (after `super(...)` in a derived class) or object literal
   method it is in, captured in a box as a variable is.
@@ -726,6 +737,9 @@ The differential tests run every case with both.
   statements while keeping JS evaluation order, so microtask ordering
   matches the interpreter exactly. `await Promise.resolve(x)` awaits `x`
   itself while `Promise.resolve` is the intrinsic one (the same ticks).
+  A call's frame (its locals across awaits) is one cell, the frame object
+  with its slots after it, set once rather than zeroed and set again, with
+  nothing to finalize.
 - **Generators** (`function*`, generator methods and closures), with
   `yield`, `yield*` and the exact `next` / `return` / `throw` behavior:
   native generator objects are the engine's own.

@@ -9,10 +9,68 @@
  /* An array iterator (values) positioned at `idx`, for code that iterated
     the array directly until it has to close the iterator. */
  JS_EXTERN JSValue JS_NewArrayIteratorAt(JSContext *ctx, JSValueConst arr, uint32_t idx);
+@@ -1280,6 +1282,7 @@
+ #define JS_LAYOUT_OBJ_FLAGS         0    /* uint32_t: flags and class id */
+ #define JS_LAYOUT_OBJ_PLAIN_FLAGS   0x10002 /* ... of a new plain object (JS_LayoutCheck) */
+ #define JS_LAYOUT_OBJ_WEAK_REF      4    /* uint32_t weak_index: 0 */
++#define JS_LAYOUT_OBJ_INLINE_PROPS  0x200 /* of the flags word: properties in the object's cell (JS_LayoutCheck) */
+ #define JS_LAYOUT_OBJ_OPAQUE_WORD   24   /* u.opaque (not of a plain object) */
+ #define JS_LAYOUT_OBJ_SIZE          24   /* the properties of a new plain object follow */
+ /* Appending to a fast array inline (as JS_DefineElement's fast path). */
+@@ -1646,11 +1649,36 @@
+                                           JSValueConst *data);
+ /* JS_NewCFunctionDataFast with the name as an atom, for many functions of one
+    kind: `*pshape` caches (with a reference) the shape of the first one, and
+-   later ones are made with it directly. */
++   later ones are made with it directly. Their prototype: `proto`, or
++   Function.prototype if it is undefined. */
+ JS_EXTERN JSValue JS_NewCFunctionDataShaped(JSContext *ctx, JSCFunctionFast *fast,
+                                             JSCFunctionData *func, JSAtom name,
+                                             int length, int magic, int data_len,
+-                                            JSValueConst *data, void **pshape);
++                                            JSValueConst *data, JSValueConst proto,
++                                            void **pshape);
++/* luminous: how native code makes those functions inline, for a shape
++   `*pshape` cached: what each starts with (its first word, shape, `length`
++   and `name`, and its record's head but `self`), its data following.
++   Returns the cell class and the cell size of one (as JS_ShapeAllocInfo),
++   or 0 if they cannot be made so. The shape is then pinned (see
++   JS_CachePlainShape) and the name's atom must outlive the template. */
++typedef struct JSFunctionTemplate {
++    uint64_t flags;
++    void *shape;
++    JSValue props[2];
++    uint64_t record[4];
++} JSFunctionTemplate;
++JS_EXTERN uint32_t JS_CFunctionDataTemplate(JSContext *ctx, JSCFunctionFast *fast,
++                                            JSCFunctionData *func, JSAtom name,
++                                            int length, int magic, int data_len,
++                                            void *shape, JSFunctionTemplate *t);
++#define JS_LAYOUT_FTMPL_FLAGS       0
++#define JS_LAYOUT_FTMPL_SHAPE       8
++#define JS_LAYOUT_FTMPL_PROPS       16
++#define JS_LAYOUT_FTMPL_RECORD      48
++#define JS_LAYOUT_FTMPL_SIZE        80
++#define JS_LAYOUT_OBJ_CLASS_SIZE    48   /* an object of another class than Object: its properties follow */
++#define JS_LAYOUT_FDATA_SELF        16   /* JSObject *: the function */
+ /* The function object of a C function data object, from the data that its
+    JSCFunctionFast entry receives (borrowed). */
+ JS_EXTERN JSValueConst JS_GetFunctionOfData(JSValueConst *func_data);
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7664,15 +7664,29 @@
+@@ -7662,41 +7662,54 @@
+     printf("}\n");
+ }
  
++/* luminous: the first word of a new object: its flags (extensible, and
++   `inline_props`), class id and weak index (0) */
++static inline void js_object_set_header(JSObject *p, JSClassID class_id, bool inline_props)
++{
++    uint64_t w = (JS_LAYOUT_OBJ_PLAIN_FLAGS & 0xffff) | (uint64_t)class_id << 16 |
++        (inline_props ? JS_LAYOUT_OBJ_INLINE_PROPS : 0);
++    memcpy(p, &w, sizeof(w));
++}
++
  /* 'props[]' is used to initialized the object properties. The number
     of elements depends on the shape. */
 +static JSValue JS_NewObjectFromShapeExtra(JSContext *ctx, JSShape *sh, JSClassID class_id,
@@ -44,7 +102,35 @@
      if (unlikely(!p)) {
          JS_ThrowOutOfMemory(ctx);
          goto fail;
-@@ -7796,8 +7810,11 @@
+     }
+-    p->class_id = class_id;
+-    p->extensible = true;
+-    p->free_mark = 0;
+-    p->is_exotic = 0;
+-    p->fast_array = 0;
+-    p->is_constructor = 0;
+-    p->is_uncatchable_error = 0;
+-    p->tmp_mark = 0;
+-    p->is_HTMLDDA = 0;
+-    p->is_prototype = 0;
+-    p->inline_props = 0;
+-    p->is_watched = 0;
+-    p->weak_index = 0;
++    /* (luminous: the flags, the class id and the weak index in one store:
++       extensible, its properties inline unless it is a plain object, no
++       weak references; JS_LayoutCheck checks the bits) */
++    js_object_set_header(p, class_id, class_id != JS_CLASS_OBJECT);
+     p->shape = sh;
+     if (class_id == JS_CLASS_OBJECT) {
+         p->prop = (JSProperty *)&p->u;
+     } else {
+         p->u.opaque = NULL;
+         p->prop = (JSProperty *)(p + 1);
+-        p->inline_props = 1;
+     }
+     if (0) {
+     fail:
+@@ -7796,8 +7809,11 @@
      add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
      /* (luminous: its property array, a class's data, are released by its
         finalization) */
@@ -57,7 +143,7 @@
      return JS_MKPTR(JS_TAG_OBJECT, p);
  }
  
-@@ -8124,6 +8141,8 @@
+@@ -8124,6 +8140,8 @@
      /* luminous: constructed as an ordinary function is (see
         JS_SetCFunctionDataConstructor) */
      uint8_t ordinary_ctor;
@@ -66,7 +152,7 @@
      JSValue data[];
  } JSCFunctionDataRecord;
  
-@@ -8142,7 +8161,8 @@
+@@ -8142,7 +8160,8 @@
          for(i = 0; i < s->data_len; i++) {
              JS_FreeValueRT(rt, s->data[i]);
          }
@@ -76,7 +162,7 @@
      }
  }
  
-@@ -8259,6 +8279,7 @@
+@@ -8259,6 +8278,7 @@
      s->data_len = data_len;
      s->magic = magic;
      s->ordinary_ctor = 0;
@@ -84,6 +170,16 @@
      for(i = 0; i < data_len; i++)
          s->data[i] = js_dup(data[i]);
      JS_SetOpaqueInternal(func_obj, s);
+@@ -8290,7 +8310,8 @@
+ JSValue JS_NewCFunctionDataShaped(JSContext *ctx, JSCFunctionFast *fast,
+                                   JSCFunctionData *func, JSAtom name,
+                                   int length, int magic, int data_len,
+-                                  JSValueConst *data, void **pshape)
++                                  JSValueConst *data, JSValueConst proto,
++                                  void **pshape)
+ {
+     JSCFunctionDataRecord *s;
+     JSShape *sh = *pshape;
 @@ -8298,24 +8319,32 @@
      int i;
  
@@ -107,7 +203,8 @@
 +        s = rec;
 +        s->inline_record = 1;
      } else {
-         func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
+-        func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
++        func_obj = JS_NewObjectProtoClass(ctx, JS_IsUndefined(proto) ? ctx->function_proto : proto,
                                            JS_CLASS_C_FUNCTION_DATA);
 -    }
 -    if (JS_IsException(func_obj))
@@ -127,7 +224,94 @@
      }
      s->func = func;
      s->fast = fast;
-@@ -61079,6 +61108,20 @@
+@@ -8336,6 +8365,48 @@
+     return func_obj;
+ }
+ 
++static_assert(offsetof(JSFunctionTemplate, shape) == JS_LAYOUT_FTMPL_SHAPE, "");
++static_assert(offsetof(JSFunctionTemplate, props) == JS_LAYOUT_FTMPL_PROPS, "");
++static_assert(offsetof(JSFunctionTemplate, record) == JS_LAYOUT_FTMPL_RECORD, "");
++static_assert(sizeof(JSFunctionTemplate) == JS_LAYOUT_FTMPL_SIZE, "");
++static_assert(sizeof(JSObject) == JS_LAYOUT_OBJ_CLASS_SIZE, "");
++static_assert(offsetof(JSCFunctionDataRecord, self) == JS_LAYOUT_FDATA_SELF, "");
++static_assert(sizeof(JSCFunctionDataRecord) == sizeof(((JSFunctionTemplate *)0)->record), "");
++
++uint32_t JS_CFunctionDataTemplate(JSContext *ctx, JSCFunctionFast *fast,
++                                  JSCFunctionData *func, JSAtom name,
++                                  int length, int magic, int data_len,
++                                  void *shape, JSFunctionTemplate *t)
++{
++    JSShape *sh = shape;
++    JSCFunctionDataRecord s;
++    size_t total = sizeof(JSMallocBlockHeader) + sizeof(JSObject) + 2 * sizeof(JSProperty) +
++        sizeof(JSCFunctionDataRecord) + data_len * sizeof(JSValue);
++    unsigned idx;
++    /* (A shared shape of `length` and `name` only, filling its property
++       array: the objects made from it keep their properties in their cell;
++       a name the atom holds: not a number's, made afresh) */
++    if (total > JS_ARENA_MAX_SMALL_SIZE || !sh->is_hashed || sh->special_props || sh->watched ||
++        sh->prop_count != 2 || sh->prop_size != 2 || sh->deleted_prop_count != 0 ||
++        __JS_AtomIsTaggedInt(name))
++        return 0;
++    sh->pinned = true;
++    js_object_set_header((JSObject *)&t->flags, JS_CLASS_C_FUNCTION_DATA, true);
++    t->shape = sh;
++    t->props[0] = js_int32(length);
++    t->props[1] = JS_AtomToString(ctx, name);
++    memset(&s, 0, sizeof(s));
++    s.func = func;
++    s.fast = fast;
++    s.length = length;
++    s.data_len = data_len;
++    s.magic = magic;
++    s.inline_record = 1;
++    memcpy(t->record, &s, sizeof(s));
++    idx = ctx->rt->arena_state.size_index[total / 8];
++    return idx | (uint32_t)js_gc_cell_size(idx) << 8;
++}
++
+ JSValueConst JS_GetFunctionOfData(JSValueConst *func_data)
+ {
+     JSCFunctionDataRecord *s = (JSCFunctionDataRecord *)((uint8_t *)func_data -
+@@ -60794,13 +60865,15 @@
+         js_free_shape(ctx->rt, sh);
+         return JS_EXCEPTION;
+     }
+-    /* The data is the caller's to initialize. */
+-    memset(p, 0, sizeof(JSObject));
+-    p->class_id = class_id;
++    /* The data is the caller's to initialize. (luminous: the header in
++       one store, as JS_NewObjectFromShapeExtra's) */
++    js_object_set_header(p, class_id, false);
+     p->extensible = extensible;
+-    p->is_exotic = ctx->rt->class_array[class_id].exotic != NULL;
++    if (unlikely(ctx->rt->class_array[class_id].exotic))
++        p->is_exotic = 1;
+     p->shape = sh;
+     p->prop = NULL;
++    memset(&p->u, 0, sizeof(p->u));
+     p->u.opaque = p + 1;
+     *pdata = p + 1;
+     JS_REF_COUNT(p) = 1;
+@@ -60834,6 +60907,9 @@
+     a.p.extensible = true;
+     a.p.fast_array = true;
+     a.p.class_id = JS_CLASS_ARRAY;
++    union { JSObject p; uint32_t w[JS_LAYOUT_OBJ_SIZE / 4]; } f;
++    memset(&f, 0, sizeof(f));
++    f.p.inline_props = true;
+     union { JSMallocBlockHeader b; uint8_t c[sizeof(JSMallocBlockHeader)]; } m, r;
+     memset(&h, 0xff, sizeof(h));
+     h.b.gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+@@ -60846,6 +60922,7 @@
+     return m.c[sizeof(JSMallocBlockHeader) + JS_LAYOUT_GC_FLAGS] == 0x80 &&
+         r.c[sizeof(JSMallocBlockHeader) + JS_LAYOUT_GC_FLAGS] == 0x40 &&
+         o.w[JS_LAYOUT_OBJ_FLAGS / 4] == JS_LAYOUT_OBJ_PLAIN_FLAGS &&
++        f.w[JS_LAYOUT_OBJ_FLAGS / 4] == JS_LAYOUT_OBJ_INLINE_PROPS &&
+         a.w[JS_LAYOUT_OBJ_FLAGS / 4] == JS_LAYOUT_OBJ_APPEND_FLAGS &&
+         (JS_LAYOUT_OBJ_APPEND_FLAGS & ~JS_LAYOUT_OBJ_APPEND_MASK) == 0 &&
+         h.c[offsetof(JSMallocBlockHeader, ref_count) - 1] == 0;
+@@ -61079,6 +61156,20 @@
      return JS_SetPrivateField(ctx, obj, name, val);
  }
  

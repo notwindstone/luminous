@@ -168,15 +168,19 @@ void lum_ic_refresh(LumIC *ic, void *p);
 extern LumIC lum_ics[] __attribute__((weak));
 extern const int32_t lum_nics __attribute__((weak));
 /* Per native function: the shape of its closures (referenced) and its name
- * as an atom, both made with its first closure. */
+ * as an atom, both made with its first closure; then, if native code makes
+ * the next ones inline (JS_CFunctionDataTemplate), their cell class and
+ * size in `info` (else 0) and what each starts with. */
 typedef struct LumFnCache {
     void *shape;
     JSAtom name;
+    uint32_t info;
+    JSFunctionTemplate tmpl;
 } LumFnCache;
 extern LumFnCache lum_fn_caches[] __attribute__((weak));
 extern const int32_t lum_nfn_caches __attribute__((weak));
 JSValue lum_new_closure(JSContext *ctx, LumFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
-                          const char *name, int length, int magic, int n, JSValue *data);
+                          const char *name, int length, int magic, int n, JSValue *data, int kind);
 JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 JSValue lum_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 void lum_record_learn(JSContext *ctx, JSValue obj, int r);

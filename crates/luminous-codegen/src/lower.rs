@@ -263,6 +263,9 @@ pub(crate) struct Env {
     pub sarr_class: GlobalValue,
     /// `lum_record_shapes`: per record type, its shape once learned.
     pub record_shapes: GlobalValue,
+    /// `lum_fn_caches`: per native function, its closures' shape, and how
+    /// native code makes them inline (`FN_CACHE_SIZE` bytes each).
+    pub fn_caches: GlobalValue,
     /// `js_proto_epoch`: the engine's count of changes to watched
     /// prototypes (see `LumIC.epoch`).
     pub proto_epoch: GlobalValue,
@@ -1948,13 +1951,27 @@ impl Lower {
                     vals.push(obj);
                     vals.push((slot, tag));
                 }
+                // Inline once the function's first closure is made (see
+                // `alloc_closure`), else made by the runtime.
+                let fn_index = self.env.closure_base + cid;
+                let call = self.b.create_block();
+                self.b.set_cold_block(call);
+                let join = self.b.create_block();
+                let rp = self.b.append_block_param(join, I64);
+                let rt = self.b.append_block_param(join, I64);
+                let p = self.alloc_closure(fn_index, &vals, call);
+                let tag = self.b.ins().iconst(I64, TAG_OBJECT);
+                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(tag)]);
+                self.b.switch_to_block(call);
                 let data = self.values_slot(&vals);
-                let index = self.b.ins().iconst(I32, (self.env.closure_base + cid) as i64);
+                let index = self.b.ins().iconst(I32, fn_index as i64);
                 let n = self.b.ins().iconst(I32, vals.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_make_closure", &[ctx, index, n, data]);
                 self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.switch_to_block(join);
+                V::Any(rp, rt)
             }
             ExprKind::Update { local, delta, prefix } => {
                 if let LVar::Int(var) = self.vars[*local] {
@@ -4234,6 +4251,25 @@ impl Lower {
     fn alloc_object(&mut self, ic: Value, shape: Value, call: Block) -> Value {
         // The site's cell class and cell size (`JS_ShapeAllocInfo`).
         let info = self.b.ins().uload32(M_IC, ic, 8);
+        let p = self.alloc_cell(info, call);
+        // The object: extensible, of class Object, no weak references (the
+        // flags word, then the weak index, 0, in one store), with the shape
+        // (pinned: not counted, see `JSShape`) and its properties after
+        // it.
+        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
+        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
+        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
+        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
+        p
+    }
+
+    /// A young GC cell of the class and size `info` gives (as
+    /// `JS_ShapeAllocInfo`), bumped off its class's run, with its header (a
+    /// JS object's, with one reference); else (`info` 0, or no room) to
+    /// `call`. The caller sets every field before anything may collect.
+    fn alloc_cell(&mut self, info: Value, call: Block) -> Value {
         let alloc = self.b.create_block();
         self.b.ins().brif(info, alloc, &[], call, &[]);
         self.b.switch_to_block(alloc);
@@ -4256,16 +4292,45 @@ impl Lower {
         // with one reference.
         let word = self.b.ins().bor_imm_u(idx, layout::GC_CELL_WORD | (1 << 32));
         self.b.ins().store(M_RC, word, p, -8);
-        // The object: extensible, of class Object, no weak references (the
-        // flags word, then the weak index, 0, in one store), with the shape
-        // (pinned: not counted, see `JSShape`) and its properties after
-        // it.
-        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
-        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
+        p
+    }
+
+    /// A closure of native function `index` over `vals` made inline, as
+    /// `JS_NewCFunctionDataShaped` makes it from the template its first
+    /// one left (`JS_CFunctionDataTemplate`): the object, its `length` and
+    /// `name`, then its record and data, in one cell; else (no template
+    /// yet, no room) to `call`.
+    fn alloc_closure(&mut self, index: usize, vals: &[(Value, Value)], call: Block) -> Value {
+        let caches = self.b.ins().symbol_value(self.ptr, self.env.fn_caches);
+        let c = self.b.ins().iadd_imm_s(caches, index as i64 * FN_CACHE_SIZE);
+        let info = self.b.ins().uload32(M_IC, c, FN_CACHE_INFO);
+        let p = self.alloc_cell(info, call);
+        let t = FN_CACHE_TMPL;
+        let flags = self.b.ins().load(I64, M_IC, c, t + layout::FTMPL_FLAGS);
         self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        let shape = self.b.ins().load(I64, M_IC, c, t + layout::FTMPL_SHAPE);
         self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
-        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_CLASS_SIZE as i64);
         self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
+        let rec = layout::OBJ_CLASS_SIZE + 2 * 16;
+        let rp = self.b.ins().iadd_imm_s(p, rec as i64);
+        self.b.ins().store(M_HEADER, rp, p, layout::OBJ_FUNC_DATA);
+        // `length` and `name`, and the record but `self`.
+        for k in 0..4 {
+            let w = self.b.ins().load(I64, M_IC, c, t + layout::FTMPL_PROPS + 8 * k);
+            self.b.ins().store(M_SLOT, w, p, layout::OBJ_CLASS_SIZE + 8 * k);
+        }
+        for k in [0, 1, 3] {
+            let w = self.b.ins().load(I64, M_IC, c, t + layout::FTMPL_RECORD + 8 * k);
+            self.b.ins().store(M_HEADER, w, p, rec + 8 * k);
+        }
+        const _: () = assert!(layout::FDATA_SELF == 16);
+        self.b.ins().store(M_HEADER, p, p, rec + layout::FDATA_SELF);
+        for (k, &(vp, vt)) in vals.iter().enumerate() {
+            let at = rec + layout::FDATA_DATA + 16 * k as i32;
+            self.b.ins().store(M_SLOT, vp, p, at);
+            self.b.ins().store(M_SLOT, vt, p, at + 8);
+        }
         p
     }
 
@@ -8118,6 +8183,11 @@ const RECORD_TRIES: i64 = 64;
 pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 /// Size of a `LumIC` (an inline cache entry).
 pub(crate) const IC_SIZE: usize = 88;
+/// `LumFnCache`: its size, its closures' cell class and size (0: not made
+/// inline), and their template (`JSFunctionTemplate`).
+const FN_CACHE_SIZE: i64 = 96;
+const FN_CACHE_INFO: i32 = 12;
+const FN_CACHE_TMPL: i32 = 16;
 /// `LumIC.epoch`, `LumIC.value` and `LumIC.entry`.
 const IC_EPOCH: i32 = 48;
 const IC_VALUE: i32 = 56;
