@@ -1,0 +1,200 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11378,6 +11378,25 @@
+     return ret;
+ }
+ 
++/* Whether `obj`'s @@hasInstance is Function.prototype's (which is neither
++   writable nor configurable): no object on its prototype chain before
++   Function.prototype has one of its own. `instanceof` is then
++   OrdinaryHasInstance, without calling the method. */
++static bool js_default_has_instance(JSContext *ctx, JSValueConst obj)
++{
++    const JSObject *fp = JS_VALUE_GET_OBJ(ctx->function_proto);
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    for (int depth = 0; p && depth < 16; depth++) {
++        if (p == fp)
++            return true;
++        if (p->class_id == JS_CLASS_PROXY || p->is_exotic ||
++            find_own_property1(p, JS_ATOM_Symbol_hasInstance))
++            return false;
++        p = p->shape->proto;
++    }
++    return false;
++}
++
+ /* return true, false or (-1) in case of exception */
+ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
+ {
+@@ -11385,6 +11404,8 @@
+ 
+     if (!JS_IsObject(obj))
+         goto fail;
++    if (js_default_has_instance(ctx, obj))
++        return JS_OrdinaryIsInstanceOf(ctx, val, obj);
+     method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
+     if (JS_IsException(method))
+         return -1;
+@@ -55311,6 +55332,140 @@
+     return -1;
+ }
+ 
++/* luminous: JSON.stringify without a replacer or indentation, for plain
++   data: objects of class Object (data properties; no toJSON on them or on
++   Object.prototype; no index keys, whose order differs) and dense arrays
++   (no toJSON on Array.prototype either), of strings, numbers, booleans and
++   null. Written straight from the shapes and arrays: 1 when done, 0 when
++   the value is not such data (nothing written then: the caller truncates
++   and runs the general algorithm), -1 on an exception. */
++static int js_json_fast_string(StringBuffer *b, JSString *str)
++{
++    if (!str->is_wide_char && str->kind == JS_STRING_KIND_NORMAL) {
++        const uint8_t *src = str8(str);
++        uint32_t len = str->len, i;
++        for (i = 0; i < len; i++) {
++            uint8_t c = src[i];
++            if (c < 0x20 || c == '"' || c == '\\' || c >= 0x80)
++                break;
++        }
++        if (i == len) {
++            string_buffer_putc8(b, '"');
++            string_buffer_write8(b, src, len);
++            return string_buffer_putc8(b, '"');
++        }
++    }
++    {
++        JSValue q = JS_ToQuotedString(b->ctx, JS_MKPTR(JS_TAG_STRING, str));
++        if (JS_IsException(q))
++            return -1;
++        return string_buffer_concat_value_free(b, q);
++    }
++}
++
++static int js_json_fast(JSContext *ctx, StringBuffer *b, JSValueConst val, int depth)
++{
++    char buf[32];
++    switch (JS_VALUE_GET_NORM_TAG(val)) {
++    case JS_TAG_INT:
++        return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, JS_VALUE_GET_INT(val))) < 0 ? -1 : 1;
++    case JS_TAG_FLOAT64: {
++        double d = JS_VALUE_GET_FLOAT64(val);
++        if (!isfinite(d))
++            return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
++        return string_buffer_concat_value_free(b, js_dtoa2(ctx, d, 10, 0, JS_DTOA_FORMAT_FREE)) < 0 ? -1 : 1;
++    }
++    case JS_TAG_BOOL:
++        return (JS_VALUE_GET_BOOL(val) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
++                                      : string_buffer_write8(b, (const uint8_t *)"false", 5)) < 0 ? -1 : 1;
++    case JS_TAG_NULL:
++        return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
++    case JS_TAG_STRING:
++        return js_json_fast_string(b, JS_VALUE_GET_STRING(val)) < 0 ? -1 : 1;
++    case JS_TAG_OBJECT:
++        break;
++    default:
++        return 0;
++    }
++    if (depth > 32)
++        return 0;
++    JSObject *p = JS_VALUE_GET_OBJ(val);
++    JSObject *object_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
++    if (find_own_property1(object_proto, JS_ATOM_toJSON))
++        return 0;
++    if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
++        JSObject *array_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
++        if (p->shape->proto != array_proto || find_own_property1(array_proto, JS_ATOM_toJSON) ||
++            find_own_property1(p, JS_ATOM_toJSON))
++            return 0;
++        uint32_t len = p->u.array.count;
++        string_buffer_putc8(b, '[');
++        for (uint32_t i = 0; i < len; i++) {
++            if (i > 0)
++                string_buffer_putc8(b, ',');
++            /* (Re-read: the array may not change, as no code runs.) */
++            JSValueConst v = p->u.array.u.values[i];
++            int tag = JS_VALUE_GET_NORM_TAG(v);
++            if (tag == JS_TAG_UNDEFINED) {
++                string_buffer_write8(b, (const uint8_t *)"null", 4);
++                continue;
++            }
++            if (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)) {
++                string_buffer_write8(b, (const uint8_t *)"null", 4);
++                continue;
++            }
++            int r = js_json_fast(ctx, b, v, depth + 1);
++            if (r <= 0)
++                return r;
++        }
++        return string_buffer_putc8(b, ']') < 0 ? -1 : 1;
++    }
++    if (p->class_id != JS_CLASS_OBJECT || p->is_exotic ||
++        (p->shape->proto != object_proto && p->shape->proto != NULL))
++        return 0;
++    JSShape *sh = p->shape;
++    JSShapeProperty *prs = get_shape_prop(sh);
++    bool first = true;
++    string_buffer_putc8(b, '{');
++    for (uint32_t i = 0; i < sh->prop_count; i++, prs++) {
++        JSAtom atom = prs->atom;
++        if (atom == JS_ATOM_NULL)
++            continue;
++        if (__JS_AtomIsTaggedInt(atom))
++            return 0;
++        JSAtomStruct *as = ctx->rt->atom_array[atom];
++        if (as->atom_type != JS_ATOM_TYPE_STRING) {
++            if (as->atom_type == JS_ATOM_TYPE_SYMBOL)
++                continue;
++            return 0;
++        }
++        if (atom == JS_ATOM_toJSON)
++            return 0;
++        uint32_t idx;
++        if (is_num_string(&idx, as))
++            return 0;
++        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++            return 0;
++        if (!(prs->flags & JS_PROP_ENUMERABLE))
++            continue;
++        JSValueConst v = p->prop[i].u.value;
++        int tag = JS_VALUE_GET_NORM_TAG(v);
++        if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL ||
++            (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
++            continue;
++        if (!first)
++            string_buffer_putc8(b, ',');
++        first = false;
++        if (js_json_fast_string(b, as) < 0)
++            return -1;
++        string_buffer_putc8(b, ':');
++        int r = js_json_fast(ctx, b, v, depth + 1);
++        if (r <= 0)
++            return r;
++    }
++    return string_buffer_putc8(b, '}') < 0 ? -1 : 1;
++}
++
+ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+                          JSValueConst replacer, JSValueConst space0)
+ {
+@@ -55330,6 +55485,21 @@
+     wrapper = JS_UNDEFINED;
+ 
+     string_buffer_init(ctx, jsc->b, 0);
++    /* luminous: plain data, without a replacer or indentation. */
++    if (JS_IsUndefined(replacer) && JS_IsUndefined(space0)) {
++        int r = js_json_fast(ctx, jsc->b, obj, 0);
++        if (r > 0) {
++            JS_FreeValue(ctx, jsc->empty);
++            return string_buffer_end(jsc->b);
++        }
++        if (r < 0) {
++            string_buffer_free(jsc->b);
++            JS_FreeValue(ctx, jsc->empty);
++            return JS_EXCEPTION;
++        }
++        /* (Not such data: from the start, the general way.) */
++        jsc->b->len = 0;
++    }
+     jsc->stack = JS_NewArray(ctx);
+     if (JS_IsException(jsc->stack))
+         goto exception;
