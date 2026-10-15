@@ -2288,6 +2288,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_closure: self.is_closure,
             has_this: self.has_this,
             is_async: self.is_async,
+            frameless: false,
             is_generator: self.is_generator,
             rest: self.rest,
             ret_slot: self.ret_slot,
@@ -2296,6 +2297,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             ret_hint,
             body: prologue,
         };
+        func.frameless = func.is_async && !func.is_generator && !ir::has_await(&func.body);
         ir::scalar_replace(&mut func);
         ir::scalar_replace_structs(&mut func, self.m.layouts);
         ir::promote_struct_fields(&mut func, self.m.layouts);

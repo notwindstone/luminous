@@ -503,6 +503,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_async_start", &[P, Int, Int, P, P], &[W, W]),
         ("lum_async_step", &[P, P, Int, P, Int], &[]),
         ("lum_await", &[P, P, W, W, Int], &[Int]),
+        ("lum_async_settled", &[P, W, W], &[W, W]),
         ("lum_is_promise_resolve", &[W, W, W, W], &[Int]),
         ("lum_pow", &[D, D], &[D]),
         ("lum_toint32_slow", &[D], &[Int]),
@@ -561,7 +562,7 @@ impl Codegen {
         for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
             // The step functions of async functions and generators are
             // referenced by the C glue; the others only by native code.
-            let linkage = if f.is_async || f.is_generator { Linkage::Export } else { Linkage::Local };
+            let linkage = if f.suspends() { Linkage::Export } else { Linkage::Local };
             funcs.push(module.declare_function(&symbol_name(i), linkage, &native_signature(f)));
         }
         let mut sort_cmps = HashMap::new();
@@ -931,7 +932,7 @@ impl Codegen {
 
     /// Defines `lum_fn_<index>`, the function itself, for native callers.
     fn define(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        if f.is_async || f.is_generator {
+        if f.suspends() {
             return self.define_step(index, f);
         }
         self.define_as(self.funcs[index], index, f, false)
@@ -1162,13 +1163,14 @@ impl Codegen {
     /// `JS_UNINITIALIZED`, which makes the engine call the interpreted
     /// fallback instead; an exception returns `JS_EXCEPTION`.
     fn define_fast(&mut self, index: usize, f: &ir::Func) -> Result<()> {
-        if f.is_async || f.is_generator {
+        if f.suspends() {
             return self.define_async_entry(index, f);
         }
         let ptr = I64;
         let env = self.env();
         let unwinding = env.unwinding;
         let callee = env.funcs[index];
+        let settled = env.helpers["lum_async_settled"];
         let mut b = self.module.builder(fast_signature());
 
         let entry = b.create_block();
@@ -1260,8 +1262,15 @@ impl Codegen {
             Ty::MaybeF64 => unreachable!("MaybeF64 return type"),
         };
         // Returned in registers: the result never touches memory on its way
-        // back into the interpreter.
-        b.ins().return_(&[payload, tag]);
+        // back into the interpreter. (An async function that never awaits:
+        // the promise of its result.)
+        if f.is_async {
+            let call = b.ins().call(settled, &[js_ctx, payload, tag]);
+            let r = b.inst_results(call).to_vec();
+            b.ins().return_(&r);
+        } else {
+            b.ins().return_(&[payload, tag]);
+        }
 
         b.switch_to_block(exception);
         let flag_addr = b.ins().symbol_value(ptr, unwinding);
@@ -1269,7 +1278,14 @@ impl Codegen {
         b.ins().store(M_FLAG, zero8, flag_addr, 0);
         let payload = b.ins().iconst(I64, 0);
         let tag = b.ins().iconst(I64, jsvalue::TAG_EXCEPTION);
-        b.ins().return_(&[payload, tag]);
+        if f.is_async {
+            // (Rejected with the exception.)
+            let call = b.ins().call(settled, &[js_ctx, payload, tag]);
+            let r = b.inst_results(call).to_vec();
+            b.ins().return_(&r);
+        } else {
+            b.ins().return_(&[payload, tag]);
+        }
 
         b.switch_to_block(decline);
         let payload = b.ins().iconst(I64, 0);
@@ -1283,7 +1299,7 @@ impl Codegen {
 
 fn native_signature(f: &ir::Func) -> Signature {
     let mut sig = Signature::default();
-    if f.is_async || f.is_generator {
+    if f.suspends() {
         // The step function: (ctx, frame slots, state, value delivered on
         // resumption, whether to throw it) -> completion value, or
         // JS_UNINITIALIZED (suspended), or JS_EXCEPTION.

@@ -131,9 +131,9 @@ regular call path's generated code alone.
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
 `patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
-`0004-prototype-epoch.patch`, `0005-json-writers.patch` and
-`0006-native-construction.patch`, each made against the tree the earlier
-ones give) and builds the engine without
+`0004-prototype-epoch.patch`, `0005-json-writers.patch`,
+`0006-native-construction.patch` and `0007-promises.patch`, each made
+against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -181,10 +181,9 @@ engine's semantics:
   `JS_NewPendingPromise` / `JS_SettlePromise`: a promise without resolving
   functions, settled once by native code as its resolve or reject function
   would (thenables followed), which is what a native async function's
-  promise is; resolving functions, and the functions that resume native
-  async functions, are made with a cached shape that has their `length`
-  and `name` (they were defined one at a time, two property definitions
-  each) (`0003`);
+  promise is; resolving functions are made with a cached shape that has
+  their `length` and `name` (they were defined one at a time, two
+  property definitions each) (`0003`);
 - `JS_NewObjectClassData`: an object of a class with its data in the same
   allocation and no property storage (`aot type` objects), and
   `JS_DupObjectShape` for caching their shape;
@@ -198,6 +197,29 @@ engine's semantics:
   inline from; a new object's flags, class id and weak index set in one
   store (they were set a bit field at a time, or zeroed then set)
   (`0006`);
+- promises and jobs without allocations of their own, as JSC's (`0007`):
+  the job queue is a ring of entries (a job was an allocation, freed once
+  run); a promise's data is in its own cell; a pending promise's
+  reactions are GC cells in one list for either outcome (two records in
+  two lists, allocated and freed, the promise finalized for them); the
+  data of resolving functions is in their own cells, the reject function
+  holding the resolve function whose flag both share (three allocations
+  per pair, two finalizers); `JS_AwaitNative`: an await whose reaction
+  queues the native frame's resumption directly (no resolve and reject
+  functions, no call through the engine); `JS_NewPromiseSettledWith`:
+  the promise of an async function that completed without suspending;
+  `JS_NewObjectClassDataShaped`: frames allocated with their shape known.
+  Fast paths, taken while the builtins they stand for are the original
+  ones (`Promise.prototype.then` and `constructor`, `Promise[@@species]`,
+  `Promise.resolve`, array iteration: their objects are watched, so a
+  change to any of them is seen at once) and no promise hook is set:
+  `then` of a promise of `%Promise%` makes the derived promise without
+  resolving functions (the reaction settles it as they would);
+  `Promise.all`, `allSettled`, `any` and `race` over an array of promises
+  of `%Promise%` and other values react to each natively (no element
+  functions, no derived promises, no iterator objects). Microtask order is
+  the spec's: the result of each is reacted to in the same job, at the
+  same place in the queue;
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first;
@@ -739,7 +761,16 @@ The differential tests run every case with both.
   itself while `Promise.resolve` is the intrinsic one (the same ticks).
   A call's frame (its locals across awaits) is one cell, the frame object
   with its slots after it, set once rather than zeroed and set again, with
-  nothing to finalize.
+  nothing to finalize; an await resumes it from its own job, queued where
+  the awaited promise's reaction job would be. An async function that
+  never awaits has no frame: it runs as other functions do, and its entry
+  makes the promise of its result. `bench/micro/async.ts`, ns per
+  iteration on a 4-core x86-64 VM (before these changes; bun 1.4.3):
+  `await` of a primitive 49 (140; 48), of an async call 57 (142; 37),
+  nested async calls 136 (436; 154), `await new Promise(...)` 155 (210;
+  149), a promise resolved later 190 (366; 222), `Promise.all` of four
+  async calls 480 (3,293; 479), a chain of two `then`s 196 (900; 166), a
+  three-deep middleware chain each awaiting the next 874 (2,461; 1,580).
 - **Generators** (`function*`, generator methods and closures), with
   `yield`, `yield*` and the exact `next` / `return` / `throw` behavior:
   native generator objects are the engine's own.

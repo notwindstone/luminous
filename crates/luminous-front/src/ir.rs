@@ -328,8 +328,13 @@ pub struct Func {
     pub has_this: bool,
     /// Class methods: their class, and whether they are static.
     pub class: Option<(usize, bool)>,
-    /// `async`: compiled as a resumable step function over a heap frame.
+    /// `async`: compiled as a resumable step function over a heap frame,
+    /// unless `frameless`.
     pub is_async: bool,
+    /// An `async` function that never awaits (no `Stmt::Await`): compiled
+    /// as other functions are, its JS entry making the promise of its
+    /// result (no frame).
+    pub frameless: bool,
     /// The last parameter collects the remaining arguments in an array.
     pub rest: bool,
     /// `function*`: compiled as a resumable step function over a heap
@@ -1397,6 +1402,30 @@ pub fn nothrow_leaf(f: &Func) -> bool {
         && f.locals.iter().all(|t| matches!(t, Ty::F64 | Ty::I32 | Ty::Bool))
         && matches!(f.ret, Ty::F64 | Ty::I32 | Ty::Bool | Ty::Void)
         && stmts_ok(&f.body)
+}
+
+impl Func {
+    /// Whether it is compiled as a step function over a heap frame: it may
+    /// suspend (`await`, `yield`).
+    pub fn suspends(&self) -> bool {
+        (self.is_async && !self.frameless) || self.is_generator
+    }
+}
+
+/// Whether `stmts` await (`Stmt::Await`, `for await` included).
+pub fn has_await(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Await { .. } => true,
+        Stmt::If(_, a, b) => has_await(a) || has_await(b),
+        Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => has_await(body),
+        Stmt::Switch { cases, .. } => cases.iter().any(|(_, b)| has_await(b)),
+        Stmt::Try { body, catch, finally, .. } => {
+            has_await(body)
+                || catch.as_ref().is_some_and(|(_, b)| has_await(b))
+                || finally.as_ref().is_some_and(|b| has_await(b))
+        }
+        _ => false,
+    })
 }
 
 /// Whether evaluating `x` may assign local `l` (only the function's own code

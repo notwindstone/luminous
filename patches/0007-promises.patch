@@ -1,0 +1,1279 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1185,6 +1185,10 @@
+ JS_EXTERN bool JS_AtomToArrayIndex(JSContext *ctx, uint32_t *pidx, JSAtom atom);
+ JS_EXTERN JSValue JS_NewObjectClassData(JSContext *ctx, JSClassID class_id, size_t size, bool extensible,
+                                         void **pdata);
++/* The same, extensible, with the shape of a first one (JS_DupObjectShape),
++   for a class without exotic methods or a finalizer. */
++JS_EXTERN JSValue JS_NewObjectClassDataShaped(JSContext *ctx, void *shape, JSClassID class_id, size_t size,
++                                              void **pdata);
+ JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
+ JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
+ /* For natively compiled code: the interpreter's own iteration (for-of,
+@@ -1525,6 +1529,14 @@
+                             int argc, JSValueConst *argv);
+ /* `await` of a primitive in native code: see quickjs.c. */
+ JS_EXTERN int JS_EnqueueAwaitJob(JSContext *ctx, JSValueConst value, JSJobFunc *job, JSValueConst data);
++/* `await value` in native code that resumes from a job of its own, queued
++   with (data, the value, whether it was rejected) where the reaction job
++   would be: see quickjs.c. */
++JS_EXTERN int JS_AwaitNative(JSContext *ctx, JSValueConst value, JSJobFunc *job, JSValueConst data);
++/* A new promise of %Promise% settled as its resolve function (its reject
++   function if is_reject) would settle it with `value` (a thenable is
++   followed): an async function's, which completed without suspending. */
++JS_EXTERN JSValue JS_NewPromiseSettledWith(JSContext *ctx, JSValueConst value, bool is_reject);
+ 
+ JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
+ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -569,7 +569,11 @@
+     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
+     void *host_promise_rejection_tracker_opaque;
+ 
+-    struct list_head job_list; /* list of JSJobEntry.link */
++    /* luminous: the pending jobs, a ring of job_size entries (a power of
++       two, see the end) from job_head, job_count of them (in the 16 bytes
++       the list head took) */
++    struct JSJobEntry *jobs;
++    uint32_t job_head, job_count;
+ 
+     bool module_normalize_has_attr;
+     union {
+@@ -612,6 +616,7 @@
+        between calls (see js_json_fast_run), and its size in bytes. */
+     JSString *json_buf;
+     int json_buf_size;
++    uint32_t job_size;
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -845,6 +850,12 @@
+                              const char *filename, int line, int flags, int scope_idx);
+     void *user_opaque;
+     JSShape *resolving_func_shape;  /* promise resolving functions' (luminous) */
++    JSShape *promise_shape;  /* luminous: of %Promise.prototype% without properties */
++    /* luminous: which builtins the promise builtins' fast paths rely on
++       are still the original ones (JS_PRISTINE_*), as of js_proto_epoch's
++       value pristine_epoch (0: not known) */
++    uint64_t pristine_epoch;
++    int pristine;
+ };
+ 
+ typedef union JSFloat64Union {
+@@ -1311,12 +1322,14 @@
+     JSValue private_value; /* private value for C modules */
+ };
+ 
++/* luminous: an entry of the job ring (JSRuntime.jobs): up to
++   JS_JOB_MAX_ARGS arguments, which the engine's jobs fit */
++#define JS_JOB_MAX_ARGS 5
+ typedef struct JSJobEntry {
+-    struct list_head link;
+     JSContext *ctx;
+     JSJobFunc *job_func;
+     int argc;
+-    JSValue argv[];
++    JSValue argv[JS_JOB_MAX_ARGS];
+ } JSJobEntry;
+ 
+ typedef struct JSProperty {
+@@ -3572,7 +3585,6 @@
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     init_list_head(&rt->string_list);
+ #endif
+-    init_list_head(&rt->job_list);
+ 
+     if (JS_InitAtoms(rt))
+         goto fail;
+@@ -3717,6 +3729,23 @@
+     rt->sab_funcs = *sf;
+ }
+ 
++/* luminous: the job ring, twice as big (its entries in order from 0). */
++static no_inline int js_jobs_grow(JSContext *ctx)
++{
++    JSRuntime *rt = ctx->rt;
++    uint32_t size = rt->job_size ? rt->job_size * 2 : 64, i;
++    JSJobEntry *jobs = js_malloc(ctx, size * sizeof(*jobs));
++    if (!jobs)
++        return -1;
++    for (i = 0; i < rt->job_count; i++)
++        jobs[i] = rt->jobs[(rt->job_head + i) & (rt->job_size - 1)];
++    js_free(ctx, rt->jobs);
++    rt->jobs = jobs;
++    rt->job_head = 0;
++    rt->job_size = size;
++    return 0;
++}
++
+ /* return 0 if OK, < 0 if exception */
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                   int argc, JSValueConst *argv)
+@@ -3726,30 +3755,33 @@
+     int i;
+ 
+     assert(!rt->in_free);
+-
+-    /* (Traced: a job being run is held only by the native stack.) */
+-    e = JS_MallocTraced(ctx, sizeof(*e) + argc * sizeof(JSValue));
+-    if (!e)
++    if (unlikely(argc > JS_JOB_MAX_ARGS)) {
++        JS_ThrowInternalError(ctx, "too many job arguments");
+         return -1;
++    }
++    /* (luminous: an entry of the ring, which the collector marks) */
++    if (unlikely(rt->job_count == rt->job_size) && js_jobs_grow(ctx) < 0)
++        return -1;
++    e = &rt->jobs[(rt->job_head + rt->job_count) & (rt->job_size - 1)];
+     e->ctx = ctx;
+     e->job_func = job_func;
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = js_dup(argv[i]);
+     }
+-    list_add_tail(&e->link, &rt->job_list);
++    rt->job_count++;
+     return 0;
+ }
+ 
+ bool JS_IsJobPending(JSRuntime *rt)
+ {
+-    return !list_empty(&rt->job_list);
++    return rt->job_count != 0;
+ }
+ 
+ JSContext *JS_GetPendingJobContext(JSRuntime *rt)
+ {
+     if (JS_IsJobPending(rt)) {
+-        return list_entry(rt->job_list.next, JSJobEntry, link)->ctx;
++        return rt->jobs[rt->job_head].ctx;
+     }
+     return NULL;
+ }
+@@ -3759,29 +3791,30 @@
+ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+ {
+     JSContext *ctx;
+-    JSJobEntry *e;
++    JSJobEntry e;
+     JSValue res;
+-    int i, ret;
++    int ret;
+ 
+-    if (list_empty(&rt->job_list)) {
++    if (rt->job_count == 0) {
+         *pctx = NULL;
+         return 0;
+     }
+ 
+-    /* get the first pending job and execute it */
+-    e = list_entry(rt->job_list.next, JSJobEntry, link);
+-    list_del(&e->link);
+-    ctx = e->ctx;
+-    res = e->job_func(e->ctx, e->argc, vc(e->argv));
+-    for(i = 0; i < e->argc; i++)
+-        JS_FreeValue(ctx, e->argv[i]);
++    /* get the first pending job and execute it (luminous: taken out of the
++       ring, its values held by the native stack, which the collector
++       scans) */
++    e = rt->jobs[rt->job_head];
++    rt->job_head = (rt->job_head + 1) & (rt->job_size - 1);
++    rt->job_count--;
++    ctx = e.ctx;
++    res = e.job_func(e.ctx, e.argc, vc(e.argv));
+     if (JS_IsException(res))
+         ret = -1;
+     else
+         ret = 1;
+-    JS_FreeValue(ctx, res);
+-    js_free(ctx, e);
+     *pctx = ctx;
++    /* (the entry stays on the stack until the job is done) */
++    __asm__ volatile("" : : "r"(&e) : "memory");
+     return ret;
+ }
+ 
+@@ -3879,18 +3912,16 @@
+ 
+ void JS_FreeRuntime(JSRuntime *rt)
+ {
+-    struct list_head *el, *el1;
++    __maybe_unused struct list_head *el, *el1;
+     bool leak = false;
+     int i;
+ 
+     rt->in_free = true;
+     rt->current_exception = JS_UNINITIALIZED;
+ 
+-    list_for_each_safe(el, el1, &rt->job_list) {
+-        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+-        js_free_rt(rt, e);
+-    }
+-    init_list_head(&rt->job_list);
++    js_free_rt(rt, rt->jobs);
++    rt->jobs = NULL;
++    rt->job_count = rt->job_size = 0;
+ 
+     /* luminous: everything is unreachable now: the finalizers run, then the
+        contexts go (their memory and the cells' with the heap, below). */
+@@ -4242,6 +4273,8 @@
+ 
+     if (ctx->resolving_func_shape)
+         mark_func(rt, &ctx->resolving_func_shape->header);
++    if (ctx->promise_shape)
++        mark_func(rt, &ctx->promise_shape->header);
+ }
+ 
+ static void js_free_context_body(JSContext *ctx);
+@@ -4335,6 +4368,7 @@
+     js_free_shape_null(ctx->rt, ctx->regexp_shape);
+     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+     js_free_shape_null(ctx->rt, ctx->resolving_func_shape);
++    js_free_shape_null(ctx->rt, ctx->promise_shape);
+ 
+     js_free_rt(ctx->rt, ctx);
+ }
+@@ -7671,6 +7705,37 @@
+     memcpy(p, &w, sizeof(w));
+ }
+ 
++/* luminous: a new object of class class_id (not exotic, finalized only if
++   its properties come to move out of its cell) and shape sh (a reference
++   taken: of no properties), its `size` bytes of data in its own cell
++   (*pdata, the opaque), after room for the shape's properties if
++   props_room, else with no property storage (as JS_NewObjectClassData's).
++   All inline: the allocation's fast path, the header in one store. */
++static inline __attribute__((always_inline)) JSValue
++js_new_object_data(JSContext *ctx, JSShape *sh, JSClassID class_id, size_t size,
++                   bool props_room, void **pdata)
++{
++    JSRuntime *rt = ctx->rt;
++    size_t base = sizeof(JSObject) + (props_room ? sizeof(JSProperty) * sh->prop_size : 0);
++    JSObject *p;
++
++    js_trigger_gc(rt, base + size);
++    p = js_gc_alloc_rt(rt, base + size);
++    if (unlikely(!p)) {
++        js_free_shape(rt, sh);
++        JS_ThrowOutOfMemory(ctx);
++        return JS_EXCEPTION;
++    }
++    js_object_set_header(p, class_id, props_room);
++    p->shape = sh;
++    p->prop = props_room ? (JSProperty *)(p + 1) : NULL;
++    p->u.opaque = (uint8_t *)p + base;
++    *pdata = (uint8_t *)p + base;
++    JS_REF_COUNT(p) = 1;
++    add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
++    return JS_MKPTR(JS_TAG_OBJECT, p);
++}
++
+ /* 'props[]' is used to initialized the object properties. The number
+    of elements depends on the shape. */
+ static JSValue JS_NewObjectFromShapeExtra(JSContext *ctx, JSShape *sh, JSClassID class_id,
+@@ -9304,10 +9369,11 @@
+     list_for_each(el, &rt->context_list)
+         mark_func(rt, &list_entry(el, JSContext, link)->header);
+     JS_MarkValue(rt, rt->current_exception, mark_func);
+-    list_for_each(el, &rt->job_list) {
+-        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+-        /* (a traced block: its values with it) */
+-        mark_func(rt, (JSGCObjectHeader *)e);
++    for (i = 0; i < (int)rt->job_count; i++) {
++        JSJobEntry *e = &rt->jobs[(rt->job_head + i) & (rt->job_size - 1)];
++        int j;
++        for (j = 0; j < e->argc; j++)
++            JS_MarkValue(rt, e->argv[j], mark_func);
+         mark_func(rt, &e->ctx->header);
+     }
+     /* The atoms referenced as atoms (the others are weak: see
+@@ -59815,29 +59881,51 @@
+ 
+ typedef struct JSPromiseData {
+     JSPromiseStateEnum promise_state;
+-    /* 0=fulfill, 1=reject, list of JSPromiseReactionData.link */
+-    struct list_head promise_reactions[2];
++    /* luminous: its reactions while it is pending, in the order they were
++       added, for either outcome (two lists of records it freed) */
++    struct JSPromiseReactionData *reactions, *reactions_last;
+     bool is_handled;
+     bool is_settling; /* (luminous) JS_SettlePromise was called */
++    /* luminous: in the promise object's own cell, after its properties
++       (not freed with it) */
++    bool own_cell;
+     JSValue promise_result;
+ } JSPromiseData;
+ 
+-typedef struct JSPromiseFunctionDataResolved {
+-    int ref_count;
+-    bool already_resolved;
+-} JSPromiseFunctionDataResolved;
+-
++/* luminous: in the function object's own cell (own_cell), after its
++   properties; the reject function holds the resolve function, whose
++   already_resolved both share (there was a separate allocation, counted) */
+ typedef struct JSPromiseFunctionData {
+     JSValue promise;
+-    JSPromiseFunctionDataResolved *presolved;
++    JSValue resolve_func; /* the reject function's; undefined in the resolve function */
++    bool already_resolved;
++    bool own_cell;
+ } JSPromiseFunctionData;
+ 
++/* luminous: a reaction to a pending promise, for either outcome: a GC
++   cell whose words are scanned (JS_GC_OBJ_TYPE_CONS_BLOCK), dropped once
++   the promise settles (no allocation to free) */
+ typedef struct JSPromiseReactionData {
+-    struct list_head link; /* not used in promise_reaction_job */
++    struct JSPromiseReactionData *next;
+     JSValue resolving_funcs[2];
+-    JSValue handler;
++    JSValue handlers[2]; /* on fulfillment, on rejection */
++    /* luminous: a native reaction (JS_AwaitNative's, the fast
++       Promise.all's): it queues this job with (handlers[0], the value,
++       whether rejected, handlers[1]) */
++    JSJobFunc *await_job;
+ } JSPromiseReactionData;
+ 
++/* A new reaction record (its fields the caller's to set). */
++static JSPromiseReactionData *js_promise_reaction_new(JSContext *ctx)
++{
++    JSPromiseReactionData *rd;
++    js_trigger_gc(ctx->rt, sizeof(*rd));
++    rd = js_gc_alloc(ctx, sizeof(*rd));
++    if (rd)
++        JS_GC_TYPE(rd) = JS_GC_OBJ_TYPE_CONS_BLOCK;
++    return rd;
++}
++
+ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
+ {
+     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+@@ -59897,15 +59985,6 @@
+ static int js_create_resolving_functions(JSContext *ctx, JSValue *args,
+                                          JSValueConst promise);
+ 
+-static void promise_reaction_data_free(JSRuntime *rt,
+-                                       JSPromiseReactionData *rd)
+-{
+-    JS_FreeValueRT(rt, rd->resolving_funcs[0]);
+-    JS_FreeValueRT(rt, rd->resolving_funcs[1]);
+-    JS_FreeValueRT(rt, rd->handler);
+-    js_free_rt(rt, rd);
+-}
+-
+ #ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
+ #define promise_trace(ctx, ...) \
+    do { \
+@@ -59950,7 +60029,12 @@
+     /* as an extension, we support undefined as value to avoid
+        creating a dummy promise in the 'await' implementation of async
+        functions */
+-    if (!JS_IsUndefined(func)) {
++    if (JS_IsNull(argv[1])) {
++        /* luminous: the derived promise itself, without resolving
++           functions: settled as they would */
++        JS_SettlePromise(ctx, argv[0], res, is_reject);
++        res2 = JS_UNDEFINED;
++    } else if (!JS_IsUndefined(func)) {
+         res2 = JS_Call(ctx, func, JS_UNDEFINED, 1, vc(&res));
+     } else {
+         res2 = JS_UNDEFINED;
+@@ -59978,7 +60062,6 @@
+                                       JSValueConst value, bool is_reject)
+ {
+     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+-    struct list_head *el, *el1;
+     JSPromiseReactionData *rd;
+     JSValueConst args[5];
+ 
+@@ -60000,22 +60083,23 @@
+ 
+     call_promise_rejection_tracker(ctx, promise, false);
+ 
+-    list_for_each_safe(el, el1, &s->promise_reactions[is_reject]) {
+-        rd = list_entry(el, JSPromiseReactionData, link);
+-        args[0] = rd->resolving_funcs[0];
+-        args[1] = rd->resolving_funcs[1];
+-        args[2] = rd->handler;
+-        args[3] = js_bool(is_reject);
+-        args[4] = value;
+-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+-        list_del(&rd->link);
+-        promise_reaction_data_free(ctx->rt, rd);
+-    }
+-
+-    list_for_each_safe(el, el1, &s->promise_reactions[1 - is_reject]) {
+-        rd = list_entry(el, JSPromiseReactionData, link);
+-        list_del(&rd->link);
+-        promise_reaction_data_free(ctx->rt, rd);
++    rd = s->reactions;
++    s->reactions = s->reactions_last = NULL;
++    for (; rd; rd = rd->next) {
++        if (rd->await_job) {
++            args[0] = rd->handlers[0];
++            args[1] = value;
++            args[2] = js_bool(is_reject);
++            args[3] = rd->handlers[1];
++            JS_EnqueueJob(ctx, rd->await_job, 4, args);
++        } else {
++            args[0] = rd->resolving_funcs[0];
++            args[1] = rd->resolving_funcs[1];
++            args[2] = rd->handlers[is_reject];
++            args[3] = js_bool(is_reject);
++            args[4] = value;
++            JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
++        }
+     }
+ }
+ 
+@@ -60054,14 +60138,6 @@
+     return res;
+ }
+ 
+-static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
+-                                                      JSPromiseFunctionDataResolved *sr)
+-{
+-    if (--sr->ref_count == 0) {
+-        js_free_rt(rt, sr);
+-    }
+-}
+-
+ static int js_create_resolving_functions(JSContext *ctx,
+                                          JSValue *resolving_funcs,
+                                          JSValueConst promise)
+@@ -60069,46 +60145,42 @@
+ {
+     JSValue obj;
+     JSPromiseFunctionData *s;
+-    JSPromiseFunctionDataResolved *sr;
+-    int i, ret;
++    int i;
+ 
+     resolving_funcs[0] = JS_UNDEFINED;
+     resolving_funcs[1] = JS_UNDEFINED;
+-    sr = js_malloc(ctx, sizeof(*sr));
+-    if (!sr)
+-        return -1;
+-    sr->ref_count = 1;
+-    sr->already_resolved = false; /* must be shared between the two functions */
+-    ret = 0;
+     for(i = 0; i < 2; i++) {
+         JSShape *sh = ctx->resolving_func_shape;
+         if (sh) {
+             /* (luminous) made with their properties: `length` then `name`,
+-               as js_function_set_properties defines them */
++               as js_function_set_properties defines them, and their data
++               in their own cell */
+             JSProperty props[2];
++            void *data;
+             props[0].u.value = js_int32(1);
+             props[1].u.value = JS_AtomToString(ctx, JS_ATOM_empty_string);
+-            obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh),
+-                                        JS_CLASS_PROMISE_RESOLVE_FUNCTION + i,
+-                                        props);
++            obj = JS_NewObjectFromShapeExtra(ctx, js_dup_shape(sh),
++                                             JS_CLASS_PROMISE_RESOLVE_FUNCTION + i,
++                                             props, sizeof(*s), &data);
++            if (JS_IsException(obj))
++                goto fail;
++            s = data;
++            s->own_cell = true;
+         } else {
+             obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
+                                          JS_CLASS_PROMISE_RESOLVE_FUNCTION + i);
++            if (JS_IsException(obj))
++                goto fail;
++            s = js_malloc(ctx, sizeof(*s));
++            if (!s) {
++                JS_FreeValue(ctx, obj);
++                goto fail;
++            }
++            s->own_cell = false;
+         }
+-        if (JS_IsException(obj))
+-            goto fail;
+-        s = js_malloc(ctx, sizeof(*s));
+-        if (!s) {
+-            JS_FreeValue(ctx, obj);
+-        fail:
+-            JS_FreeValue(ctx, resolving_funcs[0]);
+-            resolving_funcs[0] = JS_UNDEFINED;
+-            ret = -1;
+-            break;
+-        }
+-        sr->ref_count++;
+-        s->presolved = sr;
++        s->already_resolved = false;
+         s->promise = js_dup(promise);
++        s->resolve_func = js_dup(resolving_funcs[0]);
+         JS_SetOpaqueInternal(obj, s);
+         if (!sh) {
+             js_function_set_properties(ctx, obj, JS_ATOM_empty_string, 1);
+@@ -60118,8 +60190,11 @@
+         }
+         resolving_funcs[i] = obj;
+     }
+-    js_promise_resolve_function_free_resolved(ctx->rt, sr);
+-    return ret;
++    return 0;
++ fail:
++    JS_FreeValue(ctx, resolving_funcs[0]);
++    resolving_funcs[0] = JS_UNDEFINED;
++    return -1;
+ }
+ 
+ static void js_promise_resolve_function_finalizer(JSRuntime *rt,
+@@ -60127,9 +60202,10 @@
+ {
+     JSPromiseFunctionData *s = JS_VALUE_GET_OBJ(val)->u.promise_function_data;
+     if (s) {
+-        js_promise_resolve_function_free_resolved(rt, s->presolved);
+         JS_FreeValueRT(rt, s->promise);
+-        js_free_rt(rt, s);
++        JS_FreeValueRT(rt, s->resolve_func);
++        if (!s->own_cell)
++            js_free_rt(rt, s);
+     }
+ }
+ 
+@@ -60139,6 +60215,7 @@
+     JSPromiseFunctionData *s = JS_VALUE_GET_OBJ(val)->u.promise_function_data;
+     if (s) {
+         JS_MarkValue(rt, s->promise, mark_func);
++        JS_MarkValue(rt, s->resolve_func, mark_func);
+     }
+ }
+ 
+@@ -60183,14 +60260,17 @@
+                                                 int flags)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+-    JSPromiseFunctionData *s;
++    JSPromiseFunctionData *s, *r;
+     JSValueConst resolution;
+     bool is_reject;
+ 
+     s = p->u.promise_function_data;
+-    if (!s || s->presolved->already_resolved)
++    if (!s)
+         return JS_UNDEFINED;
+-    s->presolved->already_resolved = true;
++    r = JS_IsUndefined(s->resolve_func) ? s : JS_VALUE_GET_OBJ(s->resolve_func)->u.promise_function_data;
++    if (r->already_resolved)
++        return JS_UNDEFINED;
++    r->already_resolved = true;
+     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
+     if (argc > 0)
+         resolution = argv[0];
+@@ -60207,44 +60287,74 @@
+     return JS_UNDEFINED;
+ }
+ 
++/* (luminous: a promise whose data is in its own cell is not finalized,
++   unless properties it was given moved out of the cell) */
+ static void js_promise_finalizer(JSRuntime *rt, JSValueConst val)
+ {
+     JSPromiseData *s = JS_GetOpaque(val, JS_CLASS_PROMISE);
+-    struct list_head *el, *el1;
+-    int i;
+ 
+     if (!s)
+         return;
+-    for(i = 0; i < 2; i++) {
+-        list_for_each_safe(el, el1, &s->promise_reactions[i]) {
+-            JSPromiseReactionData *rd =
+-                list_entry(el, JSPromiseReactionData, link);
+-            promise_reaction_data_free(rt, rd);
+-        }
+-    }
+     JS_FreeValueRT(rt, s->promise_result);
+-    js_free_rt(rt, s);
++    if (!s->own_cell)
++        js_free_rt(rt, s);
+ }
+ 
+ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
+                             JS_MarkFunc *mark_func)
+ {
+     JSPromiseData *s = JS_GetOpaque(val, JS_CLASS_PROMISE);
+-    struct list_head *el;
+-    int i;
+ 
+     if (!s)
+         return;
+-    for(i = 0; i < 2; i++) {
+-        list_for_each(el, &s->promise_reactions[i]) {
+-            JSPromiseReactionData *rd =
+-                list_entry(el, JSPromiseReactionData, link);
+-            JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
+-            JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
+-            JS_MarkValue(rt, rd->handler, mark_func);
++    /* (the first record: each one's words are scanned, `next` with them) */
++    if (s->reactions)
++        mark_func(rt, (JSGCObjectHeader *)s->reactions);
++    JS_MarkValue(rt, s->promise_result, mark_func);
++}
++
++/* luminous: a new pending promise, without resolving functions: of
++   new_target's prototype, or of %Promise.prototype% if it is undefined,
++   then with its data in its own cell. */
++static JSValue js_promise_alloc(JSContext *ctx, JSValueConst new_target)
++{
++    JSValue obj;
++    JSPromiseData *s;
++
++    if (JS_IsUndefined(new_target)) {
++        JSShape *sh = ctx->promise_shape;
++        void *data;
++        if (unlikely(!sh)) {
++            JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_PROMISE]);
++            sh = find_hashed_shape_proto(ctx->rt, proto);
++            sh = sh ? js_dup_shape(sh) : js_new_shape(ctx, proto);
++            if (!sh)
++                return JS_EXCEPTION;
++            ctx->promise_shape = sh;
+         }
++        obj = js_new_object_data(ctx, js_dup_shape(sh), JS_CLASS_PROMISE, sizeof(*s), true, &data);
++        if (JS_IsException(obj))
++            return obj;
++        s = data;
++        s->own_cell = true;
++    } else {
++        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
++        if (JS_IsException(obj))
++            return JS_EXCEPTION;
++        s = js_malloc(ctx, sizeof(*s));
++        if (!s) {
++            JS_FreeValue(ctx, obj);
++            return JS_EXCEPTION;
++        }
++        s->own_cell = false;
+     }
+-    JS_MarkValue(rt, s->promise_result, mark_func);
++    s->promise_state = JS_PROMISE_PENDING;
++    s->is_handled = false;
++    s->is_settling = false;
++    s->reactions = s->reactions_last = NULL;
++    s->promise_result = JS_UNDEFINED;
++    JS_SetOpaqueInternal(obj, s);
++    return obj;
+ }
+ 
+ /* Create a new promise object with resolving functions. Returns the promise
+@@ -60253,23 +60363,11 @@
+                                JSValue *resolving_funcs)
+ {
+     JSValue obj;
+-    JSPromiseData *s;
+     JSRuntime *rt;
+ 
+-    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
++    obj = js_promise_alloc(ctx, new_target);
+     if (JS_IsException(obj))
+         return JS_EXCEPTION;
+-    s = js_mallocz(ctx, sizeof(*s));
+-    if (!s) {
+-        JS_FreeValue(ctx, obj);
+-        return JS_EXCEPTION;
+-    }
+-    s->promise_state = JS_PROMISE_PENDING;
+-    s->is_handled = false;
+-    init_list_head(&s->promise_reactions[0]);
+-    init_list_head(&s->promise_reactions[1]);
+-    s->promise_result = JS_UNDEFINED;
+-    JS_SetOpaqueInternal(obj, s);
+     if (js_create_resolving_functions(ctx, resolving_funcs, obj)) {
+         JS_FreeValue(ctx, obj);
+         return JS_EXCEPTION;
+@@ -60386,23 +60484,11 @@
+ JSValue JS_NewPendingPromise(JSContext *ctx)
+ {
+     JSValue obj;
+-    JSPromiseData *s;
+     JSRuntime *rt;
+ 
+-    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_PROMISE);
++    obj = js_promise_alloc(ctx, JS_UNDEFINED);
+     if (JS_IsException(obj))
+         return JS_EXCEPTION;
+-    s = js_mallocz(ctx, sizeof(*s));
+-    if (!s) {
+-        JS_FreeValue(ctx, obj);
+-        return JS_EXCEPTION;
+-    }
+-    s->promise_state = JS_PROMISE_PENDING;
+-    s->is_handled = false;
+-    init_list_head(&s->promise_reactions[0]);
+-    init_list_head(&s->promise_reactions[1]);
+-    s->promise_result = JS_UNDEFINED;
+-    JS_SetOpaqueInternal(obj, s);
+     rt = ctx->rt;
+     if (rt->promise_hook) {
+         JSValueConst parent_promise = JS_UNDEFINED;
+@@ -60469,42 +60555,139 @@
+ static JSValue js_promise_new_settled(JSContext *ctx, JSValueConst value, bool is_reject)
+ {
+     JSValue obj;
+-    JSPromiseData *s;
+ 
+-    obj = js_create_from_ctor(ctx, JS_UNDEFINED, JS_CLASS_PROMISE);
++    obj = js_promise_alloc(ctx, JS_UNDEFINED);
+     if (JS_IsException(obj))
+         return JS_EXCEPTION;
+-    s = js_mallocz(ctx, sizeof(*s));
+-    if (!s) {
+-        JS_FreeValue(ctx, obj);
+-        return JS_EXCEPTION;
++    if (!is_reject && !ctx->rt->promise_hook) {
++        /* luminous: fulfilled (no reactions yet, no rejection to track) */
++        JSPromiseData *s = JS_VALUE_GET_OBJ(obj)->u.opaque;
++        s->promise_state = JS_PROMISE_FULFILLED;
++        s->promise_result = js_dup(value);
++        JS_GC_WBV(ctx->rt, JS_VALUE_GET_OBJ(obj), value);
++    } else {
++        fulfill_or_reject_promise(ctx, obj, value, is_reject);
+     }
+-    s->promise_state = JS_PROMISE_PENDING;
+-    s->is_handled = false;
+-    init_list_head(&s->promise_reactions[0]);
+-    init_list_head(&s->promise_reactions[1]);
+-    s->promise_result = JS_UNDEFINED;
+-    JS_SetOpaqueInternal(obj, s);
+-    fulfill_or_reject_promise(ctx, obj, value, is_reject);
+     return obj;
+ }
+ 
+-/* Whether `promise.constructor` is %Promise% with nothing observable
+-   happening: no own properties, %Promise.prototype% as the prototype, and
+-   its `constructor` a data property holding %Promise%. */
+-static bool js_promise_ctor_is_intrinsic(JSContext *ctx, JSObject *p)
++/* luminous: a new promise of %Promise%, settled as its resolve function
++   (its reject function if is_reject) would settle it with `value`: an
++   object is looked at as a thenable. An async function's, which
++   completed without suspending. */
++JSValue JS_NewPromiseSettledWith(JSContext *ctx, JSValueConst value, bool is_reject)
++{
++    JSValue obj;
++
++    if ((is_reject || !JS_IsObject(value)) && !ctx->rt->promise_hook)
++        return js_promise_new_settled(ctx, value, is_reject);
++    obj = JS_NewPendingPromise(ctx);
++    if (!JS_IsException(obj))
++        JS_SettlePromise(ctx, obj, value, is_reject);
++    return obj;
++}
++
++/* luminous: what the fast paths of the promise builtins rely on, still
++   true while the objects holding them are unchanged (they are watched:
++   see js_pristine) */
++#define JS_PRISTINE_CTOR       1 /* %Promise.prototype%.constructor is %Promise% */
++#define JS_PRISTINE_SPECIES    2 /* %Promise%[@@species] is the getter returning `this` */
++#define JS_PRISTINE_THEN       4 /* %Promise.prototype%.then is the builtin */
++#define JS_PRISTINE_RESOLVE    8 /* %Promise%.resolve is the builtin */
++#define JS_PRISTINE_ARRAY_ITER 16 /* Array.prototype[@@iterator] is %Array.prototype.values%,
++                                     %ArrayIteratorPrototype%.next the builtin */
++
++static JSValue js_get_this(JSContext *ctx, JSValueConst this_val);
++static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
++                                      int argc, JSValueConst *argv,
++                                      int *pdone, int magic);
++static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
++                               int argc, JSValueConst *argv);
++
++/* The value of own data property `atom` of `p`, or JS_UNINITIALIZED. */
++static JSValue js_own_data(JSObject *p, JSAtom atom)
+ {
+-    JSObject *proto = p->shape->proto;
+     JSShapeProperty *prs;
+     JSProperty *pr;
++    prs = find_own_property(&pr, p, atom);
++    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++        return JS_UNINITIALIZED;
++    return pr->u.value;
++}
+ 
+-    if (p->shape->prop_count != 0 ||
+-        proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_PROMISE]))
++/* Whether `v` is the builtin C function `fn` (of magic `magic`). */
++static bool js_is_builtin(JSValueConst v, void *fn, int magic)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+         return false;
+-    prs = find_own_property(&pr, proto, JS_ATOM_constructor);
+-    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
+-           JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT &&
+-           JS_VALUE_GET_PTR(pr->u.value) == JS_VALUE_GET_PTR(ctx->promise_ctor);
++    p = JS_VALUE_GET_OBJ(v);
++    return p->class_id == JS_CLASS_C_FUNCTION && (void *)p->u.cfunc.c_function.generic == fn &&
++           p->u.cfunc.magic == magic;
++}
++
++static no_inline int js_pristine_update(JSContext *ctx)
++{
++    JSValueConst watched[4] = {
++        ctx->class_proto[JS_CLASS_PROMISE], ctx->promise_ctor,
++        ctx->class_proto[JS_CLASS_ARRAY], ctx->class_proto[JS_CLASS_ARRAY_ITERATOR],
++    };
++    JSObject *proto = JS_VALUE_GET_OBJ(watched[0]), *ctor = JS_VALUE_GET_OBJ(watched[1]);
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    JSValue v;
++    bool all_watched = true;
++    int i, r = 0;
++
++    for (i = 0; i < 4; i++) {
++        if (JS_VALUE_GET_TAG(watched[i]) != JS_TAG_OBJECT) {
++            all_watched = false;
++        } else if (!JS_VALUE_GET_OBJ(watched[i])->is_watched &&
++                   JS_WatchPrototype(ctx, watched[i]) < 0) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            all_watched = false;
++        }
++    }
++    v = js_own_data(proto, JS_ATOM_constructor);
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v) == ctor)
++        r |= JS_PRISTINE_CTOR;
++    prs = find_own_property(&pr, ctor, JS_ATOM_Symbol_species);
++    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET && pr->u.getset.getter &&
++        js_is_builtin(JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter), (void *)js_get_this, 0))
++        r |= JS_PRISTINE_SPECIES;
++    if (js_is_builtin(js_own_data(proto, JS_ATOM_then), (void *)js_promise_then, 0))
++        r |= JS_PRISTINE_THEN;
++    if (js_is_builtin(js_own_data(ctor, JS_ATOM_resolve), (void *)js_promise_resolve, 0))
++        r |= JS_PRISTINE_RESOLVE;
++    v = js_own_data(JS_VALUE_GET_OBJ(watched[2]), JS_ATOM_Symbol_iterator);
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(ctx->array_proto_values) &&
++        js_is_builtin(js_own_data(JS_VALUE_GET_OBJ(watched[3]), JS_ATOM_next),
++                      (void *)js_array_iterator_next, 0))
++        r |= JS_PRISTINE_ARRAY_ITER;
++    if (all_watched) {
++        ctx->pristine_epoch = js_proto_epoch;
++        ctx->pristine = r;
++    }
++    return r;
++}
++
++/* Which of JS_PRISTINE_* hold. */
++static inline int js_pristine(JSContext *ctx)
++{
++    if (likely(ctx->pristine_epoch == js_proto_epoch))
++        return ctx->pristine;
++    return js_pristine_update(ctx);
++}
++
++/* Whether `promise.constructor` is %Promise% with nothing observable
++   happening: no own properties, %Promise.prototype% as the prototype, and
++   its `constructor` a data property holding %Promise%. */
++static bool js_promise_ctor_is_intrinsic(JSContext *ctx, JSObject *p)
++{
++    return p->shape->prop_count == 0 &&
++           p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_PROMISE]) &&
++           (js_pristine(ctx) & JS_PRISTINE_CTOR);
+ }
+ 
+ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
+@@ -60595,6 +60778,74 @@
+     return res;
+ }
+ 
++static void js_promise_add_reaction(JSContext *ctx, JSValueConst promise, JSPromiseData *s,
++                                    JSPromiseReactionData *rd);
++
++/* luminous: a native reaction to `promise` (with no other observer of
++   the reaction: its derived promise, its functions): `job` queued with
++   (data, the value, whether it was rejected, data2) where the reaction
++   job would be (now if it is settled). Returns -1 on exception. */
++static int js_promise_react_native(JSContext *ctx, JSValueConst promise, JSJobFunc *job,
++                                   JSValueConst data, JSValueConst data2)
++{
++    JSPromiseData *s = JS_VALUE_GET_OBJ(promise)->u.opaque;
++    JSPromiseReactionData *rd;
++    JSValueConst args[4];
++    int ret;
++
++    if (s->promise_state != JS_PROMISE_PENDING) {
++        int is_reject = s->promise_state - JS_PROMISE_FULFILLED;
++        call_promise_rejection_tracker(ctx, promise, true);
++        args[0] = data;
++        args[1] = s->promise_result;
++        args[2] = js_bool(is_reject);
++        args[3] = data2;
++        ret = JS_EnqueueJob(ctx, job, 4, args);
++        if (ret == 0)
++            s->is_handled = true;
++        return ret;
++    }
++    rd = js_promise_reaction_new(ctx);
++    if (!rd)
++        return -1;
++    rd->resolving_funcs[0] = JS_UNDEFINED;
++    rd->resolving_funcs[1] = JS_UNDEFINED;
++    rd->handlers[0] = js_dup(data);
++    rd->handlers[1] = js_dup(data2);
++    rd->await_job = job;
++    js_promise_add_reaction(ctx, promise, s, rd);
++    return 0;
++}
++
++/* `await value` for native code that resumes from a job of its own: as
++   JS_AwaitValue, with a reaction that queues `job` with (data, the
++   value, whether it was rejected) where the reaction job would be queued
++   (no functions to call). Returns -1 on exception. */
++int JS_AwaitNative(JSContext *ctx, JSValueConst value, JSJobFunc *job, JSValueConst data)
++{
++    JSValueConst args[3];
++    JSValue promise;
++    int ret;
++
++    if (!JS_IsObject(value) && !ctx->rt->promise_hook) {
++        /* (fulfilled with value, then only reacted to) */
++        args[0] = data;
++        args[1] = value;
++        args[2] = JS_FALSE;
++        return JS_EnqueueJob(ctx, job, 3, args);
++    }
++    /* (a promise of %Promise%: PromiseResolve gives it back) */
++    if (JS_VALUE_GET_OBJ(value)->class_id == JS_CLASS_PROMISE &&
++        js_promise_ctor_is_intrinsic(ctx, JS_VALUE_GET_OBJ(value)))
++        return js_promise_react_native(ctx, value, job, data, JS_UNDEFINED);
++    promise = js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, 0);
++    if (JS_IsException(promise))
++        return -1;
++    ret = js_promise_react_native(ctx, promise, job, data, JS_UNDEFINED);
++    JS_FreeValue(ctx, promise);
++    return ret;
++}
++
+ /* A property found on the prototype of obj (an ordinary object without it
+    as an own property), or on the prototype of that prototype: its slot in
+    the holder's properties, with references to the shapes of obj, of the
+@@ -60851,6 +61102,7 @@
+ {
+     JSObject *p, *proto = object_or_null(ctx->class_proto[class_id]);
+     JSShape *sh = find_hashed_shape_proto(ctx->rt, proto);
++    JSValue obj;
+ 
+     if (sh) {
+         sh = js_dup_shape(sh);
+@@ -60859,28 +61111,25 @@
+         if (!sh)
+             return JS_EXCEPTION;
+     }
+-    js_trigger_gc(ctx->rt, sizeof(JSObject) + size);
+-    p = js_gc_alloc(ctx, sizeof(JSObject) + size);
+-    if (!p) {
+-        js_free_shape(ctx->rt, sh);
+-        return JS_EXCEPTION;
+-    }
+-    /* The data is the caller's to initialize. (luminous: the header in
+-       one store, as JS_NewObjectFromShapeExtra's) */
+-    js_object_set_header(p, class_id, false);
++    /* The data is the caller's to initialize. */
++    obj = js_new_object_data(ctx, sh, class_id, size, false, pdata);
++    if (JS_IsException(obj))
++        return obj;
++    p = JS_VALUE_GET_OBJ(obj);
+     p->extensible = extensible;
+     if (unlikely(ctx->rt->class_array[class_id].exotic))
+         p->is_exotic = 1;
+-    p->shape = sh;
+-    p->prop = NULL;
+-    memset(&p->u, 0, sizeof(p->u));
+-    p->u.opaque = p + 1;
+-    *pdata = p + 1;
+-    JS_REF_COUNT(p) = 1;
+-    add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+     if (ctx->rt->class_array[class_id].finalizer)
+         js_gc_set_fin(p);
+-    return JS_MKPTR(JS_TAG_OBJECT, p);
++    return obj;
++}
++
++/* luminous: an extensible one, of a class without exotic methods or a
++   finalizer, with the shape of a first one (JS_DupObjectShape). */
++JSValue JS_NewObjectClassDataShaped(JSContext *ctx, void *shape, JSClassID class_id, size_t size,
++                                    void **pdata)
++{
++    return js_new_object_data(ctx, js_dup_shape(shape), class_id, size, false, pdata);
+ }
+ 
+ uint32_t JS_ShapeAllocInfo(JSRuntime *rt, void *shape)
+@@ -61347,6 +61596,152 @@
+     return JS_UNDEFINED;
+ }
+ 
++#define PROMISE_MAGIC_race 3
++
++/* luminous: the job of an element of a fast Promise.all, allSettled, any
++   or race (js_promise_all_fast): (state, the element's value, whether it
++   was rejected, its index), state being [the result promise, its values
++   (its errors for any), how many are left, magic]: what its resolve or
++   reject element function would do. */
++static JSValue js_promise_all_job(JSContext *ctx, int argc, JSValueConst *argv)
++{
++    JSValue *st = JS_VALUE_GET_OBJ(argv[0])->u.array.u.values;
++    JSValueConst value = argv[1], result = st[0];
++    bool is_reject = JS_VALUE_GET_BOOL(argv[2]);
++    int index = JS_VALUE_GET_INT(argv[3]), magic = JS_VALUE_GET_INT(st[3]), left;
++    JSObject *vp;
++    JSValue obj;
++
++    if (magic == PROMISE_MAGIC_race ||
++        (magic == PROMISE_MAGIC_all && is_reject) || (magic == PROMISE_MAGIC_any && !is_reject)) {
++        JS_SettlePromise(ctx, result, value, is_reject);
++        return JS_UNDEFINED;
++    }
++    if (magic == PROMISE_MAGIC_allSettled) {
++        JSValue str;
++        obj = JS_NewObject(ctx);
++        if (JS_IsException(obj))
++            return JS_EXCEPTION;
++        str = js_new_string8(ctx, is_reject ? "rejected" : "fulfilled");
++        if (JS_IsException(str) ||
++            JS_DefinePropertyValue(ctx, obj, JS_ATOM_status, str, JS_PROP_C_W_E) < 0 ||
++            JS_DefinePropertyValue(ctx, obj, is_reject ? JS_ATOM_reason : JS_ATOM_value,
++                                   js_dup(value), JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, obj);
++            return JS_EXCEPTION;
++        }
++    } else {
++        obj = js_dup(value);
++    }
++    vp = JS_VALUE_GET_OBJ(st[1]);
++    set_value(ctx, &vp->u.array.u.values[index], obj);
++    JS_GC_WBV(ctx->rt, vp, obj);
++    left = JS_VALUE_GET_INT(st[2]) - 1;
++    st[2] = js_int32(left);
++    if (left == 0) {
++        if (magic == PROMISE_MAGIC_any) {
++            JSValue error = js_aggregate_error_constructor(ctx, st[1]);
++            if (JS_IsException(error))
++                return JS_EXCEPTION;
++            JS_SettlePromise(ctx, result, error, true);
++            JS_FreeValue(ctx, error);
++        } else {
++            JS_SettlePromise(ctx, result, st[1], false);
++        }
++    }
++    return JS_UNDEFINED;
++}
++
++/* luminous: Promise.all, allSettled, any or race (magic) of %Promise% over
++   a fast array of primitives and promises of %Promise%, when nothing it
++   does is observable but its result (no promise hook; the builtins it
++   uses the original ones, see js_pristine): the elements' reactions are
++   native (no element functions, no derived promises; an element that is
++   not an object is reacted to as the promise it would be fulfilled
++   with), the iteration direct. JS_UNINITIALIZED if not applicable. */
++static JSValue js_promise_all_fast(JSContext *ctx, JSValueConst this_val, JSValueConst iterable,
++                                   int magic)
++{
++    const int needed = JS_PRISTINE_CTOR | JS_PRISTINE_SPECIES | JS_PRISTINE_THEN |
++                       JS_PRISTINE_RESOLVE | JS_PRISTINE_ARRAY_ITER;
++    JSObject *ap, *promise_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_PROMISE]);
++    JSValue result, values, state, st[4];
++    JSValueConst args[4];
++    uint32_t n, i;
++
++    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_PTR(this_val) != JS_VALUE_GET_PTR(ctx->promise_ctor) ||
++        ctx->rt->promise_hook || JS_VALUE_GET_TAG(iterable) != JS_TAG_OBJECT)
++        return JS_UNINITIALIZED;
++    ap = JS_VALUE_GET_OBJ(iterable);
++    if (ap->class_id != JS_CLASS_ARRAY || !ap->fast_array || ap->shape->prop_count != 1 ||
++        ap->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||
++        JS_VALUE_GET_TAG(ap->prop[0].u.value) != JS_TAG_INT ||
++        (uint32_t)JS_VALUE_GET_INT(ap->prop[0].u.value) != ap->u.array.count ||
++        (js_pristine(ctx) & needed) != needed)
++        return JS_UNINITIALIZED;
++    n = ap->u.array.count;
++    for (i = 0; i < n; i++) {
++        JSValueConst v = ap->u.array.u.values[i];
++        JSObject *p;
++        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++            continue;
++        p = JS_VALUE_GET_OBJ(v);
++        if (p->class_id != JS_CLASS_PROMISE || p->shape->prop_count != 0 || p->shape->proto != promise_proto)
++            return JS_UNINITIALIZED;
++    }
++    result = js_promise_alloc(ctx, JS_UNDEFINED);
++    if (JS_IsException(result))
++        return result;
++    values = magic == PROMISE_MAGIC_race ? JS_UNDEFINED : js_allocate_fast_array(ctx, n);
++    if (JS_IsException(values))
++        goto fail;
++    st[0] = js_dup(result);
++    st[1] = values;
++    st[2] = js_int32(n);
++    st[3] = js_int32(magic);
++    state = JS_NewArrayFrom(ctx, 4, st);
++    if (JS_IsException(state))
++        goto fail;
++    for (i = 0; i < n; i++) {
++        /* (the array is unchanged: nothing here runs code) */
++        JSValueConst v = ap->u.array.u.values[i];
++        int ret;
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
++            ret = js_promise_react_native(ctx, v, js_promise_all_job, state, js_int32(i));
++        } else {
++            args[0] = state;
++            args[1] = v;
++            args[2] = JS_FALSE;
++            args[3] = js_int32(i);
++            ret = JS_EnqueueJob(ctx, js_promise_all_job, 4, args);
++        }
++        if (ret < 0) {
++            /* (IfAbruptRejectPromise) */
++            JSValue error = JS_GetException(ctx);
++            JS_SettlePromise(ctx, result, error, true);
++            JS_FreeValue(ctx, error);
++            break;
++        }
++    }
++    if (n == 0 && magic != PROMISE_MAGIC_race) {
++        if (magic == PROMISE_MAGIC_any) {
++            JSValue error = js_aggregate_error_constructor(ctx, values);
++            if (JS_IsException(error))
++                error = JS_GetException(ctx);
++            JS_SettlePromise(ctx, result, error, true);
++            JS_FreeValue(ctx, error);
++        } else {
++            JS_SettlePromise(ctx, result, values, false);
++        }
++    }
++    JS_FreeValue(ctx, state);
++    return result;
++ fail:
++    JS_FreeValue(ctx, result);
++    return JS_EXCEPTION;
++}
++
+ /* magic = 0: Promise.all 1: Promise.allSettled */
+ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic)
+@@ -61360,6 +61755,9 @@
+ 
+     if (!JS_IsObject(this_val))
+         return JS_ThrowTypeErrorNotAnObject(ctx);
++    result_promise = js_promise_all_fast(ctx, this_val, argv[0], magic);
++    if (!JS_IsUninitialized(result_promise))
++        return result_promise;
+     result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
+     if (JS_IsException(result_promise))
+         return result_promise;
+@@ -61501,6 +61899,9 @@
+ 
+     if (!JS_IsObject(this_val))
+         return JS_ThrowTypeErrorNotAnObject(ctx);
++    result_promise = js_promise_all_fast(ctx, this_val, argv[0], PROMISE_MAGIC_race);
++    if (!JS_IsUninitialized(result_promise))
++        return result_promise;
+     result_promise = js_new_promise_capability(ctx, resolving_funcs, this_val);
+     if (JS_IsException(result_promise))
+         return result_promise;
+@@ -61559,14 +61960,31 @@
+     goto done;
+ }
+ 
++/* luminous: reaction `rd` (its fields set) added to pending promise
++   `promise` (data `s`), after the others */
++static void js_promise_add_reaction(JSContext *ctx, JSValueConst promise, JSPromiseData *s,
++                                    JSPromiseReactionData *rd)
++{
++    rd->next = NULL;
++    if (s->reactions_last) {
++        s->reactions_last->next = rd;
++        js_gc_wb(ctx->rt, s->reactions_last);
++    } else {
++        s->reactions = rd;
++    }
++    s->reactions_last = rd;
++    js_gc_wb(ctx->rt, JS_VALUE_GET_OBJ(promise));
++    s->is_handled = true;
++}
++
+ static __exception int perform_promise_then(JSContext *ctx,
+                                             JSValueConst promise,
+                                             JSValueConst *resolve_reject,
+                                             JSValueConst *cap_resolving_funcs)
+ {
+     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+-    JSPromiseReactionData *rd_array[2], *rd;
+-    int i, j;
++    JSPromiseReactionData *rd;
++    int i;
+ 
+     if (s->promise_state != JS_PROMISE_PENDING) {
+         /* Settled: the reaction job directly, without reaction records. */
+@@ -61587,29 +62005,18 @@
+         s->is_handled = true;
+         return 0;
+     }
+-    rd_array[0] = NULL;
+-    rd_array[1] = NULL;
++    rd = js_promise_reaction_new(ctx);
++    if (!rd)
++        return -1;
+     for(i = 0; i < 2; i++) {
+-        JSValueConst handler;
+-        rd = js_mallocz(ctx, sizeof(*rd));
+-        if (!rd) {
+-            if (i == 1)
+-                promise_reaction_data_free(ctx->rt, rd_array[0]);
+-            return -1;
+-        }
+-        for(j = 0; j < 2; j++)
+-            rd->resolving_funcs[j] = js_dup(cap_resolving_funcs[j]);
+-        handler = resolve_reject[i];
++        JSValueConst handler = resolve_reject[i];
++        rd->resolving_funcs[i] = js_dup(cap_resolving_funcs[i]);
+         if (!JS_IsFunction(ctx, handler))
+             handler = JS_UNDEFINED;
+-        rd->handler = js_dup(handler);
+-        rd_array[i] = rd;
++        rd->handlers[i] = js_dup(handler);
+     }
+-
+-    for(i = 0; i < 2; i++)
+-        list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
+-    js_gc_wb(ctx->rt, JS_VALUE_GET_OBJ(promise));
+-    s->is_handled = true;
++    rd->await_job = NULL;
++    js_promise_add_reaction(ctx, promise, s, rd);
+     return 0;
+ }
+ 
+@@ -61627,10 +62034,27 @@
+     if (!s)
+         return JS_EXCEPTION;
+ 
++    rt = ctx->rt;
++    /* luminous: SpeciesConstructor is %Promise% without anything
++       observable happening: the derived promise has no resolving functions
++       (the reaction settles it itself, see promise_reaction_job) */
++    if (!rt->promise_hook && js_promise_ctor_is_intrinsic(ctx, JS_VALUE_GET_OBJ(this_val)) &&
++        (js_pristine(ctx) & JS_PRISTINE_SPECIES)) {
++        JSValueConst cap[2];
++        result_promise = js_promise_alloc(ctx, JS_UNDEFINED);
++        if (JS_IsException(result_promise))
++            return result_promise;
++        cap[0] = result_promise;
++        cap[1] = JS_NULL;
++        if (perform_promise_then(ctx, this_val, argv, cap)) {
++            JS_FreeValue(ctx, result_promise);
++            return JS_EXCEPTION;
++        }
++        return result_promise;
++    }
+     ctor = JS_SpeciesConstructor(ctx, this_val, JS_UNDEFINED);
+     if (JS_IsException(ctor))
+         return ctor;
+-    rt = ctx->rt;
+     // always restore, even if js_new_promise_capability callee removes hook
+     have_promise_hook = (rt->promise_hook != NULL);
+     if (have_promise_hook) {

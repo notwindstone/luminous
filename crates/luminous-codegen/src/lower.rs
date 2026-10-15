@@ -479,7 +479,7 @@ impl Lower {
                     slot: b.declare_var(I64),
                     // Step functions own every box (captures are dup'ed
                     // into their frame).
-                    owned: f.is_async || f.is_generator || !f.captures.contains(&i),
+                    owned: f.suspends() || !f.captures.contains(&i),
                 },
                 Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {
                     LVar::Two(b.declare_var(I64), b.declare_var(I64))
@@ -8616,11 +8616,9 @@ impl Lower {
                     self.b.def_var(v, x);
                 }
             }
-            // The frame no longer owns these values while the step runs.
-            let zero = self.b.ins().iconst(I64, 0);
-            let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
-            self.b.ins().store(M_SLOT, zero, slots, at);
-            self.b.ins().store(M_SLOT, undef, slots, at + TAG_OFFSET);
+            // (The slots keep their values while the step runs: the
+            // collector traces what they hold, which the next suspension
+            // or the frame's end replaces or drops.)
         }
         if let Some(s) = this_slot {
             // `this` stays owned by the frame; borrowed here.

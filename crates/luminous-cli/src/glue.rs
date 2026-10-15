@@ -97,13 +97,13 @@ _Static_assert(LUM_NATIVE_STACK == {budget}u, "stack budget mismatch");
 
     // Step functions of async functions and generators.
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        if f.is_async || f.is_generator {
+        if f.suspends() {
             writeln!(c, "extern LumStep lum_fn_{i};").unwrap();
         }
     }
     c.push_str("LumStep *const lum_steps[] = {\n");
     for (i, f) in m.funcs.iter().chain(&m.closures).enumerate() {
-        if f.is_async || f.is_generator {
+        if f.suspends() {
             writeln!(c, "    lum_fn_{i},").unwrap();
         } else {
             c.push_str("    NULL,\n");
