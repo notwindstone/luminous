@@ -1081,9 +1081,9 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   or `Array.prototype`, another prototype for an array, or nesting deeper
   than 32 sends the whole call to the general algorithm.
   `bench/micro/json.ts`, a 7-field object with a nested one, on a 4-core
-  x86-64 VM: about 200 ns (2.2 µs before the writers; the same plain
-  object, 300–400 ns; bun 1.4.3, 210–280 ns), and an array of 100 of them
-  about 15 µs (170 µs before; plain, 22–27 µs; bun, about 30 µs).
+  x86-64 VM: about 200 ns, as bun 1.4.3 (190–230 ns; 2.2 µs before the
+  writers; the same plain object, 230–320 ns), and an array of 100 of them
+  12–15 µs, about half of bun's (22–29 µs; 170 µs before; plain, 23–29 µs).
 
 ## Getting started
 
