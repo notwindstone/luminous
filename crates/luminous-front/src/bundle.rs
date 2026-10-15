@@ -1395,8 +1395,15 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         taken.extend(["console", "Set", "JSON"].map(String::from));
     }
     for u in units {
-        for name in u.sem.scoping().root_unresolved_references().keys() {
+        let scoping = u.sem.scoping();
+        for name in scoping.root_unresolved_references().keys() {
             taken.insert(name.to_string());
+        }
+        // (`declare const x`: the global `x`.)
+        for (name, &sym) in scoping.get_bindings(u.root()).iter() {
+            if scoping.symbol_flags(sym).is_ambient() {
+                taken.insert(name.to_string());
+            }
         }
     }
     let mut importers: HashMap<Binding, Vec<(usize, SymbolId)>> = HashMap::new();
@@ -1446,6 +1453,11 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             }
             let name = scoping.symbol_name(sym);
             let b = Binding::Symbol(m, sym);
+            // An ambient declaration names a global: its references stay.
+            if scoping.symbol_flags(sym).is_ambient() {
+                names.of.insert(b, name.to_string());
+                continue;
+            }
             if name == "int" && scoping.symbol_flags(sym).is_type_alias() {
                 int_aliases.push((m, sym));
                 if int_aliases.len() > 1 {

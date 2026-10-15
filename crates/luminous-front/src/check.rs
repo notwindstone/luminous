@@ -4501,9 +4501,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         arm
     }
 
+    /// The symbol `id` refers to (none: a global, `declare`d or not).
     fn resolve(&self, id: &'a IdentifierReference<'a>) -> Option<SymbolId> {
         let scoping = self.m.scoping;
-        id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id())
+        id.reference_id
+            .get()
+            .and_then(|r| scoping.get_reference(r).symbol_id())
+            .filter(|&s| !scoping.symbol_flags(s).is_ambient())
     }
 
     fn is_module_symbol(&self, sym: SymbolId) -> bool {

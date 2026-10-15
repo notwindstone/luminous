@@ -1,6 +1,7 @@
 //! The embedding API (`EmbedOpts`): a prelude module, a module directory
-//! (`demo:`), a native C module (`demo:native`), and the init and event loop
-//! hooks, as a runtime built on Luminous uses them.
+//! (`demo:`), a native C module (`demo:native`), the init and event loop
+//! hooks, and a global that is a module's binding, as a runtime built on
+//! Luminous uses them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,6 +37,7 @@ fn embed() {
         .arg("--module-dir")
         .arg(format!("demo:={}", dir.join("lib").display()))
         .args(["--c-module", "demo:native=js_init_module_demo", "--init-fn", "demo_init", "--loop-fn", "demo_loop"])
+        .args(["--global", "Greeter=demo:greet"])
         .arg("--link")
         .arg(&obj)
         .output()
@@ -44,8 +46,9 @@ fn embed() {
     let run = Command::new(&exe).args(["a", "b"]).output().unwrap();
     let _ = std::fs::remove_dir_all(&out);
     assert!(run.status.success());
+    // (The module's code after its `await` runs in the embedder's loop.)
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
-        "demo_init: 3 args\nprelude ran first\nhello, beyond (42)\nafter await\ndemo_loop: ran 0 jobs\n"
+        "demo_init: 3 args\nprelude ran first\nhello, beyond (42)\nhi, there true\nafter await\ndemo_loop: ran 2 jobs\n"
     );
 }
