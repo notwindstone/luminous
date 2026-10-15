@@ -367,6 +367,11 @@ static int lum_fn_cache_count(void)
 static JSValue *lum_regexp_bc;
 static int *lum_regexp_flags;
 
+/* String.prototype's shape and charCodeAt's slot in it (see
+   lum_char_code_at_ok). */
+static void *lum_cca_shape;
+static int lum_cca_slot;
+
 static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
@@ -382,6 +387,9 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
     if (lum_resume_cache.shape)
         JS_FreeCachedShape(rt, lum_resume_cache.shape);
     lum_resume_cache.shape = NULL;
+    if (lum_cca_shape)
+        JS_FreeCachedShape(rt, lum_cca_shape);
+    lum_cca_shape = NULL;
     if (lum_resume_cache.name != JS_ATOM_NULL)
         JS_FreeAtomRT(rt, lum_resume_cache.name);
     lum_resume_cache.name = JS_ATOM_NULL;
@@ -988,11 +996,35 @@ void lum_record_learn(JSContext *ctx, JSValue obj, int r)
 }
 
 /* Whether String.prototype.charCodeAt is still the builtin, as an own
- * data property: speculative regions read characters directly then. */
+ * data property: speculative regions read characters directly then. Each
+ * region's guard asks, so the prototype's shape (shared: any change to it
+ * makes another) and the property's slot in it are kept: while the shape
+ * is the same, only the slot's value is compared. */
 int lum_char_code_at_ok(JSContext *ctx)
 {
-    return JS_OwnDataIs(ctx, lum_pins[LUM_PIN_STRING_PROTO], lum_atom_char_code_at,
-                        lum_pins[LUM_PIN_CHAR_CODE_AT]);
+    JSValueConst proto = lum_pins[LUM_PIN_STRING_PROTO];
+    JSValueConst fn = lum_pins[LUM_PIN_CHAR_CODE_AT];
+    char *p = JS_VALUE_GET_PTR(proto);
+
+    if (lum_cca_shape && *(void **)(p + JS_LAYOUT_OBJ_SHAPE) == lum_cca_shape) {
+        JSValue v = ((JSValue *)*(char **)(p + JS_LAYOUT_OBJ_PROP))[lum_cca_slot];
+        return JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(fn);
+    }
+    if (!JS_OwnDataIs(ctx, proto, lum_atom_char_code_at, fn))
+        return 0;
+    if (lum_cca_shape) {
+        JS_FreeCachedShape(JS_GetRuntime(ctx), lum_cca_shape);
+        lum_cca_shape = NULL;
+    }
+    if (JS_ShareObjectShape(ctx, proto) == 0) {
+        void *s;
+        int k = JS_CacheOwnProperty(ctx, proto, lum_atom_char_code_at, 0, &s);
+        if (k >= 0) {
+            lum_cca_shape = s;
+            lum_cca_slot = k;
+        }
+    }
+    return 1;
 }
 
 /* Whether Array.prototype.push is still the builtin, as an own data

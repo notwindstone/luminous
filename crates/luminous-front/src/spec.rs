@@ -1195,6 +1195,7 @@ impl Region {
                 let v = match (e, ret) {
                     (None, _) => None,
                     (Some(e), Ty::F64) => Some(self.num(e, cx)?),
+                    (Some(e), Ty::Bool) => Some(self.cond(e, cx)?),
                     (Some(e), Ty::Any) => {
                         let mut probe = self.clone();
                         match probe.num(e, cx) {

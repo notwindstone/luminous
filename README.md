@@ -342,7 +342,9 @@ saturating float-to-integer conversions, NaN-propagating `fmin` / `fmax`.
 The differential tests run every case with both.
 
 - **Cranelift** compiles in process, in milliseconds. It optimizes little
-  beyond what the lowering does itself.
+  beyond what the lowering does itself (which, for instance, lowers the
+  tests of `if` and loops through `&&`, `||`, `!` and `?:` as jumps, so
+  `a || b || c` is a compare and a branch each, no boolean made).
 - **LLVM** emits LLVM IR (text) and compiles it with `clang -O3
   -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `LUMINOUS_CLANG`;
   `--march` picks another CPU, e.g. `x86-64-v3` for portable executables).
@@ -557,7 +559,13 @@ The differential tests run every case with both.
   `s.charCodeAt(i)` / `s.length` of strings in locals: the guard then also
   checks that those are flat strings and that `charCodeAt` is the builtin,
   so a scanning loop such as `while (i < n && isDigit(s.charCodeAt(i)))
-  i++` runs as integer code. Methods take part: `this` is guarded as
+  i++` runs as integer code. A string's length is an int32 (a loop
+  counter below it needs no overflow check), and a local only ever
+  assigned characters' codes (and integer constants) keeps the code as an
+  integer too, -1 standing for NaN past the end: `c === 0x22`, `c >= 0x7f`
+  are integer compares, and need no in-bounds flag where -1 compares as
+  NaN does (`===`, `!==`, `>`, `>=` with constants from 0). A region may
+  return a boolean. Methods take part: `this` is guarded as
   locals are, objects held by guarded objects' fields (`this.center`)
   are guarded too, a predicted call of a class's method runs its body in
   the region (the guard checks that the receiver's prototype is the

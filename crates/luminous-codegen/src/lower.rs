@@ -325,6 +325,10 @@ pub(crate) struct Lower {
     /// `Any` locals: an `F64` variable holding the value's number whenever
     /// it is one (see `num_shadow`).
     shadows: Vec<Option<Variable>>,
+    /// `F64` locals only ever assigned characters' codes (`StrCharCode`)
+    /// and integer constants: variables holding the code as an integer
+    /// (-1 where it is NaN) and whether it is one (see `char_code_locals`).
+    code_vars: Vec<Option<(Variable, Variable)>>,
     /// Number "shadows" of JS values: for a payload (of a value made by
     /// arithmetic, or read from an `Any` local), the number it holds when
     /// its tag is a number's. `number_of` uses it instead of converting the
@@ -430,6 +434,10 @@ struct RemInt {
     nan: bool,
     /// Below 2^53 in magnitude, so comparable with rounded products.
     small: bool,
+    /// Where not `ok`, the integer this holds (a `charCodeAt` past the end:
+    /// -1), if a fixed one: a comparison with a constant that gives the
+    /// same at it as at NaN then needs no flag.
+    none: Option<i64>,
 }
 
 impl Lower {
@@ -475,6 +483,12 @@ impl Lower {
             .zip(&vars)
             .map(|(&t, v)| (t == Ty::Any && matches!(v, LVar::Two(..))).then(|| b.declare_var(F64)))
             .collect();
+        let codes = char_code_locals(f, &predicted_params(f, &env.params));
+        let code_vars = codes
+            .iter()
+            .zip(&vars)
+            .map(|(&c, v)| (c && matches!(v, LVar::One(_))).then(|| (b.declare_var(I64), b.declare_var(I8))))
+            .collect();
         let exc_exit = b.create_block();
         b.set_cold_block(exc_exit);
         let ret_block = b.create_block();
@@ -491,6 +505,7 @@ impl Lower {
             names: f.local_names.clone(),
             vars,
             shadows,
+            code_vars,
             num_shadow: HashMap::new(),
             spec_src: HashMap::new(),
             spec_floats: false,
@@ -561,6 +576,10 @@ impl Lower {
                 },
                 None => l.zero(t),
             };
+            // (A character code's local starts as the integer 0 too.)
+            if let (V::Num(d), Some(_), None) = (v, l.code_vars[i], params.get(i)) {
+                l.int_consts.insert(d, 0);
+            }
             l.def_local(i, v);
         }
         // A closure's data slots hold, per captured variable, its box object
@@ -627,6 +646,17 @@ impl Lower {
 
     fn def_local(&mut self, l: ir::LocalId, v: V) {
         match (self.vars[l], v) {
+            (LVar::One(var), V::Num(x)) if self.code_vars[l].is_some() => {
+                self.b.def_var(var, x);
+                let (iv, okv) = self.code_vars[l].expect("checked");
+                let (int, ok) = match (self.rem_of.get(&x), self.int_consts.get(&x)) {
+                    (Some(r), _) if r.nan && r.none == Some(-1) => (r.int, r.ok),
+                    (_, Some(&c)) => (self.b.ins().iconst(I64, c), self.b.ins().iconst(I8, 1)),
+                    _ => unreachable!("local {l}: a character code or an integer constant (see char_code_locals)"),
+                };
+                self.b.def_var(iv, int);
+                self.b.def_var(okv, ok);
+            }
             (LVar::One(var), V::Num(x) | V::Bool(x)) => self.b.def_var(var, x),
             // Only ever an integer (by `int_locals`).
             (LVar::Int(var), V::Num(x)) => {
@@ -649,6 +679,14 @@ impl Lower {
     /// The local's value, borrowed. Boxed locals are checked for their TDZ.
     fn use_local(&mut self, l: ir::LocalId) -> V {
         match (self.vars[l], self.locals[l]) {
+            (LVar::One(v), Ty::F64) if self.code_vars[l].is_some() => {
+                let (iv, okv) = self.code_vars[l].expect("checked");
+                let d = self.b.use_var(v);
+                let int = self.b.use_var(iv);
+                let ok = self.b.use_var(okv);
+                self.rem_of.insert(d, RemInt { int, ok, nan: true, small: true, none: Some(-1) });
+                V::Num(d)
+            }
             (LVar::One(v), Ty::F64 | Ty::MaybeF64) => V::Num(self.b.use_var(v)),
             (LVar::One(v), Ty::Bool) => V::Bool(self.b.use_var(v)),
             (LVar::Int(v), t) => {
@@ -1003,6 +1041,39 @@ impl Lower {
 
     // ---- statements ----
 
+    /// Jump to `t` if `c` holds, else to `f`: `&&`, `||`, `!` and `?:` of
+    /// booleans as jumps, so that no boolean is made at each step (a test
+    /// of `a || b || c` is a compare and a branch each).
+    fn branch(&mut self, c: &Expr, t: Block, f: Block) {
+        match &c.kind {
+            ExprKind::Logical(op @ (LogicalOp::And | LogicalOp::Or), x, y)
+                if c.ty == Ty::Bool && x.ty == Ty::Bool && y.ty == Ty::Bool =>
+            {
+                let next = self.b.create_block();
+                if *op == LogicalOp::And {
+                    self.branch(x, next, f);
+                } else {
+                    self.branch(x, t, next);
+                }
+                self.b.switch_to_block(next);
+                self.branch(y, t, f);
+            }
+            ExprKind::Unary(UnOp::Not, x) if x.ty == Ty::Bool => self.branch(x, f, t),
+            ExprKind::Cond(k, x, y) if c.ty == Ty::Bool && x.ty == Ty::Bool && y.ty == Ty::Bool => {
+                let (xb, yb) = (self.b.create_block(), self.b.create_block());
+                self.branch(k, xb, yb);
+                self.b.switch_to_block(xb);
+                self.branch(x, t, f);
+                self.b.switch_to_block(yb);
+                self.branch(y, t, f);
+            }
+            _ => {
+                let v = self.expr(c).boolean();
+                self.b.ins().brif(v, t, &[], f, &[]);
+            }
+        }
+    }
+
     fn stmts(&mut self, list: &[Stmt]) {
         for s in list {
             self.stmt(s);
@@ -1062,11 +1133,10 @@ impl Lower {
                 bail,
             ) => self.elem_guard(elems, nums, bounds, derived, fields, distinct, then, bail),
             Stmt::If(c, then, els) => {
-                let cv = self.expr(c).boolean();
                 let tb = self.b.create_block();
                 let eb = self.b.create_block();
                 let join = self.b.create_block();
-                self.b.ins().brif(cv, tb, &[], eb, &[]);
+                self.branch(c, tb, eb);
                 self.b.switch_to_block(tb);
                 self.stmts(then);
                 if !self.is_filled() {
@@ -1094,10 +1164,7 @@ impl Lower {
 
                 self.b.switch_to_block(header);
                 match test {
-                    Some(t) if !post_test => {
-                        let v = self.expr(t).boolean();
-                        self.b.ins().brif(v, body_b, &[], exit, &[]);
-                    }
+                    Some(t) if !post_test => self.branch(t, body_b, exit),
                     _ => {
                         self.b.ins().jump(body_b, &[]);
                     }
@@ -1138,8 +1205,7 @@ impl Lower {
                 }
                 match test {
                     Some(t) if *post_test => {
-                        let v = self.expr(t).boolean();
-                        self.b.ins().brif(v, header, &[], exit, &[]);
+                        self.branch(t, header, exit);
                     }
                     // Rotated: a copy of a cheap test at the bottom saves a
                     // jump per iteration.
@@ -1677,7 +1743,7 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, none: None });
         res
     }
 
@@ -1698,7 +1764,7 @@ impl Lower {
         let rf = self.b.ins().fcvt_from_sint(F64, r);
         let rf = self.b.ins().fcopysign(rf, a);
         let ok = self.b.ins().iconst(I8, 1);
-        self.rem_of.insert(rf, RemInt { int: r, ok, nan: true, small: bits <= 53 });
+        self.rem_of.insert(rf, RemInt { int: r, ok, nan: true, small: bits <= 53, none: None });
         rf
     }
 
@@ -2240,7 +2306,34 @@ impl Lower {
                 let c = self.expr(y);
                 V::Bool(match (a, c) {
                     (V::Num(a), V::Num(c)) if self.int_pair(a, c).is_some() => {
-                        let (ia, ic, valid) = self.int_pair(a, c).unwrap();
+                        let (ia, ic, mut valid) = self.int_pair(a, c).unwrap();
+                        // (An operand whose integer is fixed where it is NaN,
+                        // against a constant that compares with that integer as
+                        // with NaN: false, or true for `!=`, needs no flag.)
+                        let moot = |v: Value, other: Value, left: bool| {
+                            let (Some(n), Some(&k)) = (self.rem_of.get(&v).and_then(|r| r.none), self.int_consts.get(&other))
+                            else {
+                                return false;
+                            };
+                            let (x, y) = if left { (n, k) } else { (k, n) };
+                            let at = match op {
+                                CmpOp::Lt => x < y,
+                                CmpOp::Le => x <= y,
+                                CmpOp::Gt => x > y,
+                                CmpOp::Ge => x >= y,
+                                CmpOp::Eq => x == y,
+                                CmpOp::Ne => x != y,
+                            };
+                            at == (*op == CmpOp::Ne)
+                        };
+                        // (`valid` has `a`'s flag first, if it has one: see
+                        // `int_pair`.)
+                        if self.rem_of.contains_key(&c) && moot(c, a, false) {
+                            valid.pop();
+                        }
+                        if self.rem_of.contains_key(&a) && moot(a, c, true) {
+                            valid.remove(0);
+                        }
                         let cc = match op {
                             CmpOp::Lt => IntCC::SignedLessThan,
                             CmpOp::Le => IntCC::SignedLessThanOrEqual,
@@ -2263,9 +2356,12 @@ impl Lower {
                         } else {
                             // Where an integer form is not valid, the doubles
                             // compare.
-                            let ok = valid.iter().map(|&(ok, _)| ok).reduce(|x, y| self.b.ins().band(x, y)).unwrap();
+                            let ok = valid.iter().map(|&(ok, _)| ok).reduce(|x, y| self.b.ins().band(x, y));
                             let f = self.b.ins().fcmp(float_cc(*op), a, c);
-                            self.b.ins().select(ok, r, f)
+                            match ok {
+                                Some(ok) => self.b.ins().select(ok, r, f),
+                                None => r,
+                            }
                         }
                     }
                     (V::Num(a), V::Num(c)) => self.b.ins().fcmp(float_cc(*op), a, c),
@@ -4977,8 +5073,8 @@ impl Lower {
         let r = self.b.append_block_param(join, F64);
         let ri = self.b.append_block_param(join, I64);
         let nan = self.b.ins().f64const(f64::NAN);
-        let zero = self.b.ins().iconst(I64, 0);
-        self.b.ins().brif(inside, load, &[], join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
+        let none = self.b.ins().iconst(I64, -1);
+        self.b.ins().brif(inside, load, &[], join, &[BlockArg::Value(nan), BlockArg::Value(none)]);
         self.b.switch_to_block(load);
         // A 16-bit load at the character: an 8-bit string ends with a NUL,
         // so it stays inside; masked to 8 bits for those.
@@ -4997,9 +5093,9 @@ impl Lower {
         let cd = self.b.ins().fcvt_from_sint(F64, c);
         self.b.ins().jump(join, &[BlockArg::Value(cd), BlockArg::Value(c)]);
         self.b.switch_to_block(join);
-        // (Its code as an integer where the index is inside, else NaN:
-        // compared with integers as integers.)
-        self.rem_of.insert(r, RemInt { int: ri, ok: inside, nan: true, small: true });
+        // (Its code as an integer where the index is inside, else NaN (-1
+        // as the integer): compared with integers as integers.)
+        self.rem_of.insert(r, RemInt { int: ri, ok: inside, nan: true, small: true, none: Some(-1) });
         r
     }
 
@@ -6346,7 +6442,7 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, none: None });
         res
     }
 
@@ -6408,7 +6504,7 @@ impl Lower {
         self.b.switch_to_block(join);
         // On the fast path, the exact remainder (|r| < |c|).
         let small = self.bits_of(c).is_some_and(|b| b <= 53);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: is_int, nan: false, small });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: is_int, nan: false, small, none: None });
         res
     }
 
@@ -8058,6 +8154,41 @@ fn int_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
             return ints;
         }
     }
+}
+
+/// `F64` locals (not parameters, nor bound elsewhere: see
+/// `predicted_params`) that are only assigned characters' codes
+/// (`StrCharCode`, where the region's guard checked the string) and integer
+/// constants, never updated: they keep the code as an integer too, so that
+/// comparing them with integers compares integers (see `Lower::code_vars`).
+fn char_code_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
+    let n = f.locals.len();
+    let mut codes: Vec<bool> = (0..n).map(|i| i >= f.params.len() && !f.boxed[i] && f.locals[i] == Ty::F64).collect();
+    let mut assigned = vec![false; n];
+    for &l in bound_elsewhere {
+        codes[l] = false;
+    }
+    ir::visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => {
+            assigned[*l] = true;
+            let ok = matches!(x.kind, ExprKind::StrCharCode { .. }) || int_literal(x, (1i64 << 31) as f64).is_some();
+            if !ok {
+                codes[*l] = false;
+            }
+        }
+        ExprKind::Update { local, .. } => codes[*local] = false,
+        _ => {}
+    });
+    // (Only those that hold a code somewhere: not plain integer locals.)
+    let mut any_code = vec![false; n];
+    ir::visit_stmts(&f.body, &mut |e| {
+        if let ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) = &e.kind
+            && matches!(x.kind, ExprKind::StrCharCode { .. })
+        {
+            any_code[*l] = true;
+        }
+    });
+    (0..n).map(|l| codes[l] && assigned[l] && any_code[l]).collect()
 }
 
 /// The parameters of the bodies predicted calls inline (`Pred`), which
