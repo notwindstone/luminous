@@ -131,8 +131,9 @@ regular call path's generated code alone.
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
 `patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
-`0004-prototype-epoch.patch` and `0005-json-writers.patch`, each made
-against the tree the earlier ones give) and builds the engine without
+`0004-prototype-epoch.patch`, `0005-json-writers.patch` and
+`0006-native-construction.patch`, each made against the tree the earlier
+ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -187,6 +188,12 @@ engine's semantics:
 - `JS_NewObjectClassData`: an object of a class with its data in the same
   allocation and no property storage (`aot type` objects), and
   `JS_DupObjectShape` for caching their shape;
+- `JS_PrivateDefine` and `JS_PrivateAddBrand`: what a class's
+  construction does to an instance (a private field defined, the brand of
+  its private methods given), for native constructors; and a native
+  closure's data (`JS_NewCFunctionDataShaped`) in the function object's
+  own cell, after its properties, rather than a separate allocation its
+  finalization freed (`0006`);
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first;
@@ -503,7 +510,10 @@ The differential tests run every case with both.
 - **Class methods, getters and setters** (`this` included; static ones
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
-  `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
+  `#x in obj`) and `super.x` / `super.m()` / `super.x = v`. Private
+  instance methods are compiled too, and native `obj.#m(...)` calls them
+  directly after the brand check (a private method cannot be replaced);
+  interpreted code calls the class's own.
 - **Classes written as class expressions** bound at the top level of a
   module (`var X = class {...}`, or `let` / `const`, as bundlers and
   compilers write class declarations): compiled as the declaration
@@ -513,21 +523,29 @@ The differential tests run every case with both.
   TDZ). A name of its own (`var X = class X {...}`) is the binding. Other
   class expressions stay interpreted.
 - **Class constructors** of classes whose instances are plain objects
-  with public fields (no private names, accessors or computed keys,
-  initializers that do not use `this`, a constructor that returns nothing
-  but the instance), TS parameter properties (`constructor(public x:
-  number)`) included. Native `new C(args)` calls the native constructor
-  directly (after reading `C`, which may be in its TDZ): the instance is
-  made with the class's fields, initializers evaluated first, through an
-  allocation site that caches the instance's final shape, then the body
-  runs. A constructor that only assigns its fields (`this.x = x`, values
-  that run no code) makes the instance with them directly, so an inlined
-  `new V(a, b)` is an object expression. Interpreted code keeps the
-  class's own constructor.
+  with their fields (no accessors or computed keys, initializers that do
+  not use `this` but in arrow functions that are a field's value, a
+  constructor that returns nothing but the instance), TS parameter
+  properties (`constructor(public x: number)`) included. Native `new
+  C(args)` calls the native constructor directly (after reading `C`,
+  which may be in its TDZ): the instance is made with the class's fields,
+  initializers evaluated first, through an allocation site that caches
+  the instance's final shape, then the body runs. Private fields, and the
+  brand that private methods and accessors check, are part of that shape
+  (after the public fields: nothing can enumerate them), so a later
+  instance is made with all of them at once. Fields that are arrow
+  functions seeing the instance (`json = (o) => this.#send(o)`, as
+  frameworks write handlers) are made right after it, with `this` boxed:
+  making a function runs no code. A constructor that only assigns its
+  fields (`this.x = x`, values that run no code) makes the instance with
+  them directly, so an inlined `new V(a, b)` is an object expression.
+  Interpreted code keeps the class's own constructor.
 - **Constructors of derived classes** (`class B extends A`, `A` a class
   with a native constructor) that start with their only `super(...)` call
   (arguments that cannot see `this`, parameter defaults that are
-  literals), or have none (the default one passes its arguments on). Each
+  literals, or object and array literals of them: `options = {}`), or
+  have none (the default one passes its arguments on). Its fields are
+  defined in order after it, and may use `this`. Each
   superclass constructor is also compiled once per subclass to make that
   subclass's instances (`new.target` known), so `super(...)` is a direct
   call that returns the instance; the subclass's fields are then defined
@@ -731,11 +749,12 @@ The differential tests run every case with both.
   generator and async methods too; `super` in them
   is not supported yet).
 
-Not yet: constructors of classes with private names, of derived classes
-whose superclass is not compiled natively or that run code before
-`super(...)` (which stay interpreted), computed method and accessor names in object
-literals, classes inside functions, `arguments`, `this` in arrow functions
-in class field initializers or outside methods and constructors. A
+Not yet: constructors of derived classes whose superclass is not
+compiled natively or that run code before `super(...)` (which stay
+interpreted), private accessors' and static private methods' direct calls,
+computed method and accessor names in object literals, classes inside
+functions, `arguments`, `this` outside methods, constructors and their
+field initializers. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `luminous report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.

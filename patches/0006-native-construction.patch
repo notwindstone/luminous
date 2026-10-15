@@ -11,7 +11,123 @@
  JS_EXTERN JSValue JS_NewArrayIteratorAt(JSContext *ctx, JSValueConst arr, uint32_t idx);
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -61079,6 +61079,20 @@
+@@ -7664,15 +7664,29 @@
+ 
+ /* 'props[]' is used to initialized the object properties. The number
+    of elements depends on the shape. */
++static JSValue JS_NewObjectFromShapeExtra(JSContext *ctx, JSShape *sh, JSClassID class_id,
++                                          JSProperty *props, size_t extra, void **pextra);
++
+ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                      JSProperty *props)
+ {
++    return JS_NewObjectFromShapeExtra(ctx, sh, class_id, props, 0, NULL);
++}
++
++/* luminous: with `extra` bytes after its properties in its own cell (its
++   class's data, at *pextra, which its finalization does not free: an
++   object of another class than Object is finalized only once its
++   properties move out of the cell). */
++static JSValue JS_NewObjectFromShapeExtra(JSContext *ctx, JSShape *sh, JSClassID class_id,
++                                          JSProperty *props, size_t extra, void **pextra)
++{
+     JSObject *p;
+     int i;
++    size_t base = (class_id == JS_CLASS_OBJECT ? JS_PLAIN_OBJECT_SIZE : sizeof(JSObject)) +
++        sizeof(JSProperty) * sh->prop_size;
+ 
+-    js_trigger_gc(ctx->rt, sizeof(JSObject) + sizeof(JSProperty) * sh->prop_size);
+-    p = js_gc_alloc_rt(ctx->rt, (class_id == JS_CLASS_OBJECT ? JS_PLAIN_OBJECT_SIZE : sizeof(JSObject)) +
+-                       sizeof(JSProperty) * sh->prop_size);
++    js_trigger_gc(ctx->rt, base + extra);
++    p = js_gc_alloc_rt(ctx->rt, base + extra);
+     if (unlikely(!p)) {
+         JS_ThrowOutOfMemory(ctx);
+         goto fail;
+@@ -7796,8 +7810,11 @@
+     add_gc_object(ctx->rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+     /* (luminous: its property array, a class's data, are released by its
+        finalization) */
+-    if (class_id != JS_CLASS_OBJECT)
++    if (extra) {
++        *pextra = (uint8_t *)p + base;
++    } else if (class_id != JS_CLASS_OBJECT) {
+         js_gc_set_fin(p);
++    }
+     return JS_MKPTR(JS_TAG_OBJECT, p);
+ }
+ 
+@@ -8124,6 +8141,8 @@
+     /* luminous: constructed as an ordinary function is (see
+        JS_SetCFunctionDataConstructor) */
+     uint8_t ordinary_ctor;
++    /* luminous: in the function object's own cell (not freed with it) */
++    uint8_t inline_record;
+     JSValue data[];
+ } JSCFunctionDataRecord;
+ 
+@@ -8142,7 +8161,8 @@
+         for(i = 0; i < s->data_len; i++) {
+             JS_FreeValueRT(rt, s->data[i]);
+         }
+-        js_free_rt(rt, s);
++        if (!s->inline_record)
++            js_free_rt(rt, s);
+     }
+ }
+ 
+@@ -8259,6 +8279,7 @@
+     s->data_len = data_len;
+     s->magic = magic;
+     s->ordinary_ctor = 0;
++    s->inline_record = 0;
+     for(i = 0; i < data_len; i++)
+         s->data[i] = js_dup(data[i]);
+     JS_SetOpaqueInternal(func_obj, s);
+@@ -8298,24 +8319,32 @@
+     int i;
+ 
+     if (sh) {
+-        /* `length` then `name`, as js_function_set_properties defines them */
++        /* `length` then `name`, as js_function_set_properties defines them;
++           luminous: the data in the function's own cell (one allocation,
++           nothing to finalize) */
+         JSProperty props[2];
++        void *rec;
+         props[0].u.value = js_int32(length);
+         props[1].u.value = JS_AtomToString(ctx, name);
+         if (JS_IsException(props[1].u.value))
+             return JS_EXCEPTION;
+-        func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh),
+-                                         JS_CLASS_C_FUNCTION_DATA, props);
++        func_obj = JS_NewObjectFromShapeExtra(ctx, js_dup_shape(sh), JS_CLASS_C_FUNCTION_DATA, props,
++                                              sizeof(*s) + data_len * sizeof(JSValue), &rec);
++        if (JS_IsException(func_obj))
++            return func_obj;
++        s = rec;
++        s->inline_record = 1;
+     } else {
+         func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
+                                           JS_CLASS_C_FUNCTION_DATA);
+-    }
+-    if (JS_IsException(func_obj))
+-        return func_obj;
+-    s = js_malloc(ctx, sizeof(*s) + data_len * sizeof(JSValue));
+-    if (!s) {
+-        JS_FreeValue(ctx, func_obj);
+-        return JS_EXCEPTION;
++        if (JS_IsException(func_obj))
++            return func_obj;
++        s = js_malloc(ctx, sizeof(*s) + data_len * sizeof(JSValue));
++        if (!s) {
++            JS_FreeValue(ctx, func_obj);
++            return JS_EXCEPTION;
++        }
++        s->inline_record = 0;
+     }
+     s->func = func;
+     s->fast = fast;
+@@ -61079,6 +61108,20 @@
      return JS_SetPrivateField(ctx, obj, name, val);
  }
  
