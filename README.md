@@ -129,7 +129,8 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/0001-luminous-engine-support.patch` and builds the engine without
+`patches/*.patch` (`0001-luminous-engine-support.patch`, then
+`0002-fast-paths.patch`) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -175,6 +176,15 @@ engine's semantics:
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, built-in constructors) look
   at the index where the property was last found first;
+- `instanceof` without calling `Symbol.hasInstance` when the constructor
+  cannot have its own (none on its prototype chain up to
+  `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
+  (`0002`);
+- `JSON.stringify` without a replacer or indentation writes plain data
+  (objects of class `Object` with data properties, no `toJSON` and no index
+  keys, dense arrays, strings, numbers, booleans, `null`) straight from
+  shapes and arrays; anything else runs the general algorithm from the
+  start (`0002`);
 - `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
   `Array.prototype`, `Map.prototype`, …) shared shapes once their lazily
   created members exist, so that inline caches can hold their methods;
@@ -875,8 +885,19 @@ event loop. `luminous build` (and the `luminous_cli` library: `build` with
 - `--init-fn FUNCTION`: `int FUNCTION(JSContext *, int argc, char **argv)`,
   called before the program runs;
 - `--loop-fn FUNCTION`: `int FUNCTION(JSContext *)`, the event loop that runs
-  after the program's module code, instead of the engine's;
+  after the program's module code, instead of the engine's. The module is
+  evaluated without waiting for it: a top-level `await` waits on that loop
+  (an error the module throws at once ends the program; one after an
+  `await` is printed when the loop ends, unless the embedder reported it);
+- `--global NAME=SPECIFIER`: the global `NAME` (which a prelude defines) is
+  the binding `NAME` of the module `SPECIFIER`: the program's own modules
+  that refer to it without declaring or assigning it get an import of it
+  (at the end of their text), so that native code knows it (`new
+  Response()` calls a class's native constructor);
 - `--link ARG`: an object file, static library or linker argument.
+
+A `declare const x` (any ambient declaration) names the global `x`: its
+references stay global reads, whatever other module has a binding `x`.
 
 `tests/embed` is an example, built by `crates/luminous-cli/tests/embed.rs`.
 
