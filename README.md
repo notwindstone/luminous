@@ -129,8 +129,9 @@ regular call path's generated code alone.
 ### The engine patch
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
-`patches/*.patch` (`0001-luminous-engine-support.patch`, then
-`0002-fast-paths.patch`) and builds the engine without
+`patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
+`0002-fast-paths.patch` and `0003-promises-and-object-props.patch`, each
+made against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -170,6 +171,13 @@ engine's semantics:
   queued without allocating reaction records; `await` of a primitive
   queues its continuation without making a promise
   (`JS_EnqueueAwaitJob`: native frames resume from a job of their own);
+  `JS_NewPendingPromise` / `JS_SettlePromise`: a promise without resolving
+  functions, settled once by native code as its resolve or reject function
+  would (thenables followed), which is what a native async function's
+  promise is; resolving functions, and the functions that resume native
+  async functions, are made with a cached shape that has their `length`
+  and `name` (they were defined one at a time, two property definitions
+  each) (`0003`);
 - `JS_NewObjectClassData`: an object of a class with its data in the same
   allocation and no property storage (`aot type` objects), and
   `JS_DupObjectShape` for caching their shape;
@@ -205,7 +213,11 @@ engine's semantics:
   an arena every few dozen objects), and recently freed blocks cached per
   size class, up to 64MB each (a free and the next allocation are a push
   and a pop); plain objects made from an allocation site's shape in one
-  short function; an empty size-class cache refilled 32 blocks at a time,
+  short function; the property array of an object of any class (a
+  function, an array, a promise, a typed array) in the object's own
+  allocation until it grows, as a plain object's (it was a separate
+  allocation, freed by the object's finalization) (`0003`); an empty size-class
+  cache refilled 32 blocks at a time,
   in address order; strings allocated from the cache inline, in a path
   that makes no calls (so it saves no registers); pieces of 8-bit strings
   up to 32 bytes (`slice`, `substring`, `split`) copied with a few
@@ -224,7 +236,7 @@ engine's semantics:
   native code compares a string with a short constant (`switch` cases,
   `=== "user"`) by length, then by its characters as immediates; a
   string that is not an atom keeps its hash once a `Map` or `Set` has
-  computed it; `Map` and `Set` keys are hashed with a final mix (small
+  computed it, and an atom's is the hash it has as an atom (`0003`); `Map` and `Set` keys are hashed with a final mix (small
   integers and pointers spread over the buckets) and each entry keeps its
   key's hash, compared before the key; native code calls
   `Map.prototype.get`, `set`, `has` and `Set.prototype.add`, `has` on a

@@ -182,7 +182,7 @@ void lum_throw_uninitialized_atom(JSContext *ctx, JSAtom name)
    suspended, and its promise's resolving functions. */
 typedef struct LumFrame {
     void *self;               /* the frame object (not a counted reference) */
-    JSValue resolve, reject;
+    JSValue promise;          /* async: its promise, settled by the frame */
     /* async: the reactions to its awaits, created at the first one (an
        async function waits on one value at a time) */
     JSValue on_settled[2];
@@ -204,8 +204,7 @@ static void lum_frame_finalizer(JSRuntime *rt, JSValueConst val)
     int i;
     if (!f)
         return;
-    JS_FreeValueRT(rt, f->resolve);
-    JS_FreeValueRT(rt, f->reject);
+    JS_FreeValueRT(rt, f->promise);
     JS_FreeValueRT(rt, f->on_settled[0]);
     JS_FreeValueRT(rt, f->on_settled[1]);
     for (i = 0; i < f->nslots; i++)
@@ -221,8 +220,7 @@ static void lum_frame_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
     int i;
     if (!f)
         return;
-    JS_MarkValue(rt, f->resolve, mark_func);
-    JS_MarkValue(rt, f->reject, mark_func);
+    JS_MarkValue(rt, f->promise, mark_func);
     JS_MarkValue(rt, f->on_settled[0], mark_func);
     JS_MarkValue(rt, f->on_settled[1], mark_func);
     for (i = 0; i < f->nslots; i++)
@@ -233,13 +231,13 @@ static void lum_frame_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
 JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots)
 {
     LumFrame *f = js_mallocz(ctx, sizeof(*f) + nslots * sizeof(JSValue));
-    JSValue funcs[2], obj;
+    JSValue obj;
     int i;
     if (!f)
         return JS_EXCEPTION;
     f->fn = fn;
     f->nslots = nslots;
-    f->resolve = f->reject = JS_UNDEFINED;
+    f->promise = JS_UNDEFINED;
     f->on_settled[0] = f->on_settled[1] = JS_UNDEFINED;
     for (i = 0; i < nslots; i++)
         f->slots[i] = JS_UNDEFINED;
@@ -250,13 +248,13 @@ JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JS
     }
     JS_SetOpaque(obj, f);
     f->self = JS_VALUE_GET_PTR(obj);
-    *promise = JS_NewPromiseCapability(ctx, funcs);
+    /* (No resolving functions: only the frame settles it.) */
+    *promise = JS_NewPendingPromise(ctx);
     if (JS_IsException(*promise)) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
-    f->resolve = funcs[0];
-    f->reject = funcs[1];
+    f->promise = JS_DupValue(ctx, *promise);
     /* (the frame object may have survived a collection since made) */
     JS_GCWriteBarrier(JS_GetRuntime(ctx), JS_VALUE_GET_PTR(obj));
     *slots = f->slots;
@@ -269,26 +267,24 @@ void lum_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, i
 {
     LumFrame *f = lum_frame_of(slots);
     JSValue r = lum_steps[f->fn](ctx, slots, state, value, is_throw);
-    JSValue settle, arg, ret;
+    JSValue arg;
+    int is_reject;
     /* (the slots, the reactions: written by the step) */
     JS_GCWriteBarrier(JS_GetRuntime(ctx), f->self);
     if (JS_IsUninitialized(r))
         return; /* suspended at an await */
-    if (JS_IsException(r)) {
-        settle = f->reject;
-        arg = JS_GetException(ctx);
-    } else {
-        settle = f->resolve;
-        arg = r;
-    }
-    ret = JS_Call(ctx, settle, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    is_reject = JS_IsException(r);
+    arg = is_reject ? JS_GetException(ctx) : r;
+    JS_SettlePromise(ctx, f->promise, arg, is_reject);
     JS_FreeValue(ctx, arg);
-    JS_FreeValue(ctx, ret);
     /* break the frame <-> reactions cycle */
     JS_FreeValue(ctx, f->on_settled[0]);
     JS_FreeValue(ctx, f->on_settled[1]);
     f->on_settled[0] = f->on_settled[1] = JS_UNDEFINED;
 }
+
+/* The shape of the functions resuming frames. */
+static LumFnCache lum_resume_cache;
 
 static JSValue lum_async_resume(JSContext *ctx, JSValueConst this_val, int argc,
                                   JSValueConst *argv, int is_throw, JSValueConst *data)
@@ -327,7 +323,7 @@ int lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
         if (!JS_IsUndefined(f->on_settled[i]))
             continue;
         self = JS_MKPTR(JS_TAG_OBJECT, f->self);
-        f->on_settled[i] = JS_NewCFunctionData(ctx, lum_async_resume, 1, i, 1, &self);
+        f->on_settled[i] = lum_new_closure(ctx, &lum_resume_cache, NULL, lum_async_resume, "", 1, i, 1, &self);
         if (JS_IsException(f->on_settled[i])) {
             f->on_settled[i] = JS_UNDEFINED;
             goto done;
@@ -383,6 +379,12 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
             JS_FreeAtomRT(rt, lum_fn_caches[i].name);
         lum_fn_caches[i].name = JS_ATOM_NULL;
     }
+    if (lum_resume_cache.shape)
+        JS_FreeCachedShape(rt, lum_resume_cache.shape);
+    lum_resume_cache.shape = NULL;
+    if (lum_resume_cache.name != JS_ATOM_NULL)
+        JS_FreeAtomRT(rt, lum_resume_cache.name);
+    lum_resume_cache.name = JS_ATOM_NULL;
     for (i = 0; i < lum_ncells; i++) {
         JS_FreeValueRT(rt, lum_cells[i]);
         lum_cells[i] = JS_UNINITIALIZED;
@@ -479,6 +481,8 @@ static void lum_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
         if (lum_fn_caches[i].shape)
             JS_MarkCachedShape(rt, lum_fn_caches[i].shape, mark_func);
     }
+    if (lum_resume_cache.shape)
+        JS_MarkCachedShape(rt, lum_resume_cache.shape, mark_func);
     for (i = 0; i < lum_ncells; i++)
         JS_MarkValue(rt, lum_cells[i], mark_func);
     for (i = 0; i < lum_nprivates; i++)
@@ -1279,7 +1283,7 @@ JSValue lum_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots)
         return JS_EXCEPTION;
     f->fn = fn;
     f->nslots = nslots;
-    f->resolve = f->reject = JS_UNDEFINED;
+    f->promise = JS_UNDEFINED;
     for (i = 0; i < nslots; i++)
         f->slots[i] = JS_UNDEFINED;
     obj = JS_NewObjectClass(ctx, lum_frame_class);
