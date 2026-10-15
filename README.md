@@ -130,8 +130,9 @@ regular call path's generated code alone.
 
 `vendor/quickjs` stays pristine. `scripts/build-quickjs.sh` applies
 `patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
-`0002-fast-paths.patch` and `0003-promises-and-object-props.patch`, each
-made against the tree the earlier ones give) and builds the engine without
+`0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
+`0004-prototype-epoch.patch` and `0005-json-writers.patch`, each made
+against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -197,7 +198,14 @@ engine's semantics:
   (objects of class `Object` with data properties, no `toJSON` and no index
   keys, dense arrays, strings, numbers, booleans, `null`) straight from
   shapes and arrays; anything else runs the general algorithm from the
-  start (`0002`);
+  start (`0002`). Ropes (strings built by `+`) are written by it too, and
+  doubles that are int32s are written as integers (`0005`);
+- `JS_SetJSONWriter` and `JS_JSONWrite8` / `Int` / `Number` / `Value`: the
+  same fast path hands an object of a registered class (no properties in
+  its shape; `Object.prototype`, `null` or `Array.prototype` as its
+  prototype, without `toJSON`) to the class's writer, which writes it from
+  its own data or declines (the general algorithm then runs). `aot type`
+  objects and arrays of them are written this way (`0005`);
 - `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
   `Array.prototype`, `Map.prototype`, …) shared shapes once their lazily
   created members exist, so that inline caches can hold their methods;

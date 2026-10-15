@@ -2171,9 +2171,9 @@ static void lum_field_error(JSContext *ctx, const LumLayoutDesc *l, int fi)
     JS_ThrowTypeError(ctx, "`%s` of aot type `%s` cannot hold this value", l->fields[fi].name, l->name);
 }
 
-/* Store v (taken) in field fi of s, checked against the field's type; the
- * old value of a JS-valued field goes to *old (owned). */
-static int lum_put_raw(JSContext *ctx, LumStruct *s, int fi, JSValue v, JSValue *old)
+/* Store v (taken) in field fi of s, the data of obj, checked against the
+ * field's type; the old value of a JS-valued field goes to *old (owned). */
+static int lum_put_raw(JSContext *ctx, JSValueConst obj, LumStruct *s, int fi, JSValue v, JSValue *old)
 {
     const LumLayoutDesc *l = &lum_layouts[s->layout];
     const LumFieldDesc *f = &l->fields[fi];
@@ -2212,9 +2212,8 @@ static int lum_put_raw(JSContext *ctx, LumStruct *s, int fi, JSValue v, JSValue 
     default:
         *old = *(JSValue *)at;
         *(JSValue *)at = v;
-        /* (the object, whose data the struct is) */
         if (JS_VALUE_HAS_REF_COUNT(v))
-            JS_GCWriteBarrier(JS_GetRuntime(ctx), (char *)s - JS_LAYOUT_OBJ_SIZE);
+            JS_GCWriteBarrier(JS_GetRuntime(ctx), JS_VALUE_GET_PTR(obj));
         return 0;
     }
     JS_FreeValue(ctx, v);
@@ -2264,7 +2263,7 @@ JSValue lum_struct_new(JSContext *ctx, int layout, uint32_t mask)
 int lum_struct_put(JSContext *ctx, JSValue obj, int field, JSValue v)
 {
     JSValue old;
-    int r = lum_put_raw(ctx, JS_GetOpaque(obj, lum_struct_class), field, v, &old);
+    int r = lum_put_raw(ctx, obj, JS_GetOpaque(obj, lum_struct_class), field, v, &old);
     JS_FreeValue(ctx, old);
     return r;
 }
@@ -2294,7 +2293,7 @@ int lum_struct_set(JSContext *ctx, JSValue obj, int field, JSValue v)
         return -1;
     }
     memcpy(saved, lum_field_at(s, f), lum_field_size(f));
-    if (lum_put_raw(ctx, s, field, v, &old) < 0)
+    if (lum_put_raw(ctx, obj, s, field, v, &old) < 0)
         return -1;
     if (l->validate && !f->simple && !lum_struct_matches(ctx, s)) {
         if (f->storage == LUM_ST_VALUE)
