@@ -2459,7 +2459,7 @@ static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, in
         if (f->storage == LUM_ST_VALUE) {
             JSValueConst v = *(JSValue *)at;
             int tag = JS_VALUE_GET_TAG(v);
-            if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL || JS_IsFunction(ctx, v))
+            if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL || (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
                 continue;
         }
         if (lum_json_key(ctx, w, base + i, first) < 0)

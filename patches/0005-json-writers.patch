@@ -24,7 +24,173 @@
     When 'size' is zero, 'ptr' must be freed and NULL returned. Otherwise the
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -55402,18 +55402,31 @@
+@@ -608,6 +608,10 @@
+     uint32_t weak_heads_len, weak_heads_size;
+     uint32_t *weak_free;
+     uint32_t weak_free_len, weak_free_size;
++    /* luminous: the buffer JSON.stringify's fast path writes into, kept
++       between calls (see js_json_fast_run), and its size in bytes. */
++    JSString *json_buf;
++    int json_buf_size;
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -3891,6 +3895,8 @@
+     /* luminous: everything is unreachable now: the finalizers run, then the
+        contexts go (their memory and the cells' with the heap, below). */
+     js_gc_teardown(rt);
++    js_free_rt(rt, rt->json_buf);
++    rt->json_buf = NULL;
+     while (rt->gc_heap.hooks) {
+         JSGCMarkHook *hook = rt->gc_heap.hooks;
+         rt->gc_heap.hooks = hook->next;
+@@ -55378,20 +55384,140 @@
+    null. Written straight from the shapes and arrays: 1 when done, 0 when
+    the value is not such data (nothing written then: the caller truncates
+    and runs the general algorithm), -1 on an exception. */
++/* luminous: the JSON fast path's writes. Room for n more 8-bit characters
++   at the end of b: where they go, or NULL when b has 16-bit characters (or
++   could not grow: then its error is set). */
++static no_inline uint8_t *js_json_room8_slow(StringBuffer *b, int n)
++{
++    if (b->is_wide_char || string_buffer_realloc(b, b->len + n, 0))
++        return NULL;
++    return str8(b->str) + b->len;
++}
++
++static inline uint8_t *js_json_room8(StringBuffer *b, int n)
++{
++    if (likely(!b->is_wide_char && b->len + n <= b->size))
++        return str8(b->str) + b->len;
++    return js_json_room8_slow(b, n);
++}
++
++/* (up to 16 bytes as two overlapping moves, without a call) */
++static inline void js_json_copy(uint8_t *d, const uint8_t *s, size_t n)
++{
++    if (n >= 8) {
++        uint64_t x, y;
++        if (n > 16) {
++            memcpy(d, s, n);
++            return;
++        }
++        memcpy(&x, s, 8);
++        memcpy(&y, s + n - 8, 8);
++        memcpy(d, &x, 8);
++        memcpy(d + n - 8, &y, 8);
++    } else if (n >= 4) {
++        uint32_t x, y;
++        memcpy(&x, s, 4);
++        memcpy(&y, s + n - 4, 4);
++        memcpy(d, &x, 4);
++        memcpy(d + n - 4, &y, 4);
++    } else if (n > 0) {
++        d[0] = s[0];
++        d[n / 2] = s[n / 2];
++        d[n - 1] = s[n - 1];
++    }
++}
++
++static inline int js_json_put8(StringBuffer *b, const uint8_t *s, int n)
++{
++    uint8_t *p = js_json_room8(b, n);
++    if (unlikely(!p))
++        return string_buffer_write8(b, s, n);
++    js_json_copy(p, s, n);
++    b->len += n;
++    return 0;
++}
++
++static const char js_json_digits2[201] =
++    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
++    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
++    "8081828384858687888990919293949596979899";
++
++/* n's decimal digits at p, two at a time from the end: their count. */
++static inline int js_json_u64(uint8_t *p, uint64_t n)
++{
++    int len = 1, i;
++    uint64_t t;
++    for (t = n; t >= 10; t /= 10)
++        len++;
++    i = len;
++    while (n >= 100) {
++        uint32_t r = n % 100;
++        n /= 100;
++        i -= 2;
++        memcpy(p + i, js_json_digits2 + 2 * r, 2);
++    }
++    if (n >= 10)
++        memcpy(p, js_json_digits2 + 2 * n, 2);
++    else
++        p[0] = '0' + n;
++    return len;
++}
++
++static int js_json_put_int(StringBuffer *b, int32_t v)
++{
++    uint8_t *p = js_json_room8(b, 11);
++    int len;
++    if (unlikely(!p)) {
++        char buf[16];
++        return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, v));
++    }
++    if (v < 0) {
++        *p = '-';
++        len = 1 + js_json_u64(p + 1, -(int64_t)v);
++    } else {
++        len = js_json_u64(p, v);
++    }
++    b->len += len;
++    return 0;
++}
++
++/* (8 bytes at a time: whether any is below 0x20, '"', '\\' or above 0x7f) */
++static inline bool js_json_word_plain(uint64_t w)
++{
++    const uint64_t ones = 0x0101010101010101ULL, high = 0x8080808080808080ULL;
++    uint64_t q = w ^ (ones * '"'), s = w ^ (ones * '\\');
++    uint64_t bad = ((w - ones * 0x20) & ~w) | ((q - ones) & ~q) | ((s - ones) & ~s) | w;
++    return (bad & high) == 0;
++}
++
+ static int js_json_fast_string(StringBuffer *b, JSString *str)
+ {
+     if (!str->is_wide_char && str->kind == JS_STRING_KIND_NORMAL) {
+         const uint8_t *src = str8(str);
+-        uint32_t len = str->len, i;
+-        for (i = 0; i < len; i++) {
++        uint32_t len = str->len, i = 0;
++        uint64_t w;
++        for (; i + 8 <= len; i += 8) {
++            memcpy(&w, src + i, 8);
++            if (!js_json_word_plain(w))
++                break;
++        }
++        for (; i < len; i++) {
+             uint8_t c = src[i];
+             if (c < 0x20 || c == '"' || c == '\\' || c >= 0x80)
+                 break;
+         }
+         if (i == len) {
+-            string_buffer_putc8(b, '"');
+-            string_buffer_write8(b, src, len);
+-            return string_buffer_putc8(b, '"');
++            uint8_t *p = js_json_room8(b, len + 2);
++            if (unlikely(!p)) {
++                string_buffer_putc8(b, '"');
++                string_buffer_write8(b, src, len);
++                return string_buffer_putc8(b, '"');
++            }
++            p[0] = '"';
++            js_json_copy(p + 1, src, len);
++            p[len + 1] = '"';
++            b->len += len + 2;
++            return 0;
+         }
+     }
+     {
+@@ -55402,25 +55528,91 @@
      }
  }
  
@@ -35,35 +201,91 @@
 +static JSJSONWriteFunc *js_json_writer_fn[JS_JSON_WRITERS];
 +static int js_json_writer_count;
 +
++/* A finite double, not an int32, as Number::toString writes it, when it is
++   an integer below 2^53 or a decimal of at most 8 fraction digits (else
++   -1). The decimal is the shortest that reads back as d: m / 10^k for the
++   least k at which the nearest integer m to |d| * 10^k gives exactly |d|
++   when divided by 10^k (that division and reading the decimal back both
++   round m / 10^k correctly, and m stays below 2^50, where |d| * 10^k is
++   computed closely enough for m to be the nearest). */
++static int js_dtoa_short(char *buf, double d)
++{
++    static const double pow10[] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8 };
++    double a = fabs(d), m;
++    char digits[24], *q = buf;
++    int k, len;
++    if (a < 0x1p53 && a == trunc(a)) {
++        if (d < 0)
++            *q++ = '-';
++        return q - buf + js_json_u64((uint8_t *)q, (uint64_t)a);
++    }
++    if (!(a >= 1e-6 && a < 0x1p50))
++        return -1;
++    for (k = 1; k <= 8; k++) {
++        m = a * pow10[k];
++        if (m >= 0x1p50)
++            return -1;
++        m = floor(m + 0.5);
++        if (m / pow10[k] == a)
++            break;
++    }
++    if (k > 8)
++        return -1;
++    len = js_json_u64((uint8_t *)digits, (uint64_t)m);
++    if (d < 0)
++        *q++ = '-';
++    if (len > k) {
++        memcpy(q, digits, len - k);
++        q += len - k;
++        *q++ = '.';
++    } else {
++        *q++ = '0';
++        *q++ = '.';
++        memset(q, '0', k - len);
++        q += k - len;
++    }
++    memcpy(q, digits + len - min_int(len, k), min_int(len, k));
++    return q + min_int(len, k) - buf;
++}
++
 +static int js_json_fast_number(JSContext *ctx, StringBuffer *b, double d)
 +{
-+    char buf[32];
++    char buf[64];
++    int len;
++    JSDTOATempMem dtoa_mem;
 +    if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d) /* (-0 too: "0") */
-+        return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, (int32_t)d));
++        return js_json_put_int(b, (int32_t)d);
 +    if (!isfinite(d))
-+        return string_buffer_write8(b, (const uint8_t *)"null", 4);
-+    return string_buffer_concat_value_free(b, js_dtoa2(ctx, d, 10, 0, JS_DTOA_FORMAT_FREE));
++        return js_json_put8(b, (const uint8_t *)"null", 4);
++    len = js_dtoa_short(buf, d);
++    if (len < 0)
++        len = js_dtoa(buf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
++    return js_json_put8(b, (uint8_t *)buf, len);
 +}
 +
  static int js_json_fast(JSContext *ctx, StringBuffer *b, JSValueConst val, int depth)
  {
-     char buf[32];
+-    char buf[32];
      switch (JS_VALUE_GET_NORM_TAG(val)) {
      case JS_TAG_INT:
-         return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, JS_VALUE_GET_INT(val))) < 0 ? -1 : 1;
+-        return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, JS_VALUE_GET_INT(val))) < 0 ? -1 : 1;
 -    case JS_TAG_FLOAT64: {
 -        double d = JS_VALUE_GET_FLOAT64(val);
 -        if (!isfinite(d))
 -            return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
 -        return string_buffer_concat_value_free(b, js_dtoa2(ctx, d, 10, 0, JS_DTOA_FORMAT_FREE)) < 0 ? -1 : 1;
 -    }
++        return js_json_put_int(b, JS_VALUE_GET_INT(val)) < 0 ? -1 : 1;
 +    case JS_TAG_FLOAT64:
 +        return js_json_fast_number(ctx, b, JS_VALUE_GET_FLOAT64(val)) < 0 ? -1 : 1;
      case JS_TAG_BOOL:
-         return (JS_VALUE_GET_BOOL(val) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
-                                       : string_buffer_write8(b, (const uint8_t *)"false", 5)) < 0 ? -1 : 1;
-@@ -55421,6 +55434,8 @@
-         return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
+-        return (JS_VALUE_GET_BOOL(val) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
+-                                      : string_buffer_write8(b, (const uint8_t *)"false", 5)) < 0 ? -1 : 1;
++        return (JS_VALUE_GET_BOOL(val) ? js_json_put8(b, (const uint8_t *)"true", 4)
++                                      : js_json_put8(b, (const uint8_t *)"false", 5)) < 0 ? -1 : 1;
+     case JS_TAG_NULL:
+-        return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
++        return js_json_put8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
      case JS_TAG_STRING:
          return js_json_fast_string(b, JS_VALUE_GET_STRING(val)) < 0 ? -1 : 1;
 +    case JS_TAG_STRING_ROPE:
@@ -71,7 +293,7 @@
      case JS_TAG_OBJECT:
          break;
      default:
-@@ -55432,6 +55447,25 @@
+@@ -55432,6 +55624,25 @@
      JSObject *object_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
      if (find_own_property1(object_proto, JS_ATOM_toJSON))
          return 0;
@@ -97,7 +319,7 @@
      if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
          JSObject *array_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
          if (p->shape->proto != array_proto || find_own_property1(array_proto, JS_ATOM_toJSON) ||
-@@ -55505,6 +55539,43 @@
+@@ -55505,6 +55716,91 @@
      return string_buffer_putc8(b, '}') < 0 ? -1 : 1;
  }
  
@@ -119,13 +341,12 @@
 +
 +int JS_JSONWrite8(JSJSONWriter *w, const char *s, size_t len)
 +{
-+    return string_buffer_write8((StringBuffer *)w, (const uint8_t *)s, len);
++    return js_json_put8((StringBuffer *)w, (const uint8_t *)s, len);
 +}
 +
 +int JS_JSONWriteInt(JSJSONWriter *w, int32_t v)
 +{
-+    char buf[16];
-+    return string_buffer_write8((StringBuffer *)w, (uint8_t *)buf, i32toa(buf, v));
++    return js_json_put_int((StringBuffer *)w, v);
 +}
 +
 +int JS_JSONWriteNumber(JSContext *ctx, JSJSONWriter *w, double d)
@@ -138,6 +359,82 @@
 +    return js_json_fast(ctx, (StringBuffer *)w, v, depth);
 +}
 +
++/* luminous: the fast path writes into a buffer the runtime keeps (not
++   into a string, which would be reallocated as it grows, several times
++   for a small result), and the result is one string of its length. 1 with
++   the result, 0 when the value is not such data, -1 on an exception. */
++#define JS_JSON_BUF_KEEP (64 * 1024)
++
++static int js_json_fast_run(JSContext *ctx, JSValueConst obj, JSValue *pres)
++{
++    JSRuntime *rt = ctx->rt;
++    StringBuffer b;
++    JSString *str;
++    int r;
++    b.ctx = ctx;
++    b.len = 0;
++    b.is_wide_char = 0;
++    b.error_status = 0;
++    b.str = rt->json_buf;
++    b.size = rt->json_buf_size;
++    rt->json_buf = NULL; /* (in use) */
++    if (!b.str) {
++        b.size = 256;
++        b.str = js_malloc(ctx, sizeof(JSString) + b.size);
++        if (!b.str)
++            return -1;
++    }
++    r = js_json_fast(ctx, &b, obj, 0);
++    if (r > 0) {
++        str = js_alloc_string(ctx, b.len, b.is_wide_char);
++        if (str) {
++            memcpy(str8(str), str8(b.str), (size_t)b.len << b.is_wide_char);
++            if (!b.is_wide_char)
++                str8(str)[b.len] = 0;
++            *pres = JS_MKPTR(JS_TAG_STRING, str);
++        } else {
++            r = -1;
++        }
++    }
++    if (b.str) { /* (NULL after an error) */
++        int bytes = b.size << b.is_wide_char;
++        if (bytes <= JS_JSON_BUF_KEEP && !rt->json_buf) {
++            rt->json_buf = b.str;
++            rt->json_buf_size = bytes;
++        } else {
++            js_free(ctx, b.str);
++        }
++    }
++    return r;
++}
++
  JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                           JSValueConst replacer, JSValueConst space0)
  {
+@@ -55523,22 +55819,16 @@
+     ret = JS_UNDEFINED;
+     wrapper = JS_UNDEFINED;
+ 
+-    string_buffer_init(ctx, jsc->b, 0);
+     /* luminous: plain data, without a replacer or indentation. */
+     if (JS_IsUndefined(replacer) && JS_IsUndefined(space0)) {
+-        int r = js_json_fast(ctx, jsc->b, obj, 0);
+-        if (r > 0) {
++        int r = js_json_fast_run(ctx, obj, &ret);
++        if (r != 0) {
+             JS_FreeValue(ctx, jsc->empty);
+-            return string_buffer_end(jsc->b);
+-        }
+-        if (r < 0) {
+-            string_buffer_free(jsc->b);
+-            JS_FreeValue(ctx, jsc->empty);
+-            return JS_EXCEPTION;
++            return r > 0 ? ret : JS_EXCEPTION;
+         }
+         /* (Not such data: from the start, the general way.) */
+-        jsc->b->len = 0;
+     }
++    string_buffer_init(ctx, jsc->b, 0);
+     jsc->stack = JS_NewArray(ctx);
+     if (JS_IsException(jsc->stack))
+         goto exception;

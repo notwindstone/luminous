@@ -1,4 +1,4 @@
-// @native points unions nested arrays writes guarded describe sum scalar scalarChecks
+// @native points unions nested arrays writes guarded describe sum scalar scalarChecks aged
 // `aot type`: objects of a fixed layout, in native and interpreted code.
 
 aot type Point = {
@@ -165,3 +165,22 @@ function scalarChecks(): string {
   return n.name + "," + msg;
 }
 console.log(scalarChecks());
+
+// A field of an object that survived collections, given new objects: the
+// object is remembered, and the next minor collection keeps them.
+const lines: Line[] = [];
+function aged(): string {
+  const l: Line = { from: { x: 0, y: 0 }, to: { x: 1, y: 1 }, label: "aged", visible: true };
+  lines.push(l);
+  let junk: number[][] = [];
+  let sum = 0;
+  for (let i = 0; i < 3000; i++) {
+    l.from = { x: i, y: i / 2 };
+    l.label = "aged " + i;
+    junk.push([i, i + 1]);
+    if (junk.length > 50) junk = [];
+    sum += lines[0].from.x + lines[0].to.x;
+  }
+  return JSON.stringify(lines[0]) + " " + sum;
+}
+console.log(aged());

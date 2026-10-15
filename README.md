@@ -198,8 +198,14 @@ engine's semantics:
   (objects of class `Object` with data properties, no `toJSON` and no index
   keys, dense arrays, strings, numbers, booleans, `null`) straight from
   shapes and arrays; anything else runs the general algorithm from the
-  start (`0002`). Ropes (strings built by `+`) are written by it too, and
-  doubles that are int32s are written as integers (`0005`);
+  start (`0002`). It writes into a buffer the runtime keeps between calls
+  (a string grown as it was written was reallocated about ten times for a
+  small object), and makes one string of the result's length; strings are
+  scanned for characters to escape 8 bytes at a time; numbers are written
+  without making strings: integers two digits at a time, and decimals of
+  up to 8 fraction digits as the shortest that reads back exactly (checked
+  with one division per digit count; others go to the engine's `js_dtoa`);
+  ropes (strings built by `+`) are written too (`0005`);
 - `JS_SetJSONWriter` and `JS_JSONWrite8` / `Int` / `Number` / `Value`: the
   same fast path hands an object of a registered class (no properties in
   its shape; `Object.prototype`, `null` or `Array.prototype` as its
