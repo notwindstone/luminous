@@ -98,6 +98,10 @@ pub enum Site {
     /// The constructor of top-level class `class`, which native `new`
     /// expressions call directly (interpreted code keeps the class's own).
     Ctor { class: String },
+    /// A private instance method of top-level class `class`, which native
+    /// `this.#m(...)` calls directly after the brand check (interpreted
+    /// code keeps the class's own: a private method cannot be replaced).
+    Private { class: String },
 }
 
 #[derive(Clone)]
@@ -170,8 +174,10 @@ pub struct CtorInfo<'a> {
     /// constructed as interpreted code would.
     pub checks: Vec<(usize, usize)>,
     /// (`home == class`) the fields of the instances, in the order they
-    /// are defined: its superclasses' first.
+    /// are defined: its superclasses' first (public ones).
     pub instance_fields: Vec<String>,
+    /// Its instances get its brand (it has private methods or accessors).
+    pub brand: bool,
 }
 
 impl Candidate<'_> {
@@ -928,12 +934,39 @@ fn class_methods<'a>(
         {
             continue;
         }
+        let node = FnNode::Function(&m.value);
+        // A private instance method: called directly by native code.
+        if let PropertyKey::PrivateIdentifier(id) = &m.key {
+            if accessor != 0 || m.r#static {
+                continue;
+            }
+            let name = format!("#{}", id.name);
+            match header(node) {
+                Ok((params, rest, ret)) => out.push(Candidate {
+                    name,
+                    node,
+                    symbol: None,
+                    has_this: true,
+                    site: Site::Private { class: class.to_string() },
+                    direct_callable: true,
+                    params,
+                    rest,
+                    // (Called directly: a JS value unless annotated, so that
+                    // recursive calls need no annotation.)
+                    ret: ret.or(Some(Ty::Any)),
+                    class: Some((index, false)),
+                    cells: HashSet::new(),
+                    ctor: None,
+                }),
+                Err(r) => rejected.push((format!("{class}.{name}"), node.span(), r)),
+            }
+            continue;
+        }
         let key = match &m.key {
             PropertyKey::StaticIdentifier(id) => id.name.to_string(),
             PropertyKey::StringLiteral(s) => s.value.to_string(),
             _ => continue,
         };
-        let node = FnNode::Function(&m.value);
         let site =
             Site::Method { class: class.to_string(), is_static: m.r#static, key: key.clone(), stmt_end, accessor };
         // As JS names accessor functions.
@@ -977,13 +1010,17 @@ struct CtorDef<'a> {
     /// Its superclass (index in the `CtorDef`s).
     parent: Option<usize>,
     forward: bool,
+    /// It has private methods or accessors: its instances get its brand.
+    brand: bool,
 }
 
 /// The constructor of a top-level class, as a native function that makes
 /// the instance itself: for classes whose instances are plain objects with
-/// their public fields (no private names, accessors or computed keys) whose
-/// initializers cannot see the instance, and whose constructor returns
-/// nothing but the instance. A derived class qualifies when its superclass
+/// their fields, public or private (no accessors or computed keys), whose
+/// initializers cannot see the instance but in arrow functions that are
+/// the field's value (a derived class's may: its fields are defined in
+/// order), and whose constructor returns nothing but the instance; its
+/// private methods and accessors give the instance its brand. A derived class qualifies when its superclass
 /// (named by its binding) does, and its constructor starts with its only
 /// `super(...)` call (whose arguments, and the parameters' defaults, which
 /// run before it, are plain values) or is the default one. Its
@@ -1028,27 +1065,27 @@ fn class_ctor<'a>(
             Some(p)
         }
     };
-    let private = |k: &PropertyKey| match k {
-        PropertyKey::PrivateIdentifier(p) => Some(format!("private member `#{}` (use a plain field)", p.name)),
-        _ => None,
-    };
     let mut fields = Vec::new();
     let mut ctor = None;
+    let mut brand = false;
     for el in &c.body.body {
         match el {
             ClassElement::MethodDefinition(m) if m.kind == MethodDefinitionKind::Constructor => ctor = Some(m),
-            ClassElement::MethodDefinition(m) if !m.r#static && private(&m.key).is_some() => {
-                give_up(m.span, private(&m.key).unwrap());
-                return;
+            ClassElement::MethodDefinition(m)
+                if !m.r#static && matches!(m.key, PropertyKey::PrivateIdentifier(_)) =>
+            {
+                brand = true;
             }
             ClassElement::PropertyDefinition(p) if p.r#static || p.declare => {}
             ClassElement::PropertyDefinition(p) if p.r#type == PropertyDefinitionType::TSAbstractPropertyDefinition => {
             }
             ClassElement::PropertyDefinition(p) => {
+                // (A private field's name keeps its `#`.)
                 let key = match &p.key {
                     PropertyKey::StaticIdentifier(k) if !p.computed => k.name.to_string(),
-                    k => {
-                        give_up(p.span, private(k).unwrap_or_else(|| "field with a computed name".into()));
+                    PropertyKey::PrivateIdentifier(k) => format!("#{}", k.name),
+                    _ => {
+                        give_up(p.span, "field with a computed name".into());
                         return;
                     }
                 };
@@ -1056,8 +1093,8 @@ fn class_ctor<'a>(
                     give_up(p.span, "decorated field".into());
                     return;
                 }
-                if p.value.as_ref().is_some_and(|v| mentions_this(v)) {
-                    give_up(p.span, "field initializer uses `this`".into());
+                if parent.is_none() && p.value.as_ref().is_some_and(|v| mentions_this(v) && !this_arrow(v)) {
+                    give_up(p.span, "field initializer uses `this` (but in an arrow function that is its value)".into());
                     return;
                 }
                 fields.push((key, p.value.as_ref()));
@@ -1132,6 +1169,7 @@ fn class_ctor<'a>(
         param_props,
         parent,
         forward,
+        brand,
     };
     // Its own (called by `new`), checking its superclasses, then its
     // superclasses' (each called by `super(...)`).
@@ -1143,8 +1181,11 @@ fn class_ctor<'a>(
         at = &defs[p];
         chain.push(at);
     }
-    let instance_fields: Vec<String> =
-        chain.iter().rev().flat_map(|d| d.fields.iter().map(|(n, _)| n.clone())).collect();
+    let instance_fields: Vec<String> = chain
+        .iter()
+        .rev()
+        .flat_map(|d| d.fields.iter().filter(|(n, _)| !n.starts_with('#')).map(|(n, _)| n.clone()))
+        .collect();
     let mut make = |d: &CtorDef<'a>, checks: Vec<(usize, usize)>, instance_fields: Vec<String>| {
         let name = if d.index == index { name.clone() } else { format!("{} (constructing {name})", d.name) };
         // Called only directly by native code, with JS values.
@@ -1160,7 +1201,8 @@ fn class_ctor<'a>(
             rest: d.rest,
             // (So that recursive constructors need no annotation.)
             ret: Some(Ty::Any),
-            class: None,
+            // (Its private names, for the fields and the body.)
+            class: Some((d.index, false)),
             cells: HashSet::new(),
             ctor: Some(CtorInfo {
                 symbol: d.symbol,
@@ -1173,6 +1215,7 @@ fn class_ctor<'a>(
                 forward: d.forward,
                 checks,
                 instance_fields,
+                brand: d.brand,
             }),
         });
     };
@@ -1200,12 +1243,7 @@ fn super_first(f: &Function) -> bool {
             walk::walk_call_expression(self, c);
         }
     }
-    let plain = |e: &Expression| {
-        literal(e).is_some()
-            || matches!(e.without_parentheses(), Expression::StringLiteral(_) | Expression::NullLiteral(_))
-            || matches!(e.without_parentheses(), Expression::Identifier(i) if i.name == "undefined")
-    };
-    if f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(|d| !plain(d))) {
+    if f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(|d| !plain_value(d))) {
         return false;
     }
     let body = f.body.as_ref().unwrap();
@@ -1219,6 +1257,31 @@ fn super_first(f: &Function) -> bool {
     let mut v = Supers(0);
     v.visit_function_body(body);
     v.0 == 1
+}
+
+/// A value that evaluating cannot see anything: a literal, `undefined`,
+/// or an object or array literal of them (`options = {}`).
+fn plain_value(e: &Expression) -> bool {
+    match e.without_parentheses() {
+        e if literal(e).is_some() => true,
+        Expression::StringLiteral(_) | Expression::NullLiteral(_) => true,
+        Expression::Identifier(i) => i.name == "undefined",
+        Expression::TemplateLiteral(t) => t.expressions.is_empty(),
+        Expression::ArrayExpression(a) => a.elements.iter().all(|el| el.as_expression().is_some_and(plain_value)),
+        Expression::ObjectExpression(o) => o.properties.iter().all(|p| match p {
+            ObjectPropertyKind::ObjectProperty(p) => {
+                !p.computed && !p.method && p.kind == PropertyKind::Init && plain_value(&p.value)
+            }
+            ObjectPropertyKind::SpreadProperty(_) => false,
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `e` is an arrow function (whose `this` is the instance, in a
+/// field initializer): making it runs no code.
+fn this_arrow(e: &Expression) -> bool {
+    matches!(e.without_parentheses(), Expression::ArrowFunctionExpression(_))
 }
 
 /// Whether `this` appears in `e` outside nested non-arrow functions.
@@ -1485,7 +1548,10 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         let class = c.class;
         let ctor = c.ctor.clone();
         let cells = c.cells.clone();
-        let caps = Rc::new(capture_info(node, self.scoping, &cells));
+        // (A constructor's field initializers run in it, with its `this`.)
+        let fields: Vec<&'a Expression<'a>> =
+            ctor.as_ref().map(|k| k.fields.iter().filter_map(|(_, e)| *e).collect()).unwrap_or_default();
+        let caps = Rc::new(capture_info(node, self.scoping, &cells, &fields));
         let result = loop {
             let widened = self.widened.get(&sym).cloned().unwrap_or_default();
             let mut fx = FnCx::new(self, caps.clone(), node.span().start, false, widened);
@@ -1626,7 +1692,11 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
                     (BindingKind::Function | BindingKind::Import, _) => CellInit::Header,
                     (_, Some(c)) => match &c.site {
                         Site::ConstInit { init } => CellInit::Wrap(*init),
-                        Site::Declaration { .. } | Site::Method { .. } | Site::Segment { .. } | Site::Ctor { .. } => {
+                        Site::Declaration { .. }
+                        | Site::Method { .. }
+                        | Site::Segment { .. }
+                        | Site::Ctor { .. }
+                        | Site::Private { .. } => {
                             CellInit::Header
                         }
                     },
@@ -1672,6 +1742,10 @@ struct FnCx<'x, 'm, 'a> {
     /// it (`this`).
     ctor: Option<CtorInfo<'a>>,
     this_local: Option<ir::LocalId>,
+    /// A base class constructor's fields whose values are arrow functions
+    /// that see the instance (name, initializer, class): made once it and
+    /// the box of `this` exist (see `new_instance`).
+    deferred_fields: Vec<(String, &'a Expression<'a>, usize)>,
     /// The box holding `this` for the arrow functions inside that use it
     /// (in those arrows: the captured box).
     this_box: Option<ir::LocalId>,
@@ -1736,7 +1810,12 @@ struct CaptureInfo {
 
 /// `cells`: module bindings a segment declares that live in cells (not
 /// captured: closures access the cell).
-fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> CaptureInfo {
+fn capture_info<'a>(
+    node: FnNode<'a>,
+    scoping: &Scoping,
+    cells: &HashSet<SymbolId>,
+    fields: &[&'a Expression<'a>],
+) -> CaptureInfo {
     use oxc::ast_visit::{Visit, walk};
     use oxc::syntax::scope::ScopeFlags;
     struct V<'s> {
@@ -1846,6 +1925,15 @@ fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> C
                 v.arrows.pop();
             }
         }
+        // A constructor's field initializers: in it, with its `this` (a
+        // default constructor's too).
+        if !fields.is_empty() {
+            v.stack.push(node.span().start);
+            v.arrows.push(false);
+            fields.iter().for_each(|e| v.visit_expression(e));
+            v.stack.pop();
+            v.arrows.pop();
+        }
     }
     v.info
 }
@@ -1933,6 +2021,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             has_this: false,
             ctor: None,
             this_local: None,
+            deferred_fields: Vec::new(),
             this_box: None,
             derived: None,
             sym_hints: HashMap::new(),
@@ -2057,6 +2146,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             prologue.push(Stmt::NewBoxes(new_boxes));
             prologue.extend(inits);
         }
+        let deferred = self.deferred_fields()?;
+        prologue.extend(deferred);
         // Default values and destructuring, in order (each parameter may see
         // the previous ones).
         for (i, &(pat, _, default)) in params.iter().enumerate().filter(|_| !forward) {
@@ -2666,7 +2757,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     _ => None,
                 };
                 let Some((sym, l)) = local else {
-                    return reject(a.span, "`await` is only supported assigned to a local variable");
+                    // (Another target: the general assignment, its value
+                    // awaited before it.)
+                    return Ok(Stmt::Expr(self.expr(e)?));
                 };
                 if !self.mutable[l] {
                     return reject(a.span, "assignment to a constant");
@@ -3055,8 +3148,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn new_instance(&mut self, ctor: &CtorInfo<'a>) -> R<Vec<Stmt>> {
         let mut out = Vec::new();
         let mut fields = Vec::new();
+        let mut privates = Vec::new();
         for &(ref name, init) in &ctor.fields {
-            let atom = self.m.atom(name);
+            // An arrow function that sees the instance is made once it
+            // exists (making it runs no code); a public field is
+            // `undefined` until then.
+            if let Some(e) = init
+                && mentions_this(e)
+            {
+                self.deferred_fields.push((name.clone(), e, ctor.class));
+                if name.starts_with('#') {
+                    privates.push((name.clone(), undefined()));
+                } else {
+                    fields.push((self.m.atom(name), undefined()));
+                }
+                continue;
+            }
             let v = match init {
                 None => undefined(),
                 Some(e) => {
@@ -3076,15 +3183,74 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     }
                 }
             };
-            fields.push((atom, v));
+            if name.starts_with('#') {
+                privates.push((name.clone(), v));
+            } else {
+                fields.push((self.m.atom(name), v));
+            }
         }
         if !self.m.homes_used.contains(&ctor.home) {
             self.m.homes_used.push(ctor.home);
         }
         let this = self.temp(Ty::Any);
         self.this_local = Some(this);
-        let inst = Expr::new(Ty::Any, ExprKind::NewInstance { class: ctor.home, fields });
-        out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(inst)))));
+        let inst = if ctor.brand || !privates.is_empty() {
+            // Its brand and private fields (which nothing can enumerate:
+            // after its public ones), made with it.
+            if ctor.brand && !self.m.homes_used.contains(&ctor.class) {
+                self.m.homes_used.push(ctor.class);
+            }
+            let privates = privates.into_iter().map(|(n, v)| (self.m.private(ctor.class, &n), any(v))).collect();
+            let brand = ctor.brand.then_some(2 * ctor.class);
+            ExprKind::NewInstanceFull { class: ctor.home, fields, brand, privates }
+        } else {
+            ExprKind::NewInstance { class: ctor.home, fields }
+        };
+        out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(Expr::new(Ty::Any, inst))))));
+        Ok(out)
+    }
+
+    /// A derived class's construction of instance `this` (made by its
+    /// superclass): the class's brand, if it has private methods or
+    /// accessors.
+    fn add_brand(&mut self, ctor: &CtorInfo<'a>, this: ir::LocalId) -> Option<Stmt> {
+        if !ctor.brand {
+            return None;
+        }
+        if !self.m.homes_used.contains(&ctor.class) {
+            self.m.homes_used.push(ctor.class);
+        }
+        let brand = ExprKind::AddBrand(Box::new(self.local(this)), 2 * ctor.class);
+        Some(Stmt::Expr(Expr::new(Ty::Void, brand)))
+    }
+
+    /// The same, of private field `name` (with its `#`) of the class.
+    fn define_private(&mut self, ctor: &CtorInfo<'a>, this: ir::LocalId, name: &str, v: Expr) -> Stmt {
+        let slot = self.m.private(ctor.class, name);
+        let define = ExprKind::PrivateDefine(Box::new(self.local(this)), slot, Box::new(any(v)));
+        Stmt::Expr(Expr::new(Ty::Void, define))
+    }
+
+    /// A base class constructor's deferred fields (see `deferred_fields`).
+    fn deferred_fields(&mut self) -> R<Vec<Stmt>> {
+        let mut out = Vec::new();
+        for (name, e, class) in std::mem::take(&mut self.deferred_fields) {
+            let outer = std::mem::take(&mut self.pre);
+            self.name_hint = Some(name.clone());
+            let r = self.expr(e);
+            self.name_hint = None;
+            out.extend(std::mem::replace(&mut self.pre, outer));
+            let v = any(r?);
+            let this = self.local(self.this_local.unwrap());
+            if name.starts_with('#') {
+                // (Made with the instance, `undefined` until now.)
+                let slot = self.m.private(class, &name);
+                out.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::PrivateSetField(Box::new(this), slot, Box::new(v)))));
+            } else {
+                let atom = self.m.atom(&name);
+                out.push(Stmt::Expr(self.set_prop(this, atom, v)));
+            }
+        }
         Ok(out)
     }
 
@@ -3163,8 +3329,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.pre.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, v))));
             self.this_box = Some(b);
         }
+        // Its brand, then its fields in order.
+        let brand = self.add_brand(&ctor, this);
+        self.pre.extend(brand);
         for (name, init) in &ctor.fields {
-            let atom = self.m.atom(name);
             let v = match init {
                 None => undefined(),
                 Some(e) => {
@@ -3174,6 +3342,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     any(r?)
                 }
             };
+            if name.starts_with('#') {
+                let define = self.define_private(&ctor, this, name, v);
+                self.pre.push(define);
+                continue;
+            }
+            let atom = self.m.atom(name);
             let obj = Box::new(self.local(this));
             self.pre.push(Stmt::Expr(Expr::new(Ty::Void, ExprKind::DefineField(obj, atom, Box::new(v)))));
         }
@@ -3248,6 +3422,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Some(&(_, kind)) => Ok((class, kind)),
             None => reject(span, format!("`{name}` is not a private name of this class")),
         }
+    }
+
+    /// The native candidate of private method `name` (with its `#`) of
+    /// this class, which native code may call directly (not async or a
+    /// generator, which are called through their JS entry).
+    fn private_method(&self, name: &str, span: Span) -> Option<usize> {
+        let (class, kind) = self.private_kind(name, span).ok()?;
+        if kind != PrivateKind::Method {
+            return None;
+        }
+        let i = self.m.cands.iter().position(|c| {
+            matches!(c.site, Site::Private { .. }) && c.class == Some((class, false)) && c.name == name
+        })?;
+        let node = self.m.cands[i].node;
+        (!node.is_async() && !node.is_generator()).then_some(i)
     }
 
     fn private_read(&mut self, obj: Expr, name: &str, span: Span) -> R<Expr> {
@@ -5163,6 +5352,30 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let obj = self.expr(&p.object)?;
                 let name = format!("#{}", p.field.name);
                 let span = p.span;
+                if let Some(i) = self.private_method(&name, span)
+                    && !has_spread(&c.arguments)
+                {
+                    // The method is the class's own: a direct call, after the
+                    // brand check (before the arguments, as reading it is).
+                    let (class, _) = self.private_kind(&name, span)?;
+                    let t = self.temp(Ty::Any);
+                    let slot = self.m.private(class, &name);
+                    let check = ExprKind::PrivateMethod(Box::new(self.local(t)), slot);
+                    let mut setup =
+                        vec![set(t, any(obj)), Expr::new(Ty::Void, ExprKind::Void(Box::new(Expr::new(Ty::Any, check))))];
+                    let mark = self.pre.len();
+                    let this = self.local(t);
+                    if let Some(call) = self.direct_call_this(i, &c.arguments, c.span, None, Some(this))? {
+                        self.flush_setup(&mut setup, mark);
+                        setup.push(call);
+                        return Ok(seq(setup));
+                    }
+                    setup.truncate(1);
+                    let r = self.call_this(self.local(t), |cx, o| cx.private_read(o, &name, span), &c.arguments)?;
+                    self.flush_setup(&mut setup, mark);
+                    setup.push(r);
+                    return Ok(seq(setup));
+                }
                 self.call_this(obj, |cx, o| cx.private_read(o, &name, span), &c.arguments)
             }
             Expression::Identifier(id) => {
@@ -5321,6 +5534,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         span: Span,
         callee: Option<&'a IdentifierReference<'a>>,
     ) -> R<Option<Expr>> {
+        self.direct_call_this(i, args, span, callee, None)
+    }
+
+    /// `direct_call`, of a method with `this` (a local, or `this`).
+    fn direct_call_this(
+        &mut self,
+        i: usize,
+        args: &'a [Argument<'a>],
+        span: Span,
+        callee: Option<&'a IdentifierReference<'a>>,
+        this: Option<Expr>,
+    ) -> R<Option<Expr>> {
+        let call = |i: usize, out: Vec<Expr>| match &this {
+            Some(t) => ExprKind::CallDirectThis(i, Box::new(t.clone()), out),
+            None => ExprKind::Call(i, out),
+        };
         // Async functions and generators are called through their JS entry
         // (which returns a promise or a generator object).
         let node = self.m.cands[i].node;
@@ -5370,7 +5599,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
             }
             out.push(Expr::new(Ty::Any, ExprKind::Array(extra)));
-            return Ok(Some(Expr::new(ret, ExprKind::Call(i, out))));
+            return Ok(Some(Expr::new(ret, call(i, out))));
         }
         for (k, &p) in params.iter().enumerate() {
             let mark = self.pre.len();
@@ -5414,7 +5643,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let call = ExprKind::CallChecked { func: i, callee: Box::new(callee), args: out, checks };
             return Ok(Some(Expr::new(Ty::Any, call)));
         }
-        Ok(Some(Expr::new(ret, ExprKind::Call(i, out))))
+        Ok(Some(Expr::new(ret, call(i, out))))
     }
 }
 
@@ -6035,8 +6264,20 @@ fn class_tables(classes: &[ClassInfo], cands: &[Candidate]) -> Vec<ir::ClassTabl
             fields: c.fields.iter().filter_map(|(n, h)| Some((n.clone(), resolve_hint(h, classes)?))).collect(),
             nums: c.nums.clone(),
             instance_fields: Vec::new(),
+            private_state: false,
         })
         .collect();
+    // (A class's private names, or a superclass's.)
+    for k in 0..classes.len() {
+        let mut at = Some(k);
+        while let Some(c) = at {
+            if !classes[c].privates.is_empty() {
+                tables[k].private_state = true;
+                break;
+            }
+            at = classes[c].superclass;
+        }
+    }
     for (i, c) in cands.iter().enumerate() {
         if let (Some((k, is_static)), Site::Method { key, accessor, .. }) = (c.class, &c.site) {
             tables[k].members.push((key.clone(), *accessor, is_static, i));

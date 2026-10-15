@@ -1690,6 +1690,12 @@ int lum_private_set(JSContext *ctx, JSValue *v, JSValue val)
     return JS_PrivateSet(ctx, v[0], v[1], val);
 }
 
+/* A native constructor's private field v[1] defined on v[0] (val taken). */
+int lum_private_define(JSContext *ctx, JSValue *v, JSValue val)
+{
+    return JS_PrivateDefine(ctx, v[0], v[1], val);
+}
+
 /* obj[key] in a for-in: v = { iterator, obj, key } (borrowed). */
 JSValue lum_for_in_get(JSContext *ctx, JSValue *v)
 {
@@ -1976,6 +1982,41 @@ JSValue lum_new_object(JSContext *ctx, LumIC *ic, int n, JSAtom *atoms, JSValue 
 JSValue lum_new_instance(JSContext *ctx, LumIC *ic, JSValue proto, int n, JSAtom *atoms, JSValue *values)
 {
     return lum_new_object_proto(ctx, ic, JS_NewObjectProto(ctx, proto), n, atoms, values);
+}
+
+/* A new instance of a class with private state, as a native constructor
+ * makes it: its public fields (n, named by atoms), then the brand of the
+ * class whose home object is extra[0] (none if it is undefined), then its
+ * private fields (named by extra[1..]). values: the public fields', the
+ * brand's (undefined) if any, the private fields' (all taken). The site
+ * caches the final shape, with which native code makes the next ones. */
+JSValue lum_new_instance_full(JSContext *ctx, LumIC *ic, JSValue proto, int n, JSAtom *atoms, JSValue *values,
+                              JSValue *extra, int nprivate)
+{
+    int brand = !JS_IsUndefined(extra[0]), i;
+    JSValue *pv = values + n + brand;
+    JSValue obj = JS_NewObjectProto(ctx, proto);
+    void *shape;
+    for (i = 0; i < n; i++) {
+        if (JS_IsException(obj) ||
+            JS_DefinePropertyValue(ctx, obj, atoms[i], values[i], JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+            goto fail;
+    }
+    if (brand && JS_PrivateAddBrand(ctx, obj, extra[0]) < 0)
+        goto fail;
+    for (i = 0; i < nprivate; i++) {
+        if (JS_PrivateDefine(ctx, obj, extra[1 + i], pv[i]) < 0)
+            goto fail;
+    }
+    if (JS_CachePlainShape(ctx, obj, n + brand + nprivate, &shape) == 0) {
+        lum_ic_store(ctx, ic, shape, NULL, NULL, 0, LUM_IC_OWN);
+        ic->slot = JS_ShapeAllocInfo(JS_GetRuntime(ctx), shape);
+    }
+    return obj;
+fail:
+    /* (The values are the collector's.) */
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
 }
 
 static JSValue lum_new_object_proto(JSContext *ctx, LumIC *ic, JSValue obj, int n, JSAtom *atoms,

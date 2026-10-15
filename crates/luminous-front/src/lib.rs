@@ -38,6 +38,8 @@ pub enum NativeSite {
     Segment { span: (u32, u32) },
     /// The constructor of class `class`, called by native `new` only.
     Ctor { class: String },
+    /// A private method of class `class`, called by native code only.
+    Private { class: String },
 }
 
 /// A natively compiled function, for source rewriting and reporting.
@@ -235,6 +237,7 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
                 },
                 check::Site::Segment { span } => NativeSite::Segment { span: (span.start, span.end) },
                 check::Site::Ctor { class } => NativeSite::Ctor { class: class.clone() },
+                check::Site::Private { class } => NativeSite::Private { class: class.clone() },
             },
             line: line(c.node.span().start),
         })

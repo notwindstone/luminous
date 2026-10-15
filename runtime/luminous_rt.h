@@ -211,6 +211,9 @@ int lum_array_iter_close(JSContext *ctx, JSValue arr, int32_t idx, int is_throw)
 JSValue lum_super_get(JSContext *ctx, JSValue *v);
 JSValue lum_for_in_get(JSContext *ctx, JSValue *v);
 int lum_private_set(JSContext *ctx, JSValue *v, JSValue val);
+int lum_private_define(JSContext *ctx, JSValue *v, JSValue val);
+JSValue lum_new_instance_full(JSContext *ctx, LumIC *ic, JSValue proto, int n, JSAtom *atoms, JSValue *values,
+                              JSValue *extra, int nprivate);
 int lum_super_set(JSContext *ctx, JSValue *v, JSValue val);
 JSValue lum_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots);
 JSValue lum_gen_new(JSContext *ctx, JSValue frame, JSValueConst *func_data);

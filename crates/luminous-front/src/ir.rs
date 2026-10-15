@@ -253,6 +253,9 @@ pub struct ClassTable {
     /// Classes whose instances native constructors make: the fields they
     /// define, in order (its superclasses' first), else empty.
     pub instance_fields: Vec<String>,
+    /// Its instances (or its superclasses') have private fields or brands,
+    /// which only their constructors make: they are never virtual.
+    pub private_state: bool,
 }
 
 /// What a type annotation says a value is, for predicting the methods it
@@ -445,6 +448,8 @@ pub enum ExprKind {
     Truthy(Box<Expr>),
     /// Direct call of a native function; argument types match its params.
     Call(FuncId, Vec<Expr>),
+    /// The same of a native method (a private one), with its `this`.
+    CallDirectThis(FuncId, Box<Expr>, Vec<Expr>),
     /// A `Math` function or `Number` predicate. The arguments are numbers,
     /// or for `Math` functions also JS values, converted with ToNumber in
     /// order once all are evaluated.
@@ -508,6 +513,17 @@ pub enum ExprKind {
         class: usize,
         fields: Vec<(AtomId, Expr)>,
     },
+    /// `NewInstance` of a class whose instances also have private state:
+    /// after its public fields, the brand of the class whose home object
+    /// is `brand` (its prototype's slot), then its private fields
+    /// (`Module::privates` slots, values). The allocation site caches the
+    /// final shape, and later instances are made with all of it at once.
+    NewInstanceFull {
+        class: usize,
+        fields: Vec<(AtomId, Expr)>,
+        brand: Option<usize>,
+        privates: Vec<(usize, Expr)>,
+    },
     /// Array literal without holes or spreads.
     Array(Vec<Expr>),
     /// Array literal with holes or spreads.
@@ -553,6 +569,12 @@ pub enum ExprKind {
     PrivateGetter(Box<Expr>, usize),
     PrivateSetter(Box<Expr>, usize, Box<Expr>),
     PrivateIn(Box<Expr>, usize),
+    /// A native constructor's: a private field defined on the instance
+    /// (`Void`), and the brand of a class (`Module::homes` slot of its
+    /// prototype) given to it, for that class's private methods and
+    /// accessors (`Void`).
+    PrivateDefine(Box<Expr>, usize, Box<Expr>),
+    AddBrand(Box<Expr>, usize),
     /// `super[key]` in a method (home object: `Module::homes` slot), and
     /// its assignment (to the value).
     SuperGet(usize, Box<Expr>),
@@ -1202,6 +1224,7 @@ macro_rules! visitor {
                 | PrivateMethod(a, _)
                 | PrivateGetter(a, _)
                 | PrivateIn(a, _)
+                | AddBrand(a, _)
                 | SuperGet(_, a)
                 | ArrayPush(_, a)
                 | IntOf(a)
@@ -1238,7 +1261,7 @@ macro_rules! visitor {
                     $name(a, f);
                     $name(b, f);
                 }
-                PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) => {
+                PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) | PrivateDefine(a, _, b) => {
                     $name(a, f);
                     $name(b, f);
                 }
@@ -1283,7 +1306,7 @@ macro_rules! visitor {
                         $name(x, f);
                     }
                 }
-                CallValue(a, xs) | New(a, xs) => {
+                CallValue(a, xs) | New(a, xs) | CallDirectThis(_, a, xs) => {
                     $name(a, f);
                     for x in xs {
                         $name(x, f);
@@ -1307,6 +1330,14 @@ macro_rules! visitor {
                 }
                 Object(props) | NewInstance { fields: props, .. } => {
                     for (_, x) in props {
+                        $name(x, f);
+                    }
+                }
+                NewInstanceFull { fields, privates, .. } => {
+                    for (_, x) in fields {
+                        $name(x, f);
+                    }
+                    for (_, x) in privates {
                         $name(x, f);
                     }
                 }
@@ -2438,8 +2469,10 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
         ExprKind::Local(l) => hints.get(l).copied(),
         ExprKind::Box(e) | ExprKind::NonNull(_, e) | ExprKind::Predicted { expr: e, .. } => expr_hint(m, f, hints, e),
         ExprKind::Seq(xs) => expr_hint(m, f, hints, xs.last()?),
-        ExprKind::NewInstance { class, .. } => Some(Hint::Class(*class)),
-        ExprKind::Call(g, _) | ExprKind::CallChecked { func: g, .. } => func_at(m, *g).ret_hint,
+        ExprKind::NewInstance { class, .. } | ExprKind::NewInstanceFull { class, .. } => Some(Hint::Class(*class)),
+        ExprKind::Call(g, _) | ExprKind::CallChecked { func: g, .. } | ExprKind::CallDirectThis(g, ..) => {
+            func_at(m, *g).ret_hint
+        }
         ExprKind::CallMethod(o, Key::Atom(a), _) => match expr_hint(m, f, hints, o)? {
             Hint::Class(k) => {
                 let g = class_member(m, Some(k), false, &m.atoms[*a], 0)?;
@@ -3712,6 +3745,8 @@ struct VirtCx {
     rets: Vec<Ty>,
     /// Per class: its instance methods (own), by atom.
     methods: Vec<HashMap<AtomId, usize>>,
+    /// Per class: whether its instances have private state (never virtual).
+    private_state: Vec<bool>,
 }
 
 /// Scalar replacement of class instances, as JIT compilers' escape analysis
@@ -3731,6 +3766,7 @@ pub fn virtualize_instances(m: &mut Module) {
     let cx = VirtCx {
         params: all().map(|f| f.params.clone()).collect(),
         rets: all().map(|f| f.ret).collect(),
+        private_state: m.classes.iter().map(|c| c.private_state).collect(),
         methods: m
             .classes
             .iter()
@@ -3861,6 +3897,10 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
     });
     let Some((class, fields)) = found else { return false };
     let Some(methods) = cx.methods.get(class) else { return false };
+    // (Made from its fields alone, it would lack them.)
+    if cx.private_state[class] {
+        return false;
+    }
     let base = f.locals.len();
     let flag = base;
     let slots: Vec<LocalId> = (base + 1..base + 1 + fields.len()).collect();

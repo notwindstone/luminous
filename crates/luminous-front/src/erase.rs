@@ -160,7 +160,7 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
                 suffixes.entry(e as usize).or_default().push(")".into());
             }
             // Interpreted code keeps the class's own constructor.
-            NativeSite::Ctor { .. } => {}
+            NativeSite::Ctor { .. } | NativeSite::Private { .. } => {}
             NativeSite::Method { class, is_static, key, stmt_end, accessor } => {
                 // Over the interpreted method or accessor, which becomes the
                 // fallback.

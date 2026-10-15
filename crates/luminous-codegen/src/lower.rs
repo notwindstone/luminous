@@ -2401,6 +2401,34 @@ impl Lower {
                 let params = self.b.block_params(join).to_vec();
                 self.unabi(e.ty, &params)
             }
+            ExprKind::CallDirectThis(id, this, args) => {
+                // (The receiver is borrowed.)
+                let recv = self.expr(this);
+                self.hold(recv);
+                let mut vals = Vec::new();
+                let mut held = Vec::new();
+                let tys = self.env.params.clone();
+                for (a, &t) in args.iter().zip(&tys[*id]) {
+                    let v = self.expr(a);
+                    self.hold(v);
+                    held.push(v);
+                    vals.extend(self.abi(t, v));
+                }
+                for v in held.into_iter().rev() {
+                    self.release(v);
+                }
+                let (tp, tt) = recv.any();
+                let mut call_args = vec![self.ctx, tp, tt];
+                call_args.extend(vals);
+                let call = self.b.ins().call(self.env.funcs[*id], &call_args);
+                let results = self.b.inst_results(call).to_vec();
+                if !self.env.nothrow.get(*id).copied().unwrap_or(false) {
+                    self.check_flag();
+                }
+                self.release(recv);
+                self.free_v(recv);
+                self.unabi(e.ty, &results)
+            }
             ExprKind::Call(id, args) => {
                 let mut vals = Vec::new();
                 let mut held = Vec::new();
@@ -3251,6 +3279,32 @@ impl Lower {
                 self.free_v(obj);
                 V::Void
             }
+            ExprKind::PrivateDefine(o, slot, x) => {
+                let obj = self.expr(o);
+                self.hold(obj);
+                let v = self.expr(x);
+                let (vp, vt) = v.any();
+                let (p, t) = obj.any();
+                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let ctx = self.ctx;
+                let at = self.values_slot(&[(p, t), (np, nt)]);
+                // (The field takes the value.)
+                let r = self.helper("lum_private_define", &[ctx, at, vp, vt]);
+                self.check_int(r[0]);
+                self.release(obj);
+                self.free_v(obj);
+                V::Void
+            }
+            ExprKind::AddBrand(o, home) => {
+                let obj = self.expr(o);
+                let (p, t) = obj.any();
+                let (hp, ht) = self.table_value(self.env.homes, *home);
+                let ctx = self.ctx;
+                let r = self.helper("JS_PrivateAddBrand", &[ctx, p, t, hp, ht]);
+                self.check_int(r[0]);
+                self.free_v(obj);
+                V::Void
+            }
             ExprKind::DeleteProp(o, a) => {
                 let obj = self.expr(o);
                 self.hold(obj);
@@ -3389,6 +3443,9 @@ impl Lower {
             }
             ExprKind::Object(props) => self.new_object(props, None),
             ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
+            ExprKind::NewInstanceFull { class, fields, brand, privates } => {
+                self.new_object_with(fields, Some(*class), Some((*brand, privates)))
+            }
             ExprKind::Array(elems) => {
                 let held: Vec<V> = elems
                     .iter()
@@ -4057,11 +4114,24 @@ impl Lower {
     /// An object literal (`class`: `None`), or an instance of a class with
     /// a native constructor, with these fields.
     fn new_object(&mut self, props: &[(ir::AtomId, Expr)], class: Option<usize>) -> V {
+        self.new_object_with(props, class, None)
+    }
+
+    /// `new_object`, of an instance with private state too (`private`: the
+    /// brand's home slot, and the private fields' slots and values), which
+    /// follows its public fields in its shape: the brand's property (its
+    /// value `undefined`), then the private fields.
+    fn new_object_with(
+        &mut self,
+        props: &[(ir::AtomId, Expr)],
+        class: Option<usize>,
+        private: Option<(Option<usize>, &[(usize, Expr)])>,
+    ) -> V {
         // The values first (the object is unobservable until made),
         // then the object: an allocation site caches the literal's
         // final shape, and later objects are made with it directly,
         // as JSC's allocation profiles do.
-        let held: Vec<V> = props
+        let mut held: Vec<V> = props
             .iter()
             .map(|(_, x)| {
                 let (p, t) = self.expr(x).any();
@@ -4070,7 +4140,19 @@ impl Lower {
                 v
             })
             .collect();
-        let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+        let mut vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+        if let Some((brand, privates)) = private {
+            if brand.is_some() {
+                vals.push(self.konst(0, TAG_UNDEFINED).any());
+            }
+            for (_, x) in privates {
+                let (p, t) = self.expr(x).any();
+                let v = V::Any(p, t);
+                self.hold(v);
+                held.push(v);
+                vals.push((p, t));
+            }
+        }
         // Both paths take the values.
         for &v in held.iter().rev() {
             self.release(v);
@@ -4111,11 +4193,29 @@ impl Lower {
         }
         let atoms = self.b.ins().stack_addr(self.ptr, atoms, 0);
         let count = self.b.ins().iconst(I32, n as i64);
-        let r = match class {
-            None => self.helper("lum_new_object", &[ctx, ic, count, atoms, values]),
-            Some(k) => {
+        let r = match (class, private) {
+            (None, _) => self.helper("lum_new_object", &[ctx, ic, count, atoms, values]),
+            (Some(k), None) => {
                 let (pp, pt) = self.table_value(self.env.homes, 2 * k);
                 self.helper("lum_new_instance", &[ctx, ic, pp, pt, count, atoms, values])
+            }
+            (Some(k), Some((brand, privates))) => {
+                // The brand's home object (or `undefined`), then the
+                // private names.
+                let mut extra = vec![match brand {
+                    Some(h) => self.table_value(self.env.homes, h),
+                    None => {
+                        let (p, t) = self.konst(0, TAG_UNDEFINED).any();
+                        (p, t)
+                    }
+                }];
+                for &(slot, _) in privates {
+                    extra.push(self.table_value(self.env.privates, slot));
+                }
+                let extra = self.values_slot(&extra);
+                let nprivate = self.b.ins().iconst(I32, privates.len() as i64);
+                let (pp, pt) = self.table_value(self.env.homes, 2 * k);
+                self.helper("lum_new_instance_full", &[ctx, ic, pp, pt, count, atoms, values, extra, nprivate])
             }
         };
         self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);

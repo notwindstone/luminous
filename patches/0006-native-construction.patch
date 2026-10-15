@@ -1,0 +1,34 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1216,6 +1216,8 @@
+ JS_EXTERN int JS_PrivateSet(JSContext *ctx, JSValueConst obj, JSValueConst name, JSValue val);
+ JS_EXTERN int JS_PrivateCheckBrand(JSContext *ctx, JSValueConst obj, JSValueConst method);
+ JS_EXTERN int JS_PrivateIn(JSContext *ctx, JSValueConst obj, JSValueConst name);
++JS_EXTERN int JS_PrivateDefine(JSContext *ctx, JSValueConst obj, JSValueConst name, JSValue val);
++JS_EXTERN int JS_PrivateAddBrand(JSContext *ctx, JSValueConst obj, JSValueConst home);
+ /* An array iterator (values) positioned at `idx`, for code that iterated
+    the array directly until it has to close the iterator. */
+ JS_EXTERN JSValue JS_NewArrayIteratorAt(JSContext *ctx, JSValueConst arr, uint32_t idx);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61079,6 +61079,20 @@
+     return JS_SetPrivateField(ctx, obj, name, val);
+ }
+ 
++/* luminous: what a class's construction does with an instance, for native
++   constructors: define a private field (`val` taken), and give it the
++   brand of the class whose prototype is `home` (for its private methods
++   and accessors). */
++int JS_PrivateDefine(JSContext *ctx, JSValueConst obj, JSValueConst name, JSValue val)
++{
++    return JS_DefinePrivateField(ctx, obj, unsafe_unconst(name), val);
++}
++
++int JS_PrivateAddBrand(JSContext *ctx, JSValueConst obj, JSValueConst home)
++{
++    return JS_AddBrand(ctx, obj, home);
++}
++
+ int JS_PrivateCheckBrand(JSContext *ctx, JSValueConst obj, JSValueConst method)
+ {
+     int ret = JS_CheckBrand(ctx, unsafe_unconst(obj), unsafe_unconst(method));

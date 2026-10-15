@@ -1,6 +1,6 @@
-// @native Point Counter Node Defaults Guarded Late Base WithSetter Empty OnlyFields
+// @native Point Counter Node Defaults Guarded Late Base WithSetter Empty OnlyFields Hidden
 // @native make points counters list defaults inherit setters tdz extra
-// @interpreted interpNew Hidden
+// @interpreted interpNew
 // Constructors of base classes compiled natively: native `new` makes the
 // instance with its fields (in declaration order, initializers first),
 // then runs the body; interpreted code keeps the class's own constructor.
