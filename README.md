@@ -1073,6 +1073,14 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   version runs). A call whose argument of an `aot type` is not known
   to be one (an element of an untyped array) checks it at the call and
   calls the native function directly.
+- **JSON.** `JSON.stringify` (without a replacer or indentation) writes an
+  object of an `aot type` from its fields, in their order, with each key
+  encoded once when the program starts (`,"name":`), and an array of them
+  element by element, holes as `null` (`JS_SetJSONWriter`, patch 0005).
+  The output is the general algorithm's; a `toJSON` on `Object.prototype`
+  or `Array.prototype`, another prototype for an array, or nesting deeper
+  than 32 sends the whole call to the general algorithm. `bench/micro/json.ts`, a 7-field
+  object with a nested one: JSON_NUMBERS
 
 ## Getting started
 
