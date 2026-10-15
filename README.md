@@ -146,6 +146,11 @@ engine's semantics:
   to a shape, which makes the engine clone that shape instead of modifying
   it in place, so every object with the shape has the property in the same
   slot;
+- `JS_WatchPrototype` and `js_proto_epoch` (patch 0004): a watched object
+  (a prototype whose method or getter a cache holds) moves a global counter
+  whenever it changes: a property added, deleted, redefined or written,
+  its prototype set. Watching gives it a shape of its own once (and its
+  writes are never cached), so no native store bypasses the counter;
 - the interpreter's own iteration (`for`-`of`, `for`-`in`, spread,
   destructuring), CopyDataProperties (object spread and rest), property
   access with a receiver (`super`), private field access and brand checks,
@@ -415,8 +420,19 @@ The differential tests run every case with both.
     check (one comparison: other kinds of entries keep their shape in a
     second field), then a load or store. A cache also covers the object's own
     getters and setters, methods, getters and setters found on the first
-    or second prototype (checking the shapes on the way), and private
-    fields and `super.name`. A site that sees objects of several shapes
+    or second prototype, and private fields and `super.name`. A
+    prototype's method or getter is kept in the cache itself with the
+    engine's prototype epoch (see `JS_WatchPrototype`): while no watched
+    prototype has changed, a hit is the receiver's shape and the epoch
+    compared, and the value (with its native entry, which a predicted
+    call compares instead of reading the function) taken from the cache:
+    no prototype is read, and no kind dispatched on. After a change to a
+    watched prototype, a site whose prototypes' shapes still hold takes
+    the new epoch once (a runtime call, out of line), and one that keeps
+    seeing changes stops after 64 and checks the shapes on the way, as
+    before. A method site compares the prototype entry's shape
+    first, the arguments of a predicted call are spilled only where it
+    calls, and the tests of `if` and loops are jumps. A site that sees objects of several shapes
     (a class hierarchy) keeps up to four more own or prototype data
     properties (methods up to the third prototype: a class two superclasses
     up), which its misses check before a lookup; sites that never cache

@@ -798,6 +798,27 @@ static JSValue *lum_ic_entry_slot(const LumIC *e, char *p, void *shape)
     return (JSValue *)*(char **)(holder + JS_LAYOUT_OBJ_PROP) + e->slot;
 }
 
+/* The address of the property a prototype entry (kinds 1-3) of `ic` holds
+   for object `p` (of its alt_shape), found through the cached shapes, or
+   NULL. */
+static JSValue *lum_ic_entry_holder_slot(const LumIC *ic, char *p)
+{
+    void *shape = *(void **)(p + JS_LAYOUT_OBJ_SHAPE);
+    char *holder;
+    if (ic->alt_shape != shape)
+        return NULL;
+    holder = *(char **)((char *)shape + JS_LAYOUT_SHAPE_PROTO);
+    if (ic->mid_shape) {
+        void *first = *(void **)(holder + JS_LAYOUT_OBJ_SHAPE);
+        if (first != ic->mid_shape)
+            return NULL;
+        holder = *(char **)((char *)first + JS_LAYOUT_SHAPE_PROTO);
+    }
+    if (*(void **)(holder + JS_LAYOUT_OBJ_SHAPE) != ic->proto_shape)
+        return NULL;
+    return (JSValue *)*(char **)(holder + JS_LAYOUT_OBJ_PROP) + ic->slot;
+}
+
 /* The polymorphic entry of `ic` holding obj's property, else NULL. */
 static inline JSValue *lum_ic_poly_slot(LumIC *ic, JSValueConst obj)
 {
@@ -898,6 +919,9 @@ static void lum_ic_store(JSContext *ctx, LumIC *ic, void *shape, void *proto_sha
     ic->mid_shape = mid_shape;
     ic->slot = slot;
     ic->kind = kind;
+    ic->epoch = 0;
+    ic->value = JS_UNDEFINED;
+    ic->entry = NULL;
 }
 
 /* Cache an own data property (mode 0: read, 1: write) or accessor (2: its
@@ -942,16 +966,63 @@ static bool lum_ic_fill_deep(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic
     return false;
 }
 
+static void lum_ic_keep_value(LumIC *ic, char *p);
+
 /* Cache a property of a prototype (kind: LUM_IC_PROTO_x); returns
-   whether it could. */
+   whether it could. The entry also keeps what the holder has, valid while
+   js_proto_epoch is unchanged (see LumIC). */
 static bool lum_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int kind, LumIC *ic)
 {
     void *shape, *proto_shape, *mid_shape;
-    int slot = JS_CacheProtoProperty(ctx, obj, prop, kind - 1, &shape, &proto_shape, &mid_shape);
+    int slot;
+    JS_WatchProtoChain(ctx, obj, prop, 2);
+    slot = JS_CacheProtoProperty(ctx, obj, prop, kind - 1, &shape, &proto_shape, &mid_shape);
     if (slot < 0)
         return false;
     lum_ic_store(ctx, ic, shape, proto_shape, mid_shape, slot, kind);
+    lum_ic_keep_value(ic, JS_VALUE_GET_PTR(obj));
     return true;
+}
+
+/* A prototype entry (kinds 1-3) of `ic`: keep what its holder has for
+   object `p` (of its alt_shape), with the current js_proto_epoch, if the
+   shapes on the way are the cached ones; else no epoch (see LumIC). */
+static void lum_ic_keep_value(LumIC *ic, char *p)
+{
+    JSValue *at = lum_ic_entry_holder_slot(ic, p);
+    JSValue v;
+    ic->epoch = 0;
+    ic->entry = NULL;
+    if (!at || ic->kind < LUM_IC_PROTO_DATA || ic->kind > LUM_IC_PROTO_SETTER)
+        return;
+    if (ic->kind == LUM_IC_PROTO_DATA)
+        v = *at;
+    else
+        v = JS_MKPTR(JS_TAG_OBJECT, ((void **)at)[ic->kind == LUM_IC_PROTO_GETTER ? 0 : 1]);
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+        char *f = JS_VALUE_GET_PTR(v);
+        /* (An accessor half can be missing.) */
+        if (!f)
+            return;
+        if (*(uint16_t *)(f + JS_LAYOUT_OBJ_CLASS_ID) == JS_LAYOUT_CLASS_C_FUNCTION_DATA)
+            ic->entry = *(void **)(*(char **)(f + JS_LAYOUT_OBJ_FUNC_DATA) + JS_LAYOUT_FDATA_FAST);
+    }
+    ic->value = v;
+    ic->epoch = js_proto_epoch;
+}
+
+/* For native code: where entry `ic` (of a prototype's property) has an
+   older epoch than js_proto_epoch, and object `p` its alt_shape: keep what
+   the holder has now, if the shapes on the way still hold (the prototypes
+   up to it are still watched); else, or once it has been made again too
+   many times, no epoch: native code then checks the shapes. */
+void lum_ic_refresh(LumIC *ic, void *p)
+{
+    if (++ic->refreshes > LUM_IC_REFRESHES) {
+        ic->epoch = 0;
+        return;
+    }
+    lum_ic_keep_value(ic, p);
 }
 
 /* Learn another shape of record r from obj if it has the record's fields
@@ -1717,9 +1788,10 @@ int lum_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, LumIC *ic)
 /* ---- inline caches of prototype properties ---- */
 
 /* Codegen reads entries at these offsets (lower::IC_SIZE). */
-_Static_assert(sizeof(LumIC) == 48 && offsetof(LumIC, slot) == 8 && offsetof(LumIC, kind) == 12 &&
+_Static_assert(sizeof(LumIC) == 88 && offsetof(LumIC, slot) == 8 && offsetof(LumIC, kind) == 12 &&
                    offsetof(LumIC, proto_shape) == 16 && offsetof(LumIC, mid_shape) == 24 &&
-                   offsetof(LumIC, alt_shape) == 32,
+                   offsetof(LumIC, alt_shape) == 32 && offsetof(LumIC, poly) == 40 &&
+                   offsetof(LumIC, epoch) == 48 && offsetof(LumIC, value) == 56 && offsetof(LumIC, entry) == 72,
                "LumIC layout");
 
 /* Sites that never cache (as for objects with unshared shapes) stop trying
@@ -1741,6 +1813,27 @@ static void lum_ic_count_miss(LumIC *ic)
 
 /* A cache miss reading obj.prop (obj borrowed) at a site that also caches
  * the direct prototype's data properties (methods) and getters. */
+/* obj.prop (obj borrowed) through `ic` as native code reads it: an own data
+ * property of its shape, a prototype's data property or getter while
+ * js_proto_epoch is unchanged; else as a miss. For native code's cold paths
+ * (a field of a record type, where the object is not of a shape it learned). */
+JSValue lum_ic_get_cached(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
+{
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        char *p = JS_VALUE_GET_PTR(obj);
+        void *shape = *(void **)(p + JS_LAYOUT_OBJ_SHAPE);
+        if (shape == ic->shape)
+            return JS_DupValue(ctx, ((JSValue *)*(char **)(p + JS_LAYOUT_OBJ_PROP))[ic->slot]);
+        if (shape == ic->alt_shape && ic->epoch == js_proto_epoch) {
+            if (ic->kind == LUM_IC_PROTO_DATA)
+                return JS_DupValue(ctx, ic->value);
+            if (ic->kind == LUM_IC_PROTO_GETTER)
+                return lum_call_getter(ctx, JS_VALUE_GET_PTR(ic->value), obj);
+        }
+    }
+    return lum_ic_get_proto(ctx, obj, prop, ic);
+}
+
 JSValue lum_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
 {
     JSValue v;

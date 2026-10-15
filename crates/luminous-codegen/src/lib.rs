@@ -463,8 +463,10 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_DefineElement", &[P, W, W, P, W, W], &[Int]),
         ("JS_SortNative", &[P, W, W, P, Int], &[Int]),
         ("lum_ic_own_data", &[P, W, W, Int, P], &[W, W]),
+        ("lum_ic_get_cached", &[P, W, W, Int, P], &[W, W]),
         ("lum_record_learn", &[P, W, W, Int], &[]),
         ("lum_char_code_at_ok", &[P], &[Int]),
+        ("lum_ic_refresh", &[P, W], &[]),
         ("lum_array_push_ok", &[P], &[Int]),
         ("lum_region_push", &[P, W, W, W, W], &[Int]),
         ("JS_CallStringFn", &[P, W, W, Int, Int, P], &[W, W]),
@@ -511,7 +513,7 @@ struct Codegen {
     sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 12],
+    data: [DataId; 13],
     fast_sig: SigRef,
     /// Inline caches allocated so far (`lum_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
@@ -643,6 +645,8 @@ impl Codegen {
         module.define_data(d, mir::DataInit::Bytes(ints(&index)), 4);
         let d = module.declare_data("lum_nrecords", Linkage::Export, false);
         module.define_data(d, mir::DataInit::Bytes((nrec as i32).to_le_bytes().to_vec()), 4);
+        // The engine's counter of changes to watched prototypes (see `LumIC`).
+        data.push(module.declare_data("js_proto_epoch", Linkage::Import, true));
         Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
@@ -686,6 +690,7 @@ impl Codegen {
             sarr_class,
             ics,
             record_shapes,
+            proto_epoch,
         ] = self.data;
         Env {
             helpers: self.helpers.clone(),
@@ -703,6 +708,7 @@ impl Codegen {
             sarr_class,
             ics,
             record_shapes,
+            proto_epoch,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
             params: self.params.clone(),

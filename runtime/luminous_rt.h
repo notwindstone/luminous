@@ -134,7 +134,23 @@ typedef struct LumIC {
          * prototype's shape (referenced), checked after mid_shape. */
         void *mid2_shape;
     };
+    /* Kinds 1-3: what the holder held when cached (the data property's
+     * value, or the getter or setter object), and js_proto_epoch then
+     * (else 0). The prototypes up to the holder are watched
+     * (JS_WatchPrototype): while the counter is the same, an object of
+     * alt_shape has this, and native code checks nothing else. */
+    uint64_t epoch;
+    JSValue value;
+    /* That value's JS entry if it is a native function (JSCFunctionFast),
+     * else NULL: what native code checks a predicted call by. */
+    void *entry;
+    /* How many times the entry was made again after a change to a watched
+     * prototype (lum_ic_refresh): past LUM_IC_REFRESHES, it keeps no epoch
+     * (a program that keeps changing its prototypes). */
+    uint32_t refreshes;
 } LumIC;
+#define LUM_IC_REFRESHES 64
+void lum_ic_refresh(LumIC *ic, void *p);
 #define LUM_POLY 4
 #define LUM_IC_OWN 0
 #define LUM_IC_PROTO_DATA 1
@@ -171,6 +187,7 @@ int lum_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumIC *ic)
 JSValue lum_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, LumIC *ic);
 int lum_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, LumIC *ic);
 JSValue lum_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
+JSValue lum_ic_get_cached(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 int lum_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumIC *ic);
 JSValue lum_call_getter(JSContext *ctx, void *getter, JSValue this_obj);
 JSValue lum_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAtom prop, LumIC *ic);

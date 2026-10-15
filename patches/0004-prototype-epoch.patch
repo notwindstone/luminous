@@ -1,0 +1,276 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1356,6 +1356,9 @@
+        its objects without counting them: never released (and so never
+        unique, and never changed in place) */
+     uint8_t pinned;
++    /* luminous: the shape of a watched object (JS_WatchPrototype), which no
++       other object may take: the hashed shape lookups skip it */
++    uint8_t watched;
+     uint32_t hash; /* current hash value */
+     uint32_t prop_hash_mask;
+     int prop_size; /* allocated properties */
+@@ -1382,6 +1385,10 @@
+     /* luminous: the property array of an object of another class than
+        Object follows it in its own allocation (until it grows) */
+     uint8_t inline_props : 1;
++    /* luminous: compiled code's caches keep what it holds (a prototype's
++       methods and getters): any change to it moves js_proto_epoch (see
++       JS_WatchPrototype) */
++    uint8_t is_watched : 1;
+     uint16_t class_id; /* see JS_CLASS_x */
+     /* luminous: the weak references to it are listed off the runtime:
+        rt->weak_heads[weak_index] (0: none). */
+@@ -1821,6 +1828,13 @@
+ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
+                                    JSShapeProperty **pprs);
+ static int init_shape_hash(JSRuntime *rt);
++extern uint64_t js_proto_epoch;
++/* luminous: a change to `p` (see JS_WatchPrototype) */
++static inline void js_proto_changed(JSObject *p)
++{
++    if (unlikely(p->is_watched))
++        js_proto_epoch++;
++}
+ static __exception int js_get_length32(JSContext *ctx, uint32_t *pres,
+                                        JSValueConst obj);
+ static __exception int js_get_length64(JSContext *ctx, int64_t *pres,
+@@ -7192,6 +7206,7 @@
+     sh->is_hashed = false;
+     sh->special_props = false;
+     sh->pinned = false;
++    sh->watched = false;
+     return sh;
+ }
+ 
+@@ -7281,6 +7296,7 @@
+     js_gc_set_fin(sh);
+     sh->is_hashed = false;
+     sh->pinned = false;
++    sh->watched = false;
+     if (sh->proto) {
+         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+     }
+@@ -7556,7 +7572,7 @@
+     for(sh1 = rt->shape_hash[h1]; sh1 != NULL; sh1 = sh1->shape_hash_next) {
+         if (sh1->hash == h &&
+             sh1->proto == proto &&
+-            sh1->prop_count == 0) {
++            sh1->prop_count == 0 && !sh1->watched) {
+             return sh1;
+         }
+     }
+@@ -7580,7 +7596,7 @@
+            shapes really match */
+         if (sh1->hash == h &&
+             sh1->proto == sh->proto &&
+-            sh1->prop_count == ((n = sh->prop_count) + 1)) {
++            sh1->prop_count == ((n = sh->prop_count) + 1) && !sh1->watched) {
+             for(i = 0; i < n; i++) {
+                 if (unlikely(get_shape_prop(sh1)[i].atom != get_shape_prop(sh)[i].atom) ||
+                     unlikely(get_shape_prop(sh1)[i].flags != get_shape_prop(sh)[i].flags))
+@@ -7666,6 +7682,7 @@
+     p->is_HTMLDDA = 0;
+     p->is_prototype = 0;
+     p->inline_props = 0;
++    p->is_watched = 0;
+     p->weak_index = 0;
+     p->shape = sh;
+     if (class_id == JS_CLASS_OBJECT) {
+@@ -12663,6 +12680,7 @@
+ {
+     JSShape *sh, *new_sh;
+ 
++    js_proto_changed(p);
+     if (unlikely(p->is_prototype)) {
+         /* track addition of small integer properties to
+            Array.prototype and Object.prototype */
+@@ -12674,8 +12692,9 @@
+     }
+     sh = p->shape;
+     if (sh->is_hashed) {
+-        /* try to find an existing shape */
+-        new_sh = find_hashed_shape_prop(ctx->rt, sh, prop, prop_flags);
++        /* try to find an existing shape (luminous: not for a watched
++           object, which keeps a shape of its own) */
++        new_sh = p->is_watched ? NULL : find_hashed_shape_prop(ctx->rt, sh, prop, prop_flags);
+         if (new_sh) {
+             /* matching shape found: use it */
+             /*  the property array may need to be resized */
+@@ -12695,6 +12714,7 @@
+             new_sh = js_clone_shape(ctx, sh);
+             if (!new_sh)
+                 return NULL;
++            new_sh->watched = p->is_watched;
+             /* hash the cloned shape */
+             new_sh->is_hashed = true;
+             js_shape_hash_link(ctx->rt, new_sh);
+@@ -13105,6 +13125,7 @@
+         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+             /* fast case */
++            js_proto_changed(p1);
+             set_value(ctx, &pr->u.value, val);
+             JS_GC_WBV(ctx->rt, p, val);
+             return true;
+@@ -13719,6 +13740,7 @@
+     JSShape *sh;
+     uint32_t idx = 0;    /* prevent warning */
+ 
++    js_proto_changed(p);
+     sh = p->shape;
+     if (sh->is_hashed) {
+         if (JS_REF_COUNT(sh) != 1) {
+@@ -13778,6 +13800,8 @@
+         return -1;
+     }
+     p = JS_VALUE_GET_OBJ(this_obj);
++    /* (A new value, getter or setter changes no shape.) */
++    js_proto_changed(p);
+ 
+  redo_prop_update:
+     prs = find_own_property(&pr, p, prop);
+@@ -14453,6 +14477,7 @@
+                 return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
+             }
+         }
++        js_proto_changed(p);
+         set_value(ctx, &pr->u.value, val);
+         js_gc_wb(ctx->rt, p);
+         return 0;
+@@ -14464,6 +14489,7 @@
+         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+             /* fast path */
++            js_proto_changed(p);
+             set_value(ctx, &pr->u.value, val);
+             JS_GC_WBV(ctx->rt, p, val);
+             return 0;
+@@ -22612,6 +22638,7 @@
+                     if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                               JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+                         /* fast path */
++                        js_proto_changed(p);
+                         set_value(ctx, &pr->u.value, sp[-1]);
+                         JS_GC_WBV(ctx->rt, p, pr->u.value);
+                     } else {
+@@ -60215,11 +60242,72 @@
+    (a shape fixes the prototype and the absence of the property), the
+    property is in that slot. kind: 0 for a data property, 1 for a getter, 2
+    for a setter. -1 if not cacheable. */
++/* luminous: compiled code caches a prototype's method or getter with the
++   value of this counter, and uses it while the counter is unchanged:
++   every change to an object it watches (JS_WatchPrototype) moves it. */
++uint64_t js_proto_epoch = 1;
++
++/* Watch `obj` (an object): from now on, a change to its properties, their
++   values or its prototype moves js_proto_epoch. It gets a shape of its
++   own the first time (still shared, so that it can be cached), so that no
++   cache of the shape it had writes to it directly any more; and no cache
++   takes it for writes (JS_CacheOwnProperty). Returns -1 if it cannot be
++   watched. */
++int JS_WatchPrototype(JSContext *ctx, JSValueConst obj)
++{
++    JSObject *p;
++    JSShape *sh;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (p->is_watched)
++        return 0;
++    sh = p->shape;
++    if (sh->is_hashed) {
++        sh = js_clone_shape(ctx, sh);
++        if (!sh)
++            return -1;
++        js_free_shape(ctx->rt, p->shape);
++        p->shape = sh;
++        js_gc_wb(ctx->rt, p);
++        p->is_watched = true;
++        if (JS_ShareObjectShape(ctx, obj) < 0)
++            return -1;
++        return 0;
++    }
++    p->is_watched = true;
++    return 0;
++}
++
+ static bool js_cacheable_holder(JSObject *p)
+ {
+     return (!p->is_exotic || p->class_id == JS_CLASS_ARRAY) && p->shape->is_hashed;
+ }
+ 
++/* Watch the prototypes of `obj` from the first up to the one that has
++   `prop`, `depth` of them at most (JS_WatchPrototype): before caching what
++   they hold, as the first watch gives an object another shape. */
++void JS_WatchProtoChain(JSContext *ctx, JSValueConst obj, JSAtom prop, int depth)
++{
++    JSObject *p, *proto;
++    JSProperty *pr;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return;
++    p = JS_VALUE_GET_OBJ(obj);
++    while (depth-- > 0) {
++        proto = p->shape->proto;
++        if (!proto || (proto->is_exotic && proto->class_id != JS_CLASS_ARRAY))
++            return;
++        if (JS_WatchPrototype(ctx, JS_MKPTR(JS_TAG_OBJECT, proto)) < 0)
++            return;
++        if (find_own_property(&pr, proto, prop))
++            return;
++        p = proto;
++    }
++}
++
+ int JS_CacheProtoProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int kind,
+                           void **pshape, void **pproto_shape, void **pmid_shape)
+ {
+@@ -60315,6 +60403,10 @@
+         return -1;
+     if (mode && !(flags & JS_PROP_WRITABLE))
+         return -1;
++    /* (Writes to a watched object go through the engine, which tells its
++       watchers: see JS_WatchPrototype.) */
++    if (mode && p->is_watched)
++        return -1;
+     *pshape = js_dup_shape(p->shape);
+     return pr - p->prop;
+ }
+@@ -60334,6 +60426,8 @@
+     /* (Unhashed shapes have one owner.) */
+     if (sh->deleted_prop_count != 0 || JS_REF_COUNT(sh) != 1)
+         return -1;
++    /* (A watched object's: taken by no other object.) */
++    sh->watched = JS_VALUE_GET_OBJ(obj)->is_watched;
+     /* The hash add_shape_property would have computed. */
+     h = shape_initial_hash(sh->proto);
+     for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++)
+@@ -60490,6 +60584,7 @@
+             b->mark = 0;
+             b->ref_count = 1;
+             p->is_prototype = 0;
++            p->is_watched = 0;
+             p->extensible = true;
+             p->free_mark = 0;
+             p->is_exotic = 0;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1118,6 +1118,16 @@
+    the way has it): its index, and new references to the shapes of `obj`,
+    its first, second and third prototypes in shapes[0..3]; else -1. */
+ JS_EXTERN int JS_CacheDeepProtoProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void **shapes);
++/* Watch object `obj`: every later change to it (a property added, deleted,
++   redefined or written, its prototype set) moves js_proto_epoch, so that a
++   cache of what it holds stays valid while the counter is unchanged. It
++   gets a (shared) shape of its own the first time, and writes to it are no
++   longer cached (JS_CacheOwnProperty). Returns 0, or -1 if it cannot. */
++JS_EXTERN int JS_WatchPrototype(JSContext *ctx, JSValueConst obj);
++/* Watch the prototypes of `obj` from the first, up to `depth` of them or
++   to the one that has `prop`. */
++JS_EXTERN void JS_WatchProtoChain(JSContext *ctx, JSValueConst obj, JSAtom prop, int depth);
++extern uint64_t js_proto_epoch;
+ JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
+ /* luminous: String.prototype methods with a direct entry (JS_CallStringFn). */
+ #define JS_STRING_FN_SLICE 0

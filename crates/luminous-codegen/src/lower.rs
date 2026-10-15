@@ -263,6 +263,9 @@ pub(crate) struct Env {
     pub sarr_class: GlobalValue,
     /// `lum_record_shapes`: per record type, its shape once learned.
     pub record_shapes: GlobalValue,
+    /// `js_proto_epoch`: the engine's count of changes to watched
+    /// prototypes (see `LumIC.epoch`).
+    pub proto_epoch: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -335,6 +338,10 @@ pub(crate) struct Lower {
     /// payload, so arithmetic on boxed numbers needs no boxing in between
     /// (the boxing is left unused).
     num_shadow: HashMap<Value, Value>,
+    /// Functions read through an inline cache (a prototype's method or
+    /// getter): their JS entry (`lum_fast_<i>`), as the cache keeps it, or
+    /// 0 where not known (see `fn_entry`).
+    fn_entries: HashMap<Value, Value>,
     /// In a speculative region: the property array of each guarded object.
     spec_src: HashMap<ir::LocalId, Value>,
     /// In a speculative region: whether every value its guard checked is
@@ -507,6 +514,7 @@ impl Lower {
             shadows,
             code_vars,
             num_shadow: HashMap::new(),
+            fn_entries: HashMap::new(),
             spec_src: HashMap::new(),
             spec_floats: false,
             spec_float_slots: HashSet::new(),
@@ -2844,8 +2852,15 @@ impl Lower {
                 self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
                 self.b.switch_to_block(slow);
                 self.record_learn(p, t, *record);
-                let (gp, gt) = self.prop_get_from(p, t, None, *atom, Vec::new(), false);
-                self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+                // (Through a cache, but out of line: the record's shapes are
+                // what usually holds, and this code would weigh on the
+                // function's register allocation.)
+                let ic = self.new_ic();
+                let ctx = self.ctx;
+                let atom = self.atom(*atom);
+                let r = self.helper("lum_ic_get_cached", &[ctx, p, t, atom, ic]);
+                self.check_value(r[1]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
                 self.b.switch_to_block(join);
                 self.drop_operand(o, owned);
                 V::Any(rp, rt)
@@ -3907,10 +3922,44 @@ impl Lower {
         r
     }
 
-    /// For a prediction: whether function `(fp, ft)` is the predicted one
-    /// and `args` (JS values, borrowed) suit its parameters, as its entry
-    /// requires. `None` if they cannot.
-    fn pred_guard(&mut self, pred: &Pred, fp: Value, ft: Value, args: &[(Value, Value)]) -> Option<Value> {
+    /// The JS entry (`lum_fast_<i>`) of function `(fp, ft)`, or 0 if it has
+    /// none (not a native function): as the inline cache it was read
+    /// through keeps it (`fn_entries`), else read from the function.
+    fn fn_entry(&mut self, fp: Value, ft: Value) -> Value {
+        let join = self.b.create_block();
+        let r = self.b.append_block_param(join, I64);
+        let read = self.b.create_block();
+        match self.fn_entries.get(&fp).copied() {
+            Some(e) => {
+                self.b.ins().brif(e, join, &[BlockArg::Value(e)], read, &[]);
+            }
+            None => {
+                self.b.ins().jump(read, &[]);
+            }
+        }
+        self.b.switch_to_block(read);
+        let zero = self.b.ins().iconst(I64, 0);
+        let obj = self.b.create_block();
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(obj);
+        let class = self.b.ins().uload16(I32, M_HEADER, fp, layout::OBJ_CLASS_ID);
+        let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
+        let data = self.b.create_block();
+        self.b.ins().brif(is_data, data, &[], join, &[BlockArg::Value(zero)]);
+        self.b.switch_to_block(data);
+        let rec = self.b.ins().load(I64, M_HEADER, fp, layout::OBJ_FUNC_DATA);
+        let entry = self.b.ins().load(I64, M_HEADER, rec, layout::FDATA_FAST);
+        self.b.ins().jump(join, &[BlockArg::Value(entry)]);
+        self.b.switch_to_block(join);
+        r
+    }
+
+    /// For a prediction: whether the function whose JS entry is `entry`
+    /// (see `fn_entry`) is the predicted one and `args` (JS values,
+    /// borrowed) suit its parameters, as its entry requires. `None` if they
+    /// cannot.
+    fn pred_guard(&mut self, pred: &Pred, entry: Value, args: &[(Value, Value)]) -> Option<Value> {
         let params = self.env.params[pred.func].clone();
         let mut checks = Vec::new();
         for (i, &pt) in params.iter().enumerate() {
@@ -3921,7 +3970,8 @@ impl Lower {
                 _ => return None,
             }
         }
-        let mut ok = self.is_native(fp, ft, pred.func);
+        let want = self.b.ins().func_addr(self.ptr, self.env.fast[pred.func]);
+        let mut ok = self.b.ins().icmp(IntCC::Equal, entry, want);
         for (t, number) in checks {
             let c = if number { self.is_number(t) } else { self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL) };
             ok = self.b.ins().band(ok, c);
@@ -3972,20 +4022,22 @@ impl Lower {
         f: (Value, Value),
         this: (Value, Value),
         args: &[(Value, Value)],
-        argv: Value,
+        argv: impl FnOnce(&mut Self) -> Value,
         borrowed: bool,
-        generic: impl FnOnce(&mut Self) -> (Value, Value),
+        generic: impl FnOnce(&mut Self, Value) -> (Value, Value),
     ) -> (Value, Value) {
         if preds.is_empty() {
-            return self.call_linked(f, this, args.len(), argv, borrowed, generic);
+            let argv = argv(self);
+            return self.call_linked(f, this, args.len(), argv, borrowed, |l| generic(l, argv));
         }
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
         // Each prediction in turn (a polymorphic site has several), then
         // the call.
+        let entry = self.fn_entry(f.0, f.1);
         for pred in preds {
-            let Some(ok) = self.pred_guard(pred, f.0, f.1, args) else { continue };
+            let Some(ok) = self.pred_guard(pred, entry, args) else { continue };
             let inline = self.b.create_block();
             let next = self.b.create_block();
             self.b.ins().brif(ok, inline, &[], next, &[]);
@@ -3994,7 +4046,9 @@ impl Lower {
             self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
             self.b.switch_to_block(next);
         }
-        let (p, t) = self.call_linked(f, this, args.len(), argv, borrowed, generic);
+        // (The arguments' array only where the call is made.)
+        let argv = argv(self);
+        let (p, t) = self.call_linked(f, this, args.len(), argv, borrowed, |l| generic(l, argv));
         self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
         self.b.switch_to_block(join);
         (rp, rt)
@@ -4541,8 +4595,7 @@ impl Lower {
         let ctx = self.ctx;
         // The property's reference is dropped after the call.
         let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-        let argv = self.values_slot(&[(vp, vt)]);
-        let (sp, st) = self.call_or_inline(&pred, (setter, tag), (p, t), &[(vp, vt)], argv, true, |l| {
+        let (sp, st) = self.call_or_inline(&pred, (setter, tag), (p, t), &[(vp, vt)], |l| l.values_slot(&[(vp, vt)]), true, |l, _| {
             l.dup((vp, vt));
             let r = l.helper("lum_call_setter", &[ctx, setter, p, t, vp, vt]);
             let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
@@ -5167,8 +5220,9 @@ impl Lower {
         let join = self.b.create_block();
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
+        let entry = if pred.is_empty() { None } else { Some(self.fn_entry(f.any().0, f.any().1)) };
         for p in &pred {
-            let Some(ok) = self.pred_guard(p, f.any().0, f.any().1, &js_args) else { continue };
+            let Some(ok) = self.pred_guard(p, entry.expect("predictions"), &js_args) else { continue };
             let inline = self.b.create_block();
             let next = self.b.create_block();
             self.b.ins().brif(ok, inline, &[], next, &[]);
@@ -5222,12 +5276,18 @@ impl Lower {
     fn call_held(&mut self, f: V, this: V, held: Vec<V>, pred: Vec<Pred>) -> V {
         let mut vals = vec![f.any(), this.any()];
         vals.extend(held.iter().map(|v| v.any()));
-        let slot = self.values_slot(&vals);
-        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
-        let argc = self.b.ins().iconst(I32, held.len() as i64);
+        let n = held.len();
         let ctx = self.ctx;
         let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
-        let (rp, rt) = self.call_or_inline(&pred, f.any(), this.any(), &js_args, argv, false, |l| {
+        // (The function, `this` and the arguments in a stack slot, only on
+        // the path that calls.)
+        let make_argv = |l: &mut Self| {
+            let slot = l.values_slot(&vals);
+            l.b.ins().iadd_imm_s(slot, 2 * SIZE as i64)
+        };
+        let (rp, rt) = self.call_or_inline(&pred, f.any(), this.any(), &js_args, make_argv, false, |l, argv| {
+            let slot = l.b.ins().iadd_imm_s(argv, -2 * SIZE as i64);
+            let argc = l.b.ins().iconst(I32, n as i64);
             let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
             (r[0], r[1])
         });
@@ -7043,21 +7103,31 @@ impl Lower {
         let rp = self.b.append_block_param(join, I64);
         let rt = self.b.append_block_param(join, I64);
         let owned = borrow.then(|| self.b.append_block_param(join, I8));
+        // A method's (a value that is called): its JS entry, where the cache
+        // keeps it (see `fn_entries`), else 0.
+        let entry = strings.then(|| self.b.append_block_param(join, I64));
         // The join's arguments: a borrowed value (not dup'ed when
-        // borrowing), or a new reference.
-        let args = |l: &mut Self, vp: Value, vt: Value, new_ref: bool| -> Vec<BlockArg> {
+        // borrowing), or a new reference; and the entry, if known.
+        let args_entry = |l: &mut Self, vp: Value, vt: Value, new_ref: bool, e: Option<Value>| -> Vec<BlockArg> {
             let mut a = vec![BlockArg::Value(vp), BlockArg::Value(vt)];
             if borrow {
                 a.push(BlockArg::Value(l.b.ins().iconst(I8, new_ref as i64)));
             }
+            if strings {
+                a.push(BlockArg::Value(e.unwrap_or_else(|| l.b.ins().iconst(I64, 0))));
+            }
             a
         };
+        let args = |l: &mut Self, vp: Value, vt: Value, new_ref: bool| args_entry(l, vp, vt, new_ref, None);
         let slow = self.b.create_block();
         if !poly {
             self.b.set_cold_block(slow);
         }
         let not_obj = if strings { self.b.create_block() } else { slow };
-        let (shape, kind) = self.ic_shape_hit_or(p, t, ic, not_obj, slow);
+        // (A method, or a getter something predicts, is usually a
+        // prototype's: that shape compared first.)
+        let proto_first = strings || !pred.is_empty();
+        let (shape, own, kind) = self.ic_hit_split(p, t, ic, not_obj, slow, proto_first);
         if strings {
             // A string: String.prototype's property, if it has the cached
             // shape.
@@ -7088,10 +7158,53 @@ impl Lower {
             self.b.ins().jump(join, &ja);
             self.b.switch_to_block(after);
         }
-        let own = self.b.create_block();
+        // A prototype's method or getter (kinds 1 and 2), cached with what
+        // its holder has: while js_proto_epoch is unchanged (no watched
+        // prototype changed), that value, with nothing else checked.
+        let fresh_blk = self.b.create_block();
+        let stale = self.b.create_block();
         let proto = self.b.create_block();
-        let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
-        self.b.ins().brif(is_own, own, &[], proto, &[]);
+        // (Rare once caches are made: out of the way.)
+        self.b.set_cold_block(stale);
+        self.b.set_cold_block(proto);
+        let base = self.b.ins().symbol_value(self.ptr, self.env.proto_epoch);
+        let now = self.b.ins().load(I64, M_TABLE, base, 0);
+        let then = self.b.ins().load(I64, M_IC, ic, IC_EPOCH);
+        let fresh = self.b.ins().icmp(IntCC::Equal, now, then);
+        self.b.ins().brif(fresh, fresh_blk, &[], stale, &[]);
+        // A watched prototype changed since the entry was made: it is
+        // made again where its shapes still hold (`lum_ic_refresh`), then
+        // checked once more (no loop: a back edge here would weigh on the
+        // register allocation of every function with a property read); an
+        // entry without an epoch goes through the shapes.
+        self.b.switch_to_block(stale);
+        let refresh = self.b.create_block();
+        self.b.set_cold_block(refresh);
+        self.b.ins().brif(then, refresh, &[], proto, &[]);
+        self.b.switch_to_block(refresh);
+        self.helper("lum_ic_refresh", &[ic, p]);
+        let now = self.b.ins().load(I64, M_TABLE, base, 0);
+        let then = self.b.ins().load(I64, M_IC, ic, IC_EPOCH);
+        let fresh = self.b.ins().icmp(IntCC::Equal, now, then);
+        self.b.ins().brif(fresh, fresh_blk, &[], proto, &[]);
+        // A getter's call, from either path, with its JS entry if known.
+        let call = self.b.create_block();
+        let g = self.b.append_block_param(call, I64);
+        let g_entry = self.b.append_block_param(call, I64);
+        self.b.switch_to_block(fresh_blk);
+        let fp = self.b.ins().load(I64, M_IC, ic, IC_VALUE);
+        let fe = self.b.ins().load(I64, M_IC, ic, IC_ENTRY);
+        let data_fresh = self.b.create_block();
+        let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
+        self.b.ins().brif(is_data, data_fresh, &[], call, &[BlockArg::Value(fp), BlockArg::Value(fe)]);
+        self.b.switch_to_block(data_fresh);
+        let ft = self.b.ins().load(I64, M_IC, ic, IC_VALUE + TAG_OFFSET);
+        if !borrow {
+            self.dup((fp, ft));
+        }
+        let ja = args_entry(self, fp, ft, false, Some(fe));
+        self.b.ins().jump(join, &ja);
+        // An own data property.
         self.b.switch_to_block(own);
         if receiver.is_some() {
             // (Never filled for `super`.)
@@ -7107,8 +7220,9 @@ impl Lower {
         }
         let ja = args(self, vp, vt, false);
         self.b.ins().jump(join, &ja);
-        // On the prototype: its value; or a call of a getter (own or on the
-        // prototype).
+        // The other kinds, and a prototype's property after a change to a
+        // watched object: through the holder's shapes. Or a call of a getter
+        // (own or on the prototype).
         self.b.switch_to_block(proto);
         // (Caches hold fields of `aot type` objects only in modules that
         // have such types.)
@@ -7140,14 +7254,17 @@ impl Lower {
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(getter);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
-        let g = self.b.ins().load(I64, M_SLOT, pat, 0);
+        let gv = self.b.ins().load(I64, M_SLOT, pat, 0);
+        let unknown = self.b.ins().iconst(I64, 0);
+        self.b.ins().jump(call, &[BlockArg::Value(gv), BlockArg::Value(unknown)]);
+        self.b.switch_to_block(call);
         self.nonnull(g, slow);
+        self.fn_entries.insert(g, g_entry);
         let ctx = self.ctx;
         let (thp, tht) = receiver.unwrap_or((p, t));
         let (gp, gt) = if !pred.is_empty() {
             let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-            let none = self.b.ins().iconst(I64, 0);
-            self.call_or_inline(&pred, (g, tag), (thp, tht), &[], none, true, |l| {
+            self.call_or_inline(&pred, (g, tag), (thp, tht), &[], |l| l.b.ins().iconst(I64, 0), true, |l, _| {
                 let r = l.helper("lum_call_getter", &[ctx, g, thp, tht]);
                 (r[0], r[1])
             })
@@ -7187,6 +7304,9 @@ impl Lower {
         let ja = args(self, r[0], r[1], true);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(join);
+        if let Some(e) = entry {
+            self.fn_entries.insert(rp, e);
+        }
         (rp, rt, owned)
     }
 
@@ -7256,6 +7376,42 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
         self.b.switch_to_block(join);
         (rp, rt)
+    }
+
+    /// Where `(p, t)` is an object of the shape `ic` has for an own data
+    /// property: to the block returned (not yet switched to); of its other
+    /// shape (`alt_shape`): on in the current block, with the cache's kind;
+    /// else to `slow` (`not_obj` if not an object). Also returns the shape.
+    fn ic_hit_split(
+        &mut self,
+        p: Value,
+        t: Value,
+        ic: Value,
+        not_obj: Block,
+        slow: Block,
+        proto_first: bool,
+    ) -> (Value, Block, Value) {
+        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let obj = self.b.create_block();
+        self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
+        self.b.switch_to_block(obj);
+        let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+        let own = self.b.create_block();
+        let kinded = self.b.create_block();
+        let other = self.b.create_block();
+        // `shape` for an own data property, `alt_shape` for the other kinds.
+        let (first, then, first_off, then_off) =
+            if proto_first { (kinded, own, 32, 0) } else { (own, kinded, 0, 32) };
+        let cached = self.b.ins().load(I64, M_IC, ic, first_off);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+        self.b.ins().brif(same, first, &[], other, &[]);
+        self.b.switch_to_block(other);
+        let cached = self.b.ins().load(I64, M_IC, ic, then_off);
+        let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+        self.b.ins().brif(same, then, &[], slow, &[]);
+        self.b.switch_to_block(kinded);
+        let kind = self.b.ins().uload32(M_IC, ic, 12);
+        (shape, own, kind)
     }
 
     /// Continue if `(p, t)` is an object with the shape cached in `ic`, else
@@ -7861,7 +8017,11 @@ const RECORD_SHAPES: usize = 4;
 const RECORD_TRIES: i64 = 64;
 pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 /// Size of a `LumIC` (an inline cache entry).
-pub(crate) const IC_SIZE: usize = 48;
+pub(crate) const IC_SIZE: usize = 88;
+/// `LumIC.epoch`, `LumIC.value` and `LumIC.entry`.
+const IC_EPOCH: i32 = 48;
+const IC_VALUE: i32 = 56;
+const IC_ENTRY: i32 = 72;
 /// `LumIC.poly`.
 const IC_POLY: i32 = 40;
 /// `LUM_POLY`: the entries `LumIC.poly` points to.
