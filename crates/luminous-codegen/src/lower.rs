@@ -1747,7 +1747,16 @@ impl Lower {
         let ExprKind::Compare(op, x, y) = &test?.kind else { return None };
         let ExprKind::Local(l) = x.kind else { return None };
         let ExprKind::Update { local, delta, .. } = update?.kind else { return None };
-        int_literal(y, (INT_EXACT >> 1) as f64)?;
+        // (A bound that is a constant, or always an int32: a string's
+        // length, an int32 local.)
+        let small_bound = match y.kind {
+            ExprKind::StrLen { .. } => true,
+            ExprKind::Local(m) => self.i32_range[m],
+            _ => false,
+        };
+        if !small_bound {
+            int_literal(y, (INT_EXACT >> 1) as f64)?;
+        }
         let up = matches!(op, CmpOp::Lt | CmpOp::Le) && delta > 0.0;
         let down = matches!(op, CmpOp::Gt | CmpOp::Ge) && delta < 0.0;
         if local != l || !(up || down) || !matches!(self.vars[l], LVar::Int(_)) {
@@ -2822,7 +2831,11 @@ impl Lower {
                 let (p, _) = self.use_local(*s).any();
                 let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
                 let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
-                V::Num(self.b.ins().fcvt_from_sint(F64, len))
+                // (An int32, not negative: compared as one.)
+                let d = self.int_f64(len);
+                self.i32s.insert(d);
+                self.nonneg.insert(d);
+                V::Num(d)
             }
             ExprKind::RegionPush { arr, value } => {
                 let (vp, vt) = self.expr(value).any();
@@ -4962,8 +4975,10 @@ impl Lower {
         let load = self.b.create_block();
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, F64);
+        let ri = self.b.append_block_param(join, I64);
         let nan = self.b.ins().f64const(f64::NAN);
-        self.b.ins().brif(inside, load, &[], join, &[BlockArg::Value(nan)]);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().brif(inside, load, &[], join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(load);
         // A 16-bit load at the character: an 8-bit string ends with a NUL,
         // so it stays inside; masked to 8 bits for those.
@@ -4979,9 +4994,12 @@ impl Lower {
         let mask = self.b.ins().bor_imm_u(mask, 0xff);
         let c = self.b.ins().band(c, mask);
         let c = self.b.ins().uextend(I64, c);
-        let cd = self.int_f64(c);
-        self.b.ins().jump(join, &[BlockArg::Value(cd)]);
+        let cd = self.b.ins().fcvt_from_sint(F64, c);
+        self.b.ins().jump(join, &[BlockArg::Value(cd), BlockArg::Value(c)]);
         self.b.switch_to_block(join);
+        // (Its code as an integer where the index is inside, else NaN:
+        // compared with integers as integers.)
+        self.rem_of.insert(r, RemInt { int: ri, ok: inside, nan: true, small: true });
         r
     }
 
@@ -8023,6 +8041,7 @@ fn int_locals(f: &ir::Func, bound_elsewhere: &[ir::LocalId]) -> Vec<bool> {
                 ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => (
                     *l,
                     x.ty == Ty::I32
+                        || matches!(x.kind, ExprKind::StrLen { .. })
                         || int_literal(x, INT_EXACT as f64).is_some()
                         || int_offset(x).is_some_and(|(m, _)| m == *l || ints[m])
                         || matches!(x.kind, ExprKind::Local(m) if ints[m]),
@@ -8065,7 +8084,7 @@ fn i32_locals(f: &ir::Func, ints: &[bool]) -> Vec<bool> {
     ir::visit_stmts(&f.body, &mut |e| match &e.kind {
         ExprKind::SetLocal(l, x) | ExprKind::InitLocal(l, x) => {
             let lit = int_literal(x, INT_EXACT as f64).is_some_and(|c| i32::try_from(c).is_ok());
-            if !(x.ty == Ty::I32 || lit) {
+            if !(x.ty == Ty::I32 || lit || matches!(x.kind, ExprKind::StrLen { .. })) {
                 i32s[*l] = false;
             }
         }
