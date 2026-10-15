@@ -361,7 +361,9 @@ The differential tests run every case with both.
 
 - **Numbers and booleans**, unboxed: all operators, `Math.*`, the
   `Number.is*` predicates and constants, and module-level literal `const`s
-  (folded).
+  (folded, unless code that runs before the declaration can reach one: by
+  naming it, or naming a function, class or value whose code names it). A
+  `switch` on a number whose cases are numeric constants compares numbers.
 - **Integer locals**: a `number` local only ever assigned integer literals
   and stepped by small integers (`i++`, `n += 2`) lives in a machine
   integer, exact past 2^53 (it rounds as doubles do there). Comparisons,

@@ -67,6 +67,11 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
         let Translator { mut b, .. } = t;
         b.seal_all_blocks();
         b.finalize(module.target_config());
+        remove_dead_params(&mut ctx.func);
+        // (For looking at the code made for a function: its Cranelift IR.)
+        if std::env::var("LUMINOUS_DUMP_CLIF").is_ok_and(|n| n == f.name) {
+            eprintln!("{}", ctx.func.display());
+        }
         module.define_function(funcs[i], &mut ctx).map_err(|e| anyhow!("{}: {e:?}", f.name))?;
         module.clear_context(&mut ctx);
     }
@@ -88,6 +93,87 @@ fn linkage(l: mir::Linkage) -> cranelift_module::Linkage {
         mir::Linkage::Import => cranelift_module::Linkage::Import,
         mir::Linkage::Export => cranelift_module::Linkage::Export,
         mir::Linkage::Local => cranelift_module::Linkage::Local,
+    }
+}
+
+/// Removes the block parameters nothing needs: those only passed on to
+/// parameters nothing needs either. Cranelift's SSA builder gives a block a
+/// parameter for each variable defined on more than one path to it that is
+/// read further on; a value redefined in a loop then has parameters at
+/// every merge point and loop header on its way, often all the way around
+/// loops where nothing reads it, and Cranelift keeps them (in a large
+/// function, hundreds of values moved between stack slots per iteration).
+fn remove_dead_params(func: &mut cl::Function) {
+    use cranelift_codegen::ir::{Block, BlockArg, Value};
+    use std::collections::HashSet;
+    let Some(entry) = func.layout.entry_block() else { return };
+    let dfg = &func.dfg;
+    // Needed: the operands of instructions (but arguments to blocks), and
+    // the function's parameters; then what is passed to needed parameters.
+    let mut live: HashSet<Value> = dfg.block_params(entry).iter().copied().collect();
+    let mut work: Vec<Value> = Vec::new();
+    let mut incoming: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut branches = Vec::new();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            for &v in dfg.inst_args(inst) {
+                let v = dfg.resolve_aliases(v);
+                if live.insert(v) {
+                    work.push(v);
+                }
+            }
+            let dests = dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables);
+            if !dests.is_empty() {
+                branches.push(inst);
+            }
+            for call in dests {
+                let params = dfg.block_params(call.block(&dfg.value_lists));
+                for (i, arg) in call.args(&dfg.value_lists).enumerate() {
+                    match arg {
+                        BlockArg::Value(v) => incoming.entry(params[i]).or_default().push(dfg.resolve_aliases(v)),
+                        // (Other kinds of arguments keep their parameter.)
+                        _ => {
+                            live.insert(params[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        for &s in incoming.get(&v).map_or(&[][..], |x| x) {
+            if live.insert(s) {
+                work.push(s);
+            }
+        }
+    }
+    let mut dead: HashMap<Block, Vec<usize>> = HashMap::new();
+    for block in func.layout.blocks() {
+        let idx: Vec<usize> =
+            dfg.block_params(block).iter().enumerate().filter(|(_, p)| !live.contains(p)).map(|(i, _)| i).collect();
+        if !idx.is_empty() {
+            dead.insert(block, idx);
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    let dfg = &mut func.dfg;
+    for inst in branches {
+        let dests = dfg.insts[inst].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables);
+        for call in dests {
+            if let Some(idx) = dead.get(&call.block(&dfg.value_lists)) {
+                for &i in idx.iter().rev() {
+                    call.remove(i, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    for (block, idx) in dead {
+        let params: Vec<Value> = idx.iter().map(|&i| dfg.block_params(block)[i]).collect();
+        for p in params.into_iter().rev() {
+            dfg.remove_block_param(p);
+        }
     }
 }
 
@@ -242,10 +328,34 @@ impl Translator<'_, '_> {
                 }
             }
         }
+        // Each block is sealed as soon as all the branches to it are in:
+        // its variables' values are then looked up once, and a block that
+        // waited until the end would get a parameter for each variable read
+        // below it, and its predecessors too, most of them never used (in a
+        // large function, hundreds moved around every loop).
+        let mut preds = vec![0usize; f.blocks.len()];
+        for &blk in &f.layout {
+            for &inst in &f.blocks[blk.index()].insts {
+                for (dest, _) in f.inst(inst).successors() {
+                    preds[dest.index()] += 1;
+                }
+            }
+        }
+        for (i, &n) in preds.iter().enumerate() {
+            if n == 0 {
+                self.b.seal_block(self.blocks[i]);
+            }
+        }
         for &blk in &f.layout {
             self.b.switch_to_block(self.blocks[blk.index()]);
             for &inst in &f.blocks[blk.index()].insts {
                 self.inst(inst);
+                for (dest, _) in f.inst(inst).successors() {
+                    preds[dest.index()] -= 1;
+                    if preds[dest.index()] == 0 {
+                        self.b.seal_block(self.blocks[dest.index()]);
+                    }
+                }
             }
         }
     }

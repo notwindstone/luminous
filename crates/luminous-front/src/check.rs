@@ -439,6 +439,7 @@ fn collect_toplevel<'a>(
     consts: &mut HashMap<SymbolId, ConstVal>,
     bindings: &mut HashMap<SymbolId, Binding>,
 ) {
+    use oxc::ast_visit::Visit;
     let written = |sym: SymbolId| scoping.get_resolved_references(sym).any(|r| r.is_write());
     // Names exported through `export { a, b as c }`.
     let mut export_names = HashSet::new();
@@ -457,10 +458,20 @@ fn collect_toplevel<'a>(
     };
 
     // Module-level consts can be folded, and const-bound functions called
-    // directly from native code, only while no code has run yet: before the
-    // first statement that is not a pure declaration, nothing can observe
-    // them in their TDZ.
-    let mut pure_prefix = true;
+    // directly from native code, when nothing can observe them in their
+    // TDZ: no code that runs before their declaration can reach them, by
+    // naming them or naming (transitively) functions, classes or values
+    // whose code names them.
+    let deferred = module_deferred_refs(program, scoping);
+    let mut reached: HashSet<SymbolId> = HashSet::new();
+    let run = |reached: &mut HashSet<SymbolId>, refs: Vec<SymbolId>| {
+        let mut work = refs;
+        while let Some(s) = work.pop() {
+            if reached.insert(s) {
+                work.extend(deferred.get(&s).into_iter().flatten().copied());
+            }
+        }
+    };
     let mut methods = Vec::new();
     let mut method_rejects = Vec::new();
     let mut ctor_defs = Vec::new();
@@ -522,7 +533,7 @@ fn collect_toplevel<'a>(
                 Some(d) => (d, None),
                 None => {
                     if !matches!(stmt, Statement::EmptyStatement(_) | Statement::ExportNamedDeclaration(_)) {
-                        pure_prefix = false;
+                        run(&mut reached, module_refs(scoping, |v| v.visit_statement(stmt)));
                     }
                     continue;
                 }
@@ -545,7 +556,7 @@ fn collect_toplevel<'a>(
                     VariableDeclarationKind::Let => BindingKind::Let,
                     VariableDeclarationKind::Var => BindingKind::Var,
                     _ => {
-                        pure_prefix = false;
+                        run(&mut reached, module_refs(scoping, |vis| vis.visit_variable_declaration(v)));
                         continue;
                     }
                 };
@@ -555,7 +566,7 @@ fn collect_toplevel<'a>(
                         for id in d.id.get_binding_identifiers() {
                             bind(id, kind, None, end, exported);
                         }
-                        pure_prefix = false;
+                        run(&mut reached, module_refs(scoping, |vis| vis.visit_variable_declarator(d)));
                         continue;
                     };
                     bind(id, kind, d.init.as_ref().map(|i| i.span()), end, exported);
@@ -563,27 +574,29 @@ fn collect_toplevel<'a>(
                     let Some(init) = &d.init else {
                         continue;
                     };
+                    // (Whether code that ran before can reach this binding.)
+                    let unsafe_tdz = reached.contains(&symbol);
                     if kind != BindingKind::Const {
                         if !pure_init(init) {
-                            pure_prefix = false;
+                            run(&mut reached, module_refs(scoping, |vis| vis.visit_expression(init)));
                         }
                         continue;
                     }
                     let site = Site::ConstInit { init: init.span() };
-                    // Creating a function runs no code, so it keeps the prefix pure.
+                    // Creating a function runs no code.
                     match init.without_parentheses() {
                         Expression::ArrowFunctionExpression(a) => {
-                            add(id.name.to_string(), FnNode::Arrow(a), symbol, site, pure_prefix);
+                            add(id.name.to_string(), FnNode::Arrow(a), symbol, site, !unsafe_tdz);
                         }
                         Expression::FunctionExpression(f) => {
-                            add(id.name.to_string(), FnNode::Function(f), symbol, site, pure_prefix);
+                            add(id.name.to_string(), FnNode::Function(f), symbol, site, !unsafe_tdz);
                         }
                         _ => match literal(init) {
-                            Some(val) if pure_prefix => {
+                            Some(val) if !unsafe_tdz => {
                                 consts.insert(symbol, val);
                             }
                             _ if pure_init(init) => {}
-                            _ => pure_prefix = false,
+                            _ => run(&mut reached, module_refs(scoping, |vis| vis.visit_expression(init))),
                         },
                     }
                 }
@@ -623,7 +636,7 @@ fn collect_toplevel<'a>(
                     id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none())
                 };
                 if !pure_class(c, &earlier_class, &global) {
-                    pure_prefix = false;
+                    run(&mut reached, module_refs(scoping, |vis| vis.visit_class(c)));
                 }
             }
             // Pure type-level declarations; enums and namespaces emit code but
@@ -2623,9 +2636,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     fn switch(&mut self, sw: &'a SwitchStatement<'a>) -> R<Stmt> {
-        let d = any(self.expr(&sw.discriminant)?);
-        let disc = self.temp(Ty::Any);
-        let init = Stmt::Expr(Expr::new(Ty::Any, ExprKind::SetLocal(disc, Box::new(d))));
+        let d = self.expr(&sw.discriminant)?;
         // The case clauses form one block.
         let all: Vec<&Statement> = sw.cases.iter().flat_map(|c| c.consequent.iter()).collect();
         let mut prologue = Vec::new();
@@ -2640,11 +2651,23 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mut awaits = false;
         for c in &sw.cases {
             let m = self.pre.len();
-            let test = c.test.as_ref().map(|t| self.expr(t).map(any)).transpose()?;
+            let test = c.test.as_ref().map(|t| self.expr(t)).transpose()?;
             awaits |= self.pre.len() > m;
             tests.push((self.pre.split_off(m), test));
         }
         debug_assert_eq!(self.pre.len(), mark);
+        // A number against numeric constants (as `case STATE:` with a
+        // module-level const) compares numbers; otherwise, values.
+        let numeric = d.ty.is_number()
+            && !awaits
+            && tests.iter().all(|(_, t)| t.as_ref().is_none_or(|e| matches!(e.kind, ExprKind::Num(_))));
+        let disc = self.temp(if numeric { Ty::F64 } else { Ty::Any });
+        let init = Stmt::Expr(if numeric { set(disc, to_f64(d)) } else { set(disc, any(d)) });
+        if !numeric {
+            for (_, t) in &mut tests {
+                *t = t.take().map(any);
+            }
+        }
         let mut select = Vec::new();
         let disc = if awaits {
             let sel = self.temp(Ty::Any);
@@ -5542,6 +5565,71 @@ fn array_parts(parts: Vec<Option<bool>>, values: Vec<Expr>) -> Expr {
 }
 
 // ---- module code ----
+
+/// The module-level bindings code names (in all of it, nested functions
+/// included), as `visit` walks it.
+fn module_refs<'a>(scoping: &Scoping, visit: impl FnOnce(&mut RefsVisitor<'_>)) -> Vec<SymbolId> {
+    let mut v = RefsVisitor { scoping, out: Vec::new() };
+    visit(&mut v);
+    v.out
+}
+
+struct RefsVisitor<'s> {
+    scoping: &'s Scoping,
+    out: Vec<SymbolId>,
+}
+
+impl<'a> oxc::ast_visit::Visit<'a> for RefsVisitor<'_> {
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if let Some(sym) = it.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id()) {
+            if self.scoping.symbol_scope_id(sym) == self.scoping.root_scope_id() {
+                self.out.push(sym);
+            }
+        }
+    }
+}
+
+/// For each module-level binding, the module-level bindings its value's
+/// code may name when the program uses it: a function's or a class's body,
+/// what a variable's initializer names (functions and objects in it).
+fn module_deferred_refs(program: &Program, scoping: &Scoping) -> HashMap<SymbolId, Vec<SymbolId>> {
+    use oxc::ast_visit::Visit;
+    let mut out: HashMap<SymbolId, Vec<SymbolId>> = HashMap::new();
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::ExportDeclaration(e) => &e.declaration,
+            _ => match stmt.as_declaration() {
+                Some(d) => d,
+                None => continue,
+            },
+        };
+        match decl {
+            Declaration::FunctionDeclaration(f) => {
+                if let Some(sym) = f.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                    out.insert(sym, module_refs(scoping, |v| v.visit_function(f, oxc::syntax::scope::ScopeFlags::empty())));
+                }
+            }
+            Declaration::ClassDeclaration(c) => {
+                if let Some(sym) = c.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                    out.insert(sym, module_refs(scoping, |v| v.visit_class(c)));
+                }
+            }
+            Declaration::VariableDeclaration(v) => {
+                for d in &v.declarations {
+                    let Some(init) = &d.init else { continue };
+                    let refs = module_refs(scoping, |vis| vis.visit_expression(init));
+                    for id in d.id.get_binding_identifiers() {
+                        if let Some(sym) = id.symbol_id.get() {
+                            out.insert(sym, refs.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Positions of every declaration of and reference to each module-level
 /// binding.

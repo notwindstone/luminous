@@ -69,6 +69,7 @@ pub fn speculate_numbers(m: &mut Module) {
         let mut body = std::mem::take(&mut f.body);
         let ret = f.ret;
         let this = f.has_this;
+        let exits = !has_try(&body);
         let mut cx = Cx {
             f,
             nums: &nums,
@@ -81,9 +82,11 @@ pub fn speculate_numbers(m: &mut Module) {
             next_loop: FIRST_COPY_LOOP,
             allocs: true,
             texts,
+            exits,
         };
         cx.list(&mut body, Some(ret));
         cx.allocs = false;
+        cx.exits = false;
         // The statement lists inside expressions (inlined bodies, whose
         // `return`s give the expression's value; a predicted call's `this`
         // is its receiver).
@@ -215,6 +218,21 @@ struct Cx<'a> {
     /// region is made), by `mentions` and by `local_uses`.
     refs: Vec<usize>,
     uses: Vec<usize>,
+    /// Whether a `return` in the statements being made into regions leaves
+    /// the function with nothing reading its locals after it (no `finally`;
+    /// not an inlined body, whose caller goes on).
+    exits: bool,
+}
+
+/// Whether `stmts` have a `try` statement.
+fn has_try(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Try { .. } => true,
+        Stmt::If(_, a, b) => has_try(a) || has_try(b),
+        Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => has_try(body),
+        Stmt::Switch { cases, .. } => cases.iter().any(|(_, b)| has_try(b)),
+        _ => false,
+    })
 }
 
 /// What a run of statements needs and changes.
@@ -644,9 +662,13 @@ impl Region {
     fn leave(&mut self, cx: &Cx, run: &[Stmt]) -> Vec<Stmt> {
         let mut out = Vec::new();
         let inside = mentions(run, cx.f.locals.len());
+        // (After a `return` that leaves the function, only its value reads
+        // them.)
+        let returning = cx.exits && matches!(run.first(), Some(Stmt::Return(_)));
         for l in self.assigned.clone() {
             let loaded = self.nums.iter().any(|&(m, _)| m == l);
-            if loaded || cx.refs[l] > inside[l] {
+            let needed = if returning { inside[l] > 0 } else { loaded || cx.refs[l] > inside[l] };
+            if needed {
                 // (No copy: a local an iteration declared, set to
                 // `undefined`, and the loop is done.)
                 let v = if self.undef.contains(&l) || !self.copies.contains_key(&l) {
@@ -694,9 +716,11 @@ impl Region {
         let j = self.jumps[k].clone();
         let mut out = Vec::new();
         let inside = mentions(std::slice::from_ref(&j.jump), cx.f.locals.len());
+        let returning = cx.exits && matches!(j.jump, Stmt::Return(_));
         for l in self.assigned.clone() {
             let loaded = self.nums.iter().any(|&(m, _)| m == l);
-            if !(loaded || cx.refs[l] > inside[l]) {
+            let needed = if returning { inside[l] > 0 } else { loaded || cx.refs[l] > inside[l] };
+            if !needed {
                 continue;
             }
             let sure = j.defined.contains(&l);
@@ -904,6 +928,21 @@ impl Region {
         let c = cx.new_local();
         self.elem_nums.push((c, a, i));
         Some(c)
+    }
+
+    /// Whether `e` can run after the region is left here, reading locals:
+    /// those it reads are as the region found them, or have copies that
+    /// leaving writes back (no objects, arrays or strings the region keeps
+    /// to itself).
+    fn readable_after(&self, e: &Expr, cx: &Cx) -> bool {
+        let named = mentions(&[Stmt::Expr(e.clone())], cx.f.locals.len());
+        (0..named.len()).filter(|&l| named[l] > 0).all(|l| {
+            !self.is_obj(l)
+                && !self.arrays.contains(&l)
+                && !self.appends.contains(&l)
+                && !self.undef.contains(&l)
+                && (!self.assigned.contains(&l) || self.copies.contains_key(&l))
+        })
     }
 
     /// The copy of JS-valued local `l`, holding its value here: if it may
@@ -1157,8 +1196,18 @@ impl Region {
                     (None, _) => None,
                     (Some(e), Ty::F64) => Some(self.num(e, cx)?),
                     (Some(e), Ty::Any) => {
-                        let v = self.num(e, cx)?;
-                        Some(Expr::new(Ty::Any, ExprKind::Box(bx(v))))
+                        let mut probe = self.clone();
+                        match probe.num(e, cx) {
+                            Some(v) => {
+                                *self = probe;
+                                Some(Expr::new(Ty::Any, ExprKind::Box(bx(v))))
+                            }
+                            // Any other value: computed once the region is
+                            // left (what it reads written back, or as it
+                            // was), when it leaves the function.
+                            None if cx.exits && self.readable_after(e, cx) => Some(e.clone()),
+                            None => return None,
+                        }
                     }
                     _ => return None,
                 };

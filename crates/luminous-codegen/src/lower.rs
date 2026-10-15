@@ -770,25 +770,12 @@ impl Lower {
         }
     }
 
-    fn free_all_locals(&mut self) {
-        for l in 0..self.locals.len() {
-            if self.borrowed.contains(&l) {
-                continue;
-            }
-            match self.vars[l] {
-                LVar::Boxed { obj: (op, ot), owned: true, .. } => {
-                    let obj = (self.b.use_var(op), self.b.use_var(ot));
-                    self.free(obj);
-                }
-                LVar::Boxed { .. } => {}
-                _ if is_js(self.locals[l]) => {
-                    let (p, t) = self.use_local(l).any();
-                    self.free((p, t));
-                }
-                _ => {}
-            }
-        }
-    }
+    /// What the function's locals hold, on leaving it. Nothing to do: the
+    /// collector traces what is live (`free` is a no-op), and reading every
+    /// local here would keep each one live up to the function's exits,
+    /// carried around every loop (in a large function, hundreds of values
+    /// moved between registers and stack slots per iteration).
+    fn free_all_locals(&mut self) {}
     // ---- references ----
     // The engine traces what is reachable (from the native stack too, so
     // values in registers and stack slots are found): taking or dropping
@@ -1135,10 +1122,10 @@ impl Lower {
                         && matches!(self.vars[l], LVar::Two(..))
                 });
                 for l in fresh {
-                    let old = self.use_local(l).any();
+                    // (Not read: freeing is a no-op; undefined lets the old
+                    // value go, also from the native stack.)
                     let undef = self.konst(0, TAG_UNDEFINED);
                     self.def_local(l, undef);
-                    self.free(old);
                 }
                 let counter = self.bounded_counter(test.as_ref().filter(|_| !post_test), body, update.as_ref());
                 self.bounded.extend(counter);
@@ -1423,6 +1410,10 @@ impl Lower {
             let eq = if let ExprKind::Str(id) = test.kind {
                 let d = self.use_local(disc);
                 self.eq_string_const(d.any(), id)
+            } else if let (V::Num(d), ExprKind::Num(_)) = (self.use_local(disc), &test.kind) {
+                // A numeric switch (see `check`): numbers compared.
+                let k = self.expr(test).num();
+                self.b.ins().fcmp(FloatCC::Equal, d, k)
             } else {
                 let v = self.expr(test);
                 self.hold(v);
