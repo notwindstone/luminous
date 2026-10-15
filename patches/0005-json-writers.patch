@@ -1,0 +1,143 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1326,6 +1326,21 @@
+                                const char *filename);
+ JS_EXTERN JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+                                    JSValueConst replacer, JSValueConst space0);
++/* luminous: JSON.stringify without a replacer or indentation writes the
++   objects of class `class_id` (whose exotic methods present them) with
++   `fn`, when their prototype is Object.prototype, null or Array.prototype
++   without toJSON. `fn` writes with the JS_JSONWrite functions (values
++   within it at `depth` + 1) and returns 1 when done, 0 when it cannot (the
++   general algorithm then runs from the start) or -1 on an exception.
++   JS_JSONWriteValue writes a value as data (1), or not (0: unsupported,
++   undefined among them), or -1. At most 4 classes; -1 when full. */
++typedef struct JSJSONWriter JSJSONWriter;
++typedef int JSJSONWriteFunc(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, int depth);
++JS_EXTERN int JS_SetJSONWriter(JSClassID class_id, JSJSONWriteFunc *fn);
++JS_EXTERN int JS_JSONWrite8(JSJSONWriter *w, const char *s, size_t len);
++JS_EXTERN int JS_JSONWriteInt(JSJSONWriter *w, int32_t v);
++JS_EXTERN int JS_JSONWriteNumber(JSContext *ctx, JSJSONWriter *w, double d);
++JS_EXTERN int JS_JSONWriteValue(JSContext *ctx, JSJSONWriter *w, JSValueConst v, int depth);
+ 
+ /* Manages the backing memory of an externally created ArrayBuffer.
+    When 'size' is zero, 'ptr' must be freed and NULL returned. Otherwise the
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -55402,18 +55402,31 @@
+     }
+ }
+ 
++/* luminous: the classes whose objects JSON writes with a function of
++   their own (JS_SetJSONWriter). */
++#define JS_JSON_WRITERS 4
++static JSClassID js_json_writer_class[JS_JSON_WRITERS];
++static JSJSONWriteFunc *js_json_writer_fn[JS_JSON_WRITERS];
++static int js_json_writer_count;
++
++static int js_json_fast_number(JSContext *ctx, StringBuffer *b, double d)
++{
++    char buf[32];
++    if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d) /* (-0 too: "0") */
++        return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, (int32_t)d));
++    if (!isfinite(d))
++        return string_buffer_write8(b, (const uint8_t *)"null", 4);
++    return string_buffer_concat_value_free(b, js_dtoa2(ctx, d, 10, 0, JS_DTOA_FORMAT_FREE));
++}
++
+ static int js_json_fast(JSContext *ctx, StringBuffer *b, JSValueConst val, int depth)
+ {
+     char buf[32];
+     switch (JS_VALUE_GET_NORM_TAG(val)) {
+     case JS_TAG_INT:
+         return string_buffer_write8(b, (uint8_t *)buf, i32toa(buf, JS_VALUE_GET_INT(val))) < 0 ? -1 : 1;
+-    case JS_TAG_FLOAT64: {
+-        double d = JS_VALUE_GET_FLOAT64(val);
+-        if (!isfinite(d))
+-            return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
+-        return string_buffer_concat_value_free(b, js_dtoa2(ctx, d, 10, 0, JS_DTOA_FORMAT_FREE)) < 0 ? -1 : 1;
+-    }
++    case JS_TAG_FLOAT64:
++        return js_json_fast_number(ctx, b, JS_VALUE_GET_FLOAT64(val)) < 0 ? -1 : 1;
+     case JS_TAG_BOOL:
+         return (JS_VALUE_GET_BOOL(val) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
+                                       : string_buffer_write8(b, (const uint8_t *)"false", 5)) < 0 ? -1 : 1;
+@@ -55421,6 +55434,8 @@
+         return string_buffer_write8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
+     case JS_TAG_STRING:
+         return js_json_fast_string(b, JS_VALUE_GET_STRING(val)) < 0 ? -1 : 1;
++    case JS_TAG_STRING_ROPE:
++        return string_buffer_concat_value_free(b, JS_ToQuotedString(ctx, val)) < 0 ? -1 : 1;
+     case JS_TAG_OBJECT:
+         break;
+     default:
+@@ -55432,6 +55447,25 @@
+     JSObject *object_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
+     if (find_own_property1(object_proto, JS_ATOM_toJSON))
+         return 0;
++    if (unlikely(p->class_id >= JS_CLASS_INIT_COUNT)) {
++        /* An object its class writes: only what the class's exotic methods
++           present (no shape properties), and with Object.prototype, null or
++           Array.prototype (no toJSON) as its prototype. */
++        for (int k = 0; k < js_json_writer_count; k++) {
++            if (p->class_id != js_json_writer_class[k])
++                continue;
++            JSObject *proto = p->shape->proto;
++            if (p->shape->prop_count != 0)
++                return 0;
++            if (proto != object_proto && proto != NULL) {
++                JSObject *array_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
++                if (proto != array_proto || find_own_property1(array_proto, JS_ATOM_toJSON))
++                    return 0;
++            }
++            return js_json_writer_fn[k](ctx, (JSJSONWriter *)b, val, depth);
++        }
++        return 0;
++    }
+     if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
+         JSObject *array_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
+         if (p->shape->proto != array_proto || find_own_property1(array_proto, JS_ATOM_toJSON) ||
+@@ -55505,6 +55539,43 @@
+     return string_buffer_putc8(b, '}') < 0 ? -1 : 1;
+ }
+ 
++int JS_SetJSONWriter(JSClassID class_id, JSJSONWriteFunc *fn)
++{
++    for (int k = 0; k < js_json_writer_count; k++) {
++        if (js_json_writer_class[k] == class_id) {
++            js_json_writer_fn[k] = fn;
++            return 0;
++        }
++    }
++    if (js_json_writer_count == JS_JSON_WRITERS)
++        return -1;
++    js_json_writer_class[js_json_writer_count] = class_id;
++    js_json_writer_fn[js_json_writer_count] = fn;
++    js_json_writer_count++;
++    return 0;
++}
++
++int JS_JSONWrite8(JSJSONWriter *w, const char *s, size_t len)
++{
++    return string_buffer_write8((StringBuffer *)w, (const uint8_t *)s, len);
++}
++
++int JS_JSONWriteInt(JSJSONWriter *w, int32_t v)
++{
++    char buf[16];
++    return string_buffer_write8((StringBuffer *)w, (uint8_t *)buf, i32toa(buf, v));
++}
++
++int JS_JSONWriteNumber(JSContext *ctx, JSJSONWriter *w, double d)
++{
++    return js_json_fast_number(ctx, (StringBuffer *)w, d);
++}
++
++int JS_JSONWriteValue(JSContext *ctx, JSJSONWriter *w, JSValueConst v, int depth)
++{
++    return js_json_fast(ctx, (StringBuffer *)w, v, depth);
++}
++
+ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+                          JSValueConst replacer, JSValueConst space0)
+ {

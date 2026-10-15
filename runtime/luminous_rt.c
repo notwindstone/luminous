@@ -2058,6 +2058,13 @@ uint32_t lum_struct_class;
 /* Per layout field (flat, layout by layout): its name as an atom. */
 static JSAtom *lum_struct_atoms;
 static uint32_t *lum_struct_atom_base;
+/* Per layout field (as lum_struct_atoms): its JSON key, `,"name":`, or NULL
+   when the name needs escapes or is not ASCII (written from its atom). */
+typedef struct LumJSONKey {
+    char *text;
+    uint32_t len;
+} LumJSONKey;
+static LumJSONKey *lum_struct_json_keys;
 /* lum_struct_lits as JS strings. */
 static JSValue *lum_struct_lit_values;
 
@@ -2414,6 +2421,107 @@ static const JSClassExoticMethods lum_struct_exotic = {
     .define_own_property = lum_struct_define,
 };
 
+/* JSON.stringify of an object of an `aot type` (see JS_SetJSONWriter):
+ * its fields as the general algorithm would write them (in layout order,
+ * as Object.keys gives them), read from the struct. */
+static int lum_json_key(JSContext *ctx, JSJSONWriter *w, uint32_t k, bool first)
+{
+    const LumJSONKey *key = &lum_struct_json_keys[k];
+    JSValue name;
+    int r;
+    if (key->text)
+        return JS_JSONWrite8(w, key->text + first, key->len - first);
+    if (!first && JS_JSONWrite8(w, ",", 1) < 0)
+        return -1;
+    name = JS_AtomToString(ctx, lum_struct_atoms[k]);
+    if (JS_IsException(name))
+        return -1;
+    r = JS_JSONWriteValue(ctx, w, name, 0);
+    JS_FreeValue(ctx, name);
+    if (r <= 0)
+        return -1;
+    return JS_JSONWrite8(w, ":", 1);
+}
+
+static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, int depth)
+{
+    LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
+    const LumLayoutDesc *l = &lum_layouts[s->layout];
+    uint32_t base = lum_struct_atom_base[s->layout], i;
+    bool first = true;
+    int r;
+    if (JS_JSONWrite8(w, "{", 1) < 0)
+        return -1;
+    for (i = 0; i < l->nfields; i++) {
+        const LumFieldDesc *f = &l->fields[i];
+        void *at = lum_field_at(s, f);
+        if (!(s->mask & (1u << i)))
+            continue;
+        if (f->storage == LUM_ST_VALUE) {
+            JSValueConst v = *(JSValue *)at;
+            int tag = JS_VALUE_GET_TAG(v);
+            if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL || JS_IsFunction(ctx, v))
+                continue;
+        }
+        if (lum_json_key(ctx, w, base + i, first) < 0)
+            return -1;
+        first = false;
+        switch (f->storage) {
+        case LUM_ST_INT32:
+            r = JS_JSONWriteInt(w, *(int32_t *)at);
+            break;
+        case LUM_ST_F64:
+            r = JS_JSONWriteNumber(ctx, w, *(double *)at);
+            break;
+        case LUM_ST_BOOL:
+            r = *(uint8_t *)at ? JS_JSONWrite8(w, "true", 4) : JS_JSONWrite8(w, "false", 5);
+            break;
+        default:
+            r = JS_JSONWriteValue(ctx, w, *(JSValue *)at, depth + 1);
+            if (r <= 0)
+                return r;
+            continue;
+        }
+        if (r < 0)
+            return -1;
+    }
+    return JS_JSONWrite8(w, "}", 1) < 0 ? -1 : 1;
+}
+
+/* The JSON keys of the layouts' fields. */
+static int lum_struct_json_init(JSContext *ctx, int total)
+{
+    int n = lum_layout_count(), i;
+    uint32_t f;
+    lum_struct_json_keys = js_mallocz(ctx, sizeof(LumJSONKey) * (total ? total : 1));
+    if (!lum_struct_json_keys)
+        return -1;
+    for (i = 0; i < n; i++) {
+        for (f = 0; f < lum_layouts[i].nfields; f++) {
+            const char *name = lum_layouts[i].fields[f].name;
+            size_t len = strlen(name), j;
+            LumJSONKey *key = &lum_struct_json_keys[lum_struct_atom_base[i] + f];
+            for (j = 0; j < len; j++) {
+                unsigned char c = name[j];
+                if (c < 0x20 || c >= 0x7f || c == '"' || c == '\\')
+                    break;
+            }
+            if (j < len)
+                continue;
+            key->text = js_malloc(ctx, len + 4);
+            if (!key->text)
+                return -1;
+            key->text[0] = ',';
+            key->text[1] = '"';
+            memcpy(key->text + 2, name, len);
+            key->text[len + 2] = '"';
+            key->text[len + 3] = ':';
+            key->len = len + 4;
+        }
+    }
+    return JS_SetJSONWriter(lum_struct_class, lum_struct_json);
+}
+
 /* __lum_struct(k, obj): an object of layout k with the own enumerable
  * properties of obj (a fresh object literal), checked. */
 JSValue lum_struct_from(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -2480,7 +2588,7 @@ static int lum_structs_init(JSContext *ctx)
         for (f = 0; f < lum_layouts[i].nfields; f++)
             lum_struct_atoms[lum_struct_atom_base[i] + f] = JS_NewAtom(ctx, lum_layouts[i].fields[f].name);
     }
-    if (lum_sarr_init(ctx) < 0)
+    if (lum_struct_json_init(ctx, total) < 0 || lum_sarr_init(ctx) < 0)
         return -1;
     lum_struct_lit_values = js_mallocz(ctx, sizeof(JSValue) * (lum_nstruct_lits ? lum_nstruct_lits : 1));
     for (i = 0; i < lum_nstruct_lits; i++)
@@ -2497,6 +2605,10 @@ static void lum_structs_free(JSRuntime *rt)
         total += lum_layouts[i].nfields;
     for (i = 0; i < total; i++)
         JS_FreeAtomRT(rt, lum_struct_atoms[i]);
+    for (i = 0; lum_struct_json_keys && i < total; i++)
+        js_free_rt(rt, lum_struct_json_keys[i].text);
+    js_free_rt(rt, lum_struct_json_keys);
+    lum_struct_json_keys = NULL;
     for (i = 0; i < lum_nstruct_lits; i++)
         JS_FreeValueRT(rt, lum_struct_lit_values[i]);
     js_free_rt(rt, lum_struct_atoms);
@@ -2806,6 +2918,30 @@ static void lum_sarr_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fun
         JS_MarkValue(rt, a->items[i], mark_func);
 }
 
+/* JSON.stringify of an array of an `aot type`: its elements (objects of
+ * the layout, written as such) and holes as null. */
+static int lum_sarr_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, int depth)
+{
+    LumStructArray *a = lum_sarr_of(obj);
+    uint32_t i;
+    int r;
+    if (JS_JSONWrite8(w, "[", 1) < 0)
+        return -1;
+    for (i = 0; i < a->len; i++) {
+        if (i > 0 && JS_JSONWrite8(w, ",", 1) < 0)
+            return -1;
+        if (JS_IsUndefined(a->items[i])) {
+            if (JS_JSONWrite8(w, "null", 4) < 0)
+                return -1;
+            continue;
+        }
+        r = JS_JSONWriteValue(ctx, w, a->items[i], depth + 1);
+        if (r <= 0)
+            return r;
+    }
+    return JS_JSONWrite8(w, "]", 1) < 0 ? -1 : 1;
+}
+
 static const JSClassExoticMethods lum_sarr_exotic = {
     .get_own_property = lum_sarr_get_own,
     .get_own_property_names = lum_sarr_own_names,
@@ -2829,6 +2965,8 @@ static int lum_sarr_init(JSContext *ctx)
     JS_FreeValue(ctx, arr);
     JS_SetClassProto(ctx, lum_sarr_class, proto);
     JS_SetArrayClass(lum_sarr_class);
+    if (JS_SetJSONWriter(lum_sarr_class, lum_sarr_json) < 0)
+        return -1;
     lum_atom_length = JS_NewAtom(ctx, "length");
     return 0;
 }
