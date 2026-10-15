@@ -148,6 +148,10 @@ pub struct Analysis {
     pub natives: Vec<NativeDecl>,
     pub cells: Vec<CellDecl>,
     pub cell_refs: Vec<CellRef>,
+    /// Anonymous functions and classes that interpreted code stores into a
+    /// cell (`x = __lum_init(k, class {})`, `__lum_m.x = () => 1`): their
+    /// spans and the binding's name, which is their `name` in JavaScript.
+    pub name_sites: Vec<((u32, u32), String)>,
     pub rejected: Vec<Rejected>,
     pub classes: Vec<ClassDecl>,
     pub int_wraps: Vec<IntWrap>,
@@ -325,6 +329,13 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
         refs.visit_program(program);
     }
     let cell_refs = refs.out;
+    let wrapped: std::collections::HashSet<oxc::semantic::SymbolId> =
+        out.cells.iter().filter(|c| matches!(c.init, check::CellInit::Wrap(_))).map(|c| c.symbol).collect();
+    let mut names = NameSites { scoping: &scoping, wrapped: &wrapped, mutable: &mutable, out: Vec::new() };
+    if !wrapped.is_empty() || !mutable.is_empty() {
+        names.visit_program(program);
+    }
+    let name_sites = names.out;
     let classes = out
         .class_uses
         .iter()
@@ -341,6 +352,7 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
         natives,
         cells,
         cell_refs,
+        name_sites,
         rejected,
         classes,
         int_wraps,
@@ -350,6 +362,57 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
 }
 
 /// Collects interpreted references to bindings that live in mutable cells.
+/// Whether `e` is an anonymous function or class definition: one that
+/// takes its `name` from the binding it is stored in.
+fn anonymous_definition(e: &oxc::ast::ast::Expression) -> bool {
+    use oxc::ast::ast::Expression as E;
+    match e.without_parentheses() {
+        E::ArrowFunctionExpression(_) => true,
+        E::FunctionExpression(f) => f.id.is_none(),
+        E::ClassExpression(c) => c.id.is_none(),
+        _ => false,
+    }
+}
+
+/// The anonymous definitions interpreted code stores into cells (see
+/// `Analysis::name_sites`).
+struct NameSites<'s> {
+    scoping: &'s oxc::semantic::Scoping,
+    wrapped: &'s std::collections::HashSet<oxc::semantic::SymbolId>,
+    mutable: &'s std::collections::HashMap<oxc::semantic::SymbolId, ir::CellId>,
+    out: Vec<((u32, u32), String)>,
+}
+
+impl<'a> Visit<'a> for NameSites<'_> {
+    fn visit_variable_declarator(&mut self, it: &oxc::ast::ast::VariableDeclarator<'a>) {
+        if let oxc::ast::ast::BindingPattern::BindingIdentifier(id) = &it.id
+            && let Some(sym) = id.symbol_id.get()
+            && self.wrapped.contains(&sym)
+            && let Some(init) = &it.init
+            && anonymous_definition(init)
+        {
+            let s = oxc::span::GetSpan::span(init);
+            self.out.push(((s.start, s.end), id.name.to_string()));
+        }
+        walk::walk_variable_declarator(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &oxc::ast::ast::AssignmentExpression<'a>) {
+        use oxc::ast::ast::{AssignmentOperator as Op, AssignmentTarget};
+        if matches!(it.operator, Op::Assign | Op::LogicalAnd | Op::LogicalOr | Op::LogicalNullish)
+            && let AssignmentTarget::AssignmentTargetIdentifier(id) = &it.left
+            && let Some(r) = id.reference_id.get()
+            && let Some(sym) = self.scoping.get_reference(r).symbol_id()
+            && self.mutable.contains_key(&sym)
+            && anonymous_definition(&it.right)
+        {
+            let s = oxc::span::GetSpan::span(&it.right);
+            self.out.push(((s.start, s.end), id.name.to_string()));
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+}
+
 struct CellRefs<'s> {
     scoping: &'s oxc::semantic::Scoping,
     mutable: &'s std::collections::HashMap<oxc::semantic::SymbolId, ir::CellId>,

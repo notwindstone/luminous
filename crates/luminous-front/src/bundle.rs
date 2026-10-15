@@ -2197,11 +2197,48 @@ fn edits(
             let node = r.node_id();
             rename_at(&mut out, nodes.get_node(node).kind().span(), old, new, shorthand_ref(node));
         }
+        // A class's or function's `name` comes from its binding: kept as
+        // written (`class Event$1` is still named "Event").
+        if plan.is_none()
+            && let Some(end) = named_by_binding(nodes, scoping.symbol_declaration(sym))
+        {
+            out.push((
+                Span::new(end, end),
+                format!(";Object.defineProperty({new}, \"name\", {{ value: {old:?}, configurable: true }});"),
+            ));
+        }
     }
     if let Some(plan) = plan {
         lazy_edits(u, m, names, plan, &mut hoists, &mut out)?;
     }
     Ok(out)
+}
+
+/// If the declaration `decl` gives a function or class its `name` (a class
+/// or function declaration, or a variable initialized with an anonymous
+/// function, arrow function or class), where the statement declaring it
+/// ends.
+fn named_by_binding(nodes: &oxc::semantic::AstNodes, decl: NodeId) -> Option<u32> {
+    match nodes.get_node(decl).kind() {
+        AstKind::Class(c) if c.is_declaration() => Some(c.span.end),
+        AstKind::Function(f) if f.is_declaration() => Some(f.span.end),
+        AstKind::VariableDeclarator(d) => {
+            let named = match d.init.as_ref().map(|e| e.without_parentheses()) {
+                Some(Expression::ArrowFunctionExpression(_)) => true,
+                Some(Expression::FunctionExpression(f)) => f.id.is_none(),
+                Some(Expression::ClassExpression(c)) => c.id.is_none(),
+                _ => false,
+            };
+            if !named {
+                return None;
+            }
+            match nodes.parent_kind(decl) {
+                AstKind::VariableDeclaration(v) => Some(v.span.end),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The edits that lay lazily evaluated module `m` out as `plan` says: the

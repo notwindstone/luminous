@@ -93,6 +93,13 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // `x = (x + 1) | 0`, the old value of `x++` being `(x - 1) | 0` after
     // it; `(value) | 0` for other stores.
     let mut rewritten_targets = Vec::new();
+    // Anonymous definitions stored into cells keep their binding's name
+    // (an object literal names them as a declaration would): innermost.
+    for ((s, e), name) in &a.name_sites {
+        let key = js_string(name);
+        prefixes.entry(*s as usize).or_default().push(format!("({{ [{key}]: "));
+        suffixes.entry(*e as usize).or_default().push(format!(" }})[{key}]"));
+    }
     for w in &a.int_wraps {
         let (s, e) = (w.span.0 as usize, w.span.1 as usize);
         if let IntWrapKind::Value = w.kind {
