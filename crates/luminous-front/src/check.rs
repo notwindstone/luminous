@@ -1615,6 +1615,9 @@ struct FnCx<'x, 'm, 'a> {
     /// it (`this`).
     ctor: Option<CtorInfo<'a>>,
     this_local: Option<ir::LocalId>,
+    /// The box holding `this` for the arrow functions inside that use it
+    /// (in those arrows: the captured box).
+    this_box: Option<ir::LocalId>,
     /// A derived class's constructor, until its `super(...)` call.
     derived: Option<CtorInfo<'a>>,
     /// What the type annotations of parameters and variables say they hold.
@@ -1667,6 +1670,11 @@ struct CaptureInfo {
     /// Per function (span start): captured variables of enclosing functions
     /// it uses, directly or through its own nested functions, in order.
     free: HashMap<u32, Vec<SymbolId>>,
+    /// Functions whose `this` arrow functions inside them use.
+    this_owners: HashSet<u32>,
+    /// Arrow functions that use the `this` of an enclosing function
+    /// (directly or through nested arrows).
+    this_free: HashSet<u32>,
 }
 
 /// `cells`: module bindings a segment declares that live in cells (not
@@ -1678,26 +1686,47 @@ fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> C
         scoping: &'s Scoping,
         cells: &'s HashSet<SymbolId>,
         collect_refs: bool,
+        /// The enclosing functions, and whether each is an arrow (or the
+        /// module code: neither has a `this` of its own).
         stack: Vec<u32>,
+        arrows: Vec<bool>,
         owner: HashMap<SymbolId, u32>,
         info: CaptureInfo,
     }
+    // (The owner of a top-level function's own name: none of the functions.)
+    const OUTSIDE: u32 = u32::MAX;
     impl<'a> Visit<'a> for V<'_> {
         fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
             // A declaration's name belongs to the enclosing function.
             if it.is_declaration()
-                && let (Some(id), Some(&cur)) = (&it.id, self.stack.last())
+                && let Some(id) = &it.id
             {
+                let cur = self.stack.last().copied().unwrap_or(OUTSIDE);
                 self.owner.entry(id.symbol_id.get().unwrap()).or_insert(cur);
             }
             self.stack.push(it.span.start);
+            self.arrows.push(false);
             walk::walk_function(self, it, flags);
             self.stack.pop();
+            self.arrows.pop();
         }
         fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
             self.stack.push(it.span.start);
+            self.arrows.push(true);
             walk::walk_arrow_function_expression(self, it);
             self.stack.pop();
+            self.arrows.pop();
+        }
+        fn visit_this_expression(&mut self, _: &ThisExpression) {
+            if !self.collect_refs {
+                return;
+            }
+            // The arrows between `this` and the function it belongs to.
+            let Some(k) = self.arrows.iter().rposition(|&a| !a) else { return };
+            if k + 1 < self.stack.len() {
+                self.info.this_owners.insert(self.stack[k]);
+                self.info.this_free.extend(&self.stack[k + 1..]);
+            }
         }
         fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
             if !self.collect_refs
@@ -1711,11 +1740,19 @@ fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> C
             if !self.collect_refs {
                 return;
             }
-            let Some(sym) = it.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id()) else {
+            // (Types are erased: a type parameter in an annotation is not
+            // captured.)
+            let Some(sym) = it
+                .reference_id
+                .get()
+                .map(|r| self.scoping.get_reference(r))
+                .filter(|r| r.is_value())
+                .and_then(|r| r.symbol_id())
+            else {
                 return;
             };
             let Some(&owner) = self.owner.get(&sym) else { return };
-            if self.stack.last() == Some(&owner) {
+            if owner == OUTSIDE || self.stack.last() == Some(&owner) {
                 return;
             }
             self.info.captured.insert(sym);
@@ -1730,8 +1767,15 @@ fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> C
             }
         }
     }
-    let mut v =
-        V { scoping, cells, collect_refs: false, stack: Vec::new(), owner: HashMap::new(), info: Default::default() };
+    let mut v = V {
+        scoping,
+        cells,
+        collect_refs: false,
+        stack: Vec::new(),
+        arrows: Vec::new(),
+        owner: HashMap::new(),
+        info: Default::default(),
+    };
     for pass in [false, true] {
         v.collect_refs = pass;
         match node {
@@ -1739,8 +1783,10 @@ fn capture_info(node: FnNode, scoping: &Scoping, cells: &HashSet<SymbolId>) -> C
             FnNode::Arrow(a) => v.visit_arrow_function_expression(a),
             FnNode::Segment(span, stmts) => {
                 v.stack.push(span.start);
+                v.arrows.push(true);
                 stmts.iter().for_each(|s| v.visit_statement(s));
                 v.stack.pop();
+                v.arrows.pop();
             }
         }
     }
@@ -1830,6 +1876,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             has_this: false,
             ctor: None,
             this_local: None,
+            this_box: None,
             derived: None,
             sym_hints: HashMap::new(),
             is_async: false,
@@ -1919,10 +1966,31 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let l = self.declare_boxed(sym);
                 self.captures.push(l);
             }
+            // (An arrow's `this`, last.)
+            if self.caps.this_free.contains(&self.key) {
+                let l = self.this_box_local();
+                self.captures.push(l);
+                self.this_box = Some(l);
+            }
         }
         // Captured parameters move into boxes.
         let mut new_boxes = Vec::new();
         let mut inits = Vec::new();
+        // `this`, when arrows inside use it (a derived class's: once
+        // `super(...)` has made it).
+        if self.caps.this_owners.contains(&self.key) && self.derived.is_none() {
+            let this = if self.has_this {
+                Some(Expr::new(Ty::Any, ExprKind::This))
+            } else {
+                self.this_local.map(|l| self.local(l))
+            };
+            if let Some(this) = this {
+                let b = self.this_box_local();
+                new_boxes.push(b);
+                inits.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, Box::new(this)))));
+                self.this_box = Some(b);
+            }
+        }
         for (sym, p) in boxed_params {
             let b = self.declare_boxed(sym);
             new_boxes.push(b);
@@ -2113,6 +2181,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.local_names[l] = Some(self.m.atom(&name));
         self.mutable[l] = !self.m.scoping.symbol_flags(sym).is_const_variable();
         self.sym_local.insert(sym, l);
+        l
+    }
+
+    /// A box for `this` (arrows' lexical `this`).
+    fn this_box_local(&mut self) -> ir::LocalId {
+        let l = self.temp(Ty::Any);
+        self.boxed[l] = true;
+        self.mutable[l] = false;
+        self.local_names[l] = Some(self.m.atom("this"));
         l
     }
 
@@ -3021,6 +3098,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let ctor = self.derived.take().unwrap();
         let this = self.this_local.unwrap();
         self.pre.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(this, Box::new(call)))));
+        // The box of `this` for arrows, now that there is an instance.
+        if self.caps.this_owners.contains(&self.key) {
+            let b = self.this_box_local();
+            self.pre.push(Stmt::NewBoxes(vec![b]));
+            let v = Box::new(self.local(this));
+            self.pre.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, v))));
+            self.this_box = Some(b);
+        }
         for (name, init) in &ctor.fields {
             let atom = self.m.atom(name);
             let v = match init {
@@ -3083,6 +3168,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             match self.sym_local.get(&sym) {
                 Some(&l) if self.boxed[l] => boxes.push(l),
                 _ => return reject(node.span(), "closure captures a variable that is not in scope here"),
+            }
+        }
+        if self.caps.this_free.contains(&key) {
+            match self.this_box {
+                Some(b) => boxes.push(b),
+                None => return reject(node.span(), "arrow function uses a `this` not available here"),
             }
         }
         self.m.closures.push(f);
@@ -3719,6 +3810,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::NumericLiteral(n) => Expr::num(n.value),
             Expression::ThisExpression(_) if self.has_this => Expr::new(Ty::Any, ExprKind::This),
             Expression::ThisExpression(_) if let Some(l) = self.this_local => self.local(l),
+            Expression::ThisExpression(_) if let Some(b) = self.this_box => self.local(b),
             Expression::AwaitExpression(aw) => {
                 // Hoisted into a statement that runs before the current one,
                 // with no expression temporaries live across the suspension.

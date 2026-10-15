@@ -1,5 +1,5 @@
-// @native basics accessors order kinds closures counter
-// @interpreted arrowThis superInMethod
+// @native basics accessors order kinds closures counter arrowThis
+// @interpreted superInMethod
 function basics(): string {
   const o = {
     value: 2,

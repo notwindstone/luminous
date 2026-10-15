@@ -434,7 +434,9 @@ The differential tests run every case with both.
   JS). A captured variable never assigned after its declaration is
   captured by value: no box is allocated for it. Closures of one function
   share a shape. Side effects on module-level bindings (`count++`) are shared with
-  interpreted code.
+  interpreted code. An arrow function's `this` is the `this` of the method,
+  constructor (after `super(...)` in a derived class) or object literal
+  method it is in, captured in a box as a variable is.
 - **Ordinary functions** (`function` declarations and expressions, not
   methods or arrows) are constructors, as in JS: a native one has a
   `prototype` (made when first read), and `new f()` makes an object of
@@ -661,7 +663,8 @@ The differential tests run every case with both.
 Not yet: constructors of classes with private names, of derived classes
 whose superclass is not compiled natively or that run code before
 `super(...)` (which stay interpreted), computed method and accessor names in object
-literals, classes inside functions, `arguments`, and `this` in arrow functions. A
+literals, classes inside functions, `arguments`, `this` in arrow functions
+in class field initializers or outside methods and constructors. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `luminous report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.

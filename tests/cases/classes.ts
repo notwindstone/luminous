@@ -1,5 +1,4 @@
-// @native norm add scale describe origin swap twice secret
-// @interpreted mapped
+// @native norm add scale describe origin swap twice secret mapped
 class Vec2 {
   #hidden = 7;
   constructor(public x: number, public y: number) {}
