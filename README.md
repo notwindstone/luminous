@@ -476,6 +476,9 @@ The differential tests run every case with both.
     double along (through joins and in an extra variable of each untyped
     local), so the next operation uses it directly and the boxing goes
     unused unless the value is stored or passed on;
+  - assignment operators, logical ones included (`??=`, `||=`, `&&=`:
+    the target is evaluated once, and the right-hand side only when it
+    is assigned); an anonymous function assigned to a name takes it;
   - globals.
 
   Unboxed values are boxed where they meet JS values.
@@ -501,6 +504,14 @@ The differential tests run every case with both.
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
   `#x in obj`) and `super.x` / `super.m()` / `super.x = v`.
+- **Classes written as class expressions** bound at the top level of a
+  module (`var X = class {...}`, or `let` / `const`, as bundlers and
+  compilers write class declarations): compiled as the declaration
+  `class X {...}` is (methods, constructor, native `new X()`), when nothing
+  can tell the binding from that class's: it is never reassigned, and no
+  code that runs before it can reach it (to see it `undefined`, or in its
+  TDZ). A name of its own (`var X = class X {...}`) is the binding. Other
+  class expressions stay interpreted.
 - **Class constructors** of classes whose instances are plain objects
   with public fields (no private names, accessors or computed keys,
   initializers that do not use `this`, a constructor that returns nothing

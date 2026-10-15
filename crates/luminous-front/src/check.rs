@@ -266,6 +266,7 @@ pub fn check<'a>(
     let mut consts = HashMap::new();
     let mut bindings = HashMap::new();
     let mut classes = Vec::new();
+    let mut aliases = HashMap::new();
     collect_toplevel(
         program,
         scoping,
@@ -275,6 +276,7 @@ pub fn check<'a>(
         &mut rejected,
         &mut consts,
         &mut bindings,
+        &mut aliases,
     );
     let records = collect_records(program);
     RECORD_NAMES.with(|r| *r.borrow_mut() = records.iter().map(|r| r.name.clone()).collect());
@@ -309,6 +311,7 @@ pub fn check<'a>(
             interpreted,
             consts: &consts,
             bindings: &bindings,
+            aliases: &aliases,
             cands: &candidates,
             state: vec![State::Todo; candidates.len()],
             widened: &mut widened,
@@ -438,6 +441,7 @@ fn collect_toplevel<'a>(
     rejected: &mut Vec<(String, Span, Reject)>,
     consts: &mut HashMap<SymbolId, ConstVal>,
     bindings: &mut HashMap<SymbolId, Binding>,
+    aliases: &mut HashMap<SymbolId, SymbolId>,
 ) {
     use oxc::ast_visit::Visit;
     let written = |sym: SymbolId| scoping.get_resolved_references(sym).any(|r| r.is_write());
@@ -475,6 +479,19 @@ fn collect_toplevel<'a>(
     let mut methods = Vec::new();
     let mut method_rejects = Vec::new();
     let mut ctor_defs = Vec::new();
+    // Bindings of class expressions compiled as classes (see below).
+    let mut bound_classes: HashSet<SymbolId> = HashSet::new();
+    // (An earlier top-level class, before the one starting at `start`, is
+    // initialized while the prefix is pure.)
+    let earlier_class = |bound: &HashSet<SymbolId>, start: u32, id: &IdentifierReference| {
+        id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id()).is_some_and(|s| {
+            (scoping.symbol_flags(s).is_class() || bound.contains(&s))
+                && scoping.symbol_scope_id(s) == scoping.root_scope_id()
+                && scoping.symbol_span(s).end <= start
+        })
+    };
+    let global =
+        |id: &IdentifierReference| id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none());
     let mut add = |name: String, node: FnNode<'a>, symbol: SymbolId, site: Site, direct_callable: bool| {
         if written(symbol) {
             let r = Reject { span: node.span(), msg: format!("`{name}` is reassigned"), retry: false, callee: false };
@@ -576,6 +593,44 @@ fn collect_toplevel<'a>(
                     };
                     // (Whether code that ran before can reach this binding.)
                     let unsafe_tdz = reached.contains(&symbol);
+                    // A class expression bound to a name (`var X = class
+                    // {...}`, as bundlers and compilers write class
+                    // declarations): compiled as the class declaration
+                    // `class X {...}` would be, when nothing can tell the
+                    // binding from that class's: it is never reassigned, and
+                    // no code that runs before it can reach it (to see it
+                    // undefined, or in its TDZ).
+                    if let Expression::ClassExpression(c) = init.without_parentheses()
+                        && c.id.as_ref().is_none_or(|cid| cid.name == id.name)
+                        && c.decorators.is_empty()
+                        && !written(symbol)
+                        && !unsafe_tdz
+                    {
+                        class_methods(c, &id.name, classes.len(), end, &mut methods, &mut method_rejects);
+                        class_ctor(
+                            c,
+                            id,
+                            classes.len(),
+                            interpreted,
+                            scoping,
+                            &mut ctor_defs,
+                            &mut methods,
+                            &mut method_rejects,
+                        );
+                        let info = class_info(c, &id.name, classes);
+                        classes.push(info);
+                        let start = c.span.start;
+                        if !pure_class(c, &|r| earlier_class(&bound_classes, start, r), &global) {
+                            run(&mut reached, module_refs(scoping, |vis| vis.visit_class(c)));
+                        }
+                        bound_classes.insert(symbol);
+                        // (Its own name, `class X`, is the binding's value
+                        // once it is defined: the binding.)
+                        if let Some(cid) = &c.id {
+                            aliases.insert(cid.symbol_id(), symbol);
+                        }
+                        continue;
+                    }
                     if kind != BindingKind::Const {
                         if !pure_init(init) {
                             run(&mut reached, module_refs(scoping, |vis| vis.visit_expression(init)));
@@ -623,19 +678,8 @@ fn collect_toplevel<'a>(
                     let info = class_info(c, &id.name, classes);
                     classes.push(info);
                 }
-                // (An earlier top-level class is initialized while the
-                // prefix is pure.)
-                let earlier_class = |id: &IdentifierReference| {
-                    id.reference_id.get().and_then(|r| scoping.get_reference(r).symbol_id()).is_some_and(|s| {
-                        scoping.symbol_flags(s).is_class()
-                            && scoping.symbol_scope_id(s) == scoping.root_scope_id()
-                            && scoping.symbol_span(s).end <= c.span.start
-                    })
-                };
-                let global = |id: &IdentifierReference| {
-                    id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none())
-                };
-                if !pure_class(c, &earlier_class, &global) {
+                let start = c.span.start;
+                if !pure_class(c, &|r| earlier_class(&bound_classes, start, r), &global) {
                     run(&mut reached, module_refs(scoping, |vis| vis.visit_class(c)));
                 }
             }
@@ -1239,6 +1283,16 @@ pub(crate) fn pure_init(e: &Expression) -> bool {
 /// decorators, static blocks or static initializers but pure ones, keys
 /// that are names, literals or `Symbol.<name>` (of the global `Symbol`),
 /// and no superclass but one `earlier_class` accepts.
+/// Whether `e` is an anonymous function, which takes the name of the
+/// binding it is assigned to.
+fn anonymous_function(e: &Expression) -> bool {
+    match e.without_parentheses() {
+        Expression::ArrowFunctionExpression(_) => true,
+        Expression::FunctionExpression(f) => f.id.is_none(),
+        _ => false,
+    }
+}
+
 pub(crate) fn pure_class(
     c: &Class,
     earlier_class: &dyn Fn(&IdentifierReference) -> bool,
@@ -1385,6 +1439,9 @@ struct ModuleCx<'m, 'a> {
     interpreted: &'m HashSet<u32>,
     consts: &'m HashMap<SymbolId, ConstVal>,
     bindings: &'m HashMap<SymbolId, Binding>,
+    /// The names class expressions bound to module bindings give
+    /// themselves: those bindings (see `collect_toplevel`).
+    aliases: &'m HashMap<SymbolId, SymbolId>,
     cands: &'m [Candidate<'a>],
     state: Vec<State>,
     /// Per function: locals that must be `Any`.
@@ -4508,6 +4565,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             .get()
             .and_then(|r| scoping.get_reference(r).symbol_id())
             .filter(|&s| !scoping.symbol_flags(s).is_ambient())
+            .map(|s| self.m.aliases.get(&s).copied().unwrap_or(s))
     }
 
     fn is_module_symbol(&self, sym: SymbolId) -> bool {
@@ -4770,10 +4828,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.pre.extend(stmts);
             return Ok(self.local(t));
         };
+        if a.operator.is_logical() {
+            return self.logical_assign(a, target);
+        }
         let (mut setup, place, sym) = self.place(target, a.operator != AssignmentOperator::Assign)?;
         let mark = self.pre.len();
         let value = if a.operator == AssignmentOperator::Assign {
-            let v = self.expr(&a.right)?;
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = target
+                && anonymous_function(&a.right)
+            {
+                self.name_hint = Some(id.name.to_string());
+            }
+            let v = self.expr(&a.right);
+            self.name_hint = None;
+            let v = v?;
             self.flush_setup(&mut setup, mark);
             if self.wraps(sym) && v.ty != Ty::I32 { wrap(v) } else { v }
         } else {
@@ -4826,6 +4894,80 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             };
         }
         setup.push(self.write(&place, sym, value, a.span)?);
+        Ok(seq(setup))
+    }
+
+    /// `x ??= v`, `x ||= v`, `x &&= v`: the target resolved once and read,
+    /// then assigned, with `v` evaluated, only when `??`, `||` or `&&` would
+    /// evaluate their right operand; the value is the target's or `v`'s.
+    fn logical_assign(&mut self, a: &'a AssignmentExpression<'a>, target: &'a SimpleAssignmentTarget<'a>) -> R<Expr> {
+        let op = match a.operator {
+            AssignmentOperator::LogicalAnd => LogicalOp::And,
+            AssignmentOperator::LogicalOr => LogicalOp::Or,
+            _ => LogicalOp::Nullish,
+        };
+        let (mut setup, place, sym) = self.place(target, true)?;
+        let cur = self.read(&place, a.span)?;
+        // (An anonymous function assigned to a name takes it.)
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = target
+            && anonymous_function(&a.right)
+        {
+            self.name_hint = Some(id.name.to_string());
+        }
+        let rhs_mark = self.pre.len();
+        let rhs = self.expr(&a.right);
+        self.name_hint = None;
+        let rhs = rhs?;
+        // A number or boolean is never nullish: nothing is assigned.
+        if op == LogicalOp::Nullish && !matches!(cur.ty, Ty::Any | Ty::MaybeF64) {
+            self.pre.truncate(rhs_mark);
+            setup.push(cur);
+            return Ok(seq(setup));
+        }
+        let value = if self.wraps(sym) && rhs.ty != Ty::I32 { wrap(rhs) } else { rhs };
+        let mut place = place;
+        let awaits = self.pre.len() > rhs_mark;
+        // (As in `assign`: an object held in a named local that the value may
+        // reassign, or with awaits in between, is copied first.)
+        if let Place::Prop(o, _) | Place::Elem(o, _) | Place::Private(o, _) = place
+            && self.local_names[o].is_some()
+            && (ir::assigns_local(&value, o) || awaits)
+        {
+            let t = self.temp(self.locals[o]);
+            setup.insert(0, set(t, self.local(o)));
+            place = match place {
+                Place::Prop(_, a) => Place::Prop(t, a),
+                Place::Elem(_, k) => Place::Elem(t, k),
+                Place::Private(_, n) => Place::Private(t, n),
+                other => other,
+            };
+        }
+        if awaits {
+            // The value awaits: the target is resolved and read first, and
+            // the value evaluated and assigned in an `if`.
+            let rhs_pre: Vec<Stmt> = self.pre.drain(rhs_mark..).collect();
+            self.pre.extend(setup.drain(..).map(Stmt::Expr));
+            let t = self.temp(Ty::Any);
+            self.pre.push(Stmt::Expr(set(t, any(cur))));
+            let w = self.write(&place, sym, value, a.span)?;
+            let mut arm = rhs_pre;
+            arm.push(Stmt::Expr(set(t, any(w))));
+            let now = self.local(t);
+            let cond = match op {
+                LogicalOp::And => truthy(now),
+                LogicalOp::Or => Expr::new(Ty::Bool, ExprKind::Unary(UnOp::Not, Box::new(truthy(now)))),
+                LogicalOp::Nullish => Expr::new(
+                    Ty::Bool,
+                    ExprKind::AnyCompare(AnyCmpOp::Eq, Box::new(now), Box::new(Expr::new(Ty::Any, ExprKind::Null))),
+                ),
+            };
+            self.pre.push(Stmt::If(cond, arm, vec![]));
+            return Ok(self.local(t));
+        }
+        let w = self.write(&place, sym, value, a.span)?;
+        let ty = join(cur.ty, w.ty);
+        let ty = if ty == Ty::Void { Ty::Any } else { ty };
+        setup.push(Expr::new(ty, ExprKind::Logical(op, Box::new(coerce(cur, ty)), Box::new(coerce(w, ty)))));
         Ok(seq(setup))
     }
 
