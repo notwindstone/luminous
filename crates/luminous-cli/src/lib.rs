@@ -77,6 +77,20 @@ pub struct EmbedOpts {
     /// An object file, static library or linker argument (repeatable).
     #[arg(long = "link", value_name = "ARG", allow_hyphen_values = true)]
     pub link: Vec<String>,
+    /// A global that is a binding of the embedder's module SPECIFIER (which
+    /// exports it as NAME, and a prelude makes it the global): the
+    /// program's modules refer to the binding, which native code knows
+    /// (`--global Response=beyond:fetch`).
+    #[arg(long = "global", value_name = "NAME=SPECIFIER", value_parser = parse_global)]
+    pub globals: Vec<(String, String)>,
+}
+
+fn parse_global(s: &str) -> Result<(String, String), String> {
+    let (name, spec) = s.split_once('=').ok_or("expected NAME=SPECIFIER")?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return Err(format!("`{name}` is not an identifier"));
+    }
+    Ok((name.to_string(), spec.to_string()))
 }
 
 fn parse_module_dir(s: &str) -> Result<(String, PathBuf), String> {
@@ -98,6 +112,7 @@ impl EmbedOpts {
             preludes: self.preludes.clone(),
             module_dirs: self.module_dirs.clone(),
             externals: self.c_modules.iter().map(|(s, _)| s.clone()).collect(),
+            globals: self.globals.clone(),
         }
     }
 }

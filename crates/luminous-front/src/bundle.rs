@@ -335,6 +335,41 @@ pub struct Embedding {
     /// Modules the embedder provides natively (C modules): imports of them
     /// stay, as those of the engine's own modules.
     pub externals: Vec<String>,
+    /// Globals that are bindings of the embedder's modules (name and the
+    /// specifier of the module that exports it under that name), which its
+    /// preludes make globals: in the program's own modules, a reference to
+    /// such a global that nothing declares is to that binding (an import of
+    /// it), which native code then knows (`new Response()` a class's native
+    /// constructor). Not where the module assigns the global.
+    pub globals: Vec<(String, String)>,
+}
+
+/// The imports that make the embedder's globals that `program` refers to
+/// (and does not declare or assign) bindings: text to append to its source,
+/// if there are any.
+fn global_imports(sem: &Semantic, emb: &Embedding) -> Option<String> {
+    let scoping = sem.scoping();
+    let unresolved = scoping.root_unresolved_references();
+    let mut by_module: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (name, spec) in &emb.globals {
+        let Some(refs) = unresolved.get(name.as_str()) else { continue };
+        if refs.iter().any(|&r| scoping.get_reference(r).is_write()) {
+            continue;
+        }
+        match by_module.iter_mut().find(|(s, _)| *s == spec.as_str()) {
+            Some((_, names)) => names.push(name),
+            None => by_module.push((spec, vec![name])),
+        }
+    }
+    if by_module.is_empty() {
+        return None;
+    }
+    // (At the end: the module's own text keeps its lines and columns.)
+    let mut text = String::from("\n");
+    for (spec, names) in by_module {
+        text.push_str(&format!("import {{ {} }} from {};", names.join(", "), serde_json::to_string(spec).unwrap()));
+    }
+    Some(text)
 }
 
 /// Resolve a module specifier imported by `from`.
@@ -895,15 +930,31 @@ pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
     let mut i = 0;
     while i < queue.len() {
         let (path, kind) = queue[i].clone();
-        let original = match kind {
+        let mut original = match kind {
             Kind::Script => std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?,
             _ => synthesize(&path, kind)?,
         };
-        let stripped = allocator.alloc_str(&marker::strip(&original).source);
-        let parsed = Parser::new(&allocator, stripped, SourceType::ts().with_module(true)).parse();
-        let mut errors: Vec<OxcDiagnostic> = parsed.diagnostics.into_iter().collect();
-        let program: &Program = allocator.alloc(parsed.program);
-        let ret = SemanticBuilder::new().with_build_nodes(true).with_check_syntax_error(true).build(program);
+        // The program's own modules (not the embedder's): its globals are
+        // its bindings.
+        let own = kind == Kind::Script
+            && (i == 0 || i > emb.preludes.len())
+            && !emb.module_dirs.iter().any(|(_, d)| d.canonicalize().is_ok_and(|d| path.starts_with(d)));
+        let mut pass = 0;
+        let (program, ret, mut errors) = loop {
+            let stripped = allocator.alloc_str(&marker::strip(&original).source);
+            let parsed = Parser::new(&allocator, stripped, SourceType::ts().with_module(true)).parse();
+            let errors: Vec<OxcDiagnostic> = parsed.diagnostics.into_iter().collect();
+            let program: &Program = allocator.alloc(parsed.program);
+            let ret = SemanticBuilder::new().with_build_nodes(true).with_check_syntax_error(true).build(program);
+            pass += 1;
+            if own && pass == 1 && errors.is_empty() && !emb.globals.is_empty()
+                && let Some(more) = global_imports(&ret.semantic, emb)
+            {
+                original.push_str(&more);
+                continue;
+            }
+            break (program, ret, errors);
+        };
         if errors.is_empty() {
             errors.extend(ret.diagnostics);
         }
