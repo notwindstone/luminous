@@ -345,6 +345,11 @@ pub(crate) struct Lower {
     /// payload, so arithmetic on boxed numbers needs no boxing in between
     /// (the boxing is left unused).
     num_shadow: HashMap<Value, Value>,
+    /// For a JS value made where it may or may not be a number (a binary
+    /// operation's result: numbers but from its slow path), an `I8` that
+    /// says whether it is one (constant on the number paths, so that tests
+    /// on it fold away where the value came from one).
+    num_known: HashMap<Value, Value>,
     /// Functions read through an inline cache (a prototype's method or
     /// getter): their JS entry (`lum_fast_<i>`), as the cache keeps it, or
     /// 0 where not known (see `fn_entry`).
@@ -520,6 +525,7 @@ impl Lower {
             shadows,
             code_vars,
             num_shadow: HashMap::new(),
+            num_known: HashMap::new(),
             fn_entries: HashMap::new(),
             spec_src: HashMap::new(),
             spec_floats: false,
@@ -5105,9 +5111,8 @@ impl Lower {
         // not kept for the int code, which reads them again).
         let floats = self.b.create_block();
         let check = self.b.create_block();
-        for &f in fields {
-            let w = field(self, f, M_SLOT.volatile());
-            let is_float = self.val_is_float(w);
+        for &(o, slot) in fields {
+            let is_float = val::slot_is_float(&mut self.b, M_SLOT.volatile(), props_of(o), (slot as usize * SIZE) as i32);
             let next = self.b.create_block();
             self.b.ins().brif(is_float, next, &[], check, &[]);
             self.b.switch_to_block(next);
@@ -5201,12 +5206,15 @@ impl Lower {
         }
         // Their fields hold numbers: floats, or int32s too.
         // (The second test only where the first fails.)
-        let mut words = Vec::new();
-        for &(o, slot) in fields {
-            let props = ptrs.iter().find(|x| x.0 == o).expect("guarded element").1;
-            words.push(self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32));
+        let slots: Vec<(Value, i32)> = fields
+            .iter()
+            .map(|&(o, slot)| (ptrs.iter().find(|x| x.0 == o).expect("guarded element").1, (slot as usize * SIZE) as i32))
+            .collect();
+        let mut floats = self.b.ins().iconst(I8, 1);
+        for &(props, off) in &slots {
+            let f = val::slot_is_float(&mut self.b, M_SLOT, props, off);
+            floats = self.b.ins().band(floats, f);
         }
-        let floats = self.all_floats(&words);
         // Not the region's other objects (compared by property arrays, which
         // objects do not share).
         if !distinct.is_empty() {
@@ -5233,6 +5241,7 @@ impl Lower {
         let mixed_b = self.b.create_block();
         self.b.ins().brif(floats, float_b, &[], check, &[]);
         self.b.switch_to_block(check);
+        let words: Vec<Value> = slots.iter().map(|&(props, off)| self.b.ins().load(I64, M_SLOT, props, off)).collect();
         let numbers = self.all_numbers(&words);
         self.b.ins().brif(numbers, mixed_b, &[], fail, &[]);
         for (block, f) in [(float_b, true), (mixed_b, false)] {
@@ -5323,16 +5332,6 @@ impl Lower {
         for &w in ws {
             let n = self.is_number(w);
             all = self.b.ins().band(all, n);
-        }
-        all
-    }
-
-    /// Whether the values `ws` are all floats.
-    fn all_floats(&mut self, ws: &[Value]) -> Value {
-        let mut all = self.b.ins().iconst(I8, 1);
-        for &w in ws {
-            let f = self.val_is_float(w);
-            all = self.b.ins().band(all, f);
         }
         all
     }
@@ -6097,13 +6096,29 @@ impl Lower {
         let V::Any(w) = v else { return v.num() };
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, F64);
-        let fast = self.b.create_block();
+        // A number known as one: its shadow.
+        if let (Some(&k), Some(&d)) = (self.num_known.get(&w), self.num_shadow.get(&w)) {
+            let test = self.b.create_block();
+            self.b.ins().brif(k, join, &[BlockArg::Value(d)], test, &[]);
+            self.b.switch_to_block(test);
+        }
+        // A float (its bits), else an int32, else the call.
+        let float_b = self.b.create_block();
+        let other = self.b.create_block();
+        let int_b = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let num = self.is_number(w);
-        self.b.ins().brif(num, fast, &[], slow, &[]);
-        self.b.switch_to_block(fast);
-        let d = self.number_of(w);
+        let f = self.val_is_float(w);
+        self.b.ins().brif(f, float_b, &[], other, &[]);
+        self.b.switch_to_block(float_b);
+        let d = self.val_f64(w);
+        self.b.ins().jump(join, &[BlockArg::Value(d)]);
+        self.b.switch_to_block(other);
+        let i = self.val_is(w, TAG_INT);
+        self.b.ins().brif(i, int_b, &[], slow, &[]);
+        self.b.switch_to_block(int_b);
+        let x = self.b.ins().ireduce(I32, w);
+        let d = self.b.ins().fcvt_from_sint(F64, x);
         self.b.ins().jump(join, &[BlockArg::Value(d)]);
         self.b.switch_to_block(slow);
         let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -6132,6 +6147,52 @@ impl Lower {
         let ff = self.val_f64(w);
         let is_int = self.val_is(w, TAG_INT);
         self.b.ins().select(is_int, fi, ff)
+    }
+
+    /// Two values as numbers, where they are not both floats (`fa`, `fc`:
+    /// whether each is one): a float's bits, an int32 converted, else to
+    /// `slow`. Continues in a new block, where the numbers are.
+    fn mixed_numbers(&mut self, a: Value, c: Value, fa: Value, fc: Value, slow: Block) -> (Value, Value) {
+        let done = self.b.create_block();
+        let x = self.b.append_block_param(done, F64);
+        let y = self.b.append_block_param(done, F64);
+        let a_float = self.b.create_block();
+        let a_other = self.b.create_block();
+        self.b.ins().brif(fa, a_float, &[], a_other, &[]);
+        // A float, then (not a float) an int32.
+        self.b.switch_to_block(a_float);
+        let ic = self.val_is(c, TAG_INT);
+        let ok = self.b.create_block();
+        self.b.ins().brif(ic, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
+        let xd = self.val_f64(a);
+        let ci = self.b.ins().ireduce(I32, c);
+        let yd = self.b.ins().fcvt_from_sint(F64, ci);
+        self.b.ins().jump(done, &[BlockArg::Value(xd), BlockArg::Value(yd)]);
+        // An int32, then a float or an int32.
+        self.b.switch_to_block(a_other);
+        let ia = self.val_is(a, TAG_INT);
+        let a_int = self.b.create_block();
+        self.b.ins().brif(ia, a_int, &[], slow, &[]);
+        self.b.switch_to_block(a_int);
+        let ai = self.b.ins().ireduce(I32, a);
+        let xd = self.b.ins().fcvt_from_sint(F64, ai);
+        let c_float = self.b.create_block();
+        let c_other = self.b.create_block();
+        self.b.ins().brif(fc, c_float, &[], c_other, &[]);
+        self.b.switch_to_block(c_float);
+        let yd = self.val_f64(c);
+        self.b.ins().jump(done, &[BlockArg::Value(xd), BlockArg::Value(yd)]);
+        self.b.switch_to_block(c_other);
+        let ic = self.val_is(c, TAG_INT);
+        let ok = self.b.create_block();
+        self.b.ins().brif(ic, ok, &[], slow, &[]);
+        self.b.switch_to_block(ok);
+        let ci = self.b.ins().ireduce(I32, c);
+        let yd = self.b.ins().fcvt_from_sint(F64, ci);
+        self.b.ins().jump(done, &[BlockArg::Value(xd), BlockArg::Value(yd)]);
+        self.b.switch_to_block(done);
+        (x, y)
     }
 
     fn truthy_num(&mut self, d: Value) -> Value {
@@ -6188,8 +6249,9 @@ impl Lower {
         join: Block,
         f: impl FnOnce(&mut FunctionBuilder, &[Value]) -> Option<(Value, Value)>,
     ) {
-        // (A second parameter of `join`: the result's number.)
-        let shadow = self.b.block_params(join).len() == 2;
+        // (A second parameter of `join`: the result's number; a third:
+        // whether it is one.)
+        let params = self.b.block_params(join).len();
         // All int32s: none has another high half than an int's.
         let base = val_const(TAG_INT, 0);
         let mut any = self.b.ins().bxor_imm_u(vals[0], base);
@@ -6211,8 +6273,11 @@ impl Lower {
                 let w = self.b.ins().uextend(I64, r);
                 let w = self.mk_int(w);
                 let mut args = vec![BlockArg::Value(w)];
-                if shadow {
+                if params >= 2 {
                     args.push(BlockArg::Value(self.b.ins().fcvt_from_sint(F64, r)));
+                }
+                if params >= 3 {
+                    args.push(BlockArg::Value(self.b.ins().iconst(I8, 1)));
                 }
                 self.b.ins().jump(join, &args);
             }
@@ -6223,22 +6288,35 @@ impl Lower {
         self.b.switch_to_block(rest);
     }
 
-    /// `op a b` on owned values (consumed). Fast path for two numbers.
+    /// `op a b` on owned values (consumed). Fast paths for two int32s (the
+    /// ops that have one), two floats, then two numbers.
     fn binary_any(&mut self, op: AnyBinOp, a: Value, c: Value) -> Value {
-        let na = self.is_number(a);
-        let nc = self.is_number(c);
-        let both = self.b.ins().band(na, nc);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         let rw = self.b.append_block_param(join, I64);
         let rd = self.b.append_block_param(join, F64);
+        let known = self.b.append_block_param(join, I8);
         // Two int32s: integer ops, unless the result overflows.
         let int_op = |b: &mut FunctionBuilder, x: Value, y: Value| -> Option<(Value, Value)> {
             let no = b.ins().iconst(I8, 0);
             Some(match op {
                 AnyBinOp::Add => b.ins().sadd_overflow(x, y),
                 AnyBinOp::Sub => b.ins().ssub_overflow(x, y),
+                // As the interpreter: an int32 product, else (out of range,
+                // or -0: a zero from a negative operand) a double.
+                AnyBinOp::Mul => {
+                    let (xl, yl) = (b.ins().sextend(I64, x), b.ins().sextend(I64, y));
+                    let p = b.ins().imul(xl, yl);
+                    let r = b.ins().ireduce(I32, p);
+                    let back = b.ins().sextend(I64, r);
+                    let out = b.ins().icmp(IntCC::NotEqual, back, p);
+                    let zero = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                    let signs = b.ins().bor(x, y);
+                    let neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, signs, 0);
+                    let minus_zero = b.ins().band(zero, neg);
+                    (r, b.ins().bor(out, minus_zero))
+                }
                 AnyBinOp::BitAnd => (b.ins().band(x, y), no),
                 AnyBinOp::BitOr => (b.ins().bor(x, y), no),
                 AnyBinOp::BitXor => (b.ins().bxor(x, y), no),
@@ -6252,6 +6330,7 @@ impl Lower {
             op,
             AnyBinOp::Add
                 | AnyBinOp::Sub
+                | AnyBinOp::Mul
                 | AnyBinOp::BitAnd
                 | AnyBinOp::BitOr
                 | AnyBinOp::BitXor
@@ -6260,11 +6339,6 @@ impl Lower {
         ) {
             self.int_fast_path(&[a, c], join, |b, xs| int_op(b, xs[0], xs[1]));
         }
-        self.b.ins().brif(both, fast, &[], slow, &[]);
-
-        self.b.switch_to_block(fast);
-        let x = self.number_of(a);
-        let y = self.number_of(c);
         let bop = match op {
             AnyBinOp::Add => BinOp::Add,
             AnyBinOp::Sub => BinOp::Sub,
@@ -6279,15 +6353,30 @@ impl Lower {
             AnyBinOp::BitOr => BinOp::BitOr,
             AnyBinOp::BitXor => BinOp::BitXor,
         };
-        let r = self.binary(bop, x, y);
-        // As the interpreter boxes them: sums, differences and products of
-        // doubles stay doubles.
-        let w = if matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) {
-            self.box_float(r)
-        } else {
-            self.box_number(r)
-        };
-        self.b.ins().jump(join, &[BlockArg::Value(w), BlockArg::Value(r)]);
+        // Two floats: their bits are the doubles (one compare each).
+        let fa = self.val_is_float(a);
+        let fc = self.val_is_float(c);
+        let floats = self.b.ins().band(fa, fc);
+        let float_b = self.b.create_block();
+        self.b.ins().brif(floats, float_b, &[], fast, &[]);
+        for (block, float) in [(float_b, true), (fast, false)] {
+            self.b.switch_to_block(block);
+            let (x, y) = if float {
+                (self.val_f64(a), self.val_f64(c))
+            } else {
+                self.mixed_numbers(a, c, fa, fc, slow)
+            };
+            let r = self.binary(bop, x, y);
+            // As the interpreter boxes them: sums, differences and products
+            // of doubles stay doubles.
+            let w = if matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) {
+                self.box_float(r)
+            } else {
+                self.box_number(r)
+            };
+            let one = self.b.ins().iconst(I8, 1);
+            self.b.ins().jump(join, &[BlockArg::Value(w), BlockArg::Value(r), BlockArg::Value(one)]);
+        }
 
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
@@ -6317,9 +6406,11 @@ impl Lower {
         self.free(c);
         self.free(a);
         let d = self.number_of(r[0]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(d)]);
+        let n = self.is_number(r[0]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(d), BlockArg::Value(n)]);
         self.b.switch_to_block(join);
         self.num_shadow.insert(rw, rd);
+        self.num_known.insert(rw, known);
         rw
     }
 
@@ -6363,25 +6454,6 @@ impl Lower {
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         if !matches!(op, AnyCmpOp::In | AnyCmpOp::InstanceOf) {
-            let fast = self.b.create_block();
-            match (a, c) {
-                (V::Any(aw), V::Any(cw)) => {
-                    let na = self.is_number(aw);
-                    let nc = self.is_number(cw);
-                    let both = self.b.ins().band(na, nc);
-                    self.b.ins().brif(both, fast, &[], slow, &[]);
-                }
-                (V::Any(w), _) | (_, V::Any(w)) => {
-                    let n = self.is_number(w);
-                    self.b.ins().brif(n, fast, &[], slow, &[]);
-                }
-                _ => {
-                    self.b.ins().jump(fast, &[]);
-                }
-            }
-            self.b.switch_to_block(fast);
-            let x = self.num_value(a);
-            let y = self.num_value(c);
             let cc = match op {
                 AnyCmpOp::Lt => FloatCC::LessThan,
                 AnyCmpOp::Le => FloatCC::LessThanOrEqual,
@@ -6390,7 +6462,82 @@ impl Lower {
                 AnyCmpOp::Eq | AnyCmpOp::StrictEq => FloatCC::Equal,
                 _ => FloatCC::NotEqual,
             };
-            let r = self.b.ins().fcmp(cc, x, y);
+            // `fast`: the two numbers; `float_b`: the two values, floats.
+            let fast = self.b.create_block();
+            let fx = self.b.append_block_param(fast, F64);
+            let fy = self.b.append_block_param(fast, F64);
+            let float_b = self.b.create_block();
+            let mut floats_used = true;
+            match (a, c) {
+                (V::Any(aw), V::Any(cw)) => {
+                    // Two int32s: their payloads compared.
+                    let base = val_const(TAG_INT, 0);
+                    let xa = self.b.ins().bxor_imm_u(aw, base);
+                    let xc = self.b.ins().bxor_imm_u(cw, base);
+                    let any = self.b.ins().bor(xa, xc);
+                    let ints = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, any, 1i64 << 32);
+                    let int_b = self.b.create_block();
+                    let rest = self.b.create_block();
+                    self.b.ins().brif(ints, int_b, &[], rest, &[]);
+                    self.b.switch_to_block(int_b);
+                    let x = self.b.ins().ireduce(I32, aw);
+                    let y = self.b.ins().ireduce(I32, cw);
+                    let icc = match op {
+                        AnyCmpOp::Lt => IntCC::SignedLessThan,
+                        AnyCmpOp::Le => IntCC::SignedLessThanOrEqual,
+                        AnyCmpOp::Gt => IntCC::SignedGreaterThan,
+                        AnyCmpOp::Ge => IntCC::SignedGreaterThanOrEqual,
+                        AnyCmpOp::Eq | AnyCmpOp::StrictEq => IntCC::Equal,
+                        _ => IntCC::NotEqual,
+                    };
+                    let r = self.b.ins().icmp(icc, x, y);
+                    self.b.ins().jump(join, &[BlockArg::Value(r)]);
+                    // Two floats, else two numbers.
+                    self.b.switch_to_block(rest);
+                    let fa = self.val_is_float(aw);
+                    let fc = self.val_is_float(cw);
+                    let floats = self.b.ins().band(fa, fc);
+                    let mixed = self.b.create_block();
+                    self.b.ins().brif(floats, float_b, &[], mixed, &[]);
+                    self.b.switch_to_block(mixed);
+                    let (x, y) = self.mixed_numbers(aw, cw, fa, fc, slow);
+                    self.b.ins().jump(fast, &[BlockArg::Value(x), BlockArg::Value(y)]);
+                }
+                (V::Any(w), other) | (other, V::Any(w)) => {
+                    // A float, else an int32.
+                    let f = self.val_is_float(w);
+                    let mixed = self.b.create_block();
+                    self.b.ins().brif(f, float_b, &[], mixed, &[]);
+                    self.b.switch_to_block(mixed);
+                    let i = self.val_is(w, TAG_INT);
+                    let int_b = self.b.create_block();
+                    self.b.ins().brif(i, int_b, &[], slow, &[]);
+                    self.b.switch_to_block(int_b);
+                    let wi = self.b.ins().ireduce(I32, w);
+                    let wd = self.b.ins().fcvt_from_sint(F64, wi);
+                    let od = self.num_value(other);
+                    let (x, y) = if matches!(a, V::Any(_)) { (wd, od) } else { (od, wd) };
+                    self.b.ins().jump(fast, &[BlockArg::Value(x), BlockArg::Value(y)]);
+                }
+                _ => {
+                    floats_used = false;
+                    let x = self.num_value(a);
+                    let y = self.num_value(c);
+                    self.b.ins().jump(fast, &[BlockArg::Value(x), BlockArg::Value(y)]);
+                }
+            }
+            if floats_used {
+                self.b.switch_to_block(float_b);
+                let f = |l: &mut Self, v: V| match v {
+                    V::Any(w) => l.val_f64(w),
+                    other => l.num_value(other),
+                };
+                let (x, y) = (f(self, a), f(self, c));
+                let r = self.b.ins().fcmp(cc, x, y);
+                self.b.ins().jump(join, &[BlockArg::Value(r)]);
+            }
+            self.b.switch_to_block(fast);
+            let r = self.b.ins().fcmp(cc, fx, fy);
             self.b.ins().jump(join, &[BlockArg::Value(r)]);
         } else {
             self.b.ins().jump(slow, &[]);

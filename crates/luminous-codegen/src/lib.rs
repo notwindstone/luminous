@@ -91,20 +91,42 @@ pub mod jsvalue {
 pub(crate) mod val {
     use super::jsvalue::*;
     use crate::mir::types::{F64, I32, I64};
-    use crate::mir::{FunctionBuilder, IntCC, Value};
+    use crate::mir::{FunctionBuilder, IntCC, MemFlags, Value};
+
+    /// The high half of `w` (its tag's, but for a float), as an `I32` the
+    /// optimizer keeps (see `ConvOp::IreduceApart`): compared with 32-bit
+    /// immediates.
+    fn high(b: &mut FunctionBuilder, w: Value) -> Value {
+        let hi = b.ins().ushr_imm_u(w, 32);
+        b.ins().ireduce_apart(I32, hi)
+    }
+
+    /// What `high` is for tag `tag`, sign-extended.
+    const fn tag_high(tag: i64) -> i64 {
+        (val_const(tag, 0) >> 32) as i32 as i64
+    }
 
     /// Whether `w` has tag `tag`.
     pub fn is(b: &mut FunctionBuilder, w: Value, tag: i64) -> Value {
         if tag == TAG_FLOAT64 {
             return is_float(b, w);
         }
-        let hi = b.ins().ushr_imm_u(w, 32);
-        b.ins().icmp_imm_s(IntCC::Equal, hi, val_const(tag, 0) as u64 as i64 >> 32 & 0xffff_ffff)
+        let hi = high(b, w);
+        b.ins().icmp_imm_s(IntCC::Equal, hi, tag_high(tag))
     }
 
     /// Whether `w` is a float (a double, its high half below the tags').
     pub fn is_float(b: &mut FunctionBuilder, w: Value) -> Value {
         b.ins().icmp_imm_u(IntCC::UnsignedLessThan, w, FLOATS_END)
+    }
+
+    /// Whether the value at `addr + off` is a float, from its high half
+    /// alone (a 32-bit load, little-endian): the value itself, read where
+    /// it is used, then goes straight to a float register, not through
+    /// the integer one this test would otherwise have loaded it into.
+    pub fn slot_is_float(b: &mut FunctionBuilder, flags: MemFlags, addr: Value, off: i32) -> Value {
+        let hi = b.ins().uload32(flags, addr, off + 4);
+        b.ins().icmp_imm_u(IntCC::UnsignedLessThan, hi, (FLOATS_END as u64 >> 32) as i64)
     }
 
     /// Whether `w` is a number: an int32 or a float.
@@ -117,8 +139,9 @@ pub(crate) mod val {
     /// Whether `w` has a tag in `lo..=hi` (one compare, after moving
     /// `lo`'s values to 0).
     pub fn tag_in(b: &mut FunctionBuilder, w: Value, lo: i64, hi: i64) -> Value {
-        let x = b.ins().iadd_imm_s(w, val_const(lo, 0).wrapping_neg());
-        b.ins().icmp_imm_u(IntCC::UnsignedLessThan, x, (hi - lo + 1) << 32)
+        let h = high(b, w);
+        let x = b.ins().iadd_imm_s(h, tag_high(lo).wrapping_neg());
+        b.ins().icmp_imm_u(IntCC::UnsignedLessThan, x, hi - lo + 1)
     }
 
     /// Whether `w` is a reference (to a cell).
@@ -126,7 +149,10 @@ pub(crate) mod val {
         tag_in(b, w, FIRST_TAG, TAG_OBJECT)
     }
 
-    /// The address a reference `w` holds.
+    /// The address a reference `w` holds. (64-bit throughout: the
+    /// collector takes the low half of a word for a reference only under
+    /// a reference's tag, or alone, never as a 32-bit value beside
+    /// another.)
     pub fn ptr(b: &mut FunctionBuilder, w: Value) -> Value {
         let lo = b.ins().band_imm_u(w, 0xffff_ffffi64);
         b.ins().ishl_imm_u(lo, 3)
