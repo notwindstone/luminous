@@ -50,9 +50,13 @@ pub fn generate(
 #include <string.h>
 #include "luminous_rt.h"
 
-/* The native entries read and write JSValues directly. */
-_Static_assert(sizeof(JSValue) == {size}, "luminous needs the 64-bit struct JSValue layout");
-_Static_assert(offsetof(JSValue, tag) == {tag_off}, "unexpected JSValue layout");
+/* The native entries read and write JSValues directly: 8 bytes, NaN-boxed
+   with compressed references. */
+#if !defined(JS_COMPRESSED_POINTERS)
+#error "luminous needs the engine built with JS_COMPRESSED_POINTERS"
+#endif
+_Static_assert(sizeof(JSValue) == {size}, "luminous needs 8-byte JSValues");
+_Static_assert(JS_FLOAT64_TAG_ADDEND == {addend}, "unexpected float encoding");
 _Static_assert(JS_TAG_INT == {int} && JS_TAG_BOOL == {bool} && JS_TAG_UNDEFINED == {undef} &&
                JS_TAG_UNINITIALIZED == {uninit} && JS_TAG_EXCEPTION == {exc} &&
                JS_TAG_FLOAT64 == {f64} && JS_TAG_STRING == {string} && JS_TAG_NULL == {null},
@@ -63,7 +67,7 @@ _Static_assert(LUM_NATIVE_STACK == {budget}u, "stack budget mismatch");
 
 "#,
         size = jsvalue::SIZE,
-        tag_off = jsvalue::TAG_OFFSET,
+        addend = jsvalue::FLOAT_OFFSET >> 32,
         int = jsvalue::TAG_INT,
         bool = jsvalue::TAG_BOOL,
         undef = jsvalue::TAG_UNDEFINED,

@@ -261,7 +261,6 @@ fn ty(t: Type) -> &'static str {
         Type::I64 => "i64",
         Type::F32 => "float",
         Type::F64 => "double",
-        Type::I64X2 => "<2 x i64>",
     }
 }
 
@@ -274,7 +273,6 @@ fn suffix(t: Type) -> &'static str {
         Type::I64 => "i64",
         Type::F32 => "f32",
         Type::F64 => "f64",
-        Type::I64X2 => "v2i64",
     }
 }
 
@@ -919,16 +917,6 @@ impl<'a> FnEmitter<'a> {
                 let t = f.value_type(val);
                 let line = format!("store {} {}, ptr {p}, align {}", ty(t), self.val(val), t.bytes());
                 self.line(line);
-            }
-            &InstData::StackStorePair { lo, hi, slot, off } => {
-                let p = self.slot_address(slot, off);
-                let align = if off % 16 == 0 && f.slots[slot.index()].align_shift >= 4 { 16 } else { 8 };
-                let (t1, t2) = (self.tmp(), self.tmp());
-                let line = format!("{t1} = insertelement <2 x i64> poison, i64 {}, i32 0", self.val(lo));
-                self.line(line);
-                let line = format!("{t2} = insertelement <2 x i64> {t1}, i64 {}, i32 1", self.val(hi));
-                self.line(line);
-                self.line(format!("store <2 x i64> {t2}, ptr {p}, align {align}"));
             }
             &InstData::SymbolValue { data } => {
                 self.line(format!("{name} = ptrtoint ptr @{} to i64", self.m.data[data.index()].name));

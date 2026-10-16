@@ -25,9 +25,6 @@ pub enum Type {
     I64,
     F32,
     F64,
-    /// Two `I64` lanes: a whole `JSValue` (only stored, see
-    /// `Ins::stack_store_pair`).
-    I64X2,
 }
 
 impl Type {
@@ -37,7 +34,6 @@ impl Type {
             Type::I16 => 16,
             Type::I32 | Type::F32 => 32,
             Type::I64 | Type::F64 => 64,
-            Type::I64X2 => 128,
         }
     }
 
@@ -69,7 +65,6 @@ pub mod types {
     pub const I64: Type = Type::I64;
     pub const F32: Type = Type::F32;
     pub const F64: Type = Type::F64;
-    pub const I64X2: Type = Type::I64X2;
 }
 
 macro_rules! entity {
@@ -432,15 +427,6 @@ pub enum InstData {
     },
     StackStore {
         val: Value,
-        slot: StackSlot,
-        off: i32,
-    },
-    /// One 16-byte store of `lo` and `hi` (a `JSValue`): C code copies
-    /// `JSValue`s with 16-byte loads, which two 8-byte stores could not
-    /// forward to.
-    StackStorePair {
-        lo: Value,
-        hi: Value,
         slot: StackSlot,
         off: i32,
     },
@@ -999,9 +985,6 @@ impl Ins<'_> {
     pub fn stack_store(self, _ptr: Type, val: Value, slot: StackSlot, off: i32) -> Inst {
         self.b.push(InstData::StackStore { val, slot, off }, &[])
     }
-    pub fn stack_store_pair(self, lo: Value, hi: Value, slot: StackSlot, off: i32) -> Inst {
-        self.b.push(InstData::StackStorePair { lo, hi, slot, off }, &[])
-    }
 
     pub fn symbol_value(self, _ptr: Type, data: DataId) -> Value {
         self.b.push1(InstData::SymbolValue { data }, Type::I64)
@@ -1016,7 +999,7 @@ impl Ins<'_> {
     pub fn call(self, func: FuncId, args: &[Value]) -> Inst {
         let decls = self.b.decls.clone();
         let sig = &decls.funcs[func.index()];
-        debug_assert_eq!(sig.params.len(), args.len(), "call arguments");
+        assert_eq!(sig.params.len(), args.len(), "call arguments");
         let rets: Vec<Type> = sig.returns.iter().map(|r| r.ty).collect();
         self.b.push(InstData::Call { func, args: args.to_vec() }, &rets)
     }

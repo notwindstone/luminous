@@ -375,7 +375,7 @@ fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDia
                 Storage::Int32 => (4, 4),
                 Storage::F64 => (8, 8),
                 Storage::Bool => (1, 1),
-                Storage::Value => (16, 8),
+                Storage::Value => (8, 8),
             };
             offset = offset.div_ceil(align) * align;
             let at = offset;

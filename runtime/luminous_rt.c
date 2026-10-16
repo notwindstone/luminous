@@ -979,6 +979,17 @@ static bool lum_ic_fill_proto(JSContext *ctx, JSValue obj, JSAtom prop, int kind
 /* A prototype entry (kinds 1-3) of `ic`: keep what its holder has for
    object `p` (of its alt_shape), with the current js_proto_epoch, if the
    shapes on the way are the cached ones; else no epoch (see LumIC). */
+/* The getter (which 0) or setter (1) of the accessor property at `at`
+   (`JSProperty.u.getset`: two compressed references), or NULL. */
+static void *lum_accessor(void *at, int which)
+{
+#if defined(JS_COMPRESSED_POINTERS)
+    return (void *)((uintptr_t)((uint32_t *)at)[which] << 3);
+#else
+    return ((void **)at)[which];
+#endif
+}
+
 static void lum_ic_keep_value(LumIC *ic, char *p)
 {
     JSValue *at = lum_ic_entry_holder_slot(ic, p);
@@ -990,7 +1001,7 @@ static void lum_ic_keep_value(LumIC *ic, char *p)
     if (ic->kind == LUM_IC_PROTO_DATA)
         v = *at;
     else
-        v = JS_MKPTR(JS_TAG_OBJECT, ((void **)at)[ic->kind == LUM_IC_PROTO_GETTER ? 0 : 1]);
+        v = JS_MKPTR(JS_TAG_OBJECT, lum_accessor(at, ic->kind == LUM_IC_PROTO_GETTER ? 0 : 1));
     if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
         char *f = JS_VALUE_GET_PTR(v);
         /* (An accessor half can be missing.) */
@@ -1839,7 +1850,7 @@ JSValue lum_for_in_get(JSContext *ctx, JSValue *v)
 int lum_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next)
 {
     JSValue orig = lum_pins[LUM_PIN_GENERATOR_NEXT];
-    return JS_IsNativeGenerator(iter) && JS_VALUE_GET_TAG(next) == JS_VALUE_GET_TAG(orig) &&
+    return JS_IsNativeGenerator(iter) && JS_VALUE_GET_NORM_TAG(next) == JS_VALUE_GET_NORM_TAG(orig) &&
            JS_VALUE_GET_PTR(next) == JS_VALUE_GET_PTR(orig);
 }
 
@@ -1926,10 +1937,10 @@ int lum_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, LumIC *ic)
 /* ---- inline caches of prototype properties ---- */
 
 /* Codegen reads entries at these offsets (lower::IC_SIZE). */
-_Static_assert(sizeof(LumIC) == 88 && offsetof(LumIC, slot) == 8 && offsetof(LumIC, kind) == 12 &&
+_Static_assert(sizeof(LumIC) == 80 && offsetof(LumIC, slot) == 8 && offsetof(LumIC, kind) == 12 &&
                    offsetof(LumIC, proto_shape) == 16 && offsetof(LumIC, mid_shape) == 24 &&
                    offsetof(LumIC, alt_shape) == 32 && offsetof(LumIC, poly) == 40 &&
-                   offsetof(LumIC, epoch) == 48 && offsetof(LumIC, value) == 56 && offsetof(LumIC, entry) == 72,
+                   offsetof(LumIC, epoch) == 48 && offsetof(LumIC, value) == 56 && offsetof(LumIC, entry) == 64,
                "LumIC layout");
 
 /* Sites that never cache (as for objects with unshared shapes) stop trying
@@ -2176,7 +2187,7 @@ static JSValue lum_new_object_proto(JSContext *ctx, LumIC *ic, JSValue obj, int 
 }
 
 /* Codegen reads these (lower::FN_CACHE_SIZE). */
-_Static_assert(sizeof(LumFnCache) == 96 && offsetof(LumFnCache, info) == 12 && offsetof(LumFnCache, tmpl) == 16,
+_Static_assert(sizeof(LumFnCache) == 80 && offsetof(LumFnCache, info) == 12 && offsetof(LumFnCache, tmpl) == 16,
                "LumFnCache layout");
 
 /* A closure of a native function (data borrowed): made with the shape of
@@ -2305,7 +2316,7 @@ static JSValue lum_field_get(JSContext *ctx, LumStruct *s, const LumFieldDesc *f
 
 static bool lum_value_fits(JSContext *ctx, const LumTypeDesc *t, JSValueConst v)
 {
-    int tag = JS_VALUE_GET_TAG(v);
+    int tag = JS_VALUE_GET_NORM_TAG(v);
     LumStruct *s;
     uint32_t i;
     switch (t->kind) {
@@ -2366,7 +2377,7 @@ static int lum_put_raw(JSContext *ctx, JSValueConst obj, LumStruct *s, int fi, J
     *old = JS_UNDEFINED;
     if (f->storage == LUM_ST_INT32) {
         /* Integers wrap to int32 (unless `--no-int-wrapping`). */
-        int tag = JS_VALUE_GET_TAG(v);
+        int tag = JS_VALUE_GET_NORM_TAG(v);
         double d = tag == JS_TAG_INT ? JS_VALUE_GET_INT(v) : tag == JS_TAG_FLOAT64 ? JS_VALUE_GET_FLOAT64(v) : NAN;
         int32_t i;
         if (!(d == trunc(d)) || isinf(d)) {
@@ -2389,7 +2400,7 @@ static int lum_put_raw(JSContext *ctx, JSValueConst obj, LumStruct *s, int fi, J
     }
     switch (f->storage) {
     case LUM_ST_F64:
-        *(double *)at = JS_VALUE_GET_TAG(v) == JS_TAG_INT ? JS_VALUE_GET_INT(v) : JS_VALUE_GET_FLOAT64(v);
+        *(double *)at = JS_VALUE_GET_NORM_TAG(v) == JS_TAG_INT ? JS_VALUE_GET_INT(v) : JS_VALUE_GET_FLOAT64(v);
         break;
     case LUM_ST_BOOL:
         *(uint8_t *)at = JS_VALUE_GET_BOOL(v);
@@ -2643,7 +2654,7 @@ static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, in
             continue;
         if (f->storage == LUM_ST_VALUE) {
             JSValueConst v = *(JSValue *)at;
-            int tag = JS_VALUE_GET_TAG(v);
+            int tag = JS_VALUE_GET_NORM_TAG(v);
             if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL || (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
                 continue;
         }
@@ -2810,7 +2821,7 @@ JSValue lum_struct_coerce(JSContext *ctx, int layout, int field, JSValue v)
 {
     const LumLayoutDesc *l = &lum_layouts[layout];
     if (l->fields[field].storage == LUM_ST_INT32) {
-        int tag = JS_VALUE_GET_TAG(v);
+        int tag = JS_VALUE_GET_NORM_TAG(v);
         double d = tag == JS_TAG_INT ? JS_VALUE_GET_INT(v) : tag == JS_TAG_FLOAT64 ? JS_VALUE_GET_FLOAT64(v) : NAN;
         int32_t i;
         if (!(d == trunc(d)) || isinf(d) || JS_ToInt32(ctx, &i, v) < 0 ||

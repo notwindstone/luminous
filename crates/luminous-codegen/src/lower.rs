@@ -1,9 +1,11 @@
 //! Lowering of function bodies to the backend-neutral IR (`mir.rs`).
 //!
 //! Values: `F64` / `Bool` are plain IR values. `Any` is a QuickJS
-//! `JSValue` as a `(payload, tag)` pair of `I64`s, and is *owned*: every
-//! `Any` expression evaluates to a new reference that the consumer must
-//! either store, pass on to a callee that takes ownership, or free.
+//! `JSValue`: one `I64`, NaN-boxed, its tag in the high half and a
+//! reference the address / 8 in the low one (see `jsvalue`). It is
+//! *owned*: every `Any` expression evaluates to a new reference that the
+//! consumer must either store, pass on to a callee that takes ownership,
+//! or free.
 //!
 //! Exceptions: helpers report them by returning `JS_EXCEPTION` (or a negative
 //! int); native callees by setting `lum_unwinding`. Either way control goes
@@ -25,7 +27,7 @@ use luminous_front::ir::{
 };
 
 use crate::jsvalue::*;
-use crate::layout;
+use crate::{layout, val};
 
 /// Typed array kinds (`JSTypedArrayEnum`), each with a pristine shape.
 const TYPED_ARRAYS: i64 = 12;
@@ -87,7 +89,8 @@ pub(crate) enum V {
     /// call, a return or a block boundary (see `Lower::abi`).
     Int(Value),
     Bool(Value),
-    Any(Value, Value),
+    /// A `JSValue` (see `jsvalue`).
+    Any(Value),
     Void,
 }
 
@@ -104,17 +107,16 @@ impl V {
             other => panic!("expected a boolean, got {other:?}"),
         }
     }
-    fn any(self) -> (Value, Value) {
+    fn any(self) -> Value {
         match self {
-            V::Any(p, t) => (p, t),
+            V::Any(w) => w,
             other => panic!("expected a JS value, got {other:?}"),
         }
     }
     /// As IR values (block arguments, returns).
     pub(crate) fn values(self) -> Vec<Value> {
         match self {
-            V::Num(v) | V::Bool(v) | V::Int(v) => vec![v],
-            V::Any(p, t) => vec![p, t],
+            V::Num(v) | V::Bool(v) | V::Int(v) | V::Any(v) => vec![v],
             V::Void => vec![],
         }
     }
@@ -126,7 +128,7 @@ pub(crate) fn clif_types(t: Ty) -> Vec<Type> {
         Ty::I32 => vec![I64],
         Ty::F64 | Ty::MaybeF64 => vec![F64],
         Ty::Bool => vec![I8],
-        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => vec![I64, I64],
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => vec![I64],
         Ty::Void => vec![],
     }
 }
@@ -142,7 +144,7 @@ pub(crate) fn from_values(t: Ty, vs: &[Value]) -> V {
         Ty::I32 => V::Int(vs[0]),
         Ty::F64 | Ty::MaybeF64 => V::Num(vs[0]),
         Ty::Bool => V::Bool(vs[0]),
-        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => V::Any(vs[0], vs[1]),
+        Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => V::Any(vs[0]),
         Ty::Void => V::Void,
     }
 }
@@ -153,11 +155,12 @@ enum LVar {
     /// An `F64` local that only ever holds integers (see `int_locals`), as
     /// an `i64`.
     Int(Variable),
-    Two(Variable, Variable),
+    /// A JS value.
+    Val(Variable),
     /// Captured by closures: the box object (owned unless the box comes
     /// from the closure's own captures) and a pointer to its value slot.
     Boxed {
-        obj: (Variable, Variable),
+        obj: Variable,
         slot: Variable,
         owned: bool,
     },
@@ -297,7 +300,7 @@ pub(crate) struct Env {
 }
 
 /// An exception edge: its block, the temporaries to free there, the handler.
-type ExceptionEdge = (Block, Vec<(Value, Value)>, Block);
+type ExceptionEdge = (Block, Vec<Value>, Block);
 
 enum Scope {
     Jump(ir::LoopId),
@@ -350,9 +353,6 @@ pub(crate) struct Lower {
     /// In a speculative region: whether every value its guard checked is
     /// a float (not an int32).
     spec_floats: bool,
-    /// In a speculative region's float code: the fields that keep their
-    /// float tag (only float results stored), whose tag a store leaves.
-    spec_float_slots: HashSet<(ir::LocalId, u32)>,
     /// The objects of a region's iterations (`ElemGuard`), and whether the
     /// iteration being lowered is the copy where their fields hold floats
     /// (else int32s too: read and written with their tags).
@@ -373,7 +373,7 @@ pub(crate) struct Lower {
     /// several classes inherit: see `prop_get_inner`).
     poly_site: bool,
     /// Owned values to free if an exception occurs now.
-    temps: Vec<(Value, Value)>,
+    temps: Vec<Value>,
     /// Innermost-last exception handler blocks.
     handlers: Vec<Block>,
     scopes: Vec<Scope>,
@@ -383,7 +383,7 @@ pub(crate) struct Lower {
     ret_block: Block,
     exits: Exits,
     /// Methods: the receiver (borrowed).
-    pub(crate) this: Option<(Value, Value)>,
+    pub(crate) this: Option<Value>,
     /// Closures: their function object's data slots.
     closure_data: Option<Value>,
     async_cx: Option<AsyncCx>,
@@ -477,14 +477,14 @@ impl Lower {
             .map(|(i, &t)| match t {
                 _ if ints[i] || t == Ty::I32 => LVar::Int(b.declare_var(I64)),
                 _ if f.boxed[i] => LVar::Boxed {
-                    obj: (b.declare_var(I64), b.declare_var(I64)),
+                    obj: b.declare_var(I64),
                     slot: b.declare_var(I64),
                     // Step functions own every box (captures are dup'ed
                     // into their frame).
                     owned: f.suspends() || !f.captures.contains(&i),
                 },
                 Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {
-                    LVar::Two(b.declare_var(I64), b.declare_var(I64))
+                    LVar::Val(b.declare_var(I64))
                 }
                 t => LVar::One(b.declare_var(clif_types(t)[0])),
             })
@@ -493,7 +493,7 @@ impl Lower {
             .locals
             .iter()
             .zip(&vars)
-            .map(|(&t, v)| (t == Ty::Any && matches!(v, LVar::Two(..))).then(|| b.declare_var(F64)))
+            .map(|(&t, v)| (t == Ty::Any && matches!(v, LVar::Val(..))).then(|| b.declare_var(F64)))
             .collect();
         let codes = char_code_locals(f, &predicted_params(f, &env.params));
         let code_vars = codes
@@ -522,7 +522,6 @@ impl Lower {
             fn_entries: HashMap::new(),
             spec_src: HashMap::new(),
             spec_floats: false,
-            spec_float_slots: HashSet::new(),
             spec_elems: HashSet::new(),
             spec_float_elems: HashSet::new(),
             loops: HashMap::new(),
@@ -559,33 +558,24 @@ impl Lower {
             int_lo: HashMap::new(),
         };
         for (i, &t) in f.locals.iter().enumerate() {
-            if let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[i] {
+            if let LVar::Boxed { obj, slot, .. } = l.vars[i] {
                 // Boxes are created when their scope is entered (or come
                 // from the closure, below).
                 let zero = l.b.ins().iconst(I64, 0);
-                let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
-                l.b.def_var(op, zero);
-                l.b.def_var(ot, undef);
+                let undef = l.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+                l.b.def_var(obj, undef);
                 l.b.def_var(slot, zero);
                 continue;
             }
             let v = match params.get(i) {
                 // A widened parameter is boxed on entry.
                 Some(&p) => match (t, p) {
-                    (Ty::Any, V::Num(d)) => {
-                        let (p, t) = l.box_number(d);
-                        V::Any(p, t)
-                    }
+                    (Ty::Any, V::Num(d)) => V::Any(l.box_number(d)),
                     (Ty::Any, V::Int(i)) => {
                         let d = l.int_f64(i);
-                        let (p, t) = l.box_number(d);
-                        V::Any(p, t)
+                        V::Any(l.box_number(d))
                     }
-                    (Ty::Any, V::Bool(x)) => {
-                        let p = l.b.ins().uextend(I64, x);
-                        let t = l.b.ins().iconst(I64, TAG_BOOL);
-                        V::Any(p, t)
-                    }
+                    (Ty::Any, V::Bool(x)) => V::Any(l.box_bool(x)),
                     (_, p) => p,
                 },
                 None => l.zero(t),
@@ -597,21 +587,20 @@ impl Lower {
             l.def_local(i, v);
         }
         // A closure's data slots hold, per captured variable, its box object
-        // and the address of the box's value (as a non-reference value).
-        // A value capture holds the value itself, which its slot points at.
+        // and the address of the box's value (as a non-reference value: an
+        // address's high half is no reference's tag). A value capture holds
+        // the value itself, which its slot points at.
         if let Some(data) = closure_data {
             for (k, &cl) in f.captures.iter().enumerate() {
-                let LVar::Boxed { obj: (op, ot), slot, .. } = l.vars[cl] else { unreachable!() };
+                let LVar::Boxed { obj, slot, .. } = l.vars[cl] else { unreachable!() };
                 let at = (2 * k * SIZE) as i32;
-                let p = l.b.ins().load(I64, M_SLOT, data, at);
-                let t = l.b.ins().load(I64, M_SLOT, data, at + TAG_OFFSET);
+                let w = l.b.ins().load(I64, M_SLOT, data, at);
                 let s = if f.value_captures[k] {
                     l.b.ins().iadd_imm_s(data, at as i64)
                 } else {
                     l.b.ins().load(I64, M_SLOT, data, at + SIZE as i32)
                 };
-                l.b.def_var(op, p);
-                l.b.def_var(ot, t);
+                l.b.def_var(obj, w);
                 l.b.def_var(slot, s);
             }
         }
@@ -640,10 +629,72 @@ impl Lower {
         }
     }
 
+    /// A value of a tag that is no reference's nor a float's, with a
+    /// 32-bit payload.
     fn konst(&mut self, payload: i64, tag: i64) -> V {
-        let p = self.b.ins().iconst(I64, payload);
-        let t = self.b.ins().iconst(I64, tag);
-        V::Any(p, t)
+        V::Any(self.b.ins().iconst(I64, val_const(tag, payload)))
+    }
+
+    // ---- values (see `jsvalue`, `val`) ----
+
+    /// Whether value `w` has tag `tag`.
+    fn val_is(&mut self, w: Value, tag: i64) -> Value {
+        val::is(&mut self.b, w, tag)
+    }
+
+    /// Whether value `w` is a float.
+    fn val_is_float(&mut self, w: Value) -> Value {
+        val::is_float(&mut self.b, w)
+    }
+
+    /// Whether value `w` is a reference (to a cell: an object, string,
+    /// symbol, bigint...).
+    fn val_is_ref(&mut self, w: Value) -> Value {
+        val::is_ref(&mut self.b, w)
+    }
+
+    /// The address a reference `w` holds.
+    fn val_ptr(&mut self, w: Value) -> Value {
+        val::ptr(&mut self.b, w)
+    }
+
+    /// A reference to the cell at `p`, tagged `tag`.
+    fn mk_ref(&mut self, tag: i64, p: Value) -> Value {
+        val::mk_ref(&mut self.b, tag, p)
+    }
+
+    /// The int32 payload of `w` (an int, a bool), sign-extended to `I64`.
+    fn val_int(&mut self, w: Value) -> Value {
+        val::int(&mut self.b, w)
+    }
+
+    /// The int value of `i` (an `i64` in the int32 range).
+    fn mk_int(&mut self, i: Value) -> Value {
+        self.b.ins().band_imm_u(i, 0xffff_ffffi64)
+    }
+
+    /// The double a float value `w` holds.
+    fn val_f64(&mut self, w: Value) -> Value {
+        val::f64(&mut self.b, w)
+    }
+
+    /// A double as a JS value, as is (the interpreter's `js_float64`):
+    /// integral values are not made int32s.
+    fn box_float(&mut self, d: Value) -> Value {
+        let w = self.box_float_raw(d);
+        self.num_shadow.insert(w, d);
+        w
+    }
+
+    /// The float value of `d` (NaN made the one NaN, whose bits are no
+    /// other value's).
+    fn box_float_raw(&mut self, d: Value) -> Value {
+        val::float(&mut self.b, d)
+    }
+
+    /// The bool value of `x` (an `I8` 0 or 1).
+    fn box_bool(&mut self, x: Value) -> Value {
+        val::boolean(&mut self.b, x)
     }
 
     fn helper(&mut self, name: &str, args: &[Value]) -> Vec<Value> {
@@ -678,11 +729,10 @@ impl Lower {
                 self.b.def_var(var, i)
             }
             (LVar::Int(var), V::Int(i)) => self.b.def_var(var, i),
-            (LVar::Two(p, t), V::Any(x, y)) => {
-                self.b.def_var(p, x);
-                self.b.def_var(t, y);
+            (LVar::Val(var), V::Any(w)) => {
+                self.b.def_var(var, w);
                 if let Some(sv) = self.shadows[l] {
-                    let d = self.number_of((x, y));
+                    let d = self.number_of(w);
                     self.b.def_var(sv, d);
                 }
             }
@@ -717,18 +767,18 @@ impl Lower {
                 }
                 V::Num(d)
             }
-            (LVar::Two(p, t), _) => {
-                let (p, t) = (self.b.use_var(p), self.b.use_var(t));
+            (LVar::Val(var), _) => {
+                let w = self.b.use_var(var);
                 if let Some(sv) = self.shadows[l] {
                     let d = self.b.use_var(sv);
-                    self.num_shadow.insert(p, d);
+                    self.num_shadow.insert(w, d);
                 }
-                V::Any(p, t)
+                V::Any(w)
             }
             (LVar::Boxed { .. }, _) => {
-                let (p, t) = self.load_box(l);
-                self.check_tdz(l, t);
-                V::Any(p, t)
+                let w = self.load_box(l);
+                self.check_tdz(l, w);
+                V::Any(w)
             }
             _ => unreachable!(),
         }
@@ -740,24 +790,21 @@ impl Lower {
     }
 
     /// The value in a boxed local's box, borrowed, without a TDZ check.
-    fn load_box(&mut self, l: ir::LocalId) -> (Value, Value) {
+    fn load_box(&mut self, l: ir::LocalId) -> Value {
         let slot = self.box_slot(l);
-        let p = self.b.ins().load(I64, M_SLOT, slot, 0);
-        let t = self.b.ins().load(I64, M_SLOT, slot, TAG_OFFSET);
-        (p, t)
+        self.b.ins().load(I64, M_SLOT, slot, 0)
     }
 
-    fn store_box(&mut self, l: ir::LocalId, (p, t): (Value, Value)) {
+    fn store_box(&mut self, l: ir::LocalId, w: Value) {
         let slot = self.box_slot(l);
-        self.b.ins().store(M_SLOT, p, slot, 0);
-        self.b.ins().store(M_SLOT, t, slot, TAG_OFFSET);
+        self.b.ins().store(M_SLOT, w, slot, 0);
         // (The slot starts the box's traced block.)
-        self.write_barrier(slot, t);
+        self.write_barrier(slot, w);
     }
 
     /// ReferenceError if a boxed local is still uninitialized.
-    fn check_tdz(&mut self, l: ir::LocalId, t: Value) {
-        let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNINITIALIZED);
+    fn check_tdz(&mut self, l: ir::LocalId, w: Value) {
+        let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, w, val_const(TAG_UNINITIALIZED, 0));
         let throw = self.b.create_block();
         let cont = self.b.create_block();
         self.b.set_cold_block(throw);
@@ -774,18 +821,17 @@ impl Lower {
     /// Fresh, uninitialized boxes for boxed locals (their scope is entered).
     fn new_boxes(&mut self, ls: &[ir::LocalId], copy_values: bool) {
         for &l in ls {
-            let LVar::Boxed { obj: (op, ot), slot, owned } = self.vars[l] else { unreachable!() };
+            let LVar::Boxed { obj, slot, owned } = self.vars[l] else { unreachable!() };
             debug_assert!(owned);
-            let old_obj = (self.b.use_var(op), self.b.use_var(ot));
+            let old_obj = self.b.use_var(obj);
             let old_val = if copy_values { Some(self.load_box(l)) } else { None };
             let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let out_addr = self.b.ins().stack_addr(self.ptr, out, 0);
             let ctx = self.ctx;
             let r = self.helper("lum_box_new", &[ctx, out_addr]);
-            self.check_value(r[1]);
+            self.check_value(r[0]);
             let new_slot = self.b.ins().stack_load(self.ptr, I64, out, 0);
-            self.b.def_var(op, r[0]);
-            self.b.def_var(ot, r[1]);
+            self.b.def_var(obj, r[0]);
             self.b.def_var(slot, new_slot);
             if let Some(v) = old_val {
                 // A new binding for the next iteration, with the same value.
@@ -805,7 +851,7 @@ impl Lower {
             if !is_js(self.locals[l]) {
                 continue;
             }
-            let LVar::Two(..) = self.vars[l] else { unreachable!("parameters are not boxed") };
+            let LVar::Val(..) = self.vars[l] else { unreachable!("parameters are not boxed") };
             let mut assigned = false;
             ir::visit_stmts(&f.body, &mut |e| {
                 assigned |= matches!(
@@ -835,19 +881,18 @@ impl Lower {
     // are owned, for the analyses that move them.
 
     /// A new reference to `v` (borrowed).
-    fn dup(&mut self, _v: (Value, Value)) {}
+    fn dup(&mut self, _v: Value) {}
 
     /// Release a reference.
-    fn free(&mut self, _v: (Value, Value)) {}
+    fn free(&mut self, _v: Value) {}
 
-    /// The collector's write barrier, after a value tagged `t` is stored
-    /// in the GC cell `owner` (an object, or a traced block such as a
-    /// box): an old cell (one that survived a collection) not yet
-    /// remembered is remembered, for the next minor collection to trace.
-    /// Its header's flags byte: `mark` (old) the top bit, `gc_remembered`
-    /// the next.
-    fn write_barrier(&mut self, owner: Value, t: Value) {
-        let rc = self.is_refcounted(t);
+    /// The collector's write barrier, after value `w` is stored in the GC
+    /// cell `owner` (an object, or a traced block such as a box): an old
+    /// cell (one that survived a collection) not yet remembered is
+    /// remembered, for the next minor collection to trace. Its header's
+    /// flags byte: `mark` (old) the top bit, `gc_remembered` the next.
+    fn write_barrier(&mut self, owner: Value, w: Value) {
+        let rc = self.val_is_ref(w);
         let check = self.b.create_block();
         let call = self.b.create_block();
         let join = self.b.create_block();
@@ -866,24 +911,21 @@ impl Lower {
         self.b.switch_to_block(join);
     }
 
-    fn is_refcounted(&mut self, t: Value) -> Value {
-        self.b.ins().icmp_imm_s(IntCC::SignedLessThan, t, 0)
-    }
     fn free_v(&mut self, v: V) {
-        if let V::Any(p, t) = v {
-            self.free((p, t));
+        if let V::Any(w) = v {
+            self.free(w);
         }
     }
 
     fn hold(&mut self, v: V) {
-        if let V::Any(p, t) = v {
-            self.temps.push((p, t));
+        if let V::Any(w) = v {
+            self.temps.push(w);
         }
     }
 
     fn release(&mut self, v: V) {
-        if let V::Any(p, t) = v {
-            let i = self.temps.iter().rposition(|&x| x == (p, t)).expect("released value is held");
+        if let V::Any(w) = v {
+            let i = self.temps.iter().rposition(|&x| x == w).expect("released value is held");
             self.temps.remove(i);
         }
     }
@@ -907,8 +949,8 @@ impl Lower {
     }
 
     /// Check a `JSValue` returned by a helper for `JS_EXCEPTION`.
-    fn check_value(&mut self, t: Value) {
-        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_EXCEPTION);
+    fn check_value(&mut self, w: Value) {
+        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, w, val_const(TAG_EXCEPTION, 0));
         self.branch_throw(exc);
     }
 
@@ -969,14 +1011,14 @@ impl Lower {
         if is_async {
             // The value the promise resolves to.
             let ret = self.ret;
-            let (p, t) = match self.unabi(ret, &rv) {
+            let w = match self.unabi(ret, &rv) {
                 V::Num(d) => self.box_number(d),
-                V::Bool(x) => (self.b.ins().uextend(I64, x), self.b.ins().iconst(I64, TAG_BOOL)),
-                V::Any(p, t) => (p, t),
-                V::Void => (self.b.ins().iconst(I64, 0), self.b.ins().iconst(I64, TAG_UNDEFINED)),
+                V::Bool(x) => self.box_bool(x),
+                V::Any(w) => w,
+                V::Void => self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0)),
                 V::Int(_) => unreachable!("converted by unabi"),
             };
-            self.b.ins().return_(&[p, t]);
+            self.b.ins().return_(&[w]);
         } else {
             match self.exits.ret {
                 Exit::Return => {
@@ -998,9 +1040,8 @@ impl Lower {
             // (The returned tag says so: a native callee's flag is not left
             // set for the next native call to find.)
             self.clear_flag();
-            let z = self.b.ins().iconst(I64, 0);
-            let t = self.b.ins().iconst(I64, TAG_EXCEPTION);
-            self.b.ins().return_(&[z, t]);
+            let e = self.b.ins().iconst(I64, val_const(TAG_EXCEPTION, 0));
+            self.b.ins().return_(&[e]);
         } else {
             match self.exits.unwind {
                 Exit::Return => {
@@ -1023,7 +1064,7 @@ impl Lower {
         // in common (held temporaries form a stack), as landing pads chain:
         // the code stays linear in the number of throwing points.
         let pending = std::mem::take(&mut self.pending);
-        let mut chains: HashMap<(Block, Vec<(Value, Value)>), Block> = HashMap::new();
+        let mut chains: HashMap<(Block, Vec<Value>), Block> = HashMap::new();
         for (blk, temps, target) in pending {
             let to = self.cleanup_chain(target, &temps, &mut chains);
             self.b.switch_to_block(blk);
@@ -1036,8 +1077,8 @@ impl Lower {
     fn cleanup_chain(
         &mut self,
         target: Block,
-        temps: &[(Value, Value)],
-        chains: &mut HashMap<(Block, Vec<(Value, Value)>), Block>,
+        temps: &[Value],
+        chains: &mut HashMap<(Block, Vec<Value>), Block>,
     ) -> Block {
         let Some((&last, rest)) = temps.split_last() else { return target };
         if let Some(&b) = chains.get(&(target, temps.to_vec())) {
@@ -1200,7 +1241,7 @@ impl Lower {
                     l >= self.n_params
                         && self.ret_slot != Some(l)
                         && is_js(self.locals[l])
-                        && matches!(self.vars[l], LVar::Two(..))
+                        && matches!(self.vars[l], LVar::Val(..))
                 });
                 for l in fresh {
                     // (Not read: freeing is a no-op; undefined lets the old
@@ -1277,9 +1318,9 @@ impl Lower {
                 self.return_value(v);
             }
             Stmt::Throw(e) => {
-                let (p, t) = self.expr(e).any();
+                let w = self.expr(e).any();
                 let ctx = self.ctx;
-                self.helper("JS_Throw", &[ctx, p, t]);
+                self.helper("JS_Throw", &[ctx, w]);
                 let edge = self.throw_edge();
                 self.b.ins().jump(edge, &[]);
                 self.after_terminator();
@@ -1305,17 +1346,17 @@ impl Lower {
                 }
                 (Some(slot), v) => {
                     // The finalizers may suspend: the value waits in a local.
-                    let (p, t) = self.boxed(v);
-                    self.set_local(slot, V::Any(p, t));
+                    let w = self.boxed(v);
+                    self.set_local(slot, V::Any(w));
                     self.run_finally_until(0);
-                    let (p, t) = self.take_local(slot);
+                    let w = self.take_local(slot);
                     match self.ret {
-                        Ty::F64 | Ty::I32 => V::Num(self.number_of((p, t))),
+                        Ty::F64 | Ty::I32 => V::Num(self.number_of(w)),
                         Ty::Bool => {
-                            let x = self.b.ins().ireduce(I8, p);
+                            let x = self.b.ins().ireduce(I8, w);
                             V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0))
                         }
-                        _ => V::Any(p, t),
+                        _ => V::Any(w),
                     }
                 }
             }
@@ -1330,7 +1371,7 @@ impl Lower {
     }
 
     /// Move the value out of a JS-valued local, leaving `undefined`.
-    fn take_local(&mut self, l: ir::LocalId) -> (Value, Value) {
+    fn take_local(&mut self, l: ir::LocalId) -> Value {
         let v = self.use_local(l).any();
         let u = self.konst(0, TAG_UNDEFINED);
         self.def_local(l, u);
@@ -1420,8 +1461,8 @@ impl Lower {
             let ctx = self.ctx;
             let exc = self.helper("JS_GetException", &[ctx]);
             match param {
-                Some(l) => self.set_local(*l, V::Any(exc[0], exc[1])),
-                None => self.free((exc[0], exc[1])),
+                Some(l) => self.set_local(*l, V::Any(exc[0])),
+                None => self.free(exc[0]),
             }
             self.stmts(handler);
             if !self.is_filled() {
@@ -1442,8 +1483,8 @@ impl Lower {
             self.clear_flag();
             let ctx = self.ctx;
             let exc = self.helper("JS_GetException", &[ctx]);
-            let exc = V::Any(exc[0], exc[1]);
-            let (p, t) = match exc_slot {
+            let exc = V::Any(exc[0]);
+            let w = match exc_slot {
                 // The finalizer may suspend: the exception waits in a local.
                 Some(slot) => {
                     self.set_local(slot, exc);
@@ -1457,7 +1498,7 @@ impl Lower {
                     exc.any()
                 }
             };
-            self.helper("JS_Throw", &[ctx, p, t]);
+            self.helper("JS_Throw", &[ctx, w]);
             let edge = self.throw_edge();
             self.b.ins().jump(edge, &[]);
         }
@@ -1522,11 +1563,11 @@ impl Lower {
         self.b.switch_to_block(exit);
     }
 
-    /// Whether `(p, t)` (borrowed) is string constant `id`: by pointer,
-    /// then length, before comparing characters.
-    fn eq_string_const(&mut self, (p, t): (Value, Value), id: ir::StrId) -> Value {
+    /// Whether `w` (borrowed) is string constant `id`: by reference, then
+    /// length, before comparing characters.
+    fn eq_string_const(&mut self, w: Value, id: ir::StrId) -> Value {
         let base = self.b.ins().symbol_value(self.ptr, self.env.strings);
-        let kp = self.b.ins().load(I64, M_CONST, base, (id * SIZE) as i32);
+        let kw = self.b.ins().load(I64, M_CONST, base, (id * SIZE) as i32);
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, I8);
         let yes = self.b.ins().iconst(I8, 1);
@@ -1534,14 +1575,16 @@ impl Lower {
         let string = self.b.create_block();
         let other_tag = self.b.create_block();
         let slow = self.b.create_block();
-        let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING);
+        let is_str = self.val_is(w, TAG_STRING);
         self.b.ins().brif(is_str, string, &[], other_tag, &[]);
         // Ropes are compared by the engine; other values differ.
         self.b.switch_to_block(other_tag);
-        let rope = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING_ROPE);
+        let rope = self.val_is(w, TAG_STRING_ROPE);
         self.b.ins().brif(rope, slow, &[], join, &[BlockArg::Value(no)]);
         self.b.switch_to_block(string);
-        let same = self.b.ins().icmp(IntCC::Equal, p, kp);
+        let same = self.b.ins().icmp(IntCC::Equal, w, kw);
+        let p = self.val_ptr(w);
+        let kp = self.val_ptr(kw);
         let lens = self.b.create_block();
         self.b.ins().brif(same, join, &[BlockArg::Value(yes)], lens, &[]);
         self.b.switch_to_block(lens);
@@ -1602,8 +1645,7 @@ impl Lower {
         }
         self.b.switch_to_block(slow);
         let ctx = self.ctx;
-        let kt = self.b.ins().iconst(I64, TAG_STRING);
-        let r = self.helper("JS_IsStrictEqual", &[ctx, p, t, kp, kt]);
+        let r = self.helper("JS_IsStrictEqual", &[ctx, w, kw]);
         let r = self.b.ins().ireduce(I8, r[0]);
         let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
@@ -1612,7 +1654,7 @@ impl Lower {
     }
 
     /// `a === b` for borrowed values.
-    fn strict_eq(&mut self, a: (Value, Value), b: (Value, Value)) -> Value {
+    fn strict_eq(&mut self, a: Value, b: Value) -> Value {
         self.compare_any(AnyCmpOp::StrictEq, a, b)
     }
 
@@ -1650,7 +1692,7 @@ impl Lower {
         if let LVar::Boxed { .. } = self.vars[l] {
             let old = self.load_box(l);
             self.hold(v);
-            self.check_tdz(l, old.1);
+            self.check_tdz(l, old);
             self.release(v);
             self.store_box(l, v.any());
             self.free(old);
@@ -1896,8 +1938,8 @@ impl Lower {
             ExprKind::Null => self.konst(0, TAG_NULL),
             ExprKind::Local(l) => {
                 let v = self.use_local(*l);
-                if let V::Any(p, t) = v {
-                    self.dup((p, t));
+                if let V::Any(w) = v {
+                    self.dup(w);
                 }
                 v
             }
@@ -1909,22 +1951,22 @@ impl Lower {
             }
             ExprKind::SetLocal(l, x) => {
                 let v = self.expr(x);
-                if let V::Any(p, t) = v {
+                if let V::Any(w) = v {
                     // One reference for the local, one for the expression.
-                    self.dup((p, t));
+                    self.dup(w);
                 }
                 self.set_local(*l, v);
                 v
             }
             ExprKind::This => {
-                let (p, t) = self.this.expect("`this` in a method");
-                self.dup((p, t));
-                V::Any(p, t)
+                let w = self.this.expect("`this` in a method");
+                self.dup(w);
+                V::Any(w)
             }
             ExprKind::InitLocal(l, x) => {
                 let v = self.expr(x);
-                if let V::Any(p, t) = v {
-                    self.dup((p, t));
+                if let V::Any(w) = v {
+                    self.dup(w);
                 }
                 self.init_local(*l, v);
                 v
@@ -1937,7 +1979,6 @@ impl Lower {
                 let by_value = self.env.value_captures[*cid].clone();
                 let mut vals = Vec::new();
                 for (&bl, &value) in boxes.iter().zip(&by_value) {
-                    let tag = self.b.ins().iconst(I64, TAG_FLOAT64);
                     if value {
                         let v = match self.vars[bl] {
                             LVar::Boxed { .. } => self.load_box(bl),
@@ -1945,14 +1986,16 @@ impl Lower {
                         };
                         let zero = self.b.ins().iconst(I64, 0);
                         vals.push(v);
-                        vals.push((zero, tag));
+                        vals.push(zero);
                         continue;
                     }
-                    let LVar::Boxed { obj: (op, ot), .. } = self.vars[bl] else { unreachable!() };
-                    let obj = (self.b.use_var(op), self.b.use_var(ot));
+                    let LVar::Boxed { obj, .. } = self.vars[bl] else { unreachable!() };
+                    let obj = self.b.use_var(obj);
+                    // (A raw address: below the cage's top, an int to the
+                    // collector.)
                     let slot = self.box_slot(bl);
                     vals.push(obj);
-                    vals.push((slot, tag));
+                    vals.push(slot);
                 }
                 // Inline once the function's first closure is made (see
                 // `alloc_closure`), else made by the runtime.
@@ -1960,21 +2003,20 @@ impl Lower {
                 let call = self.b.create_block();
                 self.b.set_cold_block(call);
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let p = self.alloc_closure(fn_index, &vals, call);
-                let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(tag)]);
+                let w = self.mk_ref(TAG_OBJECT, p);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
                 self.b.switch_to_block(call);
                 let data = self.values_slot(&vals);
                 let index = self.b.ins().iconst(I32, fn_index as i64);
                 let n = self.b.ins().iconst(I32, vals.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_make_closure", &[ctx, index, n, data]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::Update { local, delta, prefix } => {
                 if let LVar::Int(var) = self.vars[*local] {
@@ -2013,9 +2055,9 @@ impl Lower {
                 V::Bool(match v {
                     V::Bool(b) => b,
                     V::Num(d) => self.truthy_num(d),
-                    V::Any(p, t) => {
-                        let r = self.truthy_any((p, t));
-                        self.free((p, t));
+                    V::Any(w) => {
+                        let r = self.truthy_any(w);
+                        self.free(w);
                         r
                     }
                     V::Void => self.b.ins().iconst(I8, 0),
@@ -2042,34 +2084,34 @@ impl Lower {
                 let k = self.b.ins().iconst(I32, *layout as i64);
                 let m = self.b.ins().iconst(I32, *mask as i64);
                 let r = self.helper("lum_struct_new", &[ctx, k, m]);
-                self.check_value(r[1]);
-                let obj = V::Any(r[0], r[1]);
+                self.check_value(r[0]);
+                let obj = V::Any(r[0]);
                 self.hold(obj);
                 for (&(fi, _), &v) in fields.iter().zip(&held) {
                     self.release(v);
-                    self.struct_store(*layout, fi, (r[0], r[1]), v, true);
+                    self.struct_store(*layout, fi, r[0], v, true);
                 }
                 // Which member it matches may depend on the values.
                 let l = &self.env.layouts[*layout as usize];
                 let check = l.members.len() > 1 && fields.iter().any(|&(fi, _)| !l.fields[fi as usize].simple);
                 if check {
-                    let ok = self.helper("lum_struct_validate", &[ctx, r[0], r[1]]);
+                    let ok = self.helper("lum_struct_validate", &[ctx, r[0]]);
                     self.check_int(ok[0]);
                 }
                 self.release(obj);
                 obj
             }
             ExprKind::StructArrFrom(k, x) => {
-                let (p, t) = self.expr(x).any();
+                let w = self.expr(x).any();
                 let ctx = self.ctx;
                 let kv = self.b.ins().iconst(I32, *k as i64);
-                let r = self.helper("lum_sarr_from", &[ctx, kv, p, t]);
-                self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                let r = self.helper("lum_sarr_from", &[ctx, kv, w]);
+                self.check_value(r[0]);
+                V::Any(r[0])
             }
             ExprKind::StructArrLen(a) => {
                 let (obj, owned) = self.operand(a, &[]);
-                let (p, _) = obj.any();
+                let p = self.val_ptr(obj.any());
                 let s = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
                 let len = self.b.ins().uload32(M_STRUCT, s, 4);
                 let d = self.int_f64(len);
@@ -2079,42 +2121,40 @@ impl Lower {
             }
             ExprKind::StructArrGet(_, a, i) => {
                 let (obj, owned) = self.operand(a, &[i]);
-                let (p, _) = obj.any();
+                let p = self.val_ptr(obj.any());
                 let key = self.expr(i);
                 let (ok, idx) = self.elem_index(key);
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let s = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
                 let len = self.b.ins().uload32(M_STRUCT, s, 4);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                 let inb = self.b.ins().band(inb, ok);
                 let hit = self.b.create_block();
-                let zero = self.b.ins().iconst(I64, 0);
-                let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
-                self.b.ins().brif(inb, hit, &[], join, &[BlockArg::Value(zero), BlockArg::Value(undef)]);
+                let undef = self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+                self.b.ins().brif(inb, hit, &[], join, &[BlockArg::Value(undef)]);
                 self.b.switch_to_block(hit);
                 let items = self.b.ins().load(I64, M_STRUCT, s, 16);
                 let off = self.b.ins().imul_imm_s(idx, SIZE as i64);
                 let at = self.b.ins().iadd(items, off);
-                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                let w = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(w);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
                 self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::StructArrSet(k, a, i, x) => {
                 let (obj, owned) = self.operand(a, &[i, x]);
-                let (op_, ot) = obj.any();
+                let ow = obj.any();
+                let op_ = self.val_ptr(ow);
                 let key = self.expr(i);
                 self.hold(key);
                 let v = self.expr(x);
-                let (vp, vt) = self.boxed(v);
-                let v = V::Any(vp, vt);
+                let vw = self.boxed(v);
+                let v = V::Any(vw);
                 // One reference for the array, one for the expression.
-                self.dup((vp, vt));
+                self.dup(vw);
                 self.hold(v);
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
@@ -2132,12 +2172,10 @@ impl Lower {
                     let items = self.b.ins().load(I64, M_STRUCT, s, 16);
                     let off = self.b.ins().imul_imm_s(idx, SIZE as i64);
                     let at = self.b.ins().iadd(items, off);
-                    let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
-                    let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                    self.b.ins().store(M_SLOT, vp, at, 0);
-                    self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
-                    self.write_barrier(op_, vt);
-                    self.free((old_p, old_t));
+                    let old = self.b.ins().load(I64, M_SLOT, at, 0);
+                    self.b.ins().store(M_SLOT, vw, at, 0);
+                    self.write_barrier(op_, vw);
+                    self.free(old);
                     self.b.ins().jump(join, &[]);
                 } else {
                     self.b.ins().jump(slow, &[]);
@@ -2145,7 +2183,7 @@ impl Lower {
                 // Anything else: as JS stores it (the array checks it).
                 self.b.switch_to_block(slow);
                 let kv = self.boxed(key);
-                let slot = self.values_slot(&[(op_, ot), kv, (vp, vt)]);
+                let slot = self.values_slot(&[ow, kv, vw]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
@@ -2158,11 +2196,11 @@ impl Lower {
             }
             ExprKind::StructArrPush(_, a, x) => {
                 let (obj, owned) = self.operand(a, &[x]);
-                let (p, t) = obj.any();
+                let w = obj.any();
                 let v = self.expr(x);
-                let (vp, vt) = self.boxed(v);
+                let vw = self.boxed(v);
                 let ctx = self.ctx;
-                let r = self.helper("lum_sarr_push", &[ctx, p, t, vp, vt]);
+                let r = self.helper("lum_sarr_push", &[ctx, w, vw]);
                 let failed = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
                 self.branch_throw(failed);
                 let d = self.int_f64(r[0]);
@@ -2204,23 +2242,22 @@ impl Lower {
                         let i = self.b.ins().sextend(I64, i);
                         self.b.ins().brif(ok, join, &[BlockArg::Value(i)], slow, &[]);
                     }
-                    (ir::Storage::Int32, V::Any(p, t)) => {
-                        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-                        let i = self.b.ins().ireduce(I32, p);
-                        let i = self.b.ins().sextend(I64, i);
+                    (ir::Storage::Int32, V::Any(w)) => {
+                        let is_int = self.val_is(w, TAG_INT);
+                        let i = self.val_int(w);
                         self.b.ins().brif(is_int, join, &[BlockArg::Value(i)], slow, &[]);
                     }
-                    (ir::Storage::F64, V::Any(p, t)) => {
-                        let num = self.is_number(t);
+                    (ir::Storage::F64, V::Any(w)) => {
+                        let num = self.is_number(w);
                         let ok = self.b.create_block();
                         self.b.ins().brif(num, ok, &[], slow, &[]);
                         self.b.switch_to_block(ok);
-                        let d = self.number_of((p, t));
+                        let d = self.number_of(w);
                         self.b.ins().jump(join, &[BlockArg::Value(d)]);
                     }
-                    (ir::Storage::Bool, V::Any(p, t)) => {
-                        let is_bool = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL);
-                        let x = self.b.ins().ireduce(I32, p);
+                    (ir::Storage::Bool, V::Any(w)) => {
+                        let is_bool = self.val_is(w, TAG_BOOL);
+                        let x = self.b.ins().ireduce(I32, w);
                         let x = self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0);
                         self.b.ins().brif(is_bool, join, &[BlockArg::Value(x)], slow, &[]);
                     }
@@ -2230,23 +2267,23 @@ impl Lower {
                 }
                 // The runtime converts it, or throws.
                 self.b.switch_to_block(slow);
-                let (bp, bt) = self.boxed(v);
+                let bw = self.boxed(v);
                 let ctx = self.ctx;
                 let kv = self.b.ins().iconst(I32, *k as i64);
                 let fv = self.b.ins().iconst(I32, *fi as i64);
-                let r = self.helper("lum_struct_coerce", &[ctx, kv, fv, bp, bt]);
-                self.check_value(r[1]);
+                let r = self.helper("lum_struct_coerce", &[ctx, kv, fv, bw]);
+                self.check_value(r[0]);
                 let args: Vec<BlockArg> = match storage {
                     ir::Storage::Int32 => {
                         let i = self.b.ins().ireduce(I32, r[0]);
                         vec![BlockArg::Value(self.b.ins().sextend(I64, i))]
                     }
-                    ir::Storage::F64 => vec![BlockArg::Value(self.number_of((r[0], r[1])))],
+                    ir::Storage::F64 => vec![BlockArg::Value(self.number_of(r[0]))],
                     ir::Storage::Bool => {
                         let x = self.b.ins().ireduce(I32, r[0]);
                         vec![BlockArg::Value(self.b.ins().icmp_imm_s(IntCC::NotEqual, x, 0))]
                     }
-                    ir::Storage::Value => vec![BlockArg::Value(r[0]), BlockArg::Value(r[1])],
+                    ir::Storage::Value => vec![BlockArg::Value(r[0])],
                 };
                 self.b.ins().jump(join, &args);
                 self.b.switch_to_block(join);
@@ -2254,7 +2291,7 @@ impl Lower {
             }
             ExprKind::StructGet(k, o, fi) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let (p, _) = obj.any();
+                let p = self.val_ptr(obj.any());
                 let v = self.struct_load(*k, *fi, p);
                 self.drop_operand(obj, owned);
                 v
@@ -2264,8 +2301,8 @@ impl Lower {
                 let v = self.expr(x);
                 // One reference for the field (the store takes it), one for
                 // the expression.
-                if let V::Any(p, t) = v {
-                    self.dup((p, t));
+                if let V::Any(w) = v {
+                    self.dup(w);
                 }
                 self.hold(v);
                 self.struct_store(*k, *fi, obj.any(), v, false);
@@ -2297,17 +2334,19 @@ impl Lower {
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
             ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
             ExprKind::ProtoIs { class, parent } => {
-                let (cp, ct) = self.table_value(self.env.homes, 2 * class + 1);
-                let (pp, pt) = self.table_value(self.env.homes, 2 * parent + 1);
+                let cw = self.table_value(self.env.homes, 2 * class + 1);
+                let pw = self.table_value(self.env.homes, 2 * parent + 1);
                 let join = self.b.create_block();
                 let r = self.b.append_block_param(join, I8);
                 let objs = self.b.create_block();
-                let c_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ct, TAG_OBJECT);
-                let p_obj = self.b.ins().icmp_imm_s(IntCC::Equal, pt, TAG_OBJECT);
+                let c_obj = self.val_is(cw, TAG_OBJECT);
+                let p_obj = self.val_is(pw, TAG_OBJECT);
                 let both = self.b.ins().band(c_obj, p_obj);
                 let no = self.b.ins().iconst(I8, 0);
                 self.b.ins().brif(both, objs, &[], join, &[BlockArg::Value(no)]);
                 self.b.switch_to_block(objs);
+                let cp = self.val_ptr(cw);
+                let pp = self.val_ptr(pw);
                 let shape = self.b.ins().load(I64, M_HEADER, cp, layout::OBJ_SHAPE);
                 let proto = self.b.ins().load(I64, M_HEADER, shape, layout::SHAPE_PROTO);
                 let same = self.b.ins().icmp(IntCC::Equal, proto, pp);
@@ -2339,7 +2378,8 @@ impl Lower {
                         // against a constant that compares with that integer as
                         // with NaN: false, or true for `!=`, needs no flag.)
                         let moot = |v: Value, other: Value, left: bool| {
-                            let (Some(n), Some(&k)) = (self.rem_of.get(&v).and_then(|r| r.none), self.int_consts.get(&other))
+                            let (Some(n), Some(&k)) =
+                                (self.rem_of.get(&v).and_then(|r| r.none), self.int_consts.get(&other))
                             else {
                                 return false;
                             };
@@ -2437,8 +2477,8 @@ impl Lower {
                 for v in held.into_iter().rev() {
                     self.release(v);
                 }
-                let (tp, tt) = recv.any();
-                let mut call_args = vec![self.ctx, tp, tt];
+                let tw = recv.any();
+                let mut call_args = vec![self.ctx, tw];
                 call_args.extend(vals);
                 let call = self.b.ins().call(self.env.funcs[*id], &call_args);
                 let results = self.b.inst_results(call).to_vec();
@@ -2483,8 +2523,7 @@ impl Lower {
                     })
                     .collect();
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
                 // The arguments of `aot type`s must be objects of them;
@@ -2492,23 +2531,24 @@ impl Lower {
                 let sc = self.b.ins().symbol_value(self.ptr, self.env.struct_class);
                 let mut direct = held.clone();
                 for &(i, check) in checks {
-                    let (p, t) = held[i].any();
+                    let w = held[i].any();
                     let ok = match check {
                         ir::ArgCheck::Struct(k) => {
-                            let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+                            let is_obj = self.val_is(w, TAG_OBJECT);
                             let obj = self.b.create_block();
                             self.b.ins().brif(is_obj, obj, &[], slow, &[]);
                             self.b.switch_to_block(obj);
+                            let p = self.val_ptr(w);
                             crate::struct_check(&mut self.b, p, k, sc)
                         }
                         ir::ArgCheck::Number => {
-                            direct[i] = V::Num(self.number_of((p, t)));
-                            self.is_number(t)
+                            direct[i] = V::Num(self.number_of(w));
+                            self.is_number(w)
                         }
                         ir::ArgCheck::Bool => {
-                            let b = self.b.ins().ireduce(I32, p);
+                            let b = self.b.ins().ireduce(I32, w);
                             direct[i] = V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, b, 0));
-                            self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL)
+                            self.val_is(w, TAG_BOOL)
                         }
                     };
                     let next = self.b.create_block();
@@ -2532,8 +2572,8 @@ impl Lower {
                 }
                 let ret = self.env.rets[*func];
                 let r = self.unabi(ret, &results);
-                let (p, t) = self.boxed(r);
-                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+                let w = self.boxed(r);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
                 // Else through the function object (whose entry declines).
                 self.b.switch_to_block(slow);
                 for &v in &held {
@@ -2541,7 +2581,7 @@ impl Lower {
                 }
                 let fv = self.expr(callee);
                 self.hold(fv);
-                let mut vals = vec![fv.any(), (self.b.ins().iconst(I64, 0), self.b.ins().iconst(I64, TAG_UNDEFINED))];
+                let mut vals = vec![fv.any(), self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0))];
                 for &v in &held {
                     let b = self.boxed(v);
                     vals.push(b);
@@ -2551,16 +2591,16 @@ impl Lower {
                 let argc = self.b.ins().iconst(I32, held.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 self.release(fv);
                 self.free_v(fv);
                 for &v in held.iter().rev() {
                     self.release(v);
                     self.free_v(v);
                 }
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::Math(f, args) => {
                 // JS values are converted once all arguments are evaluated.
@@ -2593,92 +2633,79 @@ impl Lower {
             ExprKind::Str(id) => {
                 let base = self.b.ins().symbol_value(self.ptr, self.env.strings);
                 let off = (*id * SIZE) as i32;
-                let p = self.b.ins().load(I64, M_CONST, base, off);
-                let t = self.b.ins().load(I64, M_CONST, base, off + TAG_OFFSET);
-                self.dup((p, t));
-                V::Any(p, t)
+                let w = self.b.ins().load(I64, M_CONST, base, off);
+                self.dup(w);
+                V::Any(w)
             }
             ExprKind::RegExp(pattern, flags) => {
                 let ctx = self.ctx;
                 let p = self.b.ins().iconst(I32, *pattern as i64);
                 let f = self.b.ins().iconst(I32, *flags as i64);
                 let r = self.helper("lum_regexp", &[ctx, p, f]);
-                self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.check_value(r[0]);
+                V::Any(r[0])
             }
             ExprKind::Box(x) => match self.expr(x) {
-                V::Num(d) if x.ty == Ty::MaybeF64 => {
-                    let (p, t) = self.box_maybe(d);
-                    V::Any(p, t)
-                }
-                V::Num(d) => {
-                    let (p, t) = self.box_number(d);
-                    V::Any(p, t)
-                }
-                V::Bool(b) => {
-                    let p = self.b.ins().uextend(I64, b);
-                    let t = self.b.ins().iconst(I64, TAG_BOOL);
-                    V::Any(p, t)
-                }
+                V::Num(d) if x.ty == Ty::MaybeF64 => V::Any(self.box_maybe(d)),
+                V::Num(d) => V::Any(self.box_number(d)),
+                V::Bool(b) => V::Any(self.box_bool(b)),
                 other => other,
             },
             ExprKind::AsyncIterator(x) => {
                 let v = self.expr(x);
                 self.hold(v);
-                let (p, t) = v.any();
+                let w = v.any();
                 let ctx = self.ctx;
                 let is_async = self.b.ins().iconst(I32, 1);
-                let r = self.helper("JS_GetIteratorObject", &[ctx, p, t, is_async]);
-                self.check_value(r[1]);
+                let r = self.helper("JS_GetIteratorObject", &[ctx, w, is_async]);
+                self.check_value(r[0]);
                 self.release(v);
                 self.free_v(v);
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::AsyncIterResult(x, done) => {
                 let v = self.expr(x);
                 self.hold(v);
-                let (p, t) = v.any();
+                let w = v.any();
                 let ctx = self.ctx;
                 let done_addr = self.done_slot();
-                let r = self.helper("lum_for_await_result", &[ctx, p, t, done_addr]);
-                self.check_value(r[1]);
+                let r = self.helper("lum_for_await_result", &[ctx, w, done_addr]);
+                self.check_value(r[0]);
                 self.release(v);
                 self.free_v(v);
                 let d = self.b.ins().load(I32, Self::mem(), done_addr, 0);
                 let d = self.b.ins().icmp_imm_s(IntCC::NotEqual, d, 0);
                 self.set_local(*done, V::Bool(d));
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::CheckObject(x) => {
                 let v = self.expr(x);
                 self.hold(v);
-                let (p, t) = v.any();
+                let w = v.any();
                 let ctx = self.ctx;
-                let r = self.helper("lum_check_object", &[ctx, p, t]);
+                let r = self.helper("lum_check_object", &[ctx, w]);
                 self.check_int(r[0]);
                 self.release(v);
                 self.free_v(v);
                 self.konst(0, TAG_UNDEFINED)
             }
             ExprKind::IterCloseQuiet(l) => {
-                let (p, t) = self.use_local(*l).any();
+                let w = self.use_local(*l).any();
                 let ctx = self.ctx;
-                self.helper("lum_iter_close_quiet", &[ctx, p, t]);
+                self.helper("lum_iter_close_quiet", &[ctx, w]);
                 self.konst(0, TAG_UNDEFINED)
             }
             ExprKind::IntOf(x) => {
                 // An int32 is not reference-counted: nothing to free.
-                let (p, _) = self.expr(x).any();
-                let i = self.b.ins().ireduce(I32, p);
-                let i = self.b.ins().sextend(I64, i);
+                let w = self.expr(x).any();
+                let i = self.val_int(w);
                 let d = self.int_f64(i);
                 self.i32s.insert(d);
                 V::Num(d)
             }
             ExprKind::AnyUnary(op, x) => {
                 let v = self.expr(x).any();
-                let (p, t) = self.unary_any(*op, v);
-                V::Any(p, t)
+                V::Any(self.unary_any(*op, v))
             }
             ExprKind::AnyBinary(AnyBinOp::Add, ..) if concat_parts(e).is_some() => {
                 // A template literal (or a chain of `+` on strings and
@@ -2696,23 +2723,23 @@ impl Lower {
                 for &v in vals.iter().rev() {
                     self.release(v);
                 }
-                let anys: Vec<(Value, Value)> = vals.iter().map(|v| v.any()).collect();
+                let anys: Vec<Value> = vals.iter().map(|v| v.any()).collect();
                 let slot = self.values_slot(&anys);
                 let n = self.b.ins().iconst(I32, anys.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("JS_ConcatStrings", &[ctx, slot, n]);
-                self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.check_value(r[0]);
+                V::Any(r[0])
             }
             ExprKind::AnyBinary(op, x, y) => {
                 let a = self.expr(x);
                 self.hold(a);
                 let c = self.expr(y);
                 self.hold(c);
-                let (p, t) = self.binary_any(*op, a.any(), c.any());
+                let w = self.binary_any(*op, a.any(), c.any());
                 self.release(c);
                 self.release(a);
-                V::Any(p, t)
+                V::Any(w)
             }
             ExprKind::AnyCompare(op @ (AnyCmpOp::StrictEq | AnyCmpOp::StrictNe), x, y)
                 if matches!(x.kind, ExprKind::Undefined | ExprKind::Null)
@@ -2724,9 +2751,9 @@ impl Lower {
                 let (v, owned) = self.operand(other, &[]);
                 let tag = if let ExprKind::Null = konst.kind { TAG_NULL } else { TAG_UNDEFINED };
                 let r = match v {
-                    V::Any(_, t) => {
+                    V::Any(w) => {
                         let cc = if *op == AnyCmpOp::StrictEq { IntCC::Equal } else { IntCC::NotEqual };
-                        self.b.ins().icmp_imm_s(cc, t, tag)
+                        self.b.ins().icmp_imm_s(cc, w, val_const(tag, 0))
                     }
                     _ => self.b.ins().iconst(I8, (*op == AnyCmpOp::StrictNe) as i64),
                 };
@@ -2760,11 +2787,11 @@ impl Lower {
                 let (v, owned) = self.operand(other, &[]);
                 let eq = *op == AnyCmpOp::Eq;
                 let r = match v {
-                    V::Any(_, t) => {
-                        let u = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNDEFINED);
-                        let n = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_NULL);
-                        let nullish = self.b.ins().bor(u, n);
-                        if eq { nullish } else { self.b.ins().bxor_imm_u(nullish, 1) }
+                    V::Any(w) => {
+                        // (Null and undefined: tags 2 and 3, payload 0.)
+                        let x = self.b.ins().bor_imm_u(w, val_const(1, 0));
+                        let cc = if eq { IntCC::Equal } else { IntCC::NotEqual };
+                        self.b.ins().icmp_imm_s(cc, x, val_const(TAG_UNDEFINED, 0))
                     }
                     _ => self.b.ins().iconst(I8, !eq as i64),
                 };
@@ -2785,21 +2812,20 @@ impl Lower {
                 V::Bool(r)
             }
             ExprKind::Cell(k) => {
-                let (p, t) = self.load_cell(*k);
-                self.dup((p, t));
-                V::Any(p, t)
+                let w = self.load_cell(*k);
+                self.dup(w);
+                V::Any(w)
             }
             ExprKind::SetCell(k, x) | ExprKind::InitCell(k, x) => {
                 let v = self.expr(x);
                 self.hold(v);
                 // A declaration replaces `uninitialized` (nothing to free).
                 let old = if let ExprKind::InitCell(..) = e.kind { self.raw_cell(*k) } else { self.load_cell(*k) };
-                let (p, t) = v.any();
-                self.dup((p, t));
+                let w = v.any();
+                self.dup(w);
                 let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
                 let off = (*k * SIZE) as i32;
-                self.b.ins().store(M_SLOT, p, base, off);
-                self.b.ins().store(M_SLOT, t, base, off + TAG_OFFSET);
+                self.b.ins().store(M_SLOT, w, base, off);
                 self.free(old);
                 self.release(v);
                 v
@@ -2812,15 +2838,16 @@ impl Lower {
                 // data property of the global object (cached as an own
                 // property read's, by `lum_global_get`).
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
                 let vars = self.b.ins().load(I64, M_HEADER, ctx, layout::CTX_GLOBAL_VAR_OBJ);
+                let vars = self.val_ptr(vars);
                 let vars_shape = self.b.ins().load(I64, M_HEADER, vars, layout::OBJ_SHAPE);
                 let count = self.b.ins().uload32(M_HEADER, vars_shape, layout::SHAPE_PROP_COUNT);
                 let none = self.b.ins().icmp_imm_s(IntCC::Equal, count, 0);
                 let g = self.b.ins().load(I64, M_HEADER, ctx, layout::CTX_GLOBAL_OBJ);
+                let g = self.val_ptr(g);
                 let shape = self.b.ins().load(I64, M_HEADER, g, layout::OBJ_SHAPE);
                 let cached = self.b.ins().load(I64, M_IC, ic, 0);
                 let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
@@ -2829,32 +2856,31 @@ impl Lower {
                 self.b.ins().brif(ok, hit, &[], slow, &[]);
                 self.b.switch_to_block(hit);
                 let at = self.ic_slot_addr(g, ic);
-                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                let w = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(w);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
                 self.b.switch_to_block(slow);
                 let r = self.helper("lum_global_get", &[ctx, atom, ic]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::GlobalOrUndefined(a) => {
                 let atom = self.atom(*a);
                 let ctx = self.ctx;
                 let r = self.helper("lum_global_or_undefined", &[ctx, atom]);
-                self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.check_value(r[0]);
+                V::Any(r[0])
             }
             ExprKind::SetGlobal(a, x) => {
                 let v = self.expr(x);
                 self.hold(v);
-                let (p, t) = v.any();
-                self.dup((p, t));
+                let w = v.any();
+                self.dup(w);
                 let atom = self.atom(*a);
                 let ctx = self.ctx;
-                let r = self.helper("JS_SetGlobalVariable", &[ctx, atom, p, t]);
+                let r = self.helper("JS_SetGlobalVariable", &[ctx, atom, w]);
                 self.check_int(r[0]);
                 self.release(v);
                 v
@@ -2862,10 +2888,10 @@ impl Lower {
             ExprKind::GetProp(o, a) => {
                 let pred = std::mem::take(&mut self.preds);
                 let (obj, owned) = self.operand(o, &[]);
-                let (p, t) = obj.any();
-                let (rp, rt) = self.prop_get_from(p, t, None, *a, pred, false);
+                let w = obj.any();
+                let r = self.prop_get_from(w, None, *a, pred, false);
                 self.drop_operand(obj, owned);
-                V::Any(rp, rt)
+                V::Any(r)
             }
             ExprKind::SetProp(o, a, x) if self.prop_step(o, *a, x).is_some() => {
                 let step = self.prop_step(o, *a, x).unwrap();
@@ -2876,65 +2902,62 @@ impl Lower {
                 let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
-                let (vp, vt) = v.any();
+                let vw = v.any();
                 // One reference for the property, one for the expression.
-                self.dup((vp, vt));
-                let (p, t) = obj.any();
-                self.prop_set_ic(p, t, *a, (vp, vt), pred);
+                self.dup(vw);
+                let w = obj.any();
+                self.prop_set_ic(w, *a, vw, pred);
                 self.release(v);
                 self.drop_operand(obj, owned);
                 v
             }
             ExprKind::ShapeGet { obj, atom, record, slot } => {
                 let (o, owned) = self.operand(obj, &[]);
-                let (p, t) = o.any();
+                let w = o.any();
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
-                let at = self.record_slot(p, t, *record, *slot, slow);
-                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                let at = self.record_slot(w, *record, *slot, slow);
+                let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(vw);
+                self.b.ins().jump(join, &[BlockArg::Value(vw)]);
                 self.b.switch_to_block(slow);
-                self.record_learn(p, t, *record);
+                self.record_learn(w, *record);
                 // (Through a cache, but out of line: the record's shapes are
                 // what usually holds, and this code would weigh on the
                 // function's register allocation.)
                 let ic = self.new_ic();
                 let ctx = self.ctx;
                 let atom = self.atom(*atom);
-                let r = self.helper("lum_ic_get_cached", &[ctx, p, t, atom, ic]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("lum_ic_get_cached", &[ctx, w, atom, ic]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
                 self.drop_operand(o, owned);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::ShapeSet { obj, atom, record, slot, value } => {
                 let (o, owned) = self.operand(obj, &[value]);
                 let v = self.expr(value);
                 self.hold(v);
-                let (vp, vt) = v.any();
+                let vw = v.any();
                 // One reference for the property, one for the expression.
-                self.dup((vp, vt));
-                let (p, t) = o.any();
+                self.dup(vw);
+                let w = o.any();
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
-                let at = self.record_slot(p, t, *record, *slot, slow);
-                let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
-                let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.b.ins().store(M_SLOT, vp, at, 0);
-                self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
-                self.write_barrier(p, vt);
-                self.free((old_p, old_t));
+                let at = self.record_slot(w, *record, *slot, slow);
+                let old = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.b.ins().store(M_SLOT, vw, at, 0);
+                let p = self.val_ptr(w);
+                self.write_barrier(p, vw);
+                self.free(old);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
-                self.record_learn(p, t, *record);
-                self.prop_set_ic(p, t, *atom, (vp, vt), Vec::new());
+                self.record_learn(w, *record);
+                self.prop_set_ic(w, *atom, vw, Vec::new());
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
                 self.release(v);
@@ -2945,7 +2968,8 @@ impl Lower {
             ExprKind::RegionLeave(_) => unreachable!("a region's jump not made"),
             ExprKind::RegionTypedGet { arr, idx } => {
                 let Ty::Arr(kind) = self.locals[*arr] else { unreachable!("a typed array") };
-                let (ap, _) = self.use_local(*arr).any();
+                let ap = self.use_local(*arr).any();
+                let ap = self.val_ptr(ap);
                 // (An integer inside it: see `guard_index`.)
                 let i = match self.use_local(*idx) {
                     V::Num(d) => match self.int_of.get(&d) {
@@ -2964,7 +2988,8 @@ impl Lower {
                 let Ty::Arr(kind) = self.locals[*arr] else { unreachable!("a typed array") };
                 let index = self.expr(idx);
                 let d = self.expr(value).num();
-                let (ap, _) = self.use_local(*arr).any();
+                let ap = self.use_local(*arr).any();
+                let ap = self.val_ptr(ap);
                 let (ok, i) = self.elem_index(index);
                 let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, i, count);
@@ -2982,12 +3007,14 @@ impl Lower {
                 V::Num(d)
             }
             ExprKind::ArrLen { arr } => {
-                let (p, _) = self.use_local(*arr).any();
+                let w = self.use_local(*arr).any();
+                let p = self.val_ptr(w);
                 let n = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
                 V::Num(self.int_f64(n))
             }
             ExprKind::StrLen { s } => {
-                let (p, _) = self.use_local(*s).any();
+                let w = self.use_local(*s).any();
+                let p = self.val_ptr(w);
                 let head = self.b.ins().uload32(M_CONST, p, layout::STRING_LEN);
                 let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
                 // (An int32, not negative: compared as one.)
@@ -2997,8 +3024,9 @@ impl Lower {
                 V::Num(d)
             }
             ExprKind::RegionPush { arr, value } => {
-                let (vp, vt) = self.expr(value).any();
-                let (ap, at) = self.use_local(*arr).any();
+                let vw = self.expr(value).any();
+                let aw = self.use_local(*arr).any();
+                let ap = self.val_ptr(aw);
                 // (As the guard found it: an extensible fast array whose
                 // `length` is its element count, an int32.)
                 let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
@@ -3011,9 +3039,8 @@ impl Lower {
                 self.b.ins().brif(room, store, &[], grow, &[]);
                 self.b.switch_to_block(store);
                 let slot = self.array_slot(ap, count);
-                self.b.ins().store(M_SLOT, vp, slot, 0);
-                self.b.ins().store(M_SLOT, vt, slot, TAG_OFFSET);
-                self.write_barrier(ap, vt);
+                self.b.ins().store(M_SLOT, vw, slot, 0);
+                self.write_barrier(ap, vw);
                 let k1 = self.b.ins().iadd_imm_s(count, 1);
                 self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
                 let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
@@ -3021,7 +3048,7 @@ impl Lower {
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(grow);
                 let ctx = self.ctx;
-                let r = self.helper("lum_region_push", &[ctx, ap, at, vp, vt]);
+                let r = self.helper("lum_region_push", &[ctx, aw, vw]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -3029,7 +3056,8 @@ impl Lower {
             }
             ExprKind::StrCharCode { s, idx } => {
                 let d = self.expr(idx).num();
-                let (p, _) = self.use_local(*s).any();
+                let w = self.use_local(*s).any();
+                let p = self.val_ptr(w);
                 V::Num(self.flat_char_code(p, d))
             }
             ExprKind::SlotLoad { obj, slot } => {
@@ -3037,13 +3065,8 @@ impl Lower {
                 let off = (*slot as usize * SIZE) as i32;
                 let floats =
                     if self.spec_elems.contains(obj) { self.spec_float_elems.contains(obj) } else { self.spec_floats };
-                if floats {
-                    V::Num(self.b.ins().load(F64, M_SLOT, props, off))
-                } else {
-                    let p = self.b.ins().load(I64, M_SLOT, props, off);
-                    let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
-                    V::Num(self.number_tagged(p, t))
-                }
+                let w = self.b.ins().load(I64, M_SLOT, props, off);
+                if floats { V::Num(self.val_f64(w)) } else { V::Num(self.number_tagged(w)) }
             }
             ExprKind::SlotStore { obj, slot, value, arith } => {
                 let d = self.expr(value).num();
@@ -3054,52 +3077,40 @@ impl Lower {
                 // interpreter's float arithmetic makes it.
                 let elem = self.spec_elems.contains(obj);
                 let floats = self.spec_floats && *arith && (!elem || self.spec_float_elems.contains(obj));
-                let (vp, vt) = if floats { self.box_float(d) } else { self.box_number(d) };
+                let w = if floats { self.box_float(d) } else { self.box_number(d) };
                 let off = (*slot as usize * SIZE) as i32;
-                self.b.ins().store(M_SLOT, vp, props, off);
-                // (A float replacing a float keeps its tag: an element's
-                // where its fields hold floats.)
-                let kept = if elem {
-                    self.spec_float_elems.contains(obj)
-                } else {
-                    self.spec_float_slots.contains(&(*obj, *slot))
-                };
-                if !(floats && kept) {
-                    self.b.ins().store(M_SLOT, vt, props, off + TAG_OFFSET);
-                }
+                self.b.ins().store(M_SLOT, w, props, off);
                 V::Num(d)
             }
             ExprKind::GetElem(o, k) => {
                 let (obj, owned) = self.operand(o, &[k]);
                 let key = self.expr(k);
-                let (op_, ot) = obj.any();
+                let ow = obj.any();
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 // A fast array element.
                 let (ok, idx) = self.elem_index(key);
-                let count = self.array_part(op_, ot, ok, slow);
+                let (op_, count) = self.array_part(ow, ok, slow);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
                 let hit = self.b.create_block();
                 self.b.ins().brif(inb, hit, &[], slow, &[]);
                 self.b.switch_to_block(hit);
                 let at = self.array_slot(op_, idx);
-                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(vw);
+                self.b.ins().jump(join, &[BlockArg::Value(vw)]);
                 // Anything else. The key is passed on (JS_GetPropertyValue
                 // frees it).
                 self.b.switch_to_block(slow);
-                let (kp, kt) = self.boxed(key);
+                let kw = self.boxed(key);
                 let ctx = self.ctx;
-                let r = self.helper("JS_GetPropertyValue", &[ctx, op_, ot, kp, kt]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("JS_GetPropertyValue", &[ctx, ow, kw]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::SetElem(o, k, x) => {
                 let (obj, owned) = self.operand(o, &[k, x]);
@@ -3107,28 +3118,26 @@ impl Lower {
                 self.hold(key);
                 let v = self.expr(x);
                 self.hold(v);
-                let (vp, vt) = v.any();
+                let vw = v.any();
                 // One reference for the property, one for the expression.
-                self.dup((vp, vt));
-                let (op_, ot) = obj.any();
+                self.dup(vw);
+                let ow = obj.any();
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
                 // Overwrite a fast array element (always a writable data
                 // property).
                 let (ok, idx) = self.elem_index(key);
-                let count = self.array_part(op_, ot, ok, slow);
+                let (op_, count) = self.array_part(ow, ok, slow);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
                 let hit = self.b.create_block();
                 let beyond = self.b.create_block();
                 self.b.ins().brif(inb, hit, &[], beyond, &[]);
                 self.b.switch_to_block(hit);
                 let at = self.array_slot(op_, idx);
-                let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
-                let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.b.ins().store(M_SLOT, vp, at, 0);
-                self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
-                self.write_barrier(op_, vt);
-                self.free((old_p, old_t));
+                let old = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.b.ins().store(M_SLOT, vw, at, 0);
+                self.write_barrier(op_, vw);
+                self.free(old);
                 self.b.ins().jump(join, &[]);
                 // Appending (index == count): the engine's append fast path,
                 // which takes the value unless it does not apply (-2).
@@ -3138,7 +3147,7 @@ impl Lower {
                 self.b.ins().brif(is_append, append, &[], slow, &[]);
                 self.b.switch_to_block(append);
                 let ctx = self.ctx;
-                let r = self.helper("JS_ArrayAppendFast", &[ctx, op_, ot, vp, vt]);
+                let r = self.helper("JS_ArrayAppendFast", &[ctx, ow, vw]);
                 let na = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], -2);
                 let appended = self.b.create_block();
                 self.b.ins().brif(na, slow, &[], appended, &[]);
@@ -3149,7 +3158,7 @@ impl Lower {
                 // reference to the value.
                 self.b.switch_to_block(slow);
                 let kv = self.boxed(key);
-                let slot = self.values_slot(&[(op_, ot), kv, (vp, vt)]);
+                let slot = self.values_slot(&[ow, kv, vw]);
                 self.release(v);
                 self.release(key);
                 self.hold(v);
@@ -3164,13 +3173,13 @@ impl Lower {
             }
             ExprKind::Length(o, atom) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let (op_, ot) = obj.any();
+                let ow = obj.any();
+                let op_ = self.val_ptr(ow);
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 let not_obj = self.b.create_block();
-                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ot, TAG_OBJECT);
+                let is_obj = self.val_is(ow, TAG_OBJECT);
                 let obj_blk = self.b.create_block();
                 self.b.ins().brif(is_obj, obj_blk, &[], not_obj, &[]);
                 // Arrays: `length` is always own property 0, a number.
@@ -3182,9 +3191,8 @@ impl Lower {
                 self.b.ins().brif(is_array, array, &[], other, &[]);
                 self.b.switch_to_block(array);
                 let prop = self.b.ins().load(I64, M_HEADER, op_, layout::OBJ_PROP);
-                let lp = self.b.ins().load(I64, M_SLOT, prop, 0);
-                let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
-                self.b.ins().jump(join, &[BlockArg::Value(lp), BlockArg::Value(lt)]);
+                let lw = self.b.ins().load(I64, M_SLOT, prop, 0);
+                self.b.ins().jump(join, &[BlockArg::Value(lw)]);
                 // Typed arrays with a pristine shape: the element count.
                 self.b.switch_to_block(other);
                 let kind = self.b.ins().iadd_imm_s(class, -layout::CLASS_TYPED_ARRAY);
@@ -3196,33 +3204,32 @@ impl Lower {
                 let ta_len = self.b.create_block();
                 self.b.ins().brif(pristine, ta_len, &[], slow, &[]);
                 self.b.switch_to_block(ta_len);
+                // (An int value: the int32 count, tag 0 above it.)
                 let count = self.b.ins().uload32(M_HEADER, op_, layout::OBJ_ARRAY_COUNT);
-                let int = self.b.ins().iconst(I64, TAG_INT);
-                self.b.ins().jump(join, &[BlockArg::Value(count), BlockArg::Value(int)]);
+                self.b.ins().jump(join, &[BlockArg::Value(count)]);
                 // Strings: the length in the header.
                 self.b.switch_to_block(not_obj);
-                let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, ot, TAG_STRING);
+                let is_str = self.val_is(ow, TAG_STRING);
                 let string = self.b.create_block();
                 self.b.ins().brif(is_str, string, &[], slow, &[]);
                 self.b.switch_to_block(string);
-                let w = self.b.ins().uload32(M_HEADER, op_, layout::STRING_LEN);
-                let len = self.b.ins().band_imm_u(w, 0x7fff_ffff);
-                let int = self.b.ins().iconst(I64, TAG_INT);
-                self.b.ins().jump(join, &[BlockArg::Value(len), BlockArg::Value(int)]);
+                let head = self.b.ins().uload32(M_HEADER, op_, layout::STRING_LEN);
+                let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
+                self.b.ins().jump(join, &[BlockArg::Value(len)]);
                 self.b.switch_to_block(slow);
                 let a = self.atom(*atom);
                 let ctx = self.ctx;
-                let r = self.helper("JS_GetProperty", &[ctx, op_, ot, a]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("JS_GetProperty", &[ctx, ow, a]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::TypedGet(kind, a, i) => {
                 let (arr, owned) = self.operand(a, &[i]);
                 let index = self.expr(i);
-                let (p, _) = arr.any();
+                let p = self.val_ptr(arr.any());
                 let join = self.b.create_block();
                 let r = self.b.append_block_param(join, F64);
                 let (ok, idx) = self.elem_index(index);
@@ -3246,7 +3253,8 @@ impl Lower {
                 let (arr, owned) = self.operand(a, &[i, x]);
                 let index = self.expr(i);
                 let V::Num(d) = self.expr(x) else { unreachable!("TypedSet value") };
-                let (p, t) = arr.any();
+                let aw = arr.any();
+                let p = self.val_ptr(aw);
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
@@ -3274,7 +3282,7 @@ impl Lower {
                 self.b.switch_to_block(slow);
                 let kv = self.boxed(index);
                 let vv = self.box_number(d);
-                let slot = self.values_slot(&[(p, t), kv, vv]);
+                let slot = self.values_slot(&[aw, kv, vv]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_set_elem", &[ctx, slot]);
                 self.check_int(r[0]);
@@ -3287,13 +3295,13 @@ impl Lower {
                 let obj = self.expr(o);
                 self.hold(obj);
                 let v = self.expr(x);
-                let (vp, vt) = v.any();
-                let (p, t) = obj.any();
+                let vw = v.any();
+                let w = obj.any();
                 let atom = self.atom(*a);
                 // The property takes the value; JS_PROP_C_W_E.
                 let flags = self.b.ins().iconst(I32, PROP_THROW | 7);
                 let ctx = self.ctx;
-                let r = self.helper("JS_DefinePropertyValue", &[ctx, p, t, atom, vp, vt, flags]);
+                let r = self.helper("JS_DefinePropertyValue", &[ctx, w, atom, vw, flags]);
                 self.check_int(r[0]);
                 self.release(obj);
                 self.free_v(obj);
@@ -3303,13 +3311,13 @@ impl Lower {
                 let obj = self.expr(o);
                 self.hold(obj);
                 let v = self.expr(x);
-                let (vp, vt) = v.any();
-                let (p, t) = obj.any();
-                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let vw = v.any();
+                let w = obj.any();
+                let nw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let at = self.values_slot(&[(p, t), (np, nt)]);
+                let at = self.values_slot(&[w, nw]);
                 // (The field takes the value.)
-                let r = self.helper("lum_private_define", &[ctx, at, vp, vt]);
+                let r = self.helper("lum_private_define", &[ctx, at, vw]);
                 self.check_int(r[0]);
                 self.release(obj);
                 self.free_v(obj);
@@ -3317,10 +3325,10 @@ impl Lower {
             }
             ExprKind::AddBrand(o, home) => {
                 let obj = self.expr(o);
-                let (p, t) = obj.any();
-                let (hp, ht) = self.table_value(self.env.homes, *home);
+                let w = obj.any();
+                let hw = self.table_value(self.env.homes, *home);
                 let ctx = self.ctx;
-                let r = self.helper("JS_PrivateAddBrand", &[ctx, p, t, hp, ht]);
+                let r = self.helper("JS_PrivateAddBrand", &[ctx, w, hw]);
                 self.check_int(r[0]);
                 self.free_v(obj);
                 V::Void
@@ -3329,10 +3337,10 @@ impl Lower {
                 let obj = self.expr(o);
                 self.hold(obj);
                 let atom = self.atom(*a);
-                let (p, t) = obj.any();
+                let w = obj.any();
                 let flags = self.b.ins().iconst(I32, PROP_THROW);
                 let ctx = self.ctx;
-                let r = self.helper("JS_DeleteProperty", &[ctx, p, t, atom, flags]);
+                let r = self.helper("JS_DeleteProperty", &[ctx, w, atom, flags]);
                 self.check_int(r[0]);
                 self.release(obj);
                 self.free_v(obj);
@@ -3378,7 +3386,7 @@ impl Lower {
                     later.push(k);
                 }
                 let (obj, owned) = self.operand(o, &later);
-                let (op_, ot) = obj.any();
+                let ow = obj.any();
                 let ctx = self.ctx;
                 let method = match key {
                     Key::Atom(a) if pred.is_empty() => self.env.methods.get(a).copied(),
@@ -3397,8 +3405,8 @@ impl Lower {
                     && args.iter().all(|x| self.pure_arg(x))
                     && fits(method)
                 {
-                    let (mp, mt, f_owned) = self.prop_get_inner(op_, ot, None, *a, Vec::new(), true, true);
-                    let fv = V::Any(mp, mt);
+                    let (mw, f_owned) = self.prop_get_inner(ow, None, *a, Vec::new(), true, true);
+                    let fv = V::Any(mw);
                     let r = match method {
                         Method::CharCodeAt => self.char_code_at(fv, f_owned, obj, args),
                         Method::ArrayPush => self.array_push(fv, f_owned, obj, &args[0]),
@@ -3411,17 +3419,17 @@ impl Lower {
                 let m = match key {
                     Key::Atom(a) => {
                         self.poly_site = !pred.is_empty();
-                        let (mp, mt) = self.method_get(op_, ot, *a);
+                        let mw = self.method_get(ow, *a);
                         self.poly_site = false;
-                        vec![mp, mt]
+                        vec![mw]
                     }
                     Key::Value(k) => {
-                        let (kp, kt) = self.expr(k).any();
-                        self.helper("JS_GetPropertyValue", &[ctx, op_, ot, kp, kt])
+                        let kw = self.expr(k).any();
+                        self.helper("JS_GetPropertyValue", &[ctx, ow, kw])
                     }
                 };
-                self.check_value(m[1]);
-                let fv = V::Any(m[0], m[1]);
+                self.check_value(m[0]);
+                let fv = V::Any(m[0]);
                 self.hold(fv);
                 let r = match method {
                     Some(Method::CharCodeAt) => self.char_code_at(fv, None, obj, args),
@@ -3446,20 +3454,20 @@ impl Lower {
                         v
                     })
                     .collect();
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
                 let argv = self.values_slot(&vals);
                 let argc = self.b.ins().iconst(I32, args.len() as i64);
-                let (fp, ft) = fv.any();
+                let fw = fv.any();
                 let ctx = self.ctx;
-                let r = self.helper("JS_CallConstructor", &[ctx, fp, ft, argc, argv]);
-                self.check_value(r[1]);
+                let r = self.helper("JS_CallConstructor", &[ctx, fw, argc, argv]);
+                self.check_value(r[0]);
                 for v in held.into_iter().rev() {
                     self.release(v);
                     self.free_v(v);
                 }
                 self.release(fv);
                 self.free_v(fv);
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::SuperNew { class, target, args } => {
                 // (The class and `new.target`, then the arguments.)
@@ -3472,28 +3480,28 @@ impl Lower {
                         v
                     })
                     .collect();
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
                 let v = self.values_slot(&vals);
                 let argc = self.b.ins().iconst(I32, args.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_super_construct", &[ctx, argc, v]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 for v in held.into_iter().rev() {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::HomeValue(k) => {
-                let (p, t) = self.table_value(self.env.homes, *k);
-                self.dup((p, t));
-                V::Any(p, t)
+                let w = self.table_value(self.env.homes, *k);
+                self.dup(w);
+                V::Any(w)
             }
             ExprKind::CurrentFunction => {
                 let data = self.closure_data.expect("the function of a closure");
                 let r = self.helper("JS_GetFunctionOfData", &[data]);
-                self.dup((r[0], r[1]));
-                V::Any(r[0], r[1])
+                self.dup(r[0]);
+                V::Any(r[0])
             }
             ExprKind::ClassSetup { ctor, parent } => {
                 let fv = self.expr(ctor);
@@ -3507,12 +3515,12 @@ impl Lower {
                 let has = self.b.ins().iconst(I32, parent.is_some() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_class_setup", &[ctx, v, has]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 for v in [pv, fv] {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::DefineMethod { obj, key, func, kind } => {
                 let ov = self.expr(obj);
@@ -3557,16 +3565,16 @@ impl Lower {
                         v
                     })
                     .collect();
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
                 let v = self.values_slot(&vals);
                 let ctx = self.ctx;
                 let r = self.helper("lum_super_construct_array", &[ctx, v]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 for v in held.into_iter().rev() {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::Object(props) => self.new_object(props, None),
             ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
@@ -3582,7 +3590,7 @@ impl Lower {
                         v
                     })
                     .collect();
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
                 let slot = self.values_slot(&vals);
                 // lum_new_array takes ownership of the elements.
                 for v in held.into_iter().rev() {
@@ -3591,32 +3599,32 @@ impl Lower {
                 let n = self.b.ins().iconst(I32, elems.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_new_array", &[ctx, n, slot]);
-                self.check_value(r[1]);
-                V::Any(r[0], r[1])
+                self.check_value(r[0]);
+                V::Any(r[0])
             }
             ExprKind::ArrayParts(parts) => {
                 let ctx = self.ctx;
                 let a = self.helper("JS_NewArray", &[ctx]);
-                self.check_value(a[1]);
-                let arr = V::Any(a[0], a[1]);
+                self.check_value(a[0]);
+                let arr = V::Any(a[0]);
                 self.hold(arr);
                 for part in parts {
                     let r = match part {
                         ir::ArrPart::Value(x) => {
                             // Takes ownership of the value.
-                            let (p, t) = self.expr(x).any();
-                            self.helper("lum_array_push", &[ctx, a[0], a[1], p, t])
+                            let w = self.expr(x).any();
+                            self.helper("lum_array_push", &[ctx, a[0], w])
                         }
                         ir::ArrPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);
-                            let (p, t) = v.any();
-                            let r = self.helper("lum_array_spread", &[ctx, a[0], a[1], p, t]);
+                            let w = v.any();
+                            let r = self.helper("lum_array_spread", &[ctx, a[0], w]);
                             self.release(v);
                             self.free_v(v);
                             r
                         }
-                        ir::ArrPart::Hole => self.helper("lum_array_hole", &[ctx, a[0], a[1]]),
+                        ir::ArrPart::Hole => self.helper("lum_array_hole", &[ctx, a[0]]),
                     };
                     self.check_int(r[0]);
                 }
@@ -3626,48 +3634,48 @@ impl Lower {
             ExprKind::ObjectParts(parts) => {
                 let ctx = self.ctx;
                 let o = self.helper("JS_NewObject", &[ctx]);
-                self.check_value(o[1]);
-                let obj = V::Any(o[0], o[1]);
+                self.check_value(o[0]);
+                let obj = V::Any(o[0]);
                 self.hold(obj);
                 for part in parts {
                     match part {
                         ir::ObjPart::Field(a, x) => {
-                            let (p, t) = self.expr(x).any();
-                            let slot = self.values_slot(&[(o[0], o[1])]);
+                            let w = self.expr(x).any();
+                            let slot = self.values_slot(&[o[0]]);
                             let atom = self.atom(*a);
-                            let r = self.helper("lum_define_field", &[ctx, slot, atom, p, t]);
+                            let r = self.helper("lum_define_field", &[ctx, slot, atom, w]);
                             self.check_int(r[0]);
                         }
                         ir::ObjPart::Computed(k, x) => {
                             // The key is converted before the value is evaluated.
-                            let (kp, kt) = self.expr(k).any();
-                            self.hold(V::Any(kp, kt));
-                            let key = self.helper("JS_ToPropertyKey", &[ctx, kp, kt]);
-                            self.check_value(key[1]);
-                            self.release(V::Any(kp, kt));
-                            self.free((kp, kt));
-                            let key = V::Any(key[0], key[1]);
+                            let kw = self.expr(k).any();
+                            self.hold(V::Any(kw));
+                            let key = self.helper("JS_ToPropertyKey", &[ctx, kw]);
+                            self.check_value(key[0]);
+                            self.release(V::Any(kw));
+                            self.free(kw);
+                            let key = V::Any(key[0]);
                             self.hold(key);
-                            let (p, t) = self.expr(x).any();
-                            let slot = self.values_slot(&[(o[0], o[1]), key.any()]);
-                            let r = self.helper("lum_define_computed", &[ctx, slot, p, t]);
+                            let w = self.expr(x).any();
+                            let slot = self.values_slot(&[o[0], key.any()]);
+                            let r = self.helper("lum_define_computed", &[ctx, slot, w]);
                             self.check_int(r[0]);
                             self.release(key);
                             self.free_v(key);
                         }
                         ir::ObjPart::Accessor(a, x, setter) => {
-                            let (p, t) = self.expr(x).any();
-                            let slot = self.values_slot(&[(o[0], o[1])]);
+                            let w = self.expr(x).any();
+                            let slot = self.values_slot(&[o[0]]);
                             let atom = self.atom(*a);
                             let s = self.b.ins().iconst(I32, *setter as i64);
-                            let r = self.helper("lum_define_accessor", &[ctx, slot, atom, p, t, s]);
+                            let r = self.helper("lum_define_accessor", &[ctx, slot, atom, w, s]);
                             self.check_int(r[0]);
                         }
                         ir::ObjPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);
-                            let (p, t) = v.any();
-                            let r = self.helper("lum_object_spread", &[ctx, o[0], o[1], p, t]);
+                            let w = v.any();
+                            let r = self.helper("lum_object_spread", &[ctx, o[0], w]);
                             self.check_int(r[0]);
                             self.release(v);
                             self.free_v(v);
@@ -3687,27 +3695,27 @@ impl Lower {
                 let slot = self.values_slot(&[fv.any(), tv.any(), av.any()]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_apply", &[ctx, slot]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 for v in [av, tv, fv] {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::NewSpread(f, args) => {
                 let fv = self.expr(f);
                 self.hold(fv);
                 let av = self.expr(args);
                 self.hold(av);
-                let ((fp, ft), (ap, at)) = (fv.any(), av.any());
+                let (fw, aw) = (fv.any(), av.any());
                 let ctx = self.ctx;
-                let r = self.helper("lum_construct", &[ctx, fp, ft, ap, at]);
-                self.check_value(r[1]);
+                let r = self.helper("lum_construct", &[ctx, fw, aw]);
+                self.check_value(r[0]);
                 for v in [av, fv] {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::IterOpen(x, iter, next, atom) => {
                 self.iter_open(x, *iter, *next, *atom);
@@ -3717,55 +3725,52 @@ impl Lower {
             ExprKind::ToObject(x) => self.convert(x, "JS_ToObject"),
             ExprKind::PrivateField(o, slot) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let (op_, ot) = obj.any();
+                let ow = obj.any();
                 let ic = self.new_ic();
                 let join = self.b.create_block();
-                let rp = self.b.append_block_param(join, I64);
-                let rt = self.b.append_block_param(join, I64);
+                let rw = self.b.append_block_param(join, I64);
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
                 // A field of a cached shape (private fields are properties
                 // keyed by their private symbol).
-                let at = self.ic_hit(op_, ot, ic, slow);
-                let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-                let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+                let at = self.ic_hit(ow, ic, slow);
+                let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(vw);
+                self.b.ins().jump(join, &[BlockArg::Value(vw)]);
                 self.b.switch_to_block(slow);
-                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let nw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let r = self.helper("lum_private_get_ic", &[ctx, op_, ot, np, nt, ic]);
-                self.check_value(r[1]);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("lum_private_get_ic", &[ctx, ow, nw, ic]);
+                self.check_value(r[0]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
                 self.drop_operand(obj, owned);
-                V::Any(rp, rt)
+                V::Any(rw)
             }
             ExprKind::PrivateSetField(o, slot, x) => {
                 let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
-                let (vp, vt) = v.any();
+                let vw = v.any();
                 // One reference for the field (taken), one for the expression.
-                self.dup((vp, vt));
-                let (op_, ot) = obj.any();
+                self.dup(vw);
+                let ow = obj.any();
                 let ic = self.new_ic();
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
-                let at = self.ic_hit(op_, ot, ic, slow);
-                let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
-                let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-                self.b.ins().store(M_SLOT, vp, at, 0);
-                self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
-                self.write_barrier(op_, vt);
-                self.free((old_p, old_t));
+                let at = self.ic_hit(ow, ic, slow);
+                let old = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.b.ins().store(M_SLOT, vw, at, 0);
+                let op_ = self.val_ptr(ow);
+                self.write_barrier(op_, vw);
+                self.free(old);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(slow);
-                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let nw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let slot = self.values_slot(&[(op_, ot), (np, nt)]);
-                let r = self.helper("lum_private_set_ic", &[ctx, slot, vp, vt, ic]);
+                let slot = self.values_slot(&[ow, nw]);
+                let r = self.helper("lum_private_set_ic", &[ctx, slot, vw, ic]);
                 self.check_int(r[0]);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
@@ -3775,21 +3780,21 @@ impl Lower {
             }
             ExprKind::PrivateMethod(o, slot) | ExprKind::PrivateGetter(o, slot) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let (op_, ot) = obj.any();
-                let (fp, ft) = self.table_value(self.env.privates, *slot);
+                let ow = obj.any();
+                let fw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let r = self.helper("JS_PrivateCheckBrand", &[ctx, op_, ot, fp, ft]);
+                let r = self.helper("JS_PrivateCheckBrand", &[ctx, ow, fw]);
                 self.check_int(r[0]);
                 let v = if let ExprKind::PrivateGetter(..) = e.kind {
-                    let slot = self.values_slot(&[(fp, ft), (op_, ot)]);
+                    let slot = self.values_slot(&[fw, ow]);
                     let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
                     let argc = self.b.ins().iconst(I32, 0);
                     let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
-                    self.check_value(r[1]);
-                    V::Any(r[0], r[1])
+                    self.check_value(r[0]);
+                    V::Any(r[0])
                 } else {
-                    self.dup((fp, ft));
-                    V::Any(fp, ft)
+                    self.dup(fw);
+                    V::Any(fw)
                 };
                 self.drop_operand(obj, owned);
                 v
@@ -3798,37 +3803,36 @@ impl Lower {
                 let (obj, owned) = self.operand(o, &[x]);
                 let v = self.expr(x);
                 self.hold(v);
-                let (vp, vt) = v.any();
-                let (op_, ot) = obj.any();
-                let (fp, ft) = self.table_value(self.env.privates, *slot);
+                let vw = v.any();
+                let ow = obj.any();
+                let fw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let r = self.helper("JS_PrivateCheckBrand", &[ctx, op_, ot, fp, ft]);
+                let r = self.helper("JS_PrivateCheckBrand", &[ctx, ow, fw]);
                 self.check_int(r[0]);
-                let slot = self.values_slot(&[(fp, ft), (op_, ot), (vp, vt)]);
+                let slot = self.values_slot(&[fw, ow, vw]);
                 let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
                 let argc = self.b.ins().iconst(I32, 1);
                 let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
-                self.check_value(r[1]);
-                self.free((r[0], r[1]));
+                self.check_value(r[0]);
+                self.free(r[0]);
                 self.release(v);
                 self.drop_operand(obj, owned);
                 v
             }
             ExprKind::PrivateIn(o, slot) => {
                 let (obj, owned) = self.operand(o, &[]);
-                let (op_, ot) = obj.any();
-                let (np, nt) = self.table_value(self.env.privates, *slot);
+                let ow = obj.any();
+                let nw = self.table_value(self.env.privates, *slot);
                 let ctx = self.ctx;
-                let r = self.helper("JS_PrivateIn", &[ctx, op_, ot, np, nt]);
+                let r = self.helper("JS_PrivateIn", &[ctx, ow, nw]);
                 self.check_int(r[0]);
                 self.drop_operand(obj, owned);
                 V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, r[0], 0))
             }
             ExprKind::SuperGetAtom(home, a) => {
-                let (hp, ht) = self.table_value(self.env.homes, *home);
+                let hw = self.table_value(self.env.homes, *home);
                 let this = self.this.expect("`super` in a method");
-                let (rp, rt) = self.prop_get_from(hp, ht, Some(this), *a, Vec::new(), false);
-                V::Any(rp, rt)
+                V::Any(self.prop_get_from(hw, Some(this), *a, Vec::new(), false))
             }
             ExprKind::SuperGet(home, k) => {
                 let key = self.expr(k);
@@ -3838,24 +3842,24 @@ impl Lower {
                 let slot = self.values_slot(&[h, this, key.any()]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_super_get", &[ctx, slot]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 self.release(key);
                 self.free_v(key);
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::SuperSet(home, k, x) => {
                 let key = self.expr(k);
                 self.hold(key);
                 let v = self.expr(x);
                 self.hold(v);
-                let (vp, vt) = v.any();
+                let vw = v.any();
                 // One reference for the property (taken), one for the expression.
-                self.dup((vp, vt));
+                self.dup(vw);
                 let h = self.table_value(self.env.homes, *home);
                 let this = self.this.expect("`super` in a method");
                 let slot = self.values_slot(&[h, this, key.any()]);
                 let ctx = self.ctx;
-                let r = self.helper("lum_super_set", &[ctx, slot, vp, vt]);
+                let r = self.helper("lum_super_set", &[ctx, slot, vw]);
                 self.check_int(r[0]);
                 self.release(v);
                 self.release(key);
@@ -3869,18 +3873,18 @@ impl Lower {
                 let slot = self.values_slot(&[it, obj.any(), key.any()]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_for_in_get", &[ctx, slot]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 self.drop_operand(key, key_owned);
                 self.drop_operand(obj, owned);
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
             ExprKind::ToPropKey(x) => self.convert(x, "JS_ToPropertyKey"),
             ExprKind::ArrayPush(arr, x) => {
                 // Takes ownership of the value.
-                let (p, t) = self.expr(x).any();
-                let (ap, at) = self.use_local(*arr).any();
+                let w = self.expr(x).any();
+                let aw = self.use_local(*arr).any();
                 let ctx = self.ctx;
-                let r = self.helper("lum_array_push", &[ctx, ap, at, p, t]);
+                let r = self.helper("lum_array_push", &[ctx, aw, w]);
                 self.check_int(r[0]);
                 self.konst(0, TAG_UNDEFINED)
             }
@@ -3898,17 +3902,17 @@ impl Lower {
                     self.hold(v);
                     held.push(v);
                 }
-                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+                let vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
                 let slot = self.values_slot(&vals);
                 let n = self.b.ins().iconst(I32, keys.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("lum_object_rest", &[ctx, slot, n]);
-                self.check_value(r[1]);
+                self.check_value(r[0]);
                 for v in held.into_iter().rev() {
                     self.release(v);
                     self.free_v(v);
                 }
-                V::Any(r[0], r[1])
+                V::Any(r[0])
             }
         }
     }
@@ -3939,18 +3943,12 @@ impl Lower {
                 V::Bool(self.b.ins().ireduce(I8, x))
             }
             ir::Storage::Value => {
-                let vp = self.b.ins().load(I64, M_STRUCT, at, 0);
-                let vt = self.b.ins().load(I64, M_STRUCT, at, TAG_OFFSET);
-                self.dup((vp, vt));
-                V::Any(vp, vt)
+                let w = self.b.ins().load(I64, M_STRUCT, at, 0);
+                self.dup(w);
+                V::Any(w)
             }
         };
-        if boxed && !matches!(v, V::Any(..)) {
-            let (bp, bt) = self.boxed(v);
-            V::Any(bp, bt)
-        } else {
-            v
-        }
+        if boxed && !matches!(v, V::Any(..)) { V::Any(self.boxed(v)) } else { v }
     }
 
     /// `obj.field` of an object of layout `k` (borrowed): typed if the field
@@ -3960,28 +3958,27 @@ impl Lower {
             return self.struct_field_value(k, fi, p, false);
         }
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let s = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
         let mask = self.b.ins().load(I32, M_STRUCT, s, 4);
         let bit = self.b.ins().band_imm_u(mask, 1i64 << fi);
         let present = self.b.create_block();
-        let undef = self.b.ins().iconst(I64, TAG_UNDEFINED);
-        let zero = self.b.ins().iconst(I64, 0);
-        self.b.ins().brif(bit, present, &[], join, &[BlockArg::Value(zero), BlockArg::Value(undef)]);
+        let undef = self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+        self.b.ins().brif(bit, present, &[], join, &[BlockArg::Value(undef)]);
         self.b.switch_to_block(present);
-        let (vp, vt) = self.struct_field_value(k, fi, p, true).any();
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        let w = self.struct_field_value(k, fi, p, true).any();
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
         self.b.switch_to_block(join);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// Store `v` (taken) in field `fi` of `obj` (layout `k`): of a new
     /// object (`fresh`, from a literal) or a write. Numbers and booleans of
     /// the field's type go inline into fields that hold them unboxed when
     /// no member can change; everything else is checked by the runtime.
-    fn struct_store(&mut self, k: u32, fi: u32, (p, t): (Value, Value), v: V, fresh: bool) {
+    fn struct_store(&mut self, k: u32, fi: u32, ow: Value, v: V, fresh: bool) {
         let f = self.env.layouts[k as usize].fields[fi as usize].clone();
+        let p = self.val_ptr(ow);
         let join = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
@@ -4011,12 +4008,12 @@ impl Lower {
                     self.b.ins().jump(join, &[]);
                 }
             }
-            (ir::Storage::Int32, V::Any(vp, vt)) if inline => {
-                let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_INT);
+            (ir::Storage::Int32, V::Any(vw)) if inline => {
+                let is_int = self.val_is(vw, TAG_INT);
                 let st = self.b.create_block();
                 self.b.ins().brif(is_int, st, &[], slow, &[]);
                 self.b.switch_to_block(st);
-                let i = self.b.ins().ireduce(I32, vp);
+                let i = self.b.ins().ireduce(I32, vw);
                 self.b.ins().store(M_STRUCT, i, at, 0);
                 self.b.ins().jump(join, &[]);
             }
@@ -4024,12 +4021,12 @@ impl Lower {
                 self.b.ins().store(M_STRUCT, d, at, 0);
                 self.b.ins().jump(join, &[]);
             }
-            (ir::Storage::F64, V::Any(vp, vt)) if inline => {
-                let num = self.is_number(vt);
+            (ir::Storage::F64, V::Any(vw)) if inline => {
+                let num = self.is_number(vw);
                 let st = self.b.create_block();
                 self.b.ins().brif(num, st, &[], slow, &[]);
                 self.b.switch_to_block(st);
-                let d = self.number_of((vp, vt));
+                let d = self.number_of(vw);
                 self.b.ins().store(M_STRUCT, d, at, 0);
                 self.b.ins().jump(join, &[]);
             }
@@ -4043,11 +4040,11 @@ impl Lower {
             }
         }
         self.b.switch_to_block(slow);
-        let (bp, bt) = self.boxed(v);
+        let bw = self.boxed(v);
         let ctx = self.ctx;
         let fv = self.b.ins().iconst(I32, fi as i64);
         let name = if fresh { "lum_struct_put" } else { "lum_struct_set" };
-        let r = self.helper(name, &[ctx, p, t, fv, bp, bt]);
+        let r = self.helper(name, &[ctx, ow, fv, bw]);
         self.check_int(r[0]);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
@@ -4083,15 +4080,16 @@ impl Lower {
         v
     }
 
-    /// Whether `(fp, ft)` is native function `func` (by its JS entry).
-    fn is_native(&mut self, fp: Value, ft: Value, func: usize) -> Value {
+    /// Whether `fw` is native function `func` (by its JS entry).
+    fn is_native(&mut self, fw: Value, func: usize) -> Value {
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, I8);
         let no = self.b.ins().iconst(I8, 0);
         let obj = self.b.create_block();
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(no)]);
         self.b.switch_to_block(obj);
+        let fp = self.val_ptr(fw);
         let class = self.b.ins().uload16(I32, M_HEADER, fp, layout::OBJ_CLASS_ID);
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
         let data = self.b.create_block();
@@ -4106,14 +4104,14 @@ impl Lower {
         r
     }
 
-    /// The JS entry (`lum_fast_<i>`) of function `(fp, ft)`, or 0 if it has
+    /// The JS entry (`lum_fast_<i>`) of function `fw`, or 0 if it has
     /// none (not a native function): as the inline cache it was read
     /// through keeps it (`fn_entries`), else read from the function.
-    fn fn_entry(&mut self, fp: Value, ft: Value) -> Value {
+    fn fn_entry(&mut self, fw: Value) -> Value {
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, I64);
         let read = self.b.create_block();
-        match self.fn_entries.get(&fp).copied() {
+        match self.fn_entries.get(&fw).copied() {
             Some(e) => {
                 self.b.ins().brif(e, join, &[BlockArg::Value(e)], read, &[]);
             }
@@ -4124,9 +4122,10 @@ impl Lower {
         self.b.switch_to_block(read);
         let zero = self.b.ins().iconst(I64, 0);
         let obj = self.b.create_block();
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(obj);
+        let fp = self.val_ptr(fw);
         let class = self.b.ins().uload16(I32, M_HEADER, fp, layout::OBJ_CLASS_ID);
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
         let data = self.b.create_block();
@@ -4143,21 +4142,21 @@ impl Lower {
     /// (see `fn_entry`) is the predicted one and `args` (JS values,
     /// borrowed) suit its parameters, as its entry requires. `None` if they
     /// cannot.
-    fn pred_guard(&mut self, pred: &Pred, entry: Value, args: &[(Value, Value)]) -> Option<Value> {
+    fn pred_guard(&mut self, pred: &Pred, entry: Value, args: &[Value]) -> Option<Value> {
         let params = self.env.params[pred.func].clone();
         let mut checks = Vec::new();
         for (i, &pt) in params.iter().enumerate() {
             match pt {
                 Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => {}
-                Ty::F64 | Ty::MaybeF64 => checks.push((args.get(i)?.1, true)),
-                Ty::Bool => checks.push((args.get(i)?.1, false)),
+                Ty::F64 | Ty::MaybeF64 => checks.push((*args.get(i)?, true)),
+                Ty::Bool => checks.push((*args.get(i)?, false)),
                 _ => return None,
             }
         }
         let want = self.b.ins().func_addr(self.ptr, self.env.fast[pred.func]);
         let mut ok = self.b.ins().icmp(IntCC::Equal, entry, want);
-        for (t, number) in checks {
-            let c = if number { self.is_number(t) } else { self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_BOOL) };
+        for (w, number) in checks {
+            let c = if number { self.is_number(w) } else { self.val_is(w, TAG_BOOL) };
             ok = self.b.ins().band(ok, c);
         }
         Some(ok)
@@ -4166,30 +4165,25 @@ impl Lower {
     /// The predicted function's body inline, with `this` the receiver `recv`
     /// and `args` (JS values, borrowed) its arguments, which `pred_guard`
     /// checked. Its result as a new JS value.
-    fn inline_method(&mut self, pred: &Pred, recv: (Value, Value), args: &[(Value, Value)]) -> (Value, Value) {
+    fn inline_method(&mut self, pred: &Pred, recv: Value, args: &[Value]) -> Value {
         let params = self.env.params[pred.func].clone();
         let ret = self.env.rets[pred.func];
         for (i, &pt) in params.iter().enumerate() {
             let l = pred.locals[i];
             let v = match (pt, args.get(i)) {
                 (Ty::F64 | Ty::MaybeF64, Some(&a)) => V::Num(self.number_of(a)),
-                (Ty::Bool, Some(&(p, _))) => {
-                    let i = self.b.ins().ireduce(I32, p);
+                (Ty::Bool, Some(&w)) => {
+                    let i = self.b.ins().ireduce(I32, w);
                     V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, i, 0))
                 }
-                (_, Some(&(p, t))) => {
-                    self.dup((p, t));
-                    V::Any(p, t)
+                (_, Some(&w)) => {
+                    self.dup(w);
+                    V::Any(w)
                 }
                 (_, None) => self.konst(0, TAG_UNDEFINED),
             };
             // The local may be `Any` where its parameter is not.
-            let v = if is_js(self.locals[l]) && !matches!(v, V::Any(..)) {
-                let (p, t) = self.boxed(v);
-                V::Any(p, t)
-            } else {
-                v
-            };
+            let v = if is_js(self.locals[l]) && !matches!(v, V::Any(..)) { V::Any(self.boxed(v)) } else { v };
             self.init_local(l, v);
         }
         let outer = self.this.replace(recv);
@@ -4203,39 +4197,38 @@ impl Lower {
     fn call_or_inline(
         &mut self,
         preds: &[Pred],
-        f: (Value, Value),
-        this: (Value, Value),
-        args: &[(Value, Value)],
+        f: Value,
+        this: Value,
+        args: &[Value],
         argv: impl FnOnce(&mut Self) -> Value,
         borrowed: bool,
-        generic: impl FnOnce(&mut Self, Value) -> (Value, Value),
-    ) -> (Value, Value) {
+        generic: impl FnOnce(&mut Self, Value) -> Value,
+    ) -> Value {
         if preds.is_empty() {
             let argv = argv(self);
             return self.call_linked(f, this, args.len(), argv, borrowed, |l| generic(l, argv));
         }
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         // Each prediction in turn (a polymorphic site has several), then
         // the call.
-        let entry = self.fn_entry(f.0, f.1);
+        let entry = self.fn_entry(f);
         for pred in preds {
             let Some(ok) = self.pred_guard(pred, entry, args) else { continue };
             let inline = self.b.create_block();
             let next = self.b.create_block();
             self.b.ins().brif(ok, inline, &[], next, &[]);
             self.b.switch_to_block(inline);
-            let (p, t) = self.inline_method(pred, this, args);
-            self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+            let w = self.inline_method(pred, this, args);
+            self.b.ins().jump(join, &[BlockArg::Value(w)]);
             self.b.switch_to_block(next);
         }
         // (The arguments' array only where the call is made.)
         let argv = argv(self);
-        let (p, t) = self.call_linked(f, this, args.len(), argv, borrowed, |l| generic(l, argv));
-        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+        let w = self.call_linked(f, this, args.len(), argv, borrowed, |l| generic(l, argv));
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
         self.b.switch_to_block(join);
-        (rp, rt)
+        rw
     }
 
     /// An object literal (`class`: `None`), or an instance of a class with
@@ -4261,23 +4254,22 @@ impl Lower {
         let mut held: Vec<V> = props
             .iter()
             .map(|(_, x)| {
-                let (p, t) = self.expr(x).any();
-                let v = V::Any(p, t);
+                let v = V::Any(self.expr(x).any());
                 self.hold(v);
                 v
             })
             .collect();
-        let mut vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
+        let mut vals: Vec<Value> = held.iter().map(|v| v.any()).collect();
         if let Some((brand, privates)) = private {
             if brand.is_some() {
                 vals.push(self.konst(0, TAG_UNDEFINED).any());
             }
             for (_, x) in privates {
-                let (p, t) = self.expr(x).any();
-                let v = V::Any(p, t);
+                let w = self.expr(x).any();
+                let v = V::Any(w);
                 self.hold(v);
                 held.push(v);
-                vals.push((p, t));
+                vals.push(w);
             }
         }
         // Both paths take the values.
@@ -4287,8 +4279,7 @@ impl Lower {
         let ic = self.new_ic();
         let ctx = self.ctx;
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
@@ -4299,16 +4290,15 @@ impl Lower {
         self.b.set_cold_block(call);
         let p = self.alloc_object(ic, shape, call);
         let at = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
-        for (i, &(vp, vt)) in vals.iter().enumerate() {
-            self.b.ins().store(M_SLOT, vp, at, (i * SIZE) as i32);
-            self.b.ins().store(M_SLOT, vt, at, (i * SIZE) as i32 + TAG_OFFSET);
+        for (i, &w) in vals.iter().enumerate() {
+            self.b.ins().store(M_SLOT, w, at, (i * SIZE) as i32);
         }
-        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(tag)]);
+        let w = self.mk_ref(TAG_OBJECT, p);
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
         self.b.switch_to_block(call);
         let values = self.values_slot(&vals);
         let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
         let values = self.values_slot(&vals);
         let n = props.len();
@@ -4323,32 +4313,29 @@ impl Lower {
         let r = match (class, private) {
             (None, _) => self.helper("lum_new_object", &[ctx, ic, count, atoms, values]),
             (Some(k), None) => {
-                let (pp, pt) = self.table_value(self.env.homes, 2 * k);
-                self.helper("lum_new_instance", &[ctx, ic, pp, pt, count, atoms, values])
+                let pw = self.table_value(self.env.homes, 2 * k);
+                self.helper("lum_new_instance", &[ctx, ic, pw, count, atoms, values])
             }
             (Some(k), Some((brand, privates))) => {
                 // The brand's home object (or `undefined`), then the
                 // private names.
                 let mut extra = vec![match brand {
                     Some(h) => self.table_value(self.env.homes, h),
-                    None => {
-                        let (p, t) = self.konst(0, TAG_UNDEFINED).any();
-                        (p, t)
-                    }
+                    None => self.konst(0, TAG_UNDEFINED).any(),
                 }];
                 for &(slot, _) in privates {
                     extra.push(self.table_value(self.env.privates, slot));
                 }
                 let extra = self.values_slot(&extra);
                 let nprivate = self.b.ins().iconst(I32, privates.len() as i64);
-                let (pp, pt) = self.table_value(self.env.homes, 2 * k);
-                self.helper("lum_new_instance_full", &[ctx, ic, pp, pt, count, atoms, values, extra, nprivate])
+                let pw = self.table_value(self.env.homes, 2 * k);
+                self.helper("lum_new_instance_full", &[ctx, ic, pw, count, atoms, values, extra, nprivate])
             }
         };
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(join);
-        self.check_value(rt);
-        V::Any(rp, rt)
+        self.check_value(rw);
+        V::Any(rw)
     }
 
     /// A new plain object of the shape `shape` that allocation site `ic`
@@ -4410,7 +4397,7 @@ impl Lower {
     /// one left (`JS_CFunctionDataTemplate`): the object, its `length` and
     /// `name`, then its record and data, in one cell; else (no template
     /// yet, no room) to `call`.
-    fn alloc_closure(&mut self, index: usize, vals: &[(Value, Value)], call: Block) -> Value {
+    fn alloc_closure(&mut self, index: usize, vals: &[Value], call: Block) -> Value {
         let caches = self.b.ins().symbol_value(self.ptr, self.env.fn_caches);
         let c = self.b.ins().iadd_imm_s(caches, index as i64 * FN_CACHE_SIZE);
         let info = self.b.ins().uload32(M_IC, c, FN_CACHE_INFO);
@@ -4422,11 +4409,11 @@ impl Lower {
         self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
         let props = self.b.ins().iadd_imm_s(p, layout::OBJ_CLASS_SIZE as i64);
         self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
-        let rec = layout::OBJ_CLASS_SIZE + 2 * 16;
+        let rec = layout::OBJ_CLASS_SIZE + 2 * SIZE as i32;
         let rp = self.b.ins().iadd_imm_s(p, rec as i64);
         self.b.ins().store(M_HEADER, rp, p, layout::OBJ_FUNC_DATA);
         // `length` and `name`, and the record but `self`.
-        for k in 0..4 {
+        for k in 0..(2 * SIZE as i32 / 8) {
             let w = self.b.ins().load(I64, M_IC, c, t + layout::FTMPL_PROPS + 8 * k);
             self.b.ins().store(M_SLOT, w, p, layout::OBJ_CLASS_SIZE + 8 * k);
         }
@@ -4436,10 +4423,9 @@ impl Lower {
         }
         const _: () = assert!(layout::FDATA_SELF == 16);
         self.b.ins().store(M_HEADER, p, p, rec + layout::FDATA_SELF);
-        for (k, &(vp, vt)) in vals.iter().enumerate() {
-            let at = rec + layout::FDATA_DATA + 16 * k as i32;
-            self.b.ins().store(M_SLOT, vp, p, at);
-            self.b.ins().store(M_SLOT, vt, p, at + 8);
+        for (k, &w) in vals.iter().enumerate() {
+            let at = rec + layout::FDATA_DATA + (SIZE * k) as i32;
+            self.b.ins().store(M_SLOT, w, p, at);
         }
         p
     }
@@ -4461,24 +4447,22 @@ impl Lower {
         locals: &[ir::LocalId],
     ) -> V {
         let (obj, owned) = self.operand(recv, &[callback]);
-        let (op_, ot) = obj.any();
-        let (mp, mt) = self.method_get(op_, ot, method);
-        self.check_value(mt);
-        let f = V::Any(mp, mt);
+        let ow = obj.any();
+        let mw = self.method_get(ow, method);
+        self.check_value(mw);
+        let f = V::Any(mw);
         self.hold(f);
         let ctx = self.ctx;
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         // The original builtin, an array, no holes.
-        let is_fn = self.b.ins().icmp_imm_s(IntCC::Equal, mt, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, (PIN_ARRAY_LOOPS + kind as i32) * 8);
-        let same = self.b.ins().icmp(IntCC::Equal, mp, orig);
-        let ok = self.b.ins().band(is_fn, same);
-        let count = self.array_part(op_, ot, ok, slow);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let ok = self.b.ins().icmp(IntCC::Equal, mw, orig);
+        let (op_, count) = self.array_part(ow, ok, slow);
         let length = self.array_length(op_);
         let dense = self.b.ins().icmp(IntCC::Equal, count, length);
         let fast = self.b.create_block();
@@ -4493,11 +4477,11 @@ impl Lower {
                 let n = if kind == LoopKind::Map { len } else { self.b.ins().iconst(I64, -1) };
                 let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
                 let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
-                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, op_, ot, n, addr]);
-                self.check_value(r[1]);
+                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, ow, n, addr]);
+                self.check_value(r[0]);
                 let made = self.b.ins().stack_load(self.ptr, I32, slot, 0);
                 let fresh = self.b.ins().icmp_imm_s(IntCC::NotEqual, made, 0);
-                let a = V::Any(r[0], r[1]);
+                let a = V::Any(r[0]);
                 self.hold(a);
                 (Some(a), Some(fresh))
             }
@@ -4507,8 +4491,7 @@ impl Lower {
         let k = self.b.append_block_param(head, I64);
         let n = self.b.append_block_param(head, I64);
         let done = self.b.create_block();
-        let dp = self.b.append_block_param(done, I64);
-        let dt = self.b.append_block_param(done, I64);
+        let dw = self.b.append_block_param(done, I64);
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
         self.b.switch_to_block(head);
@@ -4517,23 +4500,20 @@ impl Lower {
         let nn = self.b.append_block_param(next, I64);
         let k1 = self.b.ins().iadd_imm_s(k, 1);
         // Past the end: the result without a match.
-        let (ep, et) = match (kind, out) {
+        let ew = match (kind, out) {
             (LoopKind::Map | LoopKind::Filter, Some(a)) => a.any(),
-            (LoopKind::Some, _) => (zero, self.b.ins().iconst(I64, TAG_BOOL)),
-            (LoopKind::Every, _) => (self.b.ins().iconst(I64, 1), self.b.ins().iconst(I64, TAG_BOOL)),
-            (LoopKind::FindIndex, _) => {
-                (self.b.ins().iconst(I64, -1i32 as u32 as i64), self.b.ins().iconst(I64, TAG_INT))
-            }
-            _ => (zero, self.b.ins().iconst(I64, TAG_UNDEFINED)),
+            (LoopKind::Some, _) => self.konst(0, TAG_BOOL).any(),
+            (LoopKind::Every, _) => self.konst(1, TAG_BOOL).any(),
+            (LoopKind::FindIndex, _) => self.konst(-1, TAG_INT).any(),
+            _ => self.konst(0, TAG_UNDEFINED).any(),
         };
         let more = self.b.ins().icmp(IntCC::SignedLessThan, k, len);
         let step = self.b.create_block();
-        self.b.ins().brif(more, step, &[], done, &[BlockArg::Value(ep), BlockArg::Value(et)]);
+        self.b.ins().brif(more, step, &[], done, &[BlockArg::Value(ew)]);
         self.b.switch_to_block(step);
         // The element: in place while the array is fast, else read.
         let elem = self.b.create_block();
-        let ep_ = self.b.append_block_param(elem, I64);
-        let et_ = self.b.append_block_param(elem, I64);
+        let el = self.b.append_block_param(elem, I64);
         let now = self.b.ins().uload32(M_HEADER, op_, layout::OBJ_ARRAY_COUNT);
         let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, k, now);
         let hit = self.b.create_block();
@@ -4542,57 +4522,52 @@ impl Lower {
         self.b.ins().brif(inb, hit, &[], read, &[]);
         self.b.switch_to_block(hit);
         let at = self.array_slot(op_, k);
-        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        self.dup((vp, vt));
-        self.b.ins().jump(elem, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.dup(vw);
+        self.b.ins().jump(elem, &[BlockArg::Value(vw)]);
         self.b.switch_to_block(read);
         let present = self.done_slot();
-        let r = self.helper("JS_TryGetElement", &[ctx, op_, ot, k, present]);
-        self.check_value(r[1]);
+        let r = self.helper("JS_TryGetElement", &[ctx, ow, k, present]);
+        self.check_value(r[0]);
         let has = self.b.ins().load(I32, M_SLOT, present, 0);
         let absent = self.b.ins().icmp_imm_s(IntCC::Equal, has, 0);
         let got = self.b.create_block();
         // (A hole: skipped.)
         self.b.ins().brif(absent, next, &[BlockArg::Value(k1), BlockArg::Value(n)], got, &[]);
         self.b.switch_to_block(got);
-        self.b.ins().jump(elem, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().jump(elem, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(elem);
-        let v = V::Any(ep_, et_);
+        let v = V::Any(el);
         self.hold(v);
         // The callback's result, boxed: its body inline when the element
         // has its parameter's type, else a call of the callback.
         let params = self.env.params[func].clone();
         let ret = self.env.rets[func];
         let res = self.b.create_block();
-        let resp = self.b.append_block_param(res, I64);
-        let rest = self.b.append_block_param(res, I64);
+        let resw = self.b.append_block_param(res, I64);
         let inline = self.b.create_block();
         let typed = params.first() == Some(&Ty::F64);
         if typed {
             let call = self.b.create_block();
             self.b.set_cold_block(call);
-            let num = self.is_number(et_);
+            let num = self.is_number(el);
             self.b.ins().brif(num, inline, &[], call, &[]);
             self.b.switch_to_block(call);
             let cb = self.expr(callback);
             self.hold(cb);
             let kd = self.b.ins().fcvt_from_sint(F64, k);
             let kv = self.box_number(kd);
-            let (cp, ct) = cb.any();
+            let cw = cb.any();
             let undef = self.konst(0, TAG_UNDEFINED).any();
-            let vals = [(cp, ct), undef, (ep_, et_), kv, (op_, ot)];
+            let vals = [cw, undef, el, kv, ow];
             let slot = self.values_slot(&vals);
             let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
             let argc = self.b.ins().iconst(I32, 3);
-            let (gp, gt) = self.call_linked((cp, ct), undef, 3, argv, false, |l| {
-                let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-                (r[0], r[1])
-            });
-            self.check_value(gt);
+            let gw = self.call_linked(cw, undef, 3, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
+            self.check_value(gw);
             self.release(cb);
             self.free_v(cb);
-            self.b.ins().jump(res, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+            self.b.ins().jump(res, &[BlockArg::Value(gw)]);
         } else {
             self.b.ins().jump(inline, &[]);
         }
@@ -4603,40 +4578,31 @@ impl Lower {
         for (i, &pt) in params.iter().enumerate() {
             let l = locals[i];
             let a = match (i, pt) {
-                (0, Ty::F64) => V::Num(self.number_of((ep_, et_))),
+                (0, Ty::F64) => V::Num(self.number_of(el)),
                 (0, _) if moved => {
                     self.release(v);
-                    V::Any(ep_, et_)
+                    V::Any(el)
                 }
                 (0, _) => {
-                    self.dup((ep_, et_));
-                    V::Any(ep_, et_)
+                    self.dup(el);
+                    V::Any(el)
                 }
                 (1, Ty::F64) => V::Num(self.b.ins().fcvt_from_sint(F64, k)),
-                (1, _) => {
-                    let i = self.b.ins().ireduce(I32, k);
-                    let i = self.b.ins().sextend(I64, i);
-                    V::Any(i, self.b.ins().iconst(I64, TAG_INT))
-                }
+                (1, _) => V::Any(self.mk_int(k)),
                 _ => {
-                    self.dup((op_, ot));
-                    V::Any(op_, ot)
+                    self.dup(ow);
+                    V::Any(ow)
                 }
             };
             // The local may be `Any` where its parameter is not.
-            let a = if is_js(self.locals[l]) && !matches!(a, V::Any(..)) {
-                let (p, t) = self.boxed(a);
-                V::Any(p, t)
-            } else {
-                a
-            };
+            let a = if is_js(self.locals[l]) && !matches!(a, V::Any(..)) { V::Any(self.boxed(a)) } else { a };
             self.init_local(l, a);
         }
         let r = self.inline_body(body, locals, ret);
-        let (bp, bt) = self.boxed(r);
-        self.b.ins().jump(res, &[BlockArg::Value(bp), BlockArg::Value(bt)]);
+        let bw = self.boxed(r);
+        self.b.ins().jump(res, &[BlockArg::Value(bw)]);
         self.b.switch_to_block(res);
-        let result = (resp, rest);
+        let result = resw;
         match kind {
             LoopKind::ForEach => {
                 self.free(result);
@@ -4647,7 +4613,7 @@ impl Lower {
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
             }
             LoopKind::Map => {
-                let (ap, at) = out.unwrap().any();
+                let aw = out.unwrap().any();
                 if !moved {
                     self.release(v);
                     self.free_v(v);
@@ -4655,11 +4621,11 @@ impl Lower {
                 let define = self.b.create_block();
                 self.b.set_cold_block(define);
                 // (Its `length` is the source's already.)
-                self.append_fresh(fresh.unwrap(), ap, k, (resp, rest), false, next, &[k1, n]);
-                self.append_inline((ap, at), Some(k), (resp, rest), true, define);
+                self.append_fresh(fresh.unwrap(), aw, k, resw, false, next, &[k1, n]);
+                self.append_inline(aw, Some(k), resw, true, define);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
                 self.b.switch_to_block(define);
-                let r = self.helper("JS_DefineElement", &[ctx, ap, at, k, resp, rest]);
+                let r = self.helper("JS_DefineElement", &[ctx, aw, k, resw]);
                 self.check_int(r[0]);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
             }
@@ -4670,20 +4636,20 @@ impl Lower {
                 let drop = self.b.create_block();
                 self.b.ins().brif(hit, keep, &[], drop, &[]);
                 self.b.switch_to_block(drop);
-                self.free((ep_, et_));
+                self.free(el);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
                 self.b.switch_to_block(keep);
-                let (ap, at) = out.unwrap().any();
+                let aw = out.unwrap().any();
                 // (The definition takes the element.)
                 self.release(v);
                 let n1 = self.b.ins().iadd_imm_s(n, 1);
                 let define = self.b.create_block();
                 self.b.set_cold_block(define);
-                self.append_fresh(fresh.unwrap(), ap, n, (ep_, et_), true, next, &[k1, n1]);
-                self.append_inline((ap, at), Some(n), (ep_, et_), true, define);
+                self.append_fresh(fresh.unwrap(), aw, n, el, true, next, &[k1, n1]);
+                self.append_inline(aw, Some(n), el, true, define);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
                 self.b.switch_to_block(define);
-                let r = self.helper("JS_DefineElement", &[ctx, ap, at, n, ep_, et_]);
+                let r = self.helper("JS_DefineElement", &[ctx, aw, n, el]);
                 self.check_int(r[0]);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n1)]);
             }
@@ -4695,25 +4661,21 @@ impl Lower {
                 let go_on = self.b.create_block();
                 self.b.ins().brif(stop, found, &[], go_on, &[]);
                 self.b.switch_to_block(go_on);
-                self.free((ep_, et_));
+                self.free(el);
                 self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
                 self.b.switch_to_block(found);
-                let (fp_, ft_) = match kind {
-                    LoopKind::Find => (ep_, et_),
+                let fw = match kind {
+                    LoopKind::Find => el,
                     _ => {
-                        self.free((ep_, et_));
+                        self.free(el);
                         match kind {
-                            LoopKind::Some => (self.b.ins().iconst(I64, 1), self.b.ins().iconst(I64, TAG_BOOL)),
-                            LoopKind::Every => (zero, self.b.ins().iconst(I64, TAG_BOOL)),
-                            _ => {
-                                let i = self.b.ins().ireduce(I32, k);
-                                let i = self.b.ins().sextend(I64, i);
-                                (i, self.b.ins().iconst(I64, TAG_INT))
-                            }
+                            LoopKind::Some => self.konst(1, TAG_BOOL).any(),
+                            LoopKind::Every => self.konst(0, TAG_BOOL).any(),
+                            _ => self.mk_int(k),
                         }
                     }
                 };
-                self.b.ins().jump(done, &[BlockArg::Value(fp_), BlockArg::Value(ft_)]);
+                self.b.ins().jump(done, &[BlockArg::Value(fw)]);
                 self.release(v);
             }
         }
@@ -4724,29 +4686,26 @@ impl Lower {
             // (The result: the array, now the expression's.)
             self.release(a);
         }
-        self.b.ins().jump(join, &[BlockArg::Value(dp), BlockArg::Value(dt)]);
+        self.b.ins().jump(join, &[BlockArg::Value(dw)]);
         // Otherwise a call, with the callback.
         self.b.switch_to_block(slow);
         let cb = self.expr(callback);
         self.hold(cb);
-        let (cp, ct) = cb.any();
-        let vals = [(mp, mt), (op_, ot), (cp, ct)];
+        let cw = cb.any();
+        let vals = [mw, ow, cw];
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
-        let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
-        self.check_value(gt);
+        let gw = self.call_linked(mw, ow, 1, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
+        self.check_value(gw);
         self.release(cb);
         self.free_v(cb);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         self.release(f);
         self.free_v(f);
         self.drop_operand(obj, owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// `recv.method(callback)` where `method` may be the original `sort` and
@@ -4754,58 +4713,53 @@ impl Lower {
     /// directly (`JS_SortNative`); else a call.
     fn array_sort(&mut self, recv: &Expr, method: ir::AtomId, callback: &Expr, func: usize) -> V {
         let (obj, owned) = self.operand(recv, &[callback]);
-        let (op_, ot) = obj.any();
-        let (mp, mt) = self.method_get(op_, ot, method);
-        self.check_value(mt);
-        let f = V::Any(mp, mt);
+        let ow = obj.any();
+        let mw = self.method_get(ow, method);
+        self.check_value(mw);
+        let f = V::Any(mw);
         self.hold(f);
         let ctx = self.ctx;
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let is_fn = self.b.ins().icmp_imm_s(IntCC::Equal, mt, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, PIN_ARRAY_SORT * 8);
-        let same = self.b.ins().icmp(IntCC::Equal, mp, orig);
-        let ok = self.b.ins().band(is_fn, same);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let ok = self.b.ins().icmp(IntCC::Equal, mw, orig);
         let fast = self.b.create_block();
         self.b.ins().brif(ok, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
         let numbers = self.env.params[func].first() == Some(&Ty::F64);
         let numbers = self.b.ins().iconst(I32, numbers as i64);
         let sorter = self.b.ins().func_addr(self.ptr, self.env.sorters[&func]);
-        let r = self.helper("JS_SortNative", &[ctx, op_, ot, sorter, numbers])[0];
+        let r = self.helper("JS_SortNative", &[ctx, ow, sorter, numbers])[0];
         self.check_int(r);
         let sorted = self.b.create_block();
         let done = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
         self.b.ins().brif(done, sorted, &[], slow, &[]);
         self.b.switch_to_block(sorted);
         // (`sort` returns the array.)
-        self.dup((op_, ot));
-        self.b.ins().jump(join, &[BlockArg::Value(op_), BlockArg::Value(ot)]);
+        self.dup(ow);
+        self.b.ins().jump(join, &[BlockArg::Value(ow)]);
         self.b.switch_to_block(slow);
         let cb = self.expr(callback);
         self.hold(cb);
-        let (cp, ct) = cb.any();
-        let vals = [(mp, mt), (op_, ot), (cp, ct)];
+        let cw = cb.any();
+        let vals = [mw, ow, cw];
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
-        let (gp, gt) = self.call_linked((mp, mt), (op_, ot), 1, argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
-        self.check_value(gt);
+        let gw = self.call_linked(mw, ow, 1, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
+        self.check_value(gw);
         self.release(cb);
         self.free_v(cb);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         self.release(f);
         self.free_v(f);
         self.drop_operand(obj, owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// Whether class `class`'s prototype has native function `func` as its
@@ -4813,17 +4767,17 @@ impl Lower {
     /// properties, filled on a miss without running any getter.
     fn proto_method_is(&mut self, class: usize, method: ir::AtomId, func: usize) -> Value {
         let ic = self.new_ic();
-        let (pp, pt) = self.table_value(self.env.homes, 2 * class);
+        let pw = self.table_value(self.env.homes, 2 * class);
         let join = self.b.create_block();
-        let fp = self.b.append_block_param(join, I64);
-        let ft = self.b.append_block_param(join, I64);
+        let fw = self.b.append_block_param(join, I64);
         let miss = self.b.create_block();
         self.b.set_cold_block(miss);
         let not_obj = self.b.create_block();
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, pt, TAG_OBJECT);
+        let is_obj = self.val_is(pw, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
         self.b.switch_to_block(obj);
+        let pp = self.val_ptr(pw);
         let shape = self.b.ins().load(I64, M_HEADER, pp, layout::OBJ_SHAPE);
         let cached = self.b.ins().load(I64, M_IC, ic, 0);
         let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
@@ -4831,83 +4785,98 @@ impl Lower {
         self.b.ins().brif(same, hit, &[], miss, &[]);
         self.b.switch_to_block(hit);
         let at = self.ic_slot_addr(pp, ic);
-        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(vw)]);
         self.b.switch_to_block(miss);
         let ctx = self.ctx;
         let atom = self.atom(method);
-        let r = self.helper("lum_ic_own_data", &[ctx, pp, pt, atom, ic]);
+        let r = self.helper("lum_ic_own_data", &[ctx, pw, atom, ic]);
         // (Still referenced by the prototype.)
-        self.free((r[0], r[1]));
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.free(r[0]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(not_obj);
         let undef = self.konst(0, TAG_UNDEFINED).any();
-        self.b.ins().jump(join, &[BlockArg::Value(undef.0), BlockArg::Value(undef.1)]);
+        self.b.ins().jump(join, &[BlockArg::Value(undef)]);
         self.b.switch_to_block(join);
-        self.is_native(fp, ft, func)
+        self.is_native(fw, func)
     }
 
     /// `p.a = v` (`(p, t)` borrowed; `v` taken by the property) through an
     /// inline cache: an own writable data property of a cached shape, or a
     /// setter (own or of the prototype), else the engine.
-    fn prop_set_ic(&mut self, p: Value, t: Value, a: ir::AtomId, (vp, vt): (Value, Value), pred: Vec<Pred>) {
+    fn prop_set_ic(&mut self, w: Value, a: ir::AtomId, vw: Value, pred: Vec<Pred>) {
         let ic = self.new_ic();
         let join = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         // An own writable data property of a cached shape, or a setter
         // (own or of the prototype).
-        let (shape, kind) = self.ic_shape_hit(p, t, ic, slow);
+        let (shape, kind) = self.ic_shape_hit(w, ic, slow);
+        let p = self.val_ptr(w);
         let own = self.b.create_block();
         let proto = self.b.create_block();
         let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
         self.b.ins().brif(is_own, own, &[], proto, &[]);
         self.b.switch_to_block(proto);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
-        let setter = self.b.ins().load(I64, M_SLOT, pat, 8);
+        let (setter, sw) = self.accessor(pat, true);
         self.nonnull(setter, slow);
         let ctx = self.ctx;
         // The property's reference is dropped after the call.
-        let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-        let (sp, st) = self.call_or_inline(&pred, (setter, tag), (p, t), &[(vp, vt)], |l| l.values_slot(&[(vp, vt)]), true, |l, _| {
-            l.dup((vp, vt));
-            let r = l.helper("lum_call_setter", &[ctx, setter, p, t, vp, vt]);
-            let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
-            let exc = l.b.ins().iconst(I64, TAG_EXCEPTION);
-            let undef = l.b.ins().iconst(I64, TAG_UNDEFINED);
-            let zero = l.b.ins().iconst(I64, 0);
-            (zero, l.b.ins().select(failed, exc, undef))
-        });
-        self.free((vp, vt));
-        self.free((sp, st));
-        self.check_value(st);
+        let r = self.call_or_inline(
+            &pred,
+            sw,
+            w,
+            &[vw],
+            |l| l.values_slot(&[vw]),
+            true,
+            |l, _| {
+                l.dup(vw);
+                let r = l.helper("lum_call_setter", &[ctx, setter, w, vw]);
+                let failed = l.b.ins().icmp_imm_s(IntCC::SignedLessThan, r[0], 0);
+                let exc = l.b.ins().iconst(I64, val_const(TAG_EXCEPTION, 0));
+                let undef = l.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+                l.b.ins().select(failed, exc, undef)
+            },
+        );
+        self.free(vw);
+        self.free(r);
+        self.check_value(r);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(own);
         let at = self.ic_slot_addr(p, ic);
-        let old_p = self.b.ins().load(I64, M_SLOT, at, 0);
-        let old_t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        self.b.ins().store(M_SLOT, vp, at, 0);
-        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
-        self.write_barrier(p, vt);
-        self.free((old_p, old_t));
+        let old = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.b.ins().store(M_SLOT, vw, at, 0);
+        self.write_barrier(p, vw);
+        self.free(old);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let ctx = self.ctx;
-        let r = self.helper("lum_ic_set_proto", &[ctx, p, t, atom, vp, vt, ic]);
+        let r = self.helper("lum_ic_set_proto", &[ctx, w, atom, vw, ic]);
         self.check_int(r[0]);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
     }
 
+    /// The getter (or `setter`) of the accessor property at `pat`: its
+    /// address (0 if none), and it as a JS value.
+    fn accessor(&mut self, pat: Value, setter: bool) -> (Value, Value) {
+        // (`getset`: two 32-bit references.)
+        let r = self.b.ins().uload32(M_SLOT, pat, if setter { 4 } else { 0 });
+        let addr = self.b.ins().ishl_imm_u(r, 3);
+        let w = self.b.ins().bor_imm_u(r, val_const(TAG_OBJECT, 0));
+        (addr, w)
+    }
+
     /// The address of slot `slot` of `p` if it is an object with the shape of
     /// record `record` (see `ir::specialize_fields`), else go to `slow`.
-    fn record_slot(&mut self, p: Value, t: Value, record: usize, slot: u32, slow: Block) -> Value {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    fn record_slot(&mut self, w: Value, record: usize, slot: u32, slow: Block) -> Value {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let base = (record * RECORD_STRIDE) as i32;
@@ -4945,11 +4914,12 @@ impl Lower {
         let join = self.b.create_block();
         // Strings: flat ones, read with the builtin `charCodeAt`.
         for &l in g.strs {
-            let (p, t) = self.use_local(l).any();
-            let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING);
+            let w = self.use_local(l).any();
+            let is_str = self.val_is(w, TAG_STRING);
             let next = self.b.create_block();
             self.b.ins().brif(is_str, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
+            let p = self.val_ptr(w);
             let word = self.b.ins().uload32(M_CONST, p, layout::STRING_KIND);
             let kind = self.b.ins().ushr_imm_u(word, 28);
             let kind = self.b.ins().band_imm_u(kind, 3);
@@ -4978,11 +4948,12 @@ impl Lower {
             self.b.switch_to_block(next);
             let shapes = self.b.ins().symbol_value(self.ptr, self.env.shapes);
             for &a in g.appends {
-                let (p, t) = self.use_local(a).any();
-                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+                let w = self.use_local(a).any();
+                let is_obj = self.val_is(w, TAG_OBJECT);
                 let obj = self.b.create_block();
                 self.b.ins().brif(is_obj, obj, &[], slow_b, &[]);
                 self.b.switch_to_block(obj);
+                let p = self.val_ptr(w);
                 let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
                 let fresh = self.b.ins().load(I64, M_CONST, shapes, SHAPE_ARRAY * 8);
                 let same = self.b.ins().icmp(IntCC::Equal, shape, fresh);
@@ -4994,12 +4965,10 @@ impl Lower {
                 self.b.ins().brif(ok, array, &[], slow_b, &[]);
                 self.b.switch_to_block(array);
                 let count = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
+                // (`length`: an int value, the count.)
                 let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
-                let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
-                let len = self.b.ins().uload32(M_SLOT, prop, 0);
-                let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
-                let dense = self.b.ins().icmp(IntCC::Equal, len, count);
-                let ok = self.b.ins().band(is_int, dense);
+                let len = self.b.ins().load(I64, M_SLOT, prop, 0);
+                let ok = self.b.ins().icmp(IntCC::Equal, len, count);
                 let next = self.b.create_block();
                 self.b.ins().brif(ok, next, &[], slow_b, &[]);
                 self.b.switch_to_block(next);
@@ -5007,7 +4976,8 @@ impl Lower {
         }
         // Typed arrays the region writes: not of an immutable buffer.
         for &a in g.typed_writes {
-            let (p, _) = self.use_local(a).any();
+            let w = self.use_local(a).any();
+            let p = self.val_ptr(w);
             let ta = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_TYPED_ARRAY);
             let buf = self.b.ins().load(I64, M_HEADER, ta, layout::TA_BUFFER);
             let abuf = self.b.ins().load(I64, M_HEADER, buf, layout::OBJ_ARRAY_BUFFER);
@@ -5023,8 +4993,9 @@ impl Lower {
         // pristine shape (`length` their element count, which nothing in
         // the region changes).
         for &a in g.arrays {
-            let (p, t) = self.use_local(a).any();
+            let w = self.use_local(a).any();
             if let Ty::Arr(kind) = self.locals[a] {
+                let p = self.val_ptr(w);
                 let k = self.b.ins().iconst(I32, kind as i64);
                 let ok = self.pristine_shape(p, k);
                 let next = self.b.create_block();
@@ -5033,13 +5004,11 @@ impl Lower {
                 continue;
             }
             let yes = self.b.ins().iconst(I8, 1);
-            let count = self.array_part(p, t, yes, slow_b);
+            let (p, count) = self.array_part(w, yes, slow_b);
+            // (`length`: an int value, the count.)
             let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
-            let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
-            let len = self.b.ins().uload32(M_SLOT, prop, 0);
-            let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
-            let dense = self.b.ins().icmp(IntCC::Equal, len, count);
-            let ok = self.b.ins().band(is_int, dense);
+            let len = self.b.ins().load(I64, M_SLOT, prop, 0);
+            let ok = self.b.ins().icmp(IntCC::Equal, len, count);
             let next = self.b.create_block();
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
@@ -5054,35 +5023,32 @@ impl Lower {
             self.b.ins().brif(known, check, &[], next, &[]);
             self.b.switch_to_block(check);
             let proto = self.b.ins().load(I64, M_HEADER, want, layout::SHAPE_PROTO);
-            let (hp, ht) = self.table_value(self.env.homes, 2 * class);
-            let same = self.b.ins().icmp(IntCC::Equal, proto, hp);
-            let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ht, TAG_OBJECT);
-            let ok = self.b.ins().band(same, is_obj);
+            let proto = self.mk_ref(TAG_OBJECT, proto);
+            let hw = self.table_value(self.env.homes, 2 * class);
+            let ok = self.b.ins().icmp(IntCC::Equal, proto, hw);
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
         }
         // Class bindings read by the region (whose TDZ checks it skips).
         for &k in g.cells {
             let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
-            let t = self.b.ins().load(I64, M_SLOT, base, (k * SIZE) as i32 + TAG_OFFSET);
-            let set = self.b.ins().icmp_imm_s(IntCC::NotEqual, t, TAG_UNINITIALIZED);
+            let w = self.b.ins().load(I64, M_SLOT, base, (k * SIZE) as i32);
+            let set = self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNINITIALIZED, 0));
             let next = self.b.create_block();
             self.b.ins().brif(set, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
         }
         // The objects, then those their fields hold: of their records.
         for &(o, r) in objs {
-            let (p, t) =
-                if o == ir::THIS_LOCAL { self.this.expect("`this` in a region") } else { self.use_local(o).any() };
-            let props = self.guard_record((p, t), r, table, slow_b);
+            let w = if o == ir::THIS_LOCAL { self.this.expect("`this` in a region") } else { self.use_local(o).any() };
+            let (p, props) = self.guard_record(w, r, table, slow_b);
             ptrs.push((o, p, props));
         }
         for &(o, of, slot, r) in g.derived {
             let props = ptrs.iter().find(|x| x.0 == of).expect("guarded holder").2;
             let off = (slot as usize * SIZE) as i32;
-            let p = self.b.ins().load(I64, M_SLOT, props, off);
-            let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
-            let props = self.guard_record((p, t), r, table, slow_b);
+            let w = self.b.ins().load(I64, M_SLOT, props, off);
+            let (p, props) = self.guard_record(w, r, table, slow_b);
             ptrs.push((o, p, props));
         }
         // Methods run inline: the receiver's prototype is the class's, which
@@ -5092,10 +5058,9 @@ impl Lower {
                 let p = ptrs.iter().find(|x| x.0 == o).expect("guarded receiver").1;
                 let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
                 let proto = self.b.ins().load(I64, M_HEADER, shape, layout::SHAPE_PROTO);
-                let (hp, ht) = self.table_value(self.env.homes, 2 * class);
-                let same = self.b.ins().icmp(IntCC::Equal, proto, hp);
-                let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ht, TAG_OBJECT);
-                let ok = self.b.ins().band(same, is_obj);
+                let proto = self.mk_ref(TAG_OBJECT, proto);
+                let hw = self.table_value(self.env.homes, 2 * class);
+                let ok = self.b.ins().icmp(IntCC::Equal, proto, hw);
                 let next = self.b.create_block();
                 self.b.ins().brif(ok, next, &[], slow_b, &[]);
                 self.b.switch_to_block(next);
@@ -5118,32 +5083,25 @@ impl Lower {
             self.b.switch_to_block(next);
         }
         let props_of = |o: ir::LocalId| ptrs.iter().find(|x| x.0 == o).expect("guarded object").2;
-        let tag = |l: &mut Self, (o, slot): (ir::LocalId, u32), flags: MemFlags| {
-            l.b.ins().load(I64, flags, props_of(o), (slot as usize * SIZE) as i32 + TAG_OFFSET)
+        let field = |l: &mut Self, (o, slot): (ir::LocalId, u32), flags: MemFlags| {
+            l.b.ins().load(I64, flags, props_of(o), (slot as usize * SIZE) as i32)
         };
-        let locals: Vec<(Value, Value)> = nums.iter().map(|&(from, _)| self.use_local(from).any()).collect();
-        // The locals hold numbers (int32s or floats: no tag with another
-        // bit set), converted once.
+        let locals: Vec<Value> = nums.iter().map(|&(from, _)| self.use_local(from).any()).collect();
+        // The locals hold numbers (int32s or floats), converted once.
         if !locals.is_empty() {
-            let mut any = self.b.ins().iconst(I64, 0);
-            for &(_, t) in &locals {
-                any = self.b.ins().bor(any, t);
-            }
-            let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
-            let numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+            let numbers = self.all_numbers(&locals);
             let next = self.b.create_block();
             self.b.ins().brif(numbers, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
         }
-        let values: Vec<Value> = locals.iter().map(|&(p, t)| self.number_tagged(p, t)).collect();
-        // Fields holding floats are tagged FLOAT64: each tag compared on its
-        // own (the tags are not kept for the int code, which reads them
-        // again).
+        let values: Vec<Value> = locals.iter().map(|&w| self.number_tagged(w)).collect();
+        // Fields holding floats: each compared on its own (the values are
+        // not kept for the int code, which reads them again).
         let floats = self.b.create_block();
         let check = self.b.create_block();
         for &f in fields {
-            let t = tag(self, f, M_SLOT.volatile());
-            let is_float = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
+            let w = field(self, f, M_SLOT.volatile());
+            let is_float = self.val_is_float(w);
             let next = self.b.create_block();
             self.b.ins().brif(is_float, next, &[], check, &[]);
             self.b.switch_to_block(next);
@@ -5157,32 +5115,16 @@ impl Lower {
         for (&(_, to), &d) in nums.iter().zip(&values) {
             self.def_local(to, V::Num(d));
         }
-        // A field stays a float unless the region stores something else
-        // (an int constant, a copied value) in it.
-        let mut slots: HashSet<(ir::LocalId, u32)> = fields.iter().copied().collect();
-        ir::visit_stmts(fast, &mut |e| {
-            if let ExprKind::SlotStore { obj, slot, arith: false, .. } = e.kind {
-                slots.remove(&(obj, slot));
-            }
-        });
-        self.spec_float_slots = slots;
         self.spec_floats = true;
         self.stmts(fast);
-        self.spec_float_slots.clear();
         if !self.is_filled() {
             self.b.ins().jump(join, &[]);
         }
 
-        // Int32s (INT, 0) and floats are numbers: all are iff no tag has
-        // another bit set.
+        // Else int32s and floats.
         self.b.switch_to_block(check);
-        let tags: Vec<Value> = fields.iter().map(|&f| tag(self, f, M_SLOT)).collect();
-        let mut any = self.b.ins().iconst(I64, 0);
-        for &t in &tags {
-            any = self.b.ins().bor(any, t);
-        }
-        let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
-        let numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
+        let words: Vec<Value> = fields.iter().map(|&f| field(self, f, M_SLOT)).collect();
+        let numbers = self.all_numbers(&words);
         let mixed = self.b.create_block();
         self.b.ins().brif(numbers, mixed, &[], slow_b, &[]);
         self.b.switch_to_block(mixed);
@@ -5224,56 +5166,44 @@ impl Lower {
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let mut ptrs: Vec<(ir::LocalId, Value)> = Vec::new();
         for &(o, arr, idx, record) in elems {
-            let (p, t) = self.guard_elem(arr, idx, fail);
-            let props = self.guard_record((p, t), record, table, fail);
+            let w = self.guard_elem(arr, idx, fail);
+            let (_, props) = self.guard_record(w, record, table, fail);
             ptrs.push((o, props));
         }
         // Indexes inside the typed arrays the iteration reads.
         for &(arr, idx) in bounds {
-            let (ap, _) = self.use_local(arr).any();
+            let aw = self.use_local(arr).any();
+            let ap = self.val_ptr(aw);
             self.guard_index(ap, idx, fail);
         }
-        // Elements read as numbers: int32s (INT, 0) or floats.
+        // Elements read as numbers: int32s or floats.
         for &(to, arr, idx) in nums {
-            let (p, t) = self.guard_elem(arr, idx, fail);
-            let float = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
-            let int = self.b.ins().icmp_imm_s(IntCC::Equal, t, 0);
-            let number = self.b.ins().bor(float, int);
+            let w = self.guard_elem(arr, idx, fail);
+            let number = self.is_number(w);
             let next = self.b.create_block();
             self.b.ins().brif(number, next, &[], fail, &[]);
             self.b.switch_to_block(next);
-            let bits = self.b.ins().bitcast(F64, p);
-            let n32 = self.b.ins().ireduce(I32, p);
-            let n = self.b.ins().sextend(I64, n32);
-            let from_int = self.b.ins().fcvt_from_sint(F64, n);
-            let d = self.b.ins().select(float, bits, from_int);
+            let d = self.number_tagged(w);
             self.def_local(to, V::Num(d));
         }
         for &(o, of, slot, r) in derived {
             let props = ptrs.iter().find(|x| x.0 == of).expect("guarded holder").1;
             let off = (slot as usize * SIZE) as i32;
-            let p = self.b.ins().load(I64, M_SLOT, props, off);
-            let t = self.b.ins().load(I64, M_SLOT, props, off + TAG_OFFSET);
-            let props = self.guard_record((p, t), r, table, fail);
+            let w = self.b.ins().load(I64, M_SLOT, props, off);
+            let (_, props) = self.guard_record(w, r, table, fail);
             ptrs.push((o, props));
         }
-        // Their fields hold numbers: floats (all tags FLOAT64), or int32s
-        // (INT, 0) too (no tag with another bit set).
+        // Their fields hold numbers: floats, or int32s too.
         let mut floats = self.b.ins().iconst(I8, 1);
         let mut numbers = self.b.ins().iconst(I8, 1);
         if !fields.is_empty() {
-            let mut any = self.b.ins().iconst(I64, 0);
-            let mut not8 = self.b.ins().iconst(I64, 0);
+            let mut words = Vec::new();
             for &(o, slot) in fields {
                 let props = ptrs.iter().find(|x| x.0 == o).expect("guarded element").1;
-                let t = self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32 + TAG_OFFSET);
-                any = self.b.ins().bor(any, t);
-                let x = self.b.ins().bxor_imm_u(t, TAG_FLOAT64);
-                not8 = self.b.ins().bor(not8, x);
+                words.push(self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32));
             }
-            let other = self.b.ins().band_imm_u(any, !TAG_FLOAT64);
-            numbers = self.b.ins().icmp_imm_s(IntCC::Equal, other, 0);
-            floats = self.b.ins().icmp_imm_s(IntCC::Equal, not8, 0);
+            numbers = self.all_numbers(&words);
+            floats = self.all_floats(&words);
         }
         // Not the region's other objects (compared by property arrays, which
         // objects do not share).
@@ -5330,13 +5260,12 @@ impl Lower {
     /// An iteration guard's element `idx` of the dense fast array in local
     /// `arr` (a region guard's `arrays`), the index an integer below its
     /// element count, else to `fail`.
-    fn guard_elem(&mut self, arr: ir::LocalId, idx: ir::LocalId, fail: Block) -> (Value, Value) {
-        let (ap, _) = self.use_local(arr).any();
+    fn guard_elem(&mut self, arr: ir::LocalId, idx: ir::LocalId, fail: Block) -> Value {
+        let aw = self.use_local(arr).any();
+        let ap = self.val_ptr(aw);
         let i = self.guard_index(ap, idx, fail);
         let at = self.array_slot(ap, i);
-        let p = self.b.ins().load(I64, M_SLOT, at, 0);
-        let t = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        (p, t)
+        self.b.ins().load(I64, M_SLOT, at, 0)
     }
 
     /// The value of index local `idx` as an integer below the element count
@@ -5366,14 +5295,15 @@ impl Lower {
         i
     }
 
-    /// A region guard's check that `(p, t)` is an object of `record`'s
-    /// shape (`table`: the records' shapes), else to `slow`: its property
-    /// array.
-    fn guard_record(&mut self, (p, t): (Value, Value), record: usize, table: Value, slow: Block) -> Value {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    /// A region guard's check that `w` is an object of `record`'s shape
+    /// (`table`: the records' shapes), else to `slow`: its address and
+    /// property array.
+    fn guard_record(&mut self, w: Value, record: usize, table: Value, slow: Block) -> (Value, Value) {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let next = self.b.create_block();
         self.b.ins().brif(is_obj, next, &[], slow, &[]);
         self.b.switch_to_block(next);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         // (Regions take objects of the shape learned first.)
         let want = self.b.ins().load(I64, M_IC, table, (record * RECORD_STRIDE) as i32);
@@ -5381,7 +5311,27 @@ impl Lower {
         let next = self.b.create_block();
         self.b.ins().brif(same, next, &[], slow, &[]);
         self.b.switch_to_block(next);
-        self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP)
+        (p, self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP))
+    }
+
+    /// Whether the values `ws` are all numbers (int32s or floats).
+    fn all_numbers(&mut self, ws: &[Value]) -> Value {
+        let mut all = self.b.ins().iconst(I8, 1);
+        for &w in ws {
+            let n = self.is_number(w);
+            all = self.b.ins().band(all, n);
+        }
+        all
+    }
+
+    /// Whether the values `ws` are all floats.
+    fn all_floats(&mut self, ws: &[Value]) -> Value {
+        let mut all = self.b.ins().iconst(I8, 1);
+        for &w in ws {
+            let f = self.val_is_float(w);
+            all = self.b.ins().band(all, f);
+        }
+        all
     }
 
     /// `charCodeAt` of flat string `p` at position `d` (a number): the code
@@ -5428,18 +5378,17 @@ impl Lower {
     }
 
     /// The double of a JS value known to be an int32 or a float.
-    fn number_tagged(&mut self, p: Value, t: Value) -> Value {
-        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-        let i = self.b.ins().ireduce(I32, p);
-        let i = self.b.ins().sextend(I64, i);
+    fn number_tagged(&mut self, w: Value) -> Value {
+        let is_int = self.val_is(w, TAG_INT);
+        let i = self.val_int(w);
         let fi = self.b.ins().fcvt_from_sint(F64, i);
-        let ff = self.b.ins().bitcast(F64, p);
+        let ff = self.val_f64(w);
         self.b.ins().select(is_int, fi, ff)
     }
 
     /// While record `record` has room for another shape (and learning has
-    /// not failed too often): learn one from `(p, t)`.
-    fn record_learn(&mut self, p: Value, t: Value, record: usize) {
+    /// not failed too often): learn one from `w`.
+    fn record_learn(&mut self, w: Value, record: usize) {
         let table = self.b.ins().symbol_value(self.ptr, self.env.record_shapes);
         let base = (record * RECORD_STRIDE) as i32;
         let last = self.b.ins().load(I64, M_IC, table, base + ((RECORD_SHAPES - 1) * 8) as i32);
@@ -5454,7 +5403,7 @@ impl Lower {
         self.b.switch_to_block(learn);
         let ctx = self.ctx;
         let r = self.b.ins().iconst(I32, record as i64);
-        self.helper("lum_record_learn", &[ctx, p, t, r]);
+        self.helper("lum_record_learn", &[ctx, w, r]);
         self.b.ins().jump(after, &[]);
         self.b.switch_to_block(after);
     }
@@ -5491,19 +5440,18 @@ impl Lower {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, args.len() as i64);
         let ctx = self.ctx;
-        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let js_args: Vec<Value> = vals[2..].to_vec();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
-        let entry = if pred.is_empty() { None } else { Some(self.fn_entry(f.any().0, f.any().1)) };
+        let rw = self.b.append_block_param(join, I64);
+        let entry = if pred.is_empty() { None } else { Some(self.fn_entry(f.any())) };
         for p in &pred {
             let Some(ok) = self.pred_guard(p, entry.expect("predictions"), &js_args) else { continue };
             let inline = self.b.create_block();
             let next = self.b.create_block();
             self.b.ins().brif(ok, inline, &[], next, &[]);
             self.b.switch_to_block(inline);
-            let (rp_, rt_) = self.inline_method(p, this.any(), &js_args);
-            self.b.ins().jump(join, &[BlockArg::Value(rp_), BlockArg::Value(rt_)]);
+            let iw = self.inline_method(p, this.any(), &js_args);
+            self.b.ins().jump(join, &[BlockArg::Value(iw)]);
             self.b.switch_to_block(next);
         }
         let mut lazy = Vec::new();
@@ -5511,29 +5459,28 @@ impl Lower {
             if let Some((_, x)) = lazy_part(a) {
                 let v = self.expr(x);
                 self.hold(v);
-                let (p, t) = v.any();
-                self.b.ins().stack_store_pair(p, t, stack, ((2 + i) * SIZE) as i32);
+                let w = v.any();
+                self.b.ins().stack_store(self.ptr, w, stack, ((2 + i) * SIZE) as i32);
                 lazy.push(v);
             }
         }
-        let (gp, gt) = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
+        let gw = self.call_linked(f.any(), this.any(), args.len(), argv, false, |l| {
+            l.helper("lum_call", &[ctx, slot, argc, argv])[0]
         });
         for v in lazy.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
-        self.check_value(rt);
+        self.check_value(rw);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.release(f);
         self.free_v(f);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// Evaluate call arguments, holding them.
@@ -5553,27 +5500,26 @@ impl Lower {
         vals.extend(held.iter().map(|v| v.any()));
         let n = held.len();
         let ctx = self.ctx;
-        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let js_args: Vec<Value> = vals[2..].to_vec();
         // (The function, `this` and the arguments in a stack slot, only on
         // the path that calls.)
         let make_argv = |l: &mut Self| {
             let slot = l.values_slot(&vals);
             l.b.ins().iadd_imm_s(slot, 2 * SIZE as i64)
         };
-        let (rp, rt) = self.call_or_inline(&pred, f.any(), this.any(), &js_args, make_argv, false, |l, argv| {
+        let rw = self.call_or_inline(&pred, f.any(), this.any(), &js_args, make_argv, false, |l, argv| {
             let slot = l.b.ins().iadd_imm_s(argv, -2 * SIZE as i64);
             let argc = l.b.ins().iconst(I32, n as i64);
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
+            l.helper("lum_call", &[ctx, slot, argc, argv])[0]
         });
-        self.check_value(rt);
+        self.check_value(rw);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.release(f);
         self.free_v(f);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// `this.charCodeAt(args)` with `f` (held) the method read: inline when
@@ -5591,23 +5537,24 @@ impl Lower {
                 v
             })
             .collect();
-        let (fp, ft) = f.any();
-        let (sp, st) = this.any();
+        let fw = f.any();
+        let sw = this.any();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAG_STRING);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_str = self.val_is(sw, TAG_STRING);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, PIN_CHAR_CODE_AT * 8);
-        let same = self.b.ins().icmp(IntCC::Equal, fp, orig);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
         let ok = self.b.ins().band(is_str, is_obj);
         let ok = self.b.ins().band(ok, same);
         let string = self.b.create_block();
         self.b.ins().brif(ok, string, &[], slow, &[]);
         self.b.switch_to_block(string);
+        let sp = self.val_ptr(sw);
         // ToIntegerOrInfinity of the position (NaN and undefined: 0).
         let (idx, idx_ok) = match held.first() {
             None => (self.b.ins().iconst(I64, 0), None),
@@ -5617,13 +5564,12 @@ impl Lower {
             },
             Some(&V::Int(i)) => (i, None),
             Some(&V::Bool(b)) => (self.b.ins().uextend(I64, b), None),
-            Some(&V::Any(p, t)) => {
-                let i32v = self.b.ins().ireduce(I32, p);
-                let i = self.b.ins().sextend(I64, i32v);
-                let d = self.b.ins().bitcast(F64, p);
+            Some(&V::Any(w)) => {
+                let i = self.val_int(w);
+                let d = self.val_f64(w);
                 let di = self.b.ins().fcvt_to_sint_sat(I64, d);
-                let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-                (self.b.ins().select(is_int, i, di), Some(self.is_number(t)))
+                let is_int = self.val_is(w, TAG_INT);
+                (self.b.ins().select(is_int, i, di), Some(self.is_number(w)))
             }
             Some(&V::Void) => unreachable!("void argument"),
         };
@@ -5660,15 +5606,14 @@ impl Lower {
         let mask = self.b.ins().ishl(m8, shift);
         let mask = self.b.ins().bor_imm_u(mask, 0xff);
         let c = self.b.ins().band(c, mask);
+        // (An int value: the code, tag 0 above it.)
         let c = self.b.ins().uextend(I64, c);
-        let int = self.b.ins().iconst(I64, TAG_INT);
-        self.b.ins().jump(join, &[BlockArg::Value(c), BlockArg::Value(int)]);
+        self.b.ins().jump(join, &[BlockArg::Value(c)]);
         self.b.switch_to_block(nan);
-        let bits = self.b.ins().iconst(I64, f64::NAN.to_bits() as i64);
-        let float = self.b.ins().iconst(I64, TAG_FLOAT64);
-        self.b.ins().jump(join, &[BlockArg::Value(bits), BlockArg::Value(float)]);
+        let nan_v = self.b.ins().iconst(I64, float_value(CANONICAL_NAN_BITS));
+        self.b.ins().jump(join, &[BlockArg::Value(nan_v)]);
         self.b.switch_to_block(slow);
-        let mut vals = vec![(fp, ft), (sp, st)];
+        let mut vals = vec![fw, sw];
         for &v in &held {
             let b = self.boxed(v);
             vals.push(b);
@@ -5677,28 +5622,26 @@ impl Lower {
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, held.len() as i64);
         let ctx = self.ctx;
-        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let js_args: Vec<Value> = vals[2..].to_vec();
         // (A borrowed method is held while it runs.)
         let borrowed = f_owned.is_some();
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
+        let gw =
+            self.call_linked(fw, sw, js_args.len(), argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        self.check_value_method(gt, f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.check_value_method(gw, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.drop_method(f, f_owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// `this.<method>(args)` for a `Method::StringFn` method `k`, with `f`
@@ -5715,35 +5658,35 @@ impl Lower {
                 v
             })
             .collect();
-        let (fp, ft) = f.any();
-        let (sp, st) = this.any();
+        let fw = f.any();
+        let sw = this.any();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAG_STRING);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_str = self.val_is(sw, TAG_STRING);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, (PIN_STRING_FNS + k) * 8);
-        let same = self.b.ins().icmp(IntCC::Equal, fp, orig);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
         let ok = self.b.ins().band(is_str, is_obj);
         let ok = self.b.ins().band(ok, same);
         let direct = self.b.create_block();
         self.b.ins().brif(ok, direct, &[], slow, &[]);
         self.b.switch_to_block(direct);
         let undef = self.konst(0, TAG_UNDEFINED).any();
-        let mut vals: Vec<(Value, Value)> = held.iter().map(|&v| self.boxed(v)).collect();
+        let mut vals: Vec<Value> = held.iter().map(|&v| self.boxed(v)).collect();
         vals.resize(2, undef);
         let (_, argv) = self.values_slot_raw(&vals);
         let ctx = self.ctx;
         let which = self.b.ins().iconst(I32, k as i64);
         let argc = self.b.ins().iconst(I32, held.len() as i64);
-        let r = self.helper("JS_CallStringFn", &[ctx, sp, st, which, argc, argv]);
-        self.check_value_method(r[1], f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let r = self.helper("JS_CallStringFn", &[ctx, sw, which, argc, argv]);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
-        let mut vals = vec![(fp, ft), (sp, st)];
+        let mut vals = vec![fw, sw];
         for &v in &held {
             let b = self.boxed(v);
             vals.push(b);
@@ -5751,28 +5694,26 @@ impl Lower {
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, held.len() as i64);
-        let js_args: Vec<(Value, Value)> = vals[2..].to_vec();
+        let js_args: Vec<Value> = vals[2..].to_vec();
         // (A borrowed method is held while it runs.)
         let borrowed = f_owned.is_some();
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let (gp, gt) = self.call_linked((fp, ft), (sp, st), js_args.len(), argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
+        let gw =
+            self.call_linked(fw, sw, js_args.len(), argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        self.check_value_method(gt, f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.check_value_method(gw, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.drop_method(f, f_owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// `this.get(k)`, `set(k, v)`, `has(k)`, `add(k)` with `f` (held) the
@@ -5788,24 +5729,25 @@ impl Lower {
                 v
             })
             .collect();
-        let (fp, ft) = f.any();
-        let (sp, st) = this.any();
+        let fw = f.any();
+        let sw = this.any();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, st, TAG_OBJECT);
-        let f_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_obj = self.val_is(sw, TAG_OBJECT);
+        let f_obj = self.val_is(fw, TAG_OBJECT);
         let both = self.b.ins().band(is_obj, f_obj);
         let objs = self.b.create_block();
         self.b.ins().brif(both, objs, &[], slow, &[]);
         self.b.switch_to_block(objs);
+        let sp = self.val_ptr(sw);
         let class = self.b.ins().uload16(I32, M_HEADER, sp, layout::OBJ_CLASS_ID);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let fits = |l: &mut Self, which: i32, cls: i64| {
             let orig = l.b.ins().load(I64, M_CONST, table, (PIN_MAP_FNS + which) * 8);
-            let same = l.b.ins().icmp(IntCC::Equal, fp, orig);
+            let orig = l.mk_ref(TAG_OBJECT, orig);
+            let same = l.b.ins().icmp(IntCC::Equal, fw, orig);
             let of = l.b.ins().icmp_imm_s(IntCC::Equal, class, cls);
             l.b.ins().band(same, of)
         };
@@ -5828,16 +5770,16 @@ impl Lower {
         self.b.ins().brif(ok, direct, &[], slow, &[]);
         self.b.switch_to_block(direct);
         let undef = self.konst(0, TAG_UNDEFINED).any();
-        let mut vals: Vec<(Value, Value)> = held.iter().map(|&v| self.boxed(v)).collect();
+        let mut vals: Vec<Value> = held.iter().map(|&v| self.boxed(v)).collect();
         vals.resize(2, undef);
         let (_, argv) = self.values_slot_raw(&vals);
         let ctx = self.ctx;
         let argc = self.b.ins().iconst(I32, held.len() as i64);
-        let r = self.helper("JS_CallMapFn", &[ctx, sp, st, which, argc, argv]);
-        self.check_value_method(r[1], f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let r = self.helper("JS_CallMapFn", &[ctx, sw, which, argc, argv]);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
-        let mut vals = vec![(fp, ft), (sp, st)];
+        let mut vals = vec![fw, sw];
         for &v in &held {
             let b = self.boxed(v);
             vals.push(b);
@@ -5849,33 +5791,30 @@ impl Lower {
         // (A borrowed method is held while it runs.)
         let borrowed = f_owned.is_some();
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let (gp, gt) = self.call_linked((fp, ft), (sp, st), n, argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
+        let gw = self.call_linked(fw, sw, n, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        self.check_value_method(gt, f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.check_value_method(gw, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.drop_method(f, f_owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// `check_value` in a builtin's fast path whose method read `f` is
     /// released after it (`drop_method`): an exception releases it first
     /// when the read made a new reference (a held one is freed with the
     /// other held values).
-    fn check_value_method(&mut self, t: Value, f: V, f_owned: Option<Value>) {
+    fn check_value_method(&mut self, w: Value, f: V, f_owned: Option<Value>) {
         if let Some(flag) = f_owned {
-            let exc = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_EXCEPTION);
+            let exc = self.b.ins().icmp_imm_s(IntCC::Equal, w, val_const(TAG_EXCEPTION, 0));
             let both = self.b.ins().band(exc, flag);
             let yes = self.b.create_block();
             let join = self.b.create_block();
@@ -5886,7 +5825,7 @@ impl Lower {
             self.b.ins().jump(join, &[]);
             self.b.switch_to_block(join);
         }
-        self.check_value(t);
+        self.check_value(w);
     }
 
     /// Release the method read for a builtin's fast path: held (`None`), or
@@ -5925,18 +5864,18 @@ impl Lower {
     /// builtin, else called. Frees `f`.
     fn array_push(&mut self, f: V, f_owned: Option<Value>, this: V, arg: &Expr) -> V {
         let held = self.held_args(std::slice::from_ref(arg));
-        let (fp, ft) = f.any();
-        let (sp, st) = this.any();
-        let (ap, at) = held[0].any();
+        let fw = f.any();
+        let sw = this.any();
+        let aw = held[0].any();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, PIN_ARRAY_PUSH * 8);
-        let same = self.b.ins().icmp(IntCC::Equal, fp, orig);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
         let ok = self.b.ins().band(is_obj, same);
         let fast = self.b.create_block();
         self.b.ins().brif(ok, fast, &[], slow, &[]);
@@ -5950,42 +5889,39 @@ impl Lower {
         let std = self.b.ins().icmp_imm_s(IntCC::NotEqual, std, 0);
         self.b.ins().brif(std, inline, &[], engine, &[]);
         self.b.switch_to_block(inline);
-        let n = self.append_inline((sp, st), None, (ap, at), false, engine);
-        let int = self.b.ins().iconst(I64, TAG_INT);
-        self.b.ins().jump(join, &[BlockArg::Value(n), BlockArg::Value(int)]);
+        // (The new length: an int value.)
+        let n = self.append_inline(sw, None, aw, false, engine);
+        self.b.ins().jump(join, &[BlockArg::Value(n)]);
         self.b.switch_to_block(engine);
-        let r = self.helper("JS_ArrayPushFast", &[ctx, sp, st, ap, at]);
-        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_UNINITIALIZED);
+        let r = self.helper("JS_ArrayPushFast", &[ctx, sw, aw]);
+        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], val_const(TAG_UNINITIALIZED, 0));
         let done = self.b.create_block();
         self.b.ins().brif(declined, slow, &[], done, &[]);
         self.b.switch_to_block(done);
-        self.check_value_method(r[1], f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
-        let vals = [(fp, ft), (sp, st), (ap, at)];
+        let vals = [fw, sw, aw];
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
         let borrowed = f_owned.is_some();
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let (gp, gt) = self.call_linked((fp, ft), (sp, st), 1, argv, false, |l| {
-            let r = l.helper("lum_call", &[ctx, slot, argc, argv]);
-            (r[0], r[1])
-        });
+        let gw = self.call_linked(fw, sw, 1, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        self.check_value_method(gt, f, f_owned);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        self.check_value_method(gw, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
         for v in held.into_iter().rev() {
             self.release(v);
             self.free_v(v);
         }
         self.drop_method(f, f_owned);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// Call `f` with `this` and `argc` arguments at `argv` (all borrowed;
@@ -5995,21 +5931,21 @@ impl Lower {
     /// callees, or a declining entry, take `generic`. A new reference.
     fn call_linked(
         &mut self,
-        (fp, ft): (Value, Value),
-        (thp, tht): (Value, Value),
+        fw: Value,
+        this: Value,
         argc: usize,
         argv: Value,
         borrowed: bool,
-        generic: impl FnOnce(&mut Self) -> (Value, Value),
-    ) -> (Value, Value) {
+        generic: impl FnOnce(&mut Self) -> Value,
+    ) -> Value {
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, ft, TAG_OBJECT);
+        let is_obj = self.val_is(fw, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let fp = self.val_ptr(fw);
         let class = self.b.ins().uload16(I32, M_HEADER, fp, layout::OBJ_CLASS_ID);
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_C_FUNCTION_DATA);
         let data = self.b.create_block();
@@ -6024,13 +5960,13 @@ impl Lower {
         let ctx = self.ctx;
         let n = self.b.ins().iconst(I32, argc as i64);
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let r = self.helper("JS_CallBuiltin", &[ctx, fp, ft, thp, tht, n, argv]);
+        let r = self.helper("JS_CallBuiltin", &[ctx, fw, this, n, argv]);
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(data);
         let rec = self.b.ins().load(I64, M_HEADER, fp, layout::OBJ_FUNC_DATA);
         let entry = self.b.ins().load(I64, M_HEADER, rec, layout::FDATA_FAST);
@@ -6046,40 +5982,37 @@ impl Lower {
         self.b.ins().brif(deep, slow, &[], call, &[]);
         self.b.switch_to_block(call);
         if borrowed {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
         let fdata = self.b.ins().iadd_imm_s(rec, layout::FDATA_DATA as i64);
         let ctx = self.ctx;
         let n = self.b.ins().iconst(I32, argc as i64);
         let sig: SigRef = self.env.fast_sig;
-        let inst = self.b.ins().call_indirect(sig, entry, &[ctx, thp, tht, n, argv, fdata]);
+        let inst = self.b.ins().call_indirect(sig, entry, &[ctx, this, n, argv, fdata]);
         let r = self.b.inst_results(inst).to_vec();
         if borrowed {
-            self.free((fp, ft));
+            self.free(fw);
         }
-        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_UNINITIALIZED);
-        self.b.ins().brif(declined, slow, &[], join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let declined = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], val_const(TAG_UNINITIALIZED, 0));
+        self.b.ins().brif(declined, slow, &[], join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
-        let (gp, gt) = generic(self);
-        self.b.ins().jump(join, &[BlockArg::Value(gp), BlockArg::Value(gt)]);
+        let gw = generic(self);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
         self.b.switch_to_block(join);
-        (rp, rt)
+        rw
     }
 
     /// Spill JS values into a fresh stack slot; returns its address.
-    fn values_slot(&mut self, vals: &[(Value, Value)]) -> Value {
+    fn values_slot(&mut self, vals: &[Value]) -> Value {
         self.values_slot_raw(vals).1
     }
 
     /// `values_slot`, also giving the slot.
-    fn values_slot_raw(&mut self, vals: &[(Value, Value)]) -> (StackSlot, Value) {
+    fn values_slot_raw(&mut self, vals: &[Value]) -> (StackSlot, Value) {
         let size = (vals.len().max(1) * SIZE) as u32;
-        let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 4));
-        for (i, &(p, t)) in vals.iter().enumerate() {
-            // One 16-byte store per value: C code copies JSValues with
-            // 16-byte loads, which two 8-byte stores could not forward to.
-            let off = (i * SIZE) as i32;
-            self.b.ins().stack_store_pair(p, t, slot, off);
+        let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+        for (i, &w) in vals.iter().enumerate() {
+            self.b.ins().stack_store(self.ptr, w, slot, (i * SIZE) as i32);
         }
         (slot, self.b.ins().stack_addr(self.ptr, slot, 0))
     }
@@ -6089,22 +6022,16 @@ impl Lower {
         self.b.ins().load(I32, M_CONST, base, (a * 4) as i32)
     }
 
-    /// A cell's value (borrowed); throws if it is uninitialized.
     /// A cell's value, borrowed, without a TDZ check.
-    fn raw_cell(&mut self, k: ir::CellId) -> (Value, Value) {
+    fn raw_cell(&mut self, k: ir::CellId) -> Value {
         let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
-        let off = (k * SIZE) as i32;
-        let p = self.b.ins().load(I64, M_SLOT, base, off);
-        let t = self.b.ins().load(I64, M_SLOT, base, off + TAG_OFFSET);
-        (p, t)
+        self.b.ins().load(I64, M_SLOT, base, (k * SIZE) as i32)
     }
 
-    fn load_cell(&mut self, k: ir::CellId) -> (Value, Value) {
-        let base = self.b.ins().symbol_value(self.ptr, self.env.cells);
-        let off = (k * SIZE) as i32;
-        let p = self.b.ins().load(I64, M_SLOT, base, off);
-        let t = self.b.ins().load(I64, M_SLOT, base, off + TAG_OFFSET);
-        let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNINITIALIZED);
+    /// A cell's value (borrowed); throws if it is uninitialized.
+    fn load_cell(&mut self, k: ir::CellId) -> Value {
+        let w = self.raw_cell(k);
+        let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, w, val_const(TAG_UNINITIALIZED, 0));
         let throw = self.b.create_block();
         let cont = self.b.create_block();
         self.b.set_cold_block(throw);
@@ -6116,22 +6043,26 @@ impl Lower {
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(cont);
-        (p, t)
+        w
+    }
+
+    /// Whether `w` is `null` or `undefined` (tags 2 and 3, payload 0).
+    fn is_nullish(&mut self, w: Value) -> Value {
+        let x = self.b.ins().bor_imm_u(w, val_const(1, 0));
+        self.b.ins().icmp_imm_s(IntCC::Equal, x, val_const(TAG_UNDEFINED, 0))
     }
 
     fn logical(&mut self, op: LogicalOp, ty: Ty, x: &Expr, y: &Expr) -> V {
         let a = self.expr(x);
         let truth = match (op, a) {
-            (LogicalOp::Nullish, V::Any(_, t)) => {
+            (LogicalOp::Nullish, V::Any(w)) => {
                 // "Truthy" here means: not nullish, keep the left value.
-                let u = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNDEFINED);
-                let n = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_NULL);
-                let nullish = self.b.ins().bor(u, n);
+                let nullish = self.is_nullish(w);
                 self.b.ins().bxor_imm_u(nullish, 1)
             }
             (_, V::Bool(b)) => b,
             (_, V::Num(d)) => self.truthy_num(d),
-            (_, V::Any(p, t)) => self.truthy_any((p, t)),
+            (_, V::Any(w)) => self.truthy_any(w),
             _ => unreachable!(),
         };
         let rhs = self.b.create_block();
@@ -6159,22 +6090,22 @@ impl Lower {
     /// ToNumber of an operand (borrowed): inline for numbers, else
     /// `JS_ToFloat64`, which may throw.
     fn number_value(&mut self, v: V) -> Value {
-        let V::Any(p, t) = v else { return v.num() };
+        let V::Any(w) = v else { return v.num() };
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, F64);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        let num = self.is_number(t);
+        let num = self.is_number(w);
         self.b.ins().brif(num, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
-        let d = self.number_of((p, t));
+        let d = self.number_of(w);
         self.b.ins().jump(join, &[BlockArg::Value(d)]);
         self.b.switch_to_block(slow);
         let out = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let addr = self.b.ins().stack_addr(self.ptr, out, 0);
         let ctx = self.ctx;
-        let s = self.helper("JS_ToFloat64", &[ctx, addr, p, t]);
+        let s = self.helper("JS_ToFloat64", &[ctx, addr, w]);
         self.check_int(s[0]);
         let d = self.b.ins().stack_load(self.ptr, F64, out, 0);
         self.b.ins().jump(join, &[BlockArg::Value(d)]);
@@ -6182,21 +6113,20 @@ impl Lower {
         r
     }
 
-    fn is_number(&mut self, t: Value) -> Value {
-        let i = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-        let f = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
-        self.b.ins().bor(i, f)
+    /// Whether `w` is a number: an int32 or a float.
+    fn is_number(&mut self, w: Value) -> Value {
+        val::is_number(&mut self.b, w)
     }
 
     /// The number in a value known to hold one.
-    fn number_of(&mut self, (p, t): (Value, Value)) -> Value {
-        if let Some(&d) = self.num_shadow.get(&p) {
+    fn number_of(&mut self, w: Value) -> Value {
+        if let Some(&d) = self.num_shadow.get(&w) {
             return d;
         }
-        let i = self.b.ins().ireduce(I32, p);
+        let i = self.b.ins().ireduce(I32, w);
         let fi = self.b.ins().fcvt_from_sint(F64, i);
-        let ff = self.b.ins().bitcast(F64, p);
-        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
+        let ff = self.val_f64(w);
+        let is_int = self.val_is(w, TAG_INT);
         self.b.ins().select(is_int, fi, ff)
     }
 
@@ -6207,40 +6137,38 @@ impl Lower {
     }
 
     /// JS truthiness of a borrowed value.
-    fn truthy_any(&mut self, (p, t): (Value, Value)) -> Value {
+    fn truthy_any(&mut self, w: Value) -> Value {
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, I8);
-        // int / bool: payload != 0
-        let small = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, t, TAG_BOOL);
+        // int / bool (tags 0 and 1): payload != 0
+        let small = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, w, val_const(TAG_BOOL + 1, 0));
         let int_blk = self.b.create_block();
         let other = self.b.create_block();
         self.b.ins().brif(small, int_blk, &[], other, &[]);
         self.b.switch_to_block(int_blk);
-        let i = self.b.ins().ireduce(I32, p);
+        let i = self.b.ins().ireduce(I32, w);
         let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, i, 0);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         // float
         self.b.switch_to_block(other);
-        let is_f = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT64);
+        let is_f = self.val_is_float(w);
         let f_blk = self.b.create_block();
         let other2 = self.b.create_block();
         self.b.ins().brif(is_f, f_blk, &[], other2, &[]);
         self.b.switch_to_block(f_blk);
-        let d = self.b.ins().bitcast(F64, p);
+        let d = self.val_f64(w);
         let r = self.truthy_num(d);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         // null / undefined: false
         self.b.switch_to_block(other2);
-        let u = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_UNDEFINED);
-        let n = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_NULL);
-        let nullish = self.b.ins().bor(u, n);
+        let nullish = self.is_nullish(w);
         let slow = self.b.create_block();
         let zero = self.b.ins().iconst(I8, 0);
         self.b.ins().brif(nullish, join, &[BlockArg::Value(zero)], slow, &[]);
         // everything else (strings, objects, ...)
         self.b.switch_to_block(slow);
         let ctx = self.ctx;
-        let r = self.helper("JS_ToBool", &[ctx, p, t]);
+        let r = self.helper("JS_ToBool", &[ctx, w]);
         let r = self.b.ins().icmp_imm_s(IntCC::SignedGreaterThan, r[0], 0);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
@@ -6252,33 +6180,30 @@ impl Lower {
     /// Otherwise code continues in the (new) current block.
     fn int_fast_path(
         &mut self,
-        vals: &[(Value, Value)],
+        vals: &[Value],
         join: Block,
         f: impl FnOnce(&mut FunctionBuilder, &[Value]) -> Option<(Value, Value)>,
     ) {
-        // (A third parameter of `join`: the result's number.)
-        let shadow = self.b.block_params(join).len() == 3;
-        let mut all = None;
-        for &(_, t) in vals {
-            let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-            all = Some(match all {
-                None => is_int,
-                Some(a) => self.b.ins().band(a, is_int),
-            });
+        // (A second parameter of `join`: the result's number.)
+        let shadow = self.b.block_params(join).len() == 2;
+        // All int32s: none has a bit of its high half set.
+        let mut any = vals[0];
+        for &w in &vals[1..] {
+            any = self.b.ins().bor(any, w);
         }
+        let all = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, any, 1i64 << 32);
         let int_blk = self.b.create_block();
         let rest = self.b.create_block();
-        self.b.ins().brif(all.expect("operands"), int_blk, &[], rest, &[]);
+        self.b.ins().brif(all, int_blk, &[], rest, &[]);
         self.b.switch_to_block(int_blk);
-        let xs: Vec<Value> = vals.iter().map(|&(p, _)| self.b.ins().ireduce(I32, p)).collect();
+        let xs: Vec<Value> = vals.iter().map(|&w| self.b.ins().ireduce(I32, w)).collect();
         match f(&mut self.b, &xs) {
             Some((r, overflow)) => {
                 let ok = self.b.create_block();
                 self.b.ins().brif(overflow, rest, &[], ok, &[]);
                 self.b.switch_to_block(ok);
-                let p = self.b.ins().uextend(I64, r);
-                let t = self.b.ins().iconst(I64, TAG_INT);
-                let mut args = vec![BlockArg::Value(p), BlockArg::Value(t)];
+                let w = self.b.ins().uextend(I64, r);
+                let mut args = vec![BlockArg::Value(w)];
                 if shadow {
                     args.push(BlockArg::Value(self.b.ins().fcvt_from_sint(F64, r)));
                 }
@@ -6292,15 +6217,14 @@ impl Lower {
     }
 
     /// `op a b` on owned values (consumed). Fast path for two numbers.
-    fn binary_any(&mut self, op: AnyBinOp, a: (Value, Value), c: (Value, Value)) -> (Value, Value) {
-        let na = self.is_number(a.1);
-        let nc = self.is_number(c.1);
+    fn binary_any(&mut self, op: AnyBinOp, a: Value, c: Value) -> Value {
+        let na = self.is_number(a);
+        let nc = self.is_number(c);
         let both = self.b.ins().band(na, nc);
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let rd = self.b.append_block_param(join, F64);
         // Two int32s: integer ops, unless the result overflows.
         let int_op = |b: &mut FunctionBuilder, x: Value, y: Value| -> Option<(Value, Value)> {
@@ -6351,12 +6275,12 @@ impl Lower {
         let r = self.binary(bop, x, y);
         // As the interpreter boxes them: sums, differences and products of
         // doubles stay doubles.
-        let (p, t) = if matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) {
+        let w = if matches!(op, AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul) {
             self.box_float(r)
         } else {
             self.box_number(r)
         };
-        self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t), BlockArg::Value(r)]);
+        self.b.ins().jump(join, &[BlockArg::Value(w), BlockArg::Value(r)]);
 
         self.b.switch_to_block(slow);
         self.b.set_cold_block(slow);
@@ -6377,19 +6301,19 @@ impl Lower {
         let ctx = self.ctx;
         let r = if op == AnyBinOp::Add {
             // (Strings, and a string with an int32, directly.)
-            self.helper("JS_AddValues", &[ctx, a.0, a.1, c.0, c.1])
+            self.helper("JS_AddValues", &[ctx, a, c])
         } else {
             let code = self.b.ins().iconst(I32, code);
-            self.helper("JS_BinaryOperator", &[ctx, code, a.0, a.1, c.0, c.1])
+            self.helper("JS_BinaryOperator", &[ctx, code, a, c])
         };
-        self.check_value(r[1]);
+        self.check_value(r[0]);
         self.free(c);
         self.free(a);
-        let d = self.number_of((r[0], r[1]));
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1]), BlockArg::Value(d)]);
+        let d = self.number_of(r[0]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(d)]);
         self.b.switch_to_block(join);
-        self.num_shadow.insert(rp, rd);
-        (rp, rt)
+        self.num_shadow.insert(rw, rd);
+        rw
     }
 
     /// A number from a number, or from a JS value known to be one.
@@ -6409,8 +6333,8 @@ impl Lower {
     }
 
     /// Comparison of borrowed values. Fast path for two numbers.
-    fn compare_any(&mut self, op: AnyCmpOp, a: (Value, Value), c: (Value, Value)) -> Value {
-        self.compare_mixed(op, V::Any(a.0, a.1), V::Any(c.0, c.1))
+    fn compare_any(&mut self, op: AnyCmpOp, a: Value, c: Value) -> Value {
+        self.compare_mixed(op, V::Any(a), V::Any(c))
     }
 
     /// A comparison of JS values or numbers (borrowed).
@@ -6434,14 +6358,14 @@ impl Lower {
         if !matches!(op, AnyCmpOp::In | AnyCmpOp::InstanceOf) {
             let fast = self.b.create_block();
             match (a, c) {
-                (V::Any(_, at), V::Any(_, ct)) => {
-                    let na = self.is_number(at);
-                    let nc = self.is_number(ct);
+                (V::Any(aw), V::Any(cw)) => {
+                    let na = self.is_number(aw);
+                    let nc = self.is_number(cw);
                     let both = self.b.ins().band(na, nc);
                     self.b.ins().brif(both, fast, &[], slow, &[]);
                 }
-                (V::Any(_, t), _) | (_, V::Any(_, t)) => {
-                    let n = self.is_number(t);
+                (V::Any(w), _) | (_, V::Any(w)) => {
+                    let n = self.is_number(w);
                     self.b.ins().brif(n, fast, &[], slow, &[]);
                 }
                 _ => {
@@ -6467,10 +6391,10 @@ impl Lower {
         self.b.switch_to_block(slow);
         let code = self.b.ins().iconst(I32, code);
         let ctx = self.ctx;
-        let (ap, at) = self.boxed(a);
-        let (cp, ct) = self.boxed(c);
-        let r = self.helper("JS_BinaryOperator", &[ctx, code, ap, at, cp, ct]);
-        self.check_value(r[1]);
+        let aw = self.boxed(a);
+        let cw = self.boxed(c);
+        let r = self.helper("JS_BinaryOperator", &[ctx, code, aw, cw]);
+        self.check_value(r[0]);
         let r = self.b.ins().ireduce(I8, r[0]);
         let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, r, 0);
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
@@ -6479,27 +6403,25 @@ impl Lower {
     }
 
     /// Unary operator on an owned value (consumed).
-    fn unary_any(&mut self, op: AnyUnOp, v: (Value, Value)) -> (Value, Value) {
+    fn unary_any(&mut self, op: AnyUnOp, v: Value) -> Value {
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         match op {
             AnyUnOp::ToStr => {
-                let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, v.1, TAG_STRING);
-                let same = [BlockArg::Value(v.0), BlockArg::Value(v.1)];
-                self.b.ins().brif(is_str, join, &same, slow, &[]);
+                let is_str = self.val_is(v, TAG_STRING);
+                self.b.ins().brif(is_str, join, &[BlockArg::Value(v)], slow, &[]);
                 self.b.switch_to_block(slow);
                 let ctx = self.ctx;
-                self.hold(V::Any(v.0, v.1));
-                let r = self.helper("JS_ToString", &[ctx, v.0, v.1]);
-                self.check_value(r[1]);
-                self.release(V::Any(v.0, v.1));
+                self.hold(V::Any(v));
+                let r = self.helper("JS_ToString", &[ctx, v]);
+                self.check_value(r[0]);
+                self.release(V::Any(v));
                 self.free(v);
-                self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
-                return (rp, rt);
+                return rw;
             }
             AnyUnOp::Typeof => {
                 self.b.ins().jump(slow, &[]);
@@ -6513,11 +6435,11 @@ impl Lower {
                         Some(b.ins().sadd_overflow(xs[0], one))
                     });
                 }
-                let num = self.is_number(v.1);
+                let num = self.is_number(v);
                 let fast = self.b.create_block();
                 self.b.ins().brif(num, fast, &[], slow, &[]);
                 self.b.switch_to_block(fast);
-                let (p, t) = match op {
+                let w = match op {
                     AnyUnOp::Plus | AnyUnOp::ToNumeric => v,
                     AnyUnOp::Neg | AnyUnOp::Inc | AnyUnOp::Dec | AnyUnOp::BitNot => {
                         let d = self.number_of(v);
@@ -6537,7 +6459,7 @@ impl Lower {
                     }
                     _ => unreachable!(),
                 };
-                self.b.ins().jump(join, &[BlockArg::Value(p), BlockArg::Value(t)]);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
             }
         }
         self.b.switch_to_block(slow);
@@ -6553,79 +6475,61 @@ impl Lower {
         };
         let code = self.b.ins().iconst(I32, code);
         let ctx = self.ctx;
-        self.hold(V::Any(v.0, v.1));
-        let r = self.helper("JS_UnaryOperator", &[ctx, code, v.0, v.1]);
-        self.check_value(r[1]);
-        self.release(V::Any(v.0, v.1));
+        self.hold(V::Any(v));
+        let r = self.helper("JS_UnaryOperator", &[ctx, code, v]);
+        self.check_value(r[0]);
+        self.release(V::Any(v));
         self.free(v);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(join);
-        (rp, rt)
+        rw
     }
 
     /// Box a `MaybeF64`: its reserved NaN is `undefined`.
-    fn box_maybe(&mut self, d: Value) -> (Value, Value) {
-        let (p, t) = self.box_number(d);
+    fn box_maybe(&mut self, d: Value) -> Value {
+        let w = self.box_number(d);
         let u = self.b.ins().bitcast(I64, d);
         let undef = self.b.ins().icmp_imm_s(IntCC::Equal, u, MAYBE_F64_UNDEFINED as i64);
-        let zero = self.b.ins().iconst(I64, 0);
-        let undef_tag = self.b.ins().iconst(I64, TAG_UNDEFINED);
-        let p = self.b.ins().select(undef, zero, p);
-        let t = self.b.ins().select(undef, undef_tag, t);
-        (p, t)
+        let undef_w = self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+        self.b.ins().select(undef, undef_w, w)
     }
 
     /// Boxes a number like the interpreter's `js_number()`: int32-valued
-    /// doubles (except -0) become `JS_TAG_INT`, everything else
-    /// `JS_TAG_FLOAT64`.
+    /// doubles (except -0) become int32 values, everything else floats.
     ///
     /// The int32 test is QuickJS's `double_is_int32`, done on the bit pattern
     /// with integer ops only. The obvious test (convert to int and back, then
     /// compare) is a ~20-cycle chain of dependent float conversions that
     /// sits right on the latency path back into the interpreter; here the
     /// conversion that produces the int payload runs in parallel instead.
-    /// Returns `(payload, tag)`.
-    pub(crate) fn box_number(&mut self, d: Value) -> (Value, Value) {
-        let (p, t) = self.box_number_raw(d);
-        self.num_shadow.insert(p, d);
-        (p, t)
+    pub(crate) fn box_number(&mut self, d: Value) -> Value {
+        let w = self.box_number_raw(d);
+        self.num_shadow.insert(w, d);
+        w
     }
 
-    /// A double as a JS value, as is (the interpreter's `js_float64`):
-    /// integral values are not made int32s.
-    fn box_float(&mut self, d: Value) -> (Value, Value) {
-        let p = self.b.ins().bitcast(I64, d);
-        let t = self.b.ins().iconst(I64, TAG_FLOAT64);
-        self.num_shadow.insert(p, d);
-        (p, t)
-    }
-
-    fn box_number_raw(&mut self, d: Value) -> (Value, Value) {
+    fn box_number_raw(&mut self, d: Value) -> Value {
         if let Some(&i) = self.int_of.get(&d) {
+            // (An exact integer: not a NaN.)
             let i32v = self.b.ins().ireduce(I32, i);
             let back = self.b.ins().sextend(I64, i32v);
             let is_int = self.b.ins().icmp(IntCC::Equal, back, i);
-            let int_payload = self.b.ins().uextend(I64, i32v);
+            let int_w = self.b.ins().uextend(I64, i32v);
             let u = self.b.ins().bitcast(I64, d);
-            let payload = self.b.ins().select(is_int, int_payload, u);
-            let int_tag = self.b.ins().iconst(I64, TAG_INT);
-            let float_tag = self.b.ins().iconst(I64, TAG_FLOAT64);
-            return (payload, self.b.ins().select(is_int, int_tag, float_tag));
+            let float_w = self.b.ins().iadd_imm_s(u, -FLOAT_OFFSET);
+            return self.b.ins().select(is_int, int_w, float_w);
         }
-        let b = &mut self.b;
-        let u = b.ins().bitcast(I64, d);
+        let u = self.b.ins().bitcast(I64, d);
         // An int32 iff converting there and back gives the same number
         // (never for NaN), and not -0.
-        let i = b.ins().fcvt_to_sint_any(I32, d);
-        let back = b.ins().fcvt_from_sint(F64, i);
-        let same = b.ins().fcmp(FloatCC::Equal, back, d);
-        let not_neg_zero = b.ins().icmp_imm_s(IntCC::NotEqual, u, i64::MIN);
-        let is_int = b.ins().band(same, not_neg_zero);
-        let int_payload = b.ins().uextend(I64, i);
-        let payload = b.ins().select(is_int, int_payload, u);
-        let int_tag = b.ins().iconst(I64, TAG_INT);
-        let float_tag = b.ins().iconst(I64, TAG_FLOAT64);
-        (payload, b.ins().select(is_int, int_tag, float_tag))
+        let i = self.b.ins().fcvt_to_sint_any(I32, d);
+        let back = self.b.ins().fcvt_from_sint(F64, i);
+        let same = self.b.ins().fcmp(FloatCC::Equal, back, d);
+        let not_neg_zero = self.b.ins().icmp_imm_s(IntCC::NotEqual, u, i64::MIN);
+        let is_int = self.b.ins().band(same, not_neg_zero);
+        let int_w = self.b.ins().uextend(I64, i);
+        let float_w = self.box_float_raw(d);
+        self.b.ins().select(is_int, int_w, float_w)
     }
 
     // ---- numbers ----
@@ -6849,11 +6753,11 @@ impl Lower {
     /// value and whether it is owned (then also held).
     fn operand(&mut self, e: &Expr, later: &[&Expr]) -> (V, bool) {
         if let ExprKind::This = e.kind {
-            let (p, t) = self.this.expect("`this` in a method");
-            return (V::Any(p, t), false);
+            let w = self.this.expect("`this` in a method");
+            return (V::Any(w), false);
         }
         if let ExprKind::Local(l) = e.kind
-            && let LVar::Two(..) = self.vars[l]
+            && let LVar::Val(..) = self.vars[l]
             && !later.iter().any(|x| ir::assigns_local(x, l))
         {
             return (self.use_local(l), false);
@@ -6862,7 +6766,7 @@ impl Lower {
         // `aot type`).
         if let ExprKind::NonNull(atom, x) = &e.kind
             && let ExprKind::Local(l) = x.kind
-            && let LVar::Two(..) = self.vars[l]
+            && let LVar::Val(..) = self.vars[l]
             && !later.iter().any(|x| ir::assigns_local(x, l))
         {
             let v = self.use_local(l);
@@ -6874,26 +6778,26 @@ impl Lower {
         (v, true)
     }
 
-    /// Continue if `(p, t)` (an object or `undefined`) is an object, else
+    /// Continue if `w` (an object or `undefined`) is an object, else
     /// throw what JS throws reading property `atom` of it (converting it to
     /// an object without `atom`).
-    fn non_null(&mut self, atom: Option<ir::AtomId>, (p, t): (Value, Value)) {
+    fn non_null(&mut self, atom: Option<ir::AtomId>, w: Value) {
         let ok = self.b.create_block();
         let bad = self.b.create_block();
         self.b.set_cold_block(bad);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let is_obj = self.val_is(w, TAG_OBJECT);
         self.b.ins().brif(is_obj, ok, &[], bad, &[]);
         self.b.switch_to_block(bad);
         let ctx = self.ctx;
         let r = match atom {
             Some(a) => {
                 let atom = self.atom(a);
-                self.helper("JS_GetProperty", &[ctx, p, t, atom])
+                self.helper("JS_GetProperty", &[ctx, w, atom])
             }
-            None => self.helper("JS_ToObject", &[ctx, p, t]),
+            None => self.helper("JS_ToObject", &[ctx, w]),
         };
-        self.check_value(r[1]);
-        self.free((r[0], r[1]));
+        self.check_value(r[0]);
+        self.free(r[0]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);
@@ -6913,26 +6817,27 @@ impl Lower {
     fn convert(&mut self, x: &Expr, helper: &str) -> V {
         let v = self.expr(x);
         self.hold(v);
-        let (p, t) = v.any();
+        let w = v.any();
         let ctx = self.ctx;
-        let r = self.helper(helper, &[ctx, p, t]);
-        self.check_value(r[1]);
+        let r = self.helper(helper, &[ctx, w]);
+        self.check_value(r[0]);
         self.release(v);
         self.free_v(v);
-        V::Any(r[0], r[1])
+        V::Any(r[0])
     }
 
     /// See `ExprKind::IterOpen`.
     fn iter_open(&mut self, x: &Expr, iter: ir::LocalId, next: ir::LocalId, atom: ir::AtomId) {
-        let (p, t) = self.expr(x).any();
+        let w = self.expr(x).any();
         let fast = self.b.create_block();
         let slow = self.b.create_block();
         let join = self.b.create_block();
         // An array with the shape of a fresh one: iterated directly.
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let kind = self.b.ins().iconst(I32, TYPED_ARRAYS);
         let pristine = self.pristine_shape(p, kind);
         let check = self.b.create_block();
@@ -6943,128 +6848,122 @@ impl Lower {
         let ok = self.helper("lum_array_iter_ok", &[ctx]);
         self.b.ins().brif(ok[0], fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
-        self.set_local(iter, V::Any(p, t));
+        self.set_local(iter, V::Any(w));
         let zero = self.konst(0, TAG_INT);
         self.set_local(next, zero);
         self.b.ins().jump(join, &[]);
         // Anything else: the iterator protocol.
         self.b.switch_to_block(slow);
-        let v = V::Any(p, t);
+        let v = V::Any(w);
         self.hold(v);
         let sync = self.b.ins().iconst(I32, 0);
-        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, sync]);
-        self.check_value(it[1]);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, w, sync]);
+        self.check_value(it[0]);
         self.release(v);
         self.free_v(v);
-        self.set_local(iter, V::Any(it[0], it[1]));
+        self.set_local(iter, V::Any(it[0]));
         let a = self.atom(atom);
-        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
-        self.check_value(m[1]);
-        self.set_local(next, V::Any(m[0], m[1]));
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], a]);
+        self.check_value(m[0]);
+        self.set_local(next, V::Any(m[0]));
         // A native generator with the original `next`: resumed directly
         // (`next` becomes `true`).
-        let ok = self.helper("lum_gen_iter_ok", &[ctx, it[0], it[1], m[0], m[1]]);
+        let ok = self.helper("lum_gen_iter_ok", &[ctx, it[0], m[0]]);
         let generator = self.b.create_block();
         self.b.ins().brif(ok[0], generator, &[], join, &[]);
         self.b.switch_to_block(generator);
-        let one = self.b.ins().iconst(I64, 1);
-        let bool_tag = self.b.ins().iconst(I64, TAG_BOOL);
-        self.set_local(next, V::Any(one, bool_tag));
+        let t = self.konst(1, TAG_BOOL);
+        self.set_local(next, t);
         self.b.ins().jump(join, &[]);
         self.b.switch_to_block(join);
     }
 
     /// See `ExprKind::IterStep`.
     fn iter_step(&mut self, iter: ir::LocalId, next: Option<ir::LocalId>) -> V {
-        let (ip, it) = self.use_local(iter).any();
+        let iw = self.use_local(iter).any();
         let ctx = self.ctx;
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let finished = self.b.create_block();
         let failed = self.b.create_block();
         self.b.set_cold_block(failed);
         // Done already: no more calls, `undefined`.
-        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, it, TAG_UNDEFINED);
+        let undef = val_const(TAG_UNDEFINED, 0);
+        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, iw, undef);
         let step = self.b.create_block();
-        let u = self.konst(0, TAG_UNDEFINED);
-        let (up, ut) = u.any();
-        self.b.ins().brif(live, step, &[], join, &[BlockArg::Value(up), BlockArg::Value(ut)]);
+        let u = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().brif(live, step, &[], join, &[BlockArg::Value(u)]);
         self.b.switch_to_block(step);
         let r = match next {
             Some(n) => {
-                let (np, nt) = self.use_local(n).any();
-                let direct = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_INT);
+                let nw = self.use_local(n).any();
+                let direct = self.val_is(nw, TAG_INT);
                 let array = self.b.create_block();
                 let protocol = self.b.create_block();
                 self.b.ins().brif(direct, array, &[], protocol, &[]);
                 // An array iterated directly: index `next` until its length
                 // (read every time, as the array iterator does).
                 self.b.switch_to_block(array);
-                let idx = self.b.ins().ireduce(I32, np);
-                let idx = self.b.ins().uextend(I64, idx);
+                let idx = self.b.ins().band_imm_u(nw, 0xffff_ffffi64);
+                let ip = self.val_ptr(iw);
                 let len = self.array_length(ip);
                 let more = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                 let get = self.b.create_block();
                 self.b.ins().brif(more, get, &[], finished, &[]);
                 self.b.switch_to_block(get);
-                let v = self.array_element(ip, it, idx);
-                let exc = self.b.ins().icmp_imm_s(IntCC::Equal, v.1, TAG_EXCEPTION);
+                let v = self.array_element(iw, idx);
+                let exc = self.b.ins().icmp_imm_s(IntCC::Equal, v, val_const(TAG_EXCEPTION, 0));
                 let got = self.b.create_block();
                 self.b.ins().brif(exc, failed, &[], got, &[]);
                 self.b.switch_to_block(got);
                 let n1 = self.b.ins().iadd_imm_s(idx, 1);
-                let n1 = self.b.ins().ireduce(I32, n1);
-                let n1 = self.b.ins().uextend(I64, n1);
-                let int = self.b.ins().iconst(I64, TAG_INT);
-                self.def_local(n, V::Any(n1, int));
-                self.b.ins().jump(join, &[BlockArg::Value(v.0), BlockArg::Value(v.1)]);
+                let n1 = self.mk_int(n1);
+                self.def_local(n, V::Any(n1));
+                self.b.ins().jump(join, &[BlockArg::Value(v)]);
                 // A native generator resumed directly, or the iterator protocol.
                 self.b.switch_to_block(protocol);
                 let done_addr = self.done_slot();
                 let resume = self.b.create_block();
                 let call = self.b.create_block();
                 let after = self.b.create_block();
-                let rp2 = self.b.append_block_param(after, I64);
-                let rt2 = self.b.append_block_param(after, I64);
-                let is_gen = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_BOOL);
+                let rw2 = self.b.append_block_param(after, I64);
+                let is_gen = self.val_is(nw, TAG_BOOL);
                 self.b.ins().brif(is_gen, resume, &[], call, &[]);
                 self.b.switch_to_block(resume);
-                let r = self.helper("JS_NativeGeneratorNext", &[ctx, ip, it, done_addr]);
-                self.b.ins().jump(after, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("JS_NativeGeneratorNext", &[ctx, iw, done_addr]);
+                self.b.ins().jump(after, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(call);
                 let zero = self.b.ins().iconst(I32, 0);
                 let null = self.b.ins().iconst(self.ptr, 0);
-                let r = self.helper("JS_IteratorStep", &[ctx, ip, it, np, nt, zero, null, done_addr]);
-                self.b.ins().jump(after, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+                let r = self.helper("JS_IteratorStep", &[ctx, iw, nw, zero, null, done_addr]);
+                self.b.ins().jump(after, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(after);
-                (vec![rp2, rt2], done_addr)
+                (rw2, done_addr)
             }
             None => {
                 let done_addr = self.done_slot();
-                (self.helper("JS_ForInStep", &[ctx, ip, it, done_addr]), done_addr)
+                (self.helper("JS_ForInStep", &[ctx, iw, done_addr])[0], done_addr)
             }
         };
         let (r, done_addr) = r;
-        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, r[1], TAG_EXCEPTION);
+        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, r, val_const(TAG_EXCEPTION, 0));
         let ok = self.b.create_block();
         self.b.ins().brif(exc, failed, &[], ok, &[]);
         self.b.switch_to_block(ok);
         let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
-        self.b.ins().brif(done, finished, &[], join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.b.ins().brif(done, finished, &[], join, &[BlockArg::Value(r)]);
         // Done, or thrown: the iterator is not closed after either.
         self.b.switch_to_block(finished);
         let u = self.konst(0, TAG_UNDEFINED);
         self.set_local(iter, u);
-        let (up, ut) = u.any();
-        self.b.ins().jump(join, &[BlockArg::Value(up), BlockArg::Value(ut)]);
+        self.b.ins().jump(join, &[BlockArg::Value(u.any())]);
         self.b.switch_to_block(failed);
         let u = self.konst(0, TAG_UNDEFINED);
         self.set_local(iter, u);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(join);
-        V::Any(rp, rt)
+        V::Any(rw)
     }
 
     /// A stack slot for an `int` out-parameter; its address.
@@ -7076,22 +6975,20 @@ impl Lower {
     /// The length of array `p` (its first property), as a `u32` in an `I64`.
     fn array_length(&mut self, p: Value) -> Value {
         let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
-        let lp = self.b.ins().load(I64, M_SLOT, prop, 0);
-        let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
-        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
-        let i = self.b.ins().ireduce(I32, lp);
-        let i = self.b.ins().uextend(I64, i);
-        let d = self.b.ins().bitcast(F64, lp);
+        let w = self.b.ins().load(I64, M_SLOT, prop, 0);
+        let is_int = self.val_is(w, TAG_INT);
+        let i = self.b.ins().band_imm_u(w, 0xffff_ffffi64);
+        let d = self.val_f64(w);
         let f = self.b.ins().fcvt_to_uint_sat(I64, d);
         self.b.ins().select(is_int, i, f)
     }
 
-    /// Element `idx` (an `I64` below 2^32) of array `(p, t)`: a new value,
-    /// or `JS_EXCEPTION`.
-    fn array_element(&mut self, p: Value, t: Value, idx: Value) -> (Value, Value) {
+    /// Element `idx` (an `I64` below 2^32) of array `w`: a new value, or
+    /// `JS_EXCEPTION`.
+    fn array_element(&mut self, w: Value, idx: Value) -> Value {
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
+        let p = self.val_ptr(w);
         let count = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
         let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
         let hit = self.b.create_block();
@@ -7099,48 +6996,47 @@ impl Lower {
         self.b.ins().brif(inb, hit, &[], slow, &[]);
         self.b.switch_to_block(hit);
         let at = self.array_slot(p, idx);
-        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
-        self.dup((vp, vt));
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.dup(vw);
+        self.b.ins().jump(join, &[BlockArg::Value(vw)]);
         // Holes and slow arrays: a property read.
         self.b.switch_to_block(slow);
         let d = self.b.ins().fcvt_from_uint(F64, idx);
-        let (kp, kt) = self.box_number(d);
+        let kw = self.box_number(d);
         let ctx = self.ctx;
-        let r = self.helper("JS_GetPropertyValue", &[ctx, p, t, kp, kt]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        let r = self.helper("JS_GetPropertyValue", &[ctx, w, kw]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(join);
-        (rp, rt)
+        rw
     }
 
     /// Close the iteration in `iter` unless it is done, leaving `undefined`
     /// (`pending`: with an exception pending, which closing keeps; errors of
     /// the closing itself are then ignored). Returns the closing's result.
     fn close_raw(&mut self, iter: ir::LocalId, next: ir::LocalId, pending: bool) -> Value {
-        let (p, t) = self.use_local(iter).any();
-        let (np, nt) = self.use_local(next).any();
+        let w = self.use_local(iter).any();
+        let nw = self.use_local(next).any();
         let join = self.b.create_block();
         let r = self.b.append_block_param(join, I32);
         let zero = self.b.ins().iconst(I32, 0);
-        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, t, TAG_UNDEFINED);
+        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNDEFINED, 0));
         let close = self.b.create_block();
         self.b.ins().brif(live, close, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(close);
         let ctx = self.ctx;
         let pending = self.b.ins().iconst(I32, pending as i64);
-        let direct = self.b.ins().icmp_imm_s(IntCC::Equal, nt, TAG_INT);
+        let direct = self.val_is(nw, TAG_INT);
         let array = self.b.create_block();
         let protocol = self.b.create_block();
         let closed = self.b.create_block();
         let res = self.b.append_block_param(closed, I32);
         self.b.ins().brif(direct, array, &[], protocol, &[]);
         self.b.switch_to_block(array);
-        let idx = self.b.ins().ireduce(I32, np);
-        let a = self.helper("lum_array_iter_close", &[ctx, p, t, idx, pending]);
+        let idx = self.b.ins().ireduce(I32, nw);
+        let a = self.helper("lum_array_iter_close", &[ctx, w, idx, pending]);
         self.b.ins().jump(closed, &[BlockArg::Value(a[0])]);
         self.b.switch_to_block(protocol);
-        let c = self.helper("JS_IteratorCloseCompletion", &[ctx, p, t, pending]);
+        let c = self.helper("JS_IteratorCloseCompletion", &[ctx, w, pending]);
         self.b.ins().jump(closed, &[BlockArg::Value(c[0])]);
         self.b.switch_to_block(closed);
         let u = self.konst(0, TAG_UNDEFINED);
@@ -7186,7 +7082,7 @@ impl Lower {
     /// number: updated in place by `prop_update`.
     fn prop_step<'e>(&self, o: &Expr, a: ir::AtomId, x: &'e Expr) -> Option<PropStep<'e>> {
         let plain = match o.kind {
-            ExprKind::Local(l) => matches!(self.vars[l], LVar::Two(..)),
+            ExprKind::Local(l) => matches!(self.vars[l], LVar::Val(..)),
             ExprKind::This => true,
             _ => false,
         };
@@ -7217,7 +7113,7 @@ impl Lower {
     /// everything else goes through the engine. Returns the new value if
     /// `want`ed, else `V::Void`.
     fn prop_update(&mut self, o: &Expr, a: ir::AtomId, step: PropStep, want: bool) -> V {
-        let (p, t) = match o.kind {
+        let w = match o.kind {
             ExprKind::Local(l) => self.use_local(l).any(),
             _ => self.this.expect("`this` in a method"),
         };
@@ -7225,21 +7121,15 @@ impl Lower {
         let ic = self.new_ic();
         let get_ic = self.new_ic();
         let join = self.b.create_block();
-        let (rp, rt) = if want {
-            (self.b.append_block_param(join, I64), self.b.append_block_param(join, I64))
-        } else {
-            let u = self.b.ins().iconst(I64, 0);
-            (u, u)
-        };
-        let result = |np: Value, nt: Value| if want { vec![BlockArg::Value(np), BlockArg::Value(nt)] } else { vec![] };
+        let rw = if want { self.b.append_block_param(join, I64) } else { self.b.ins().iconst(I64, 0) };
+        let result = |nw: Value| if want { vec![BlockArg::Value(nw)] } else { vec![] };
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         let num = self.b.create_block();
         let old_d = self.b.append_block_param(num, F64);
 
-        let at = self.ic_hit(p, t, ic, slow);
-        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        let at = self.ic_hit(w, ic, slow);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
         // The step, as a double and (when it is one) as an integer.
         let (cd, ci) = match step {
             PropStep::Unary(op) => {
@@ -7252,14 +7142,13 @@ impl Lower {
                 if op == AnyBinOp::Sub { (self.b.ins().fneg(d), i.map(|i| self.b.ins().ineg(i))) } else { (d, i) }
             }
         };
-        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_INT);
+        let is_int = self.val_is(vw, TAG_INT);
         let int_b = self.b.create_block();
         let not_int = self.b.create_block();
         self.b.ins().brif(is_int, int_b, &[], not_int, &[]);
 
         self.b.switch_to_block(int_b);
-        let old_i = self.b.ins().ireduce(I32, vp);
-        let old_i = self.b.ins().sextend(I64, old_i);
+        let old_i = self.val_int(vw);
         // An int result that fits is stored as is; otherwise compute in double.
         if let Some(ci) = ci {
             let r = self.b.ins().iadd(old_i, ci);
@@ -7270,90 +7159,86 @@ impl Lower {
             let wide = self.b.create_block();
             self.b.ins().brif(fits, store, &[], wide, &[]);
             self.b.switch_to_block(store);
-            let np = self.b.ins().uextend(I64, r32);
-            self.b.ins().store(M_SLOT, np, at, 0);
-            let it = self.b.ins().iconst(I64, TAG_INT);
-            self.b.ins().jump(join, &result(np, it));
+            let nw = self.b.ins().uextend(I64, r32);
+            self.b.ins().store(M_SLOT, nw, at, 0);
+            self.b.ins().jump(join, &result(nw));
             self.b.switch_to_block(wide);
         }
         let as_d = self.b.ins().fcvt_from_sint(F64, old_i);
         self.b.ins().jump(num, &[BlockArg::Value(as_d)]);
 
         self.b.switch_to_block(not_int);
-        let is_f = self.b.ins().icmp_imm_s(IntCC::Equal, vt, TAG_FLOAT64);
-        let fd = self.b.ins().bitcast(F64, vp);
+        let is_f = self.val_is_float(vw);
+        let fd = self.val_f64(vw);
         self.b.ins().brif(is_f, num, &[BlockArg::Value(fd)], slow, &[]);
 
         // Numbers: the old value is not a reference, nothing to free.
         self.b.switch_to_block(num);
         let nd = self.b.ins().fadd(old_d, cd);
-        let (np, nt) = self.box_float(nd);
-        self.b.ins().store(M_SLOT, np, at, 0);
-        self.b.ins().store(M_SLOT, nt, at, TAG_OFFSET);
-        self.b.ins().jump(join, &result(np, nt));
+        let nw = self.box_float(nd);
+        self.b.ins().store(M_SLOT, nw, at, 0);
+        self.b.ins().jump(join, &result(nw));
 
         self.b.switch_to_block(slow);
         let atom = self.atom(a);
         let ctx = self.ctx;
-        let r = self.helper("lum_ic_get", &[ctx, p, t, atom, get_ic]);
-        self.check_value(r[1]);
-        let (np, nt) = match step {
-            PropStep::Unary(op) => self.unary_any(op, (r[0], r[1])),
+        let r = self.helper("lum_ic_get", &[ctx, w, atom, get_ic]);
+        self.check_value(r[0]);
+        let nw = match step {
+            PropStep::Unary(op) => self.unary_any(op, r[0]),
             PropStep::Binary(op, y, _) => {
-                let g = V::Any(r[0], r[1]);
+                let g = V::Any(r[0]);
                 self.hold(g);
                 let c = self.expr(y);
                 self.hold(c);
-                let v = self.binary_any(op, (r[0], r[1]), c.any());
+                let v = self.binary_any(op, r[0], c.any());
                 self.release(c);
                 self.release(g);
                 v
             }
         };
-        let v = V::Any(np, nt);
+        let v = V::Any(nw);
         if want {
             self.hold(v);
             // One reference for the property, one for the expression.
-            self.dup((np, nt));
+            self.dup(nw);
         }
         let atom = self.atom(a);
-        let r = self.helper("lum_ic_set", &[ctx, p, t, atom, np, nt, ic]);
+        let r = self.helper("lum_ic_set", &[ctx, w, atom, nw, ic]);
         self.check_int(r[0]);
         if want {
             self.release(v);
         }
-        self.b.ins().jump(join, &result(np, nt));
+        self.b.ins().jump(join, &result(nw));
 
         self.b.switch_to_block(join);
-        if want { V::Any(rp, rt) } else { V::Void }
+        if want { V::Any(rw) } else { V::Void }
     }
 
     /// `obj.a` (borrowed object) through a new inline cache: an own data
     /// property, or a data property (a method) or getter of the direct
     /// prototype. A new reference.
-    fn prop_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
-        self.prop_get_from(p, t, None, a, Vec::new(), false)
+    fn prop_get(&mut self, w: Value, a: ir::AtomId) -> Value {
+        self.prop_get_from(w, None, a, Vec::new(), false)
     }
 
     /// `prop_get` for a method call: its cache also serves strings, whose
     /// methods it reads from String.prototype (`LUM_IC_STRING`).
-    fn method_get(&mut self, p: Value, t: Value, a: ir::AtomId) -> (Value, Value) {
-        self.prop_get_from(p, t, None, a, Vec::new(), true)
+    fn method_get(&mut self, w: Value, a: ir::AtomId) -> Value {
+        self.prop_get_from(w, None, a, Vec::new(), true)
     }
 
-    /// `prop_get`, or with a receiver: `super.a` (`p`, `t`: the home object;
+    /// `prop_get`, or with a receiver: `super.a` (`w`: the home object;
     /// only its prototypes are searched, and getters get the receiver).
     fn prop_get_from(
         &mut self,
-        p: Value,
-        t: Value,
-        receiver: Option<(Value, Value)>,
+        w: Value,
+        receiver: Option<Value>,
         a: ir::AtomId,
         pred: Vec<Pred>,
         strings: bool,
-    ) -> (Value, Value) {
-        let (rp, rt, _) = self.prop_get_inner(p, t, receiver, a, pred, strings, false);
-        (rp, rt)
+    ) -> Value {
+        self.prop_get_inner(w, receiver, a, pred, strings, false).0
     }
 
     /// `prop_get_from`; with `borrow`, data properties are read without a
@@ -7362,29 +7247,27 @@ impl Lower {
     #[allow(clippy::too_many_arguments)]
     fn prop_get_inner(
         &mut self,
-        p: Value,
-        t: Value,
-        receiver: Option<(Value, Value)>,
+        w: Value,
+        receiver: Option<Value>,
         a: ir::AtomId,
         pred: Vec<Pred>,
         strings: bool,
         borrow: bool,
-    ) -> (Value, Value, Option<Value>) {
+    ) -> (Value, Option<Value>) {
         // A polymorphic call site's method: its cache's other entries are
         // checked inline, and are no cold path.
         let poly = std::mem::take(&mut self.poly_site);
         let ic = self.new_ic();
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let owned = borrow.then(|| self.b.append_block_param(join, I8));
         // A method's (a value that is called): its JS entry, where the cache
         // keeps it (see `fn_entries`), else 0.
         let entry = strings.then(|| self.b.append_block_param(join, I64));
         // The join's arguments: a borrowed value (not dup'ed when
         // borrowing), or a new reference; and the entry, if known.
-        let args_entry = |l: &mut Self, vp: Value, vt: Value, new_ref: bool, e: Option<Value>| -> Vec<BlockArg> {
-            let mut a = vec![BlockArg::Value(vp), BlockArg::Value(vt)];
+        let args_entry = |l: &mut Self, vw: Value, new_ref: bool, e: Option<Value>| -> Vec<BlockArg> {
+            let mut a = vec![BlockArg::Value(vw)];
             if borrow {
                 a.push(BlockArg::Value(l.b.ins().iconst(I8, new_ref as i64)));
             }
@@ -7393,7 +7276,7 @@ impl Lower {
             }
             a
         };
-        let args = |l: &mut Self, vp: Value, vt: Value, new_ref: bool| args_entry(l, vp, vt, new_ref, None);
+        let args = |l: &mut Self, vw: Value, new_ref: bool| args_entry(l, vw, new_ref, None);
         let slow = self.b.create_block();
         if !poly {
             self.b.set_cold_block(slow);
@@ -7402,13 +7285,13 @@ impl Lower {
         // (A method, or a getter something predicts, is usually a
         // prototype's: that shape compared first.)
         let proto_first = strings || !pred.is_empty();
-        let (shape, own, kind) = self.ic_hit_split(p, t, ic, not_obj, slow, proto_first);
+        let (p, shape, own, kind) = self.ic_hit_split(w, ic, not_obj, slow, proto_first);
         if strings {
             // A string: String.prototype's property, if it has the cached
             // shape.
             let after = self.b.current_block().unwrap();
             self.b.switch_to_block(not_obj);
-            let is_str = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_STRING);
+            let is_str = self.val_is(w, TAG_STRING);
             let k = self.b.ins().uload32(M_IC, ic, 12);
             let is_k = self.b.ins().icmp_imm_s(IntCC::Equal, k, IC_STRING);
             let ok = self.b.ins().band(is_str, is_k);
@@ -7424,12 +7307,11 @@ impl Lower {
             self.b.ins().brif(same, hit, &[], slow, &[]);
             self.b.switch_to_block(hit);
             let at = self.ic_slot_addr(proto, ic);
-            let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-            let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+            let vw = self.b.ins().load(I64, M_SLOT, at, 0);
             if !borrow {
-                self.dup((vp, vt));
+                self.dup(vw);
             }
-            let ja = args(self, vp, vt, false);
+            let ja = args(self, vw, false);
             self.b.ins().jump(join, &ja);
             self.b.switch_to_block(after);
         }
@@ -7462,22 +7344,22 @@ impl Lower {
         let then = self.b.ins().load(I64, M_IC, ic, IC_EPOCH);
         let fresh = self.b.ins().icmp(IntCC::Equal, now, then);
         self.b.ins().brif(fresh, fresh_blk, &[], proto, &[]);
-        // A getter's call, from either path, with its JS entry if known.
+        // A getter's call, from either path (the getter as a JS value),
+        // with its JS entry if known.
         let call = self.b.create_block();
         let g = self.b.append_block_param(call, I64);
         let g_entry = self.b.append_block_param(call, I64);
         self.b.switch_to_block(fresh_blk);
-        let fp = self.b.ins().load(I64, M_IC, ic, IC_VALUE);
+        let fw = self.b.ins().load(I64, M_IC, ic, IC_VALUE);
         let fe = self.b.ins().load(I64, M_IC, ic, IC_ENTRY);
         let data_fresh = self.b.create_block();
         let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
-        self.b.ins().brif(is_data, data_fresh, &[], call, &[BlockArg::Value(fp), BlockArg::Value(fe)]);
+        self.b.ins().brif(is_data, data_fresh, &[], call, &[BlockArg::Value(fw), BlockArg::Value(fe)]);
         self.b.switch_to_block(data_fresh);
-        let ft = self.b.ins().load(I64, M_IC, ic, IC_VALUE + TAG_OFFSET);
         if !borrow {
-            self.dup((fp, ft));
+            self.dup(fw);
         }
-        let ja = args_entry(self, fp, ft, false, Some(fe));
+        let ja = args_entry(self, fw, false, Some(fe));
         self.b.ins().jump(join, &ja);
         // An own data property.
         self.b.switch_to_block(own);
@@ -7488,12 +7370,11 @@ impl Lower {
             self.b.switch_to_block(dead);
         }
         let at = self.ic_slot_addr(p, ic);
-        let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
         if !borrow {
-            self.dup((vp, vt));
+            self.dup(vw);
         }
-        let ja = args(self, vp, vt, false);
+        let ja = args(self, vw, false);
         self.b.ins().jump(join, &ja);
         // The other kinds, and a prototype's property after a change to a
         // watched object: through the holder's shapes. Or a call of a getter
@@ -7509,8 +7390,8 @@ impl Lower {
             let rest = self.b.create_block();
             self.b.ins().brif(is_struct, st, &[], rest, &[]);
             self.b.switch_to_block(st);
-            let (vp, vt) = self.struct_ic_read(p, kind, ic, slow);
-            let ja = args(self, vp, vt, true);
+            let vw = self.struct_ic_read(p, kind, ic, slow);
+            let ja = args(self, vw, true);
             self.b.ins().jump(join, &ja);
             self.b.switch_to_block(rest);
         }
@@ -7520,75 +7401,78 @@ impl Lower {
         self.b.ins().brif(is_data, data, &[], getter, &[]);
         self.b.switch_to_block(data);
         let pat = self.ic_proto_slot(shape, ic, slow);
-        let vp = self.b.ins().load(I64, M_SLOT, pat, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, pat, TAG_OFFSET);
+        let vw = self.b.ins().load(I64, M_SLOT, pat, 0);
         if !borrow {
-            self.dup((vp, vt));
+            self.dup(vw);
         }
-        let ja = args(self, vp, vt, false);
+        let ja = args(self, vw, false);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(getter);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
-        let gv = self.b.ins().load(I64, M_SLOT, pat, 0);
+        let (_, gv) = self.accessor(pat, false);
         let unknown = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(call, &[BlockArg::Value(gv), BlockArg::Value(unknown)]);
         self.b.switch_to_block(call);
-        self.nonnull(g, slow);
+        // (No getter: the reference 0, an object's tag above it.)
+        let gp = self.val_ptr(g);
+        self.nonnull(gp, slow);
         self.fn_entries.insert(g, g_entry);
         let ctx = self.ctx;
-        let (thp, tht) = receiver.unwrap_or((p, t));
-        let (gp, gt) = if !pred.is_empty() {
-            let tag = self.b.ins().iconst(I64, TAG_OBJECT);
-            self.call_or_inline(&pred, (g, tag), (thp, tht), &[], |l| l.b.ins().iconst(I64, 0), true, |l, _| {
-                let r = l.helper("lum_call_getter", &[ctx, g, thp, tht]);
-                (r[0], r[1])
-            })
+        let this = receiver.unwrap_or(w);
+        let gw = if !pred.is_empty() {
+            self.call_or_inline(
+                &pred,
+                g,
+                this,
+                &[],
+                |l| l.b.ins().iconst(I64, 0),
+                true,
+                |l, _| l.helper("lum_call_getter", &[ctx, gp, this])[0],
+            )
         } else {
             // (A getter nothing predicts: called by the runtime, keeping
             // every property read small.)
-            let r = self.helper("lum_call_getter", &[ctx, g, thp, tht]);
-            (r[0], r[1])
+            self.helper("lum_call_getter", &[ctx, gp, this])[0]
         };
-        self.check_value(gt);
-        let ja = args(self, gp, gt, true);
+        self.check_value(gw);
+        let ja = args(self, gw, true);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(slow);
         if receiver.is_none() {
             // A polymorphic site's other entries (`LumIC.poly`): the
             // property's address, without a lookup.
-            let at = if poly { self.ic_poly_inline(p, t, ic) } else { self.ic_poly_addr(p, t, ic) };
+            let at = if poly { self.ic_poly_inline(w, ic) } else { self.ic_poly_addr(w, ic) };
             let found = self.b.create_block();
             let miss = self.b.create_block();
             self.b.ins().brif(at, found, &[], miss, &[]);
             self.b.switch_to_block(found);
-            let vp = self.b.ins().load(I64, M_SLOT, at, 0);
-            let vt = self.b.ins().load(I64, M_SLOT, at, TAG_OFFSET);
+            let vw = self.b.ins().load(I64, M_SLOT, at, 0);
             if !borrow {
-                self.dup((vp, vt));
+                self.dup(vw);
             }
-            let ja = args(self, vp, vt, false);
+            let ja = args(self, vw, false);
             self.b.ins().jump(join, &ja);
             self.b.switch_to_block(miss);
         }
         let atom = self.atom(a);
         let r = match receiver {
-            Some((rp_, rt_)) => self.helper("lum_super_get_ic", &[ctx, p, t, rp_, rt_, atom, ic]),
-            None => self.helper("lum_ic_get_proto", &[ctx, p, t, atom, ic]),
+            Some(rw_) => self.helper("lum_super_get_ic", &[ctx, w, rw_, atom, ic]),
+            None => self.helper("lum_ic_get_proto", &[ctx, w, atom, ic]),
         };
-        self.check_value(r[1]);
-        let ja = args(self, r[0], r[1], true);
+        self.check_value(r[0]);
+        let ja = args(self, r[0], true);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(join);
         if let Some(e) = entry {
-            self.fn_entries.insert(rp, e);
+            self.fn_entries.insert(rw, e);
         }
-        (rp, rt, owned)
+        (rw, owned)
     }
 
     /// A field of an `aot type` object (`p`) cached in `ic`
     /// (`LUM_IC_STRUCT`), as a new JS value: if `p` is of the cached layout
     /// and has the field, else go to `slow`.
-    fn struct_ic_read(&mut self, p: Value, kind: Value, ic: Value, slow: Block) -> (Value, Value) {
+    fn struct_ic_read(&mut self, p: Value, kind: Value, ic: Value, slow: Block) -> Value {
         let class = self.b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
         let sc = self.b.ins().symbol_value(self.ptr, self.env.struct_class);
         let want = self.b.ins().load(I32, M_CONST, sc, 0);
@@ -7620,63 +7504,60 @@ impl Lower {
         let storage = self.b.ins().ushr_imm_u(kind, 16);
         let storage = self.b.ins().band_imm_u(storage, 3);
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let blocks: Vec<Block> = (0..4).map(|_| self.b.create_block()).collect();
         let mut table = crate::mir::Switch::new();
         for (i, &b) in blocks.iter().enumerate() {
             table.set_entry(i as u128, b);
         }
         table.emit(&mut self.b, storage, blocks[3]);
-        // int32
+        // int32 (an int value: tag 0 above it)
         self.b.switch_to_block(blocks[0]);
         let i = self.b.ins().uload32(M_STRUCT, at, 0);
-        let tag = self.b.ins().iconst(I64, TAG_INT);
-        self.b.ins().jump(join, &[BlockArg::Value(i), BlockArg::Value(tag)]);
+        self.b.ins().jump(join, &[BlockArg::Value(i)]);
         // f64
         self.b.switch_to_block(blocks[1]);
         let d = self.b.ins().load(F64, M_STRUCT, at, 0);
-        let (bp, bt) = self.box_number(d);
-        self.b.ins().jump(join, &[BlockArg::Value(bp), BlockArg::Value(bt)]);
+        let bw = self.box_number(d);
+        self.b.ins().jump(join, &[BlockArg::Value(bw)]);
         // boolean
         self.b.switch_to_block(blocks[2]);
         let x = self.b.ins().uload8(I64, M_STRUCT, at, 0);
-        let tag = self.b.ins().iconst(I64, TAG_BOOL);
-        self.b.ins().jump(join, &[BlockArg::Value(x), BlockArg::Value(tag)]);
+        let x = self.b.ins().bor_imm_u(x, val_const(TAG_BOOL, 0));
+        self.b.ins().jump(join, &[BlockArg::Value(x)]);
         // a JS value
         self.b.switch_to_block(blocks[3]);
-        let vp = self.b.ins().load(I64, M_STRUCT, at, 0);
-        let vt = self.b.ins().load(I64, M_STRUCT, at, TAG_OFFSET);
-        self.dup((vp, vt));
-        self.b.ins().jump(join, &[BlockArg::Value(vp), BlockArg::Value(vt)]);
+        let vw = self.b.ins().load(I64, M_STRUCT, at, 0);
+        self.dup(vw);
+        self.b.ins().jump(join, &[BlockArg::Value(vw)]);
         self.b.switch_to_block(join);
-        (rp, rt)
+        rw
     }
 
-    /// Where `(p, t)` is an object of the shape `ic` has for an own data
+    /// Where `w` is an object of the shape `ic` has for an own data
     /// property: to the block returned (not yet switched to); of its other
     /// shape (`alt_shape`): on in the current block, with the cache's kind;
-    /// else to `slow` (`not_obj` if not an object). Also returns the shape.
+    /// else to `slow` (`not_obj` if not an object). Also returns the
+    /// object's address and shape.
     fn ic_hit_split(
         &mut self,
-        p: Value,
-        t: Value,
+        w: Value,
         ic: Value,
         not_obj: Block,
         slow: Block,
         proto_first: bool,
-    ) -> (Value, Block, Value) {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    ) -> (Value, Value, Block, Value) {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         let own = self.b.create_block();
         let kinded = self.b.create_block();
         let other = self.b.create_block();
         // `shape` for an own data property, `alt_shape` for the other kinds.
-        let (first, then, first_off, then_off) =
-            if proto_first { (kinded, own, 32, 0) } else { (own, kinded, 0, 32) };
+        let (first, then, first_off, then_off) = if proto_first { (kinded, own, 32, 0) } else { (own, kinded, 0, 32) };
         let cached = self.b.ins().load(I64, M_IC, ic, first_off);
         let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
         self.b.ins().brif(same, first, &[], other, &[]);
@@ -7686,21 +7567,22 @@ impl Lower {
         self.b.ins().brif(same, then, &[], slow, &[]);
         self.b.switch_to_block(kinded);
         let kind = self.b.ins().uload32(M_IC, ic, 12);
-        (shape, own, kind)
+        (p, shape, own, kind)
     }
 
-    /// Continue if `(p, t)` is an object with the shape cached in `ic`, else
+    /// Continue if `w` is an object with the shape cached in `ic`, else
     /// go to `slow`. Returns the shape and the cache's kind.
-    fn ic_shape_hit(&mut self, p: Value, t: Value, ic: Value, slow: Block) -> (Value, Value) {
-        self.ic_shape_hit_or(p, t, ic, slow, slow)
+    fn ic_shape_hit(&mut self, w: Value, ic: Value, slow: Block) -> (Value, Value) {
+        self.ic_shape_hit_or(w, ic, slow, slow)
     }
 
-    /// `ic_shape_hit`, going to `not_obj` if `(p, t)` is not an object.
-    fn ic_shape_hit_or(&mut self, p: Value, t: Value, ic: Value, not_obj: Block, slow: Block) -> (Value, Value) {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    /// `ic_shape_hit`, going to `not_obj` if `w` is not an object.
+    fn ic_shape_hit_or(&mut self, w: Value, ic: Value, not_obj: Block, slow: Block) -> (Value, Value) {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], not_obj, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         // An own data property: `shape` (kind 0); any other kind: `alt_shape`.
         let cached = self.b.ins().load(I64, M_IC, ic, 0);
@@ -7723,12 +7605,12 @@ impl Lower {
     }
 
     /// Where the primary entry of `ic` misses: the address of the property
-    /// of `(p, t)` that one of its polymorphic entries (`LumIC.poly`)
-    /// holds, else 0.
-    fn ic_poly_addr(&mut self, p: Value, t: Value, ic: Value) -> Value {
+    /// of `w` that one of its polymorphic entries (`LumIC.poly`) holds,
+    /// else 0.
+    fn ic_poly_addr(&mut self, w: Value, ic: Value) -> Value {
         let join = self.b.create_block();
         let at = self.b.append_block_param(join, I64);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let poly = self.b.ins().load(I64, M_IC, ic, IC_POLY);
         let zero = self.b.ins().iconst(I64, 0);
         let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, poly, 0);
@@ -7736,6 +7618,7 @@ impl Lower {
         let call = self.b.create_block();
         self.b.ins().brif(probe, call, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(call);
+        let p = self.val_ptr(w);
         let r = self.helper("lum_ic_poly_addr", &[ic, p])[0];
         self.b.ins().jump(join, &[BlockArg::Value(r)]);
         self.b.switch_to_block(join);
@@ -7745,10 +7628,10 @@ impl Lower {
     /// `ic_poly_addr` with the entries checked inline (an own data
     /// property, or a prototype's up to three levels up), for a predicted
     /// call's method, where they are what usually hits.
-    fn ic_poly_inline(&mut self, p: Value, t: Value, ic: Value) -> Value {
+    fn ic_poly_inline(&mut self, w: Value, ic: Value) -> Value {
         let join = self.b.create_block();
         let at = self.b.append_block_param(join, I64);
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let poly = self.b.ins().load(I64, M_IC, ic, IC_POLY);
         let zero = self.b.ins().iconst(I64, 0);
         let has = self.b.ins().icmp_imm_s(IntCC::NotEqual, poly, 0);
@@ -7756,6 +7639,7 @@ impl Lower {
         let entries = self.b.create_block();
         self.b.ins().brif(probe, entries, &[], join, &[BlockArg::Value(zero)]);
         self.b.switch_to_block(entries);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         for k in 0..POLY_ENTRIES {
             let e = self.b.ins().iadd_imm_s(poly, (k * IC_SIZE) as i64);
@@ -7892,11 +7776,12 @@ impl Lower {
 
     /// Continue if `(p, t)` is an object with the shape cached in `ic`, else
     /// go to `slow`. Returns the address of the cached property's value.
-    fn ic_hit(&mut self, p: Value, t: Value, ic: Value, slow: Block) -> Value {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    fn ic_hit(&mut self, w: Value, ic: Value, slow: Block) -> Value {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
         let cached = self.b.ins().load(I64, M_IC, ic, 0);
         let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
@@ -7921,10 +7806,9 @@ impl Lower {
                 let back = self.b.ins().fcvt_from_sint(F64, i);
                 (self.b.ins().fcmp(FloatCC::Equal, back, d), i)
             }
-            V::Any(p, t) => {
-                let ok = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_INT);
-                let i = self.b.ins().ireduce(I32, p);
-                (ok, self.b.ins().sextend(I64, i))
+            V::Any(w) => {
+                let ok = self.val_is(w, TAG_INT);
+                (ok, self.val_int(w))
             }
             _ => {
                 let zero = self.b.ins().iconst(I64, 0);
@@ -7933,50 +7817,43 @@ impl Lower {
         }
     }
 
-    /// Continue only if `ok` and `(p, t)` is an array, else go to `slow`.
-    /// Returns its fast element count (0 unless a fast array).
-    fn array_part(&mut self, p: Value, t: Value, ok: Value, slow: Block) -> Value {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, t, TAG_OBJECT);
+    /// Continue only if `ok` and `w` is an array, else go to `slow`.
+    /// Returns its address and its fast element count (0 unless a fast
+    /// array).
+    fn array_part(&mut self, w: Value, ok: Value, slow: Block) -> (Value, Value) {
+        let is_obj = self.val_is(w, TAG_OBJECT);
         let go = self.b.ins().band(is_obj, ok);
         let obj = self.b.create_block();
         self.b.ins().brif(go, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let p = self.val_ptr(w);
         let class = self.b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
         let is_array = self.b.ins().icmp_imm_s(IntCC::Equal, class, layout::CLASS_ARRAY);
         let array = self.b.create_block();
         self.b.ins().brif(is_array, array, &[], slow, &[]);
         self.b.switch_to_block(array);
-        self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT)
+        (p, self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT))
     }
 
     /// Entry `slot` of a table of JS values (borrowed).
-    fn table_value(&mut self, table: GlobalValue, slot: usize) -> (Value, Value) {
+    fn table_value(&mut self, table: GlobalValue, slot: usize) -> Value {
         let base = self.b.ins().symbol_value(self.ptr, table);
-        let at = (slot * SIZE) as i32;
-        let p = self.b.ins().load(I64, M_TABLE, base, at);
-        let t = self.b.ins().load(I64, M_TABLE, base, at + TAG_OFFSET);
-        (p, t)
+        self.b.ins().load(I64, M_TABLE, base, (slot * SIZE) as i32)
     }
 
-    /// Append `(vp, vt)` (taken if `take`, else a new reference) to
-    /// `(ap, at)` inline, as the engine's fast path does, when it is an
+    /// Append `vw` (taken if `take`, else a new reference) to `aw`
+    /// inline, as the engine's fast path does, when it is an
     /// extensible fast array with a fresh array's shape (so its `length` is
     /// writable) and room for one more element, at `idx` if that is its
     /// element count (`None`: at its count, which must be its `length`, as
     /// `push` appends): the element count and `length` grow. Returns the
     /// new count; else branches to `slow` (the value not taken).
-    fn append_inline(
-        &mut self,
-        (ap, at): (Value, Value),
-        idx: Option<Value>,
-        (vp, vt): (Value, Value),
-        take: bool,
-        slow: Block,
-    ) -> Value {
-        let is_obj = self.b.ins().icmp_imm_s(IntCC::Equal, at, TAG_OBJECT);
+    fn append_inline(&mut self, aw: Value, idx: Option<Value>, vw: Value, take: bool, slow: Block) -> Value {
+        let is_obj = self.val_is(aw, TAG_OBJECT);
         let obj = self.b.create_block();
         self.b.ins().brif(is_obj, obj, &[], slow, &[]);
         self.b.switch_to_block(obj);
+        let ap = self.val_ptr(aw);
         let shape = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_SHAPE);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let fresh = self.b.ins().load(I64, M_CONST, table, SHAPE_ARRAY * 8);
@@ -7991,9 +7868,9 @@ impl Lower {
         let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
         let size = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_SIZE);
         let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
-        let lt = self.b.ins().load(I64, M_SLOT, prop, TAG_OFFSET);
-        let len = self.b.ins().uload32(M_SLOT, prop, 0);
-        let is_int = self.b.ins().icmp_imm_s(IntCC::Equal, lt, TAG_INT);
+        // (`length`: an int value, its int32 above 0 here.)
+        let len = self.b.ins().load(I64, M_SLOT, prop, 0);
+        let is_int = self.val_is(len, TAG_INT);
         let (k, at_count) = match idx {
             Some(k) => (k, self.b.ins().icmp(IntCC::Equal, k, count)),
             None => (count, self.b.ins().icmp(IntCC::Equal, len, count)),
@@ -8008,17 +7885,16 @@ impl Lower {
         self.b.ins().brif(ok, store, &[], slow, &[]);
         self.b.switch_to_block(store);
         if !take {
-            self.dup((vp, vt));
+            self.dup(vw);
         }
         let k1 = self.b.ins().iadd_imm_s(k, 1);
         let grow = self.b.ins().icmp(IntCC::UnsignedLessThan, len, k1);
         let new_len = self.b.ins().select(grow, k1, len);
         self.b.ins().store(M_SLOT, new_len, prop, 0);
         let at = self.array_slot(ap, k);
-        self.b.ins().store(M_SLOT, vp, at, 0);
-        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        self.b.ins().store(M_SLOT, vw, at, 0);
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
-        self.write_barrier(ap, vt);
+        self.write_barrier(ap, vw);
         k1
     }
 
@@ -8031,13 +7907,14 @@ impl Lower {
     fn append_fresh(
         &mut self,
         fresh: Value,
-        ap: Value,
+        aw: Value,
         k: Value,
-        (vp, vt): (Value, Value),
+        vw: Value,
         length: bool,
         next: Block,
         args: &[Value],
     ) {
+        let ap = self.val_ptr(aw);
         let private = self.b.create_block();
         let store = self.b.create_block();
         let other = self.b.create_block();
@@ -8048,14 +7925,14 @@ impl Lower {
         self.b.ins().brif(room, store, &[], other, &[]);
         self.b.switch_to_block(store);
         let at = self.array_slot(ap, k);
-        self.b.ins().store(M_SLOT, vp, at, 0);
-        self.b.ins().store(M_SLOT, vt, at, TAG_OFFSET);
+        self.b.ins().store(M_SLOT, vw, at, 0);
         let k1 = self.b.ins().iadd_imm_s(k, 1);
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
-        self.write_barrier(ap, vt);
+        self.write_barrier(ap, vw);
         if length {
+            // (An int value.)
             let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
-            self.b.ins().istore32(M_SLOT, k1, prop, 0);
+            self.b.ins().store(M_SLOT, k1, prop, 0);
         }
         let args: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
         self.b.ins().jump(next, &args);
@@ -8161,22 +8038,16 @@ impl Lower {
     }
 
     /// `v` as a JS value (a new reference only if it is a number or boolean).
-    fn boxed(&mut self, v: V) -> (Value, Value) {
+    fn boxed(&mut self, v: V) -> Value {
         match v {
             V::Num(d) => self.box_number(d),
             V::Int(i) => {
                 let d = self.int_f64(i);
                 self.box_number(d)
             }
-            V::Bool(x) => {
-                let p = self.b.ins().uextend(I64, x);
-                (p, self.b.ins().iconst(I64, TAG_BOOL))
-            }
-            V::Any(p, t) => (p, t),
-            V::Void => {
-                let V::Any(p, t) = self.konst(0, TAG_UNDEFINED) else { unreachable!() };
-                (p, t)
-            }
+            V::Bool(x) => self.box_bool(x),
+            V::Any(w) => w,
+            V::Void => self.konst(0, TAG_UNDEFINED).any(),
         }
     }
 
@@ -8292,16 +8163,16 @@ const RECORD_SHAPES: usize = 4;
 const RECORD_TRIES: i64 = 64;
 pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 /// Size of a `LumIC` (an inline cache entry).
-pub(crate) const IC_SIZE: usize = 88;
+pub(crate) const IC_SIZE: usize = 80;
 /// `LumFnCache`: its size, its closures' cell class and size (0: not made
 /// inline), and their template (`JSFunctionTemplate`).
-const FN_CACHE_SIZE: i64 = 96;
+const FN_CACHE_SIZE: i64 = 80;
 const FN_CACHE_INFO: i32 = 12;
 const FN_CACHE_TMPL: i32 = 16;
 /// `LumIC.epoch`, `LumIC.value` and `LumIC.entry`.
 const IC_EPOCH: i32 = 48;
 const IC_VALUE: i32 = 56;
-const IC_ENTRY: i32 = 72;
+const IC_ENTRY: i32 = 64;
 /// `LumIC.poly`.
 const IC_POLY: i32 = 40;
 /// `LUM_POLY`: the entries `LumIC.poly` points to.
@@ -8700,28 +8571,30 @@ impl Lower {
         let (layout, this_slot, _) = frame_layout(f);
         for (l, &s) in layout.iter().enumerate() {
             let at = (s * SIZE) as i32;
-            let p = self.b.ins().load(I64, M_SLOT, slots, at);
-            let t = self.b.ins().load(I64, M_SLOT, slots, at + TAG_OFFSET);
+            let w = self.b.ins().load(I64, M_SLOT, slots, at);
             match self.vars[l] {
-                LVar::Boxed { obj: (op, ot), slot, .. } => {
+                LVar::Boxed { obj, slot, .. } => {
                     let sp = self.b.ins().load(I64, M_SLOT, slots, at + SIZE as i32);
-                    self.b.def_var(op, p);
-                    self.b.def_var(ot, t);
+                    self.b.def_var(obj, w);
                     self.b.def_var(slot, sp);
                 }
-                LVar::Two(vp, vt) => {
-                    self.b.def_var(vp, p);
-                    self.b.def_var(vt, t);
+                LVar::Val(var) => {
+                    self.b.def_var(var, w);
                     if let Some(sv) = self.shadows[l] {
-                        let d = self.number_of((p, t));
+                        let d = self.number_of(w);
                         self.b.def_var(sv, d);
                     }
                 }
-                LVar::Int(v) => self.b.def_var(v, p),
+                // (Exact as a double: see `int_locals`.)
+                LVar::Int(v) => {
+                    let d = self.val_f64(w);
+                    let i = self.b.ins().fcvt_to_sint_sat(I64, d);
+                    self.b.def_var(v, i)
+                }
                 LVar::One(v) => {
                     let x = match self.locals[l] {
-                        Ty::F64 | Ty::MaybeF64 => self.b.ins().bitcast(F64, p),
-                        _ => self.b.ins().ireduce(I8, p),
+                        Ty::F64 | Ty::MaybeF64 => self.val_f64(w),
+                        _ => self.b.ins().ireduce(I8, w),
                     };
                     self.b.def_var(v, x);
                 }
@@ -8732,10 +8605,8 @@ impl Lower {
         }
         if let Some(s) = this_slot {
             // `this` stays owned by the frame; borrowed here.
-            let at = (s * SIZE) as i32;
-            let p = self.b.ins().load(I64, M_SLOT, slots, at);
-            let t = self.b.ins().load(I64, M_SLOT, slots, at + TAG_OFFSET);
-            self.this = Some((p, t));
+            let w = self.b.ins().load(I64, M_SLOT, slots, (s * SIZE) as i32);
+            self.this = Some(w);
         }
         let dispatch = self.b.create_block();
         self.b.ins().jump(dispatch, &[]);
@@ -8745,76 +8616,78 @@ impl Lower {
         self.async_gen = f.is_async && f.is_generator;
     }
 
-    /// Move every local into the frame (suspending).
+    /// Move every local into the frame (suspending): as JS values (the
+    /// collector traces the frame), numbers as floats.
     fn spill_locals(&mut self) {
         let cx = self.async_cx.as_ref().unwrap();
         let (slots, layout) = (cx.slots, cx.layout.clone());
         for (l, &s) in layout.iter().enumerate() {
             let at = (s * SIZE) as i32;
-            let (p, t) = match self.vars[l] {
-                LVar::Boxed { obj: (op, ot), slot, .. } => {
+            let w = match self.vars[l] {
+                LVar::Boxed { obj, slot, .. } => {
+                    // (The value's address: below the cage's top, an int to
+                    // the collector.)
                     let sp = self.b.use_var(slot);
-                    let ft = self.b.ins().iconst(I64, TAG_FLOAT64);
                     self.b.ins().store(M_SLOT, sp, slots, at + SIZE as i32);
-                    self.b.ins().store(M_SLOT, ft, slots, at + SIZE as i32 + TAG_OFFSET);
-                    (self.b.use_var(op), self.b.use_var(ot))
+                    self.b.use_var(obj)
                 }
-                // Not a JS value: only this function reads it back.
-                LVar::Int(v) => (self.b.use_var(v), self.b.ins().iconst(I64, TAG_FLOAT64)),
-                LVar::Two(vp, vt) => (self.b.use_var(vp), self.b.use_var(vt)),
+                LVar::Int(v) => {
+                    let i = self.b.use_var(v);
+                    let d = self.b.ins().fcvt_from_sint(F64, i);
+                    self.box_float_raw(d)
+                }
+                LVar::Val(var) => self.b.use_var(var),
                 LVar::One(v) => {
                     let x = self.b.use_var(v);
                     match self.locals[l] {
-                        Ty::F64 | Ty::MaybeF64 => {
-                            let p = self.b.ins().bitcast(I64, x);
-                            (p, self.b.ins().iconst(I64, TAG_FLOAT64))
-                        }
-                        _ => {
-                            let p = self.b.ins().uextend(I64, x);
-                            (p, self.b.ins().iconst(I64, TAG_BOOL))
-                        }
+                        Ty::F64 | Ty::MaybeF64 => self.box_float_raw(x),
+                        _ => self.box_bool(x),
                     }
                 }
             };
-            self.b.ins().store(M_SLOT, p, slots, at);
-            self.b.ins().store(M_SLOT, t, slots, at + TAG_OFFSET);
+            self.b.ins().store(M_SLOT, w, slots, at);
         }
+    }
+
+    /// The step function's result when it suspends (`payload`: the resume
+    /// state and what it yields; see the runtime).
+    fn suspended(&mut self, payload: i64) {
+        let r = self.b.ins().iconst(I64, val_const(TAG_UNINITIALIZED, payload));
+        self.b.ins().return_(&[r]);
     }
 
     /// `await value`: register the continuation, spill, return "suspended";
     /// lowering continues at the resume point.
     fn await_stmt(&mut self, value: &Expr, target: ir::AwaitTarget) {
-        let (vp, vt) = if self.async_gen {
+        let w = if self.async_gen {
             let v = self.expr(value).any();
             self.await_value(v)
         } else {
             self.await_promise(value)
         };
-        self.awaited(vp, vt, target);
+        self.awaited(w, target);
     }
 
     /// `await` in an async function: register the continuation, spill,
     /// return "suspended". The awaited value (a new reference).
-    fn await_promise(&mut self, value: &Expr) -> (Value, Value) {
+    fn await_promise(&mut self, value: &Expr) -> Value {
         let resume = self.b.create_block();
         let state = {
             let cx = self.async_cx.as_mut().expect("await in an async function");
             cx.resumes.push(resume);
             cx.resumes.len() - 1
         };
-        let (p, t) = self.awaited_operand(value);
+        let w = self.awaited_operand(value);
         let slots = self.async_cx.as_ref().unwrap().slots;
         let st = self.b.ins().iconst(I32, state as i64);
         let ctx = self.ctx;
         // Only locals survive a suspension.
         debug_assert!(self.temps.is_empty(), "values held across an await");
         // Takes ownership of the value.
-        let r = self.helper("lum_await", &[ctx, slots, p, t, st]);
+        let r = self.helper("lum_await", &[ctx, slots, w, st]);
         self.check_int(r[0]);
         self.spill_locals();
-        let z = self.b.ins().iconst(I64, 0);
-        let suspended = self.b.ins().iconst(I64, TAG_UNINITIALIZED);
-        self.b.ins().return_(&[z, suspended]);
+        self.suspended(0);
 
         // Resumed: the locals come back from the frame (see enter_async).
         self.b.switch_to_block(resume);
@@ -8822,27 +8695,26 @@ impl Lower {
             let cx = self.async_cx.as_ref().unwrap();
             (cx.value, cx.is_throw)
         };
-        let vp = self.b.ins().load(I64, M_SLOT, vptr, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, vptr, TAG_OFFSET);
-        self.dup((vp, vt));
+        let vw = self.b.ins().load(I64, M_SLOT, vptr, 0);
+        self.dup(vw);
         let throw = self.b.create_block();
         let ok = self.b.create_block();
         self.b.set_cold_block(throw);
         self.b.ins().brif(is_throw, throw, &[], ok, &[]);
         self.b.switch_to_block(throw);
         // A rejection is thrown at the await.
-        self.helper("JS_Throw", &[ctx, vp, vt]);
+        self.helper("JS_Throw", &[ctx, vw]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);
-        (vp, vt)
+        vw
     }
 
     /// The value to await (a new reference). `await Promise.resolve(x)`
     /// awaits `x` itself when `Promise` and its `resolve` are the intrinsic
     /// ones: PromiseResolve of `x` happens either way, and no promise is
     /// made for nothing. `Promise` and `resolve` are read first, as in JS.
-    fn awaited_operand(&mut self, value: &Expr) -> (Value, Value) {
+    fn awaited_operand(&mut self, value: &Expr) -> Value {
         let ExprKind::CallMethod(o, Key::Atom(a), args) = &value.kind else {
             return self.expr(value).any();
         };
@@ -8856,50 +8728,49 @@ impl Lower {
         let atom = self.atom(g);
         let ic = self.new_ic();
         let pr = self.helper("lum_global_get", &[ctx, atom, ic]);
-        self.check_value(pr[1]);
-        let promise = V::Any(pr[0], pr[1]);
+        self.check_value(pr[0]);
+        let promise = V::Any(pr[0]);
         self.hold(promise);
-        let (mp, mt) = self.prop_get(pr[0], pr[1], *a);
-        let method = V::Any(mp, mt);
+        let mw = self.prop_get(pr[0], *a);
+        let method = V::Any(mw);
         self.hold(method);
         let x = self.expr(&args[0]);
         self.hold(x);
-        let (xp, xt) = x.any();
-        let same = self.helper("lum_is_promise_resolve", &[pr[0], pr[1], mp, mt]);
+        let xw = x.any();
+        let same = self.helper("lum_is_promise_resolve", &[pr[0], mw]);
         // Both paths consume `x`.
         self.release(x);
         let join = self.b.create_block();
-        let rp = self.b.append_block_param(join, I64);
-        let rt = self.b.append_block_param(join, I64);
+        let rw = self.b.append_block_param(join, I64);
         let call = self.b.create_block();
         self.b.set_cold_block(call);
-        self.b.ins().brif(same[0], join, &[BlockArg::Value(xp), BlockArg::Value(xt)], call, &[]);
+        self.b.ins().brif(same[0], join, &[BlockArg::Value(xw)], call, &[]);
         self.b.switch_to_block(call);
-        let slot = self.values_slot(&[(mp, mt), (pr[0], pr[1]), (xp, xt)]);
+        let slot = self.values_slot(&[mw, pr[0], xw]);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
         let argc = self.b.ins().iconst(I32, 1);
         let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
-        self.free((xp, xt));
-        self.check_value(r[1]);
-        self.b.ins().jump(join, &[BlockArg::Value(r[0]), BlockArg::Value(r[1])]);
+        self.free(xw);
+        self.check_value(r[0]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(join);
         self.release(method);
         self.release(promise);
-        self.free((mp, mt));
-        self.free((pr[0], pr[1]));
-        (rp, rt)
+        self.free(mw);
+        self.free(pr[0]);
+        rw
     }
 
     /// Deliver an awaited value (a new reference) to `target`.
-    fn awaited(&mut self, vp: Value, vt: Value, target: ir::AwaitTarget) {
-        let v = V::Any(vp, vt);
+    fn awaited(&mut self, w: Value, target: ir::AwaitTarget) {
+        let v = V::Any(w);
         match target {
-            ir::AwaitTarget::Discard => self.free((vp, vt)),
+            ir::AwaitTarget::Discard => self.free(w),
             ir::AwaitTarget::Set(l) => self.set_local(l, v),
             ir::AwaitTarget::Init(l) => self.init_local(l, v),
             ir::AwaitTarget::Return => {
                 let v = if self.ret == Ty::Void {
-                    self.free((vp, vt));
+                    self.free(w);
                     V::Void
                 } else {
                     v
@@ -8911,9 +8782,9 @@ impl Lower {
 
     /// `await` in an async generator: suspend for the engine to await `v`
     /// (taken). The settled value (a new reference); a rejection is thrown.
-    fn await_value(&mut self, v: (Value, Value)) -> (Value, Value) {
+    fn await_value(&mut self, v: Value) -> Value {
         self.suspend(Some(v), 3);
-        let ((vp, vt), mode) = self.resumption();
+        let (vw, mode) = self.resumption();
         let throw = self.b.create_block();
         let ok = self.b.create_block();
         self.b.set_cold_block(throw);
@@ -8921,11 +8792,11 @@ impl Lower {
         self.b.ins().brif(is_throw, throw, &[], ok, &[]);
         self.b.switch_to_block(throw);
         let ctx = self.ctx;
-        self.helper("JS_Throw", &[ctx, vp, vt]);
+        self.helper("JS_Throw", &[ctx, vw]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);
-        (vp, vt)
+        vw
     }
 
     /// Suspend the generator: spill the locals and return to the runtime
@@ -8933,7 +8804,7 @@ impl Lower {
     /// value to await, in an async generator). It
     /// continues at the returned block, with the resumption in the step
     /// function's parameters.
-    fn suspend(&mut self, value: Option<(Value, Value)>, kind: i64) -> Block {
+    fn suspend(&mut self, value: Option<Value>, kind: i64) -> Block {
         let resume = self.b.create_block();
         let (state, vptr) = {
             let cx = self.async_cx.as_mut().expect("yield in a generator");
@@ -8942,28 +8813,24 @@ impl Lower {
         };
         debug_assert!(self.temps.is_empty(), "values held across a yield");
         self.spill_locals();
-        if let Some((p, t)) = value {
-            self.b.ins().store(M_SLOT, p, vptr, 0);
-            self.b.ins().store(M_SLOT, t, vptr, TAG_OFFSET);
+        if let Some(w) = value {
+            self.b.ins().store(M_SLOT, w, vptr, 0);
         }
-        let payload = self.b.ins().iconst(I64, 4 * state as i64 + kind);
-        let suspended = self.b.ins().iconst(I64, TAG_UNINITIALIZED);
-        self.b.ins().return_(&[payload, suspended]);
+        self.suspended(4 * state as i64 + kind);
         self.b.switch_to_block(resume);
         resume
     }
 
     /// The value the generator was resumed with (a new reference), and how
     /// (next / return / throw: 0 / 1 / 2).
-    fn resumption(&mut self) -> ((Value, Value), Value) {
+    fn resumption(&mut self) -> (Value, Value) {
         let (vptr, mode) = {
             let cx = self.async_cx.as_ref().unwrap();
             (cx.value, cx.is_throw)
         };
-        let vp = self.b.ins().load(I64, M_SLOT, vptr, 0);
-        let vt = self.b.ins().load(I64, M_SLOT, vptr, TAG_OFFSET);
-        self.dup((vp, vt));
-        ((vp, vt), mode)
+        let vw = self.b.ins().load(I64, M_SLOT, vptr, 0);
+        self.dup(vw);
+        (vw, mode)
     }
 
     fn yield_stmt(&mut self, value: &Expr, kind: ir::YieldKind, target: ir::AwaitTarget) {
@@ -8988,7 +8855,7 @@ impl Lower {
 
     /// After a suspension: throw or return the value delivered, or deliver
     /// it to `target`.
-    fn resumed(&mut self, (vp, vt): (Value, Value), mode: Value, target: ir::AwaitTarget) {
+    fn resumed(&mut self, vw: Value, mode: Value, target: ir::AwaitTarget) {
         let throw = self.b.create_block();
         let not_throw = self.b.create_block();
         let ret = self.b.create_block();
@@ -8998,7 +8865,7 @@ impl Lower {
         self.b.ins().brif(is_throw, throw, &[], not_throw, &[]);
         self.b.switch_to_block(throw);
         let ctx = self.ctx;
-        self.helper("JS_Throw", &[ctx, vp, vt]);
+        self.helper("JS_Throw", &[ctx, vw]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(not_throw);
@@ -9007,12 +8874,12 @@ impl Lower {
         // `return(v)`: as a `return v` here (running `finally` blocks; an
         // async generator awaits the value first).
         self.b.switch_to_block(ret);
-        let (rp, rt) = if self.async_gen { self.await_value((vp, vt)) } else { (vp, vt) };
-        self.return_value(V::Any(rp, rt));
+        let rw = if self.async_gen { self.await_value(vw) } else { vw };
+        self.return_value(V::Any(rw));
         self.b.switch_to_block(next);
-        let v = V::Any(vp, vt);
+        let v = V::Any(vw);
         match target {
-            ir::AwaitTarget::Discard => self.free((vp, vt)),
+            ir::AwaitTarget::Discard => self.free(vw),
             ir::AwaitTarget::Set(l) => self.set_local(l, v),
             ir::AwaitTarget::Init(l) => self.init_local(l, v),
             ir::AwaitTarget::Return => unreachable!("`return yield` is hoisted"),
@@ -9029,36 +8896,34 @@ impl Lower {
         next_atom: ir::AtomId,
         target: ir::AwaitTarget,
     ) {
-        let (p, t) = self.expr(value).any();
-        let v = V::Any(p, t);
+        let w = self.expr(value).any();
+        let v = V::Any(w);
         self.hold(v);
         let ctx = self.ctx;
         let sync = self.b.ins().iconst(I32, 0);
-        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, sync]);
-        self.check_value(it[1]);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, w, sync]);
+        self.check_value(it[0]);
         self.release(v);
         self.free_v(v);
-        self.set_local(iter, V::Any(it[0], it[1]));
+        self.set_local(iter, V::Any(it[0]));
         let a = self.atom(next_atom);
-        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
-        self.check_value(m[1]);
-        self.set_local(next, V::Any(m[0], m[1]));
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], a]);
+        self.check_value(m[0]);
+        self.set_local(next, V::Any(m[0]));
         // The loop: (mode, received value).
         let head = self.b.create_block();
         let mode = self.b.append_block_param(head, I32);
-        let rp = self.b.append_block_param(head, I64);
-        let rt = self.b.append_block_param(head, I64);
+        let rw = self.b.append_block_param(head, I64);
         let zero = self.b.ins().iconst(I32, 0);
-        let u = self.konst(0, TAG_UNDEFINED);
-        let (up, ut) = u.any();
-        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(up), BlockArg::Value(ut)]);
+        let u = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(u)]);
         self.b.switch_to_block(head);
-        let (ip, itag) = self.use_local(iter).any();
-        let (np, nt) = self.use_local(next).any();
-        let slot = self.values_slot(&[(ip, itag), (np, nt), (rp, rt)]);
+        let iw = self.use_local(iter).any();
+        let nw = self.use_local(next).any();
+        let slot = self.values_slot(&[iw, nw, rw]);
         let kind_addr = self.done_slot();
         let r = self.helper("lum_yield_star", &[ctx, slot, mode, kind_addr]);
-        self.check_value(r[1]);
+        self.check_value(r[0]);
         let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
         let yield_blk = self.b.create_block();
         let finished = self.b.create_block();
@@ -9068,19 +8933,19 @@ impl Lower {
         self.b.ins().brif(not_yield, finished, &[], yield_blk, &[]);
         // An inner result: yielded as is, then resumed with the next mode.
         self.b.switch_to_block(yield_blk);
-        self.suspend(Some((r[0], r[1])), 1);
-        let ((vp, vt), mode) = self.resumption();
-        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.suspend(Some(r[0]), 1);
+        let (vw, mode) = self.resumption();
+        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vw)]);
         self.b.switch_to_block(finished);
         let is_return = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 2);
         self.b.ins().brif(is_return, ret, &[], deliver, &[]);
         self.b.switch_to_block(ret);
-        self.return_value(V::Any(r[0], r[1]));
+        self.return_value(V::Any(r[0]));
         // Done: the value of the `yield*`.
         self.b.switch_to_block(deliver);
-        let v = V::Any(r[0], r[1]);
+        let v = V::Any(r[0]);
         match target {
-            ir::AwaitTarget::Discard => self.free((r[0], r[1])),
+            ir::AwaitTarget::Discard => self.free(r[0]),
             ir::AwaitTarget::Set(l) => self.set_local(l, v),
             ir::AwaitTarget::Init(l) => self.init_local(l, v),
             ir::AwaitTarget::Return => unreachable!("`return yield*` is hoisted"),
@@ -9099,36 +8964,33 @@ impl Lower {
         next_atom: ir::AtomId,
         target: ir::AwaitTarget,
     ) {
-        let (p, t) = self.expr(value).any();
-        let v = V::Any(p, t);
+        let w = self.expr(value).any();
+        let v = V::Any(w);
         self.hold(v);
         let ctx = self.ctx;
         let is_async = self.b.ins().iconst(I32, 1);
-        let it = self.helper("JS_GetIteratorObject", &[ctx, p, t, is_async]);
-        self.check_value(it[1]);
+        let it = self.helper("JS_GetIteratorObject", &[ctx, w, is_async]);
+        self.check_value(it[0]);
         self.release(v);
         self.free_v(v);
-        self.set_local(iter, V::Any(it[0], it[1]));
+        self.set_local(iter, V::Any(it[0]));
         let a = self.atom(next_atom);
-        let m = self.helper("JS_GetProperty", &[ctx, it[0], it[1], a]);
-        self.check_value(m[1]);
-        self.set_local(next, V::Any(m[0], m[1]));
+        let m = self.helper("JS_GetProperty", &[ctx, it[0], a]);
+        self.check_value(m[0]);
+        self.set_local(next, V::Any(m[0]));
 
         // The loop: (mode, received value).
         let head = self.b.create_block();
         let mode = self.b.append_block_param(head, I32);
-        let rp = self.b.append_block_param(head, I64);
-        let rt = self.b.append_block_param(head, I64);
+        let rw = self.b.append_block_param(head, I64);
         // A value to yield; the value of the `yield*`.
         let yield_part = self.b.create_block();
-        let yp = self.b.append_block_param(yield_part, I64);
-        let yt = self.b.append_block_param(yield_part, I64);
+        let yw = self.b.append_block_param(yield_part, I64);
         let finish = self.b.create_block();
-        let fp = self.b.append_block_param(finish, I64);
-        let ft = self.b.append_block_param(finish, I64);
+        let fw = self.b.append_block_param(finish, I64);
         let zero = self.b.ins().iconst(I32, 0);
-        let (up, ut) = self.konst(0, TAG_UNDEFINED).any();
-        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(up), BlockArg::Value(ut)]);
+        let u = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(u)]);
 
         self.b.switch_to_block(head);
         let on_next = self.b.create_block();
@@ -9144,14 +9006,14 @@ impl Lower {
         // Each mode separately: a mode does not survive the awaits.
         for (blk, m) in [(on_next, 0), (on_return, 1), (on_throw, 2)] {
             self.b.switch_to_block(blk);
-            let received = if m == 1 { self.await_value((rp, rt)) } else { (rp, rt) };
-            let (ip, itag) = self.use_local(iter).any();
-            let (np, nt) = self.use_local(next).any();
-            let slot = self.values_slot(&[(ip, itag), (np, nt), received]);
+            let received = if m == 1 { self.await_value(rw) } else { rw };
+            let iw = self.use_local(iter).any();
+            let nw = self.use_local(next).any();
+            let slot = self.values_slot(&[iw, nw, received]);
             let kind_addr = self.done_slot();
             let mv = self.b.ins().iconst(I32, m);
             let r = self.helper("lum_async_yield_star", &[ctx, slot, mv, kind_addr]);
-            self.check_value(r[1]);
+            self.check_value(r[0]);
             let kind = self.b.ins().load(I32, Self::mem(), kind_addr, 0);
             let call_result = self.b.create_block();
             let special = self.b.create_block();
@@ -9161,13 +9023,13 @@ impl Lower {
             self.b.switch_to_block(special);
             if m == 1 {
                 // No `return` method: return the (awaited) value.
-                let (vp, vt) = self.await_value((r[0], r[1]));
-                self.return_value(V::Any(vp, vt));
+                let vw = self.await_value(r[0]);
+                self.return_value(V::Any(vw));
             } else if m == 2 {
                 // No `throw` method: the iterator was closed; await that,
                 // then throw.
-                let (cp, ct) = self.await_value((r[0], r[1]));
-                self.free((cp, ct));
+                let cw = self.await_value(r[0]);
+                self.free(cw);
                 let e = self.helper("lum_throw_iterator_throw", &[ctx]);
                 self.check_int(e[0]);
                 self.b.ins().trap();
@@ -9176,18 +9038,18 @@ impl Lower {
             }
 
             self.b.switch_to_block(call_result);
-            let (ap, at) = self.await_value((r[0], r[1]));
+            let aw = self.await_value(r[0]);
             let done_addr = self.done_slot();
-            let val = self.helper("lum_async_yield_star_result", &[ctx, ap, at, done_addr]);
-            self.check_value(val[1]);
+            let val = self.helper("lum_async_yield_star_result", &[ctx, aw, done_addr]);
+            self.check_value(val[0]);
             let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
             let finished = self.b.create_block();
-            let args = [BlockArg::Value(val[0]), BlockArg::Value(val[1])];
+            let args = [BlockArg::Value(val[0])];
             self.b.ins().brif(done, finished, &[], yield_part, &args);
             self.b.switch_to_block(finished);
             if m == 1 {
-                let (vp, vt) = self.await_value((val[0], val[1]));
-                self.return_value(V::Any(vp, vt));
+                let vw = self.await_value(val[0]);
+                self.return_value(V::Any(vw));
             } else {
                 self.b.ins().jump(finish, &args);
             }
@@ -9196,14 +9058,14 @@ impl Lower {
         // A result not done: its value is yielded, then the generator's
         // resumption goes to the inner iterator.
         self.b.switch_to_block(yield_part);
-        self.suspend(Some((yp, yt)), 0);
-        let ((vp, vt), mode) = self.resumption();
-        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vp), BlockArg::Value(vt)]);
+        self.suspend(Some(yw), 0);
+        let (vw, mode) = self.resumption();
+        self.b.ins().jump(head, &[BlockArg::Value(mode), BlockArg::Value(vw)]);
 
         self.b.switch_to_block(finish);
-        let v = V::Any(fp, ft);
+        let v = V::Any(fw);
         match target {
-            ir::AwaitTarget::Discard => self.free((fp, ft)),
+            ir::AwaitTarget::Discard => self.free(fw),
             ir::AwaitTarget::Set(l) => self.set_local(l, v),
             ir::AwaitTarget::Init(l) => self.init_local(l, v),
             ir::AwaitTarget::Return => unreachable!("`return yield*` is hoisted"),
@@ -9265,8 +9127,7 @@ fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
     // differ, so only strings and primitives).
     let string = |x: &&Expr| matches!(x.kind, ExprKind::Str(_) | ExprKind::AnyUnary(AnyUnOp::ToStr, _));
     let primitive = |x: &&Expr| {
-        string(x)
-            || matches!(&x.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool))
+        string(x) || matches!(&x.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool))
     };
     (parts.len() >= 2 && parts[..2].iter().any(string) && parts.iter().all(primitive)).then_some(parts)
 }
@@ -9275,9 +9136,7 @@ fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
 /// ToString is left to it (an int32 is written as its digits).
 fn concat_operand(x: &Expr) -> &Expr {
     match &x.kind {
-        ExprKind::AnyUnary(AnyUnOp::ToStr, inner)
-            if matches!(&inner.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool)) =>
-        {
+        ExprKind::AnyUnary(AnyUnOp::ToStr, inner) if matches!(&inner.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool)) => {
             inner
         }
         _ => x,

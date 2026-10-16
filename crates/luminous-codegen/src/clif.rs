@@ -186,7 +186,6 @@ fn ty(t: Type) -> cl::Type {
         Type::I64 => types::I64,
         Type::F32 => types::F32,
         Type::F64 => types::F64,
-        Type::I64X2 => types::I64X2,
     }
 }
 
@@ -483,13 +482,6 @@ impl Translator<'_, '_> {
             &InstData::StackStore { val, slot, off } => {
                 let (x, s) = (self.v(val), self.slots[slot.index()]);
                 self.b.ins().stack_store(cl::types::I64, x, s, off);
-                return;
-            }
-            &InstData::StackStorePair { lo, hi, slot, off } => {
-                let (lo, hi, s) = (self.v(lo), self.v(hi), self.slots[slot.index()]);
-                let v = self.b.ins().scalar_to_vector(cl::types::I64X2, lo);
-                let v = self.b.ins().insertlane(v, hi, 1);
-                self.b.ins().stack_store(cl::types::I64, v, s, off);
                 return;
             }
             &InstData::SymbolValue { data } => {

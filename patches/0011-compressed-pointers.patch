@@ -1,12 +1,16 @@
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -169,6 +169,17 @@
+@@ -169,6 +169,21 @@
     - string contents is either pure ASCII or is UTF-8 encoded.
   */
  
-+/* luminous: JS_COMPRESSED_POINTERS (64-bit builds): values are 8 bytes,
++/* luminous: JS_COMPRESSED_POINTERS (64-bit builds, the default;
++   -DJS_COMPRESSED_POINTERS=0 for 16-byte values): values are 8 bytes,
 +   NaN-boxed as on 32-bit platforms, a reference holding the address / 8
 +   in 32 bits; every cell is below 32 GB (see js_cage). */
++#if !defined(JS_COMPRESSED_POINTERS) && INTPTR_MAX >= INT64_MAX
++#define JS_COMPRESSED_POINTERS 1
++#endif
 +#if defined(JS_COMPRESSED_POINTERS) && !JS_COMPRESSED_POINTERS
 +#undef JS_COMPRESSED_POINTERS
 +#endif
@@ -18,7 +22,7 @@
  /* Overridable purely for testing purposes; don't touch. */
  #ifndef JS_NAN_BOXING
  #if INTPTR_MAX < INT64_MAX
-@@ -256,10 +267,16 @@
+@@ -256,10 +271,16 @@
  #define JS_VALUE_GET_INT(v) (int)(v)
  #define JS_VALUE_GET_BOOL(v) (int)(v)
  #define JS_VALUE_GET_SHORT_BIG_INT(v) (int)(v)
@@ -36,7 +40,7 @@
  
  #define JS_FLOAT64_TAG_ADDEND (0x7ff80000 - JS_TAG_FIRST + 1) /* quiet NaN encoding */
  
-@@ -1299,17 +1316,30 @@
+@@ -1299,17 +1320,30 @@
  #define JS_LAYOUT_OBJ_APPEND_FLAGS  0x20012 /* ... of an extensible fast array (JS_LayoutCheck) */
  #define JS_LAYOUT_CTX_STD_ARRAY_PROTO 32 /* uint8_t: no index properties on the array prototypes */
  /* Reading global variables inline (lum_global_get's cache). */
@@ -67,7 +71,7 @@
  #define JS_LAYOUT_GC_CELL_WORD      0xfe0000
  #define JS_LAYOUT_MALLOC_OVERHEAD   8
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
-@@ -1702,8 +1732,13 @@
+@@ -1702,8 +1736,13 @@
  #define JS_LAYOUT_FTMPL_FLAGS       0
  #define JS_LAYOUT_FTMPL_SHAPE       8
  #define JS_LAYOUT_FTMPL_PROPS       16
