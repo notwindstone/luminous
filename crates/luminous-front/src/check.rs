@@ -149,8 +149,8 @@ pub struct Candidate<'a> {
 /// its `super(...)`, then defines its own fields.
 #[derive(Clone)]
 pub struct CtorInfo<'a> {
-    /// The class's binding.
-    pub symbol: SymbolId,
+    /// The class's binding (top-level classes).
+    pub symbol: Option<SymbolId>,
     /// The class (its declaration).
     pub span: Span,
     /// Index in `Outcome::classes`.
@@ -188,6 +188,12 @@ pub struct CtorInfo<'a> {
     /// check again at `super(...)` (else the superclass is constructed as
     /// interpreted code would).
     pub recheck: Vec<(usize, usize)>,
+    /// A class inside a function (`FnCx::class_value`): its constructor is
+    /// a closure that `new` calls (`ir::Func::class_ctor`), the instance
+    /// made from new.target's prototype (`class`, `home` unused), its
+    /// superclass, if it has one, constructed as interpreted code does
+    /// (`dynamic`).
+    pub local: bool,
 }
 
 impl Candidate<'_> {
@@ -1231,7 +1237,7 @@ fn class_ctor<'a>(
             class: Some((d.index, false)),
             cells: HashSet::new(),
             ctor: Some(CtorInfo {
-                symbol: d.symbol,
+                symbol: Some(d.symbol),
                 span: d.span,
                 class: d.index,
                 home: index,
@@ -1243,6 +1249,7 @@ fn class_ctor<'a>(
                 checks,
                 instance_fields,
                 brand: d.brand,
+                local: false,
                 recheck: if d.impure {
                     let mut links = Vec::new();
                     let mut at = d;
@@ -1806,6 +1813,9 @@ struct FnCx<'x, 'm, 'a> {
     this_box: Option<ir::LocalId>,
     /// A derived class's constructor, until its `super(...)` call.
     derived: Option<CtorInfo<'a>>,
+    /// The constructor of a class inside a function (`ir::Func::class_ctor`):
+    /// `ExprKind::This` is new.target.
+    class_ctor: bool,
     /// What the type annotations of parameters and variables say they hold.
     sym_hints: HashMap<SymbolId, ir::Hint>,
     /// Enclosing `for`-`in` loops: their key variable and iterator.
@@ -1918,6 +1928,50 @@ fn capture_info<'a>(
             walk::walk_arrow_function_expression(self, it);
             self.stack.pop();
             self.arrows.pop();
+        }
+        fn visit_class(&mut self, c: &Class<'a>) {
+            // A class inside the function: its instance fields are
+            // initialized in its constructor (its own, or its default one,
+            // at the class's position), with its `this`.
+            let ctor = c
+                .body
+                .body
+                .iter()
+                .find_map(|el| match el {
+                    ClassElement::MethodDefinition(m)
+                        if m.kind == MethodDefinitionKind::Constructor && m.value.body.is_some() =>
+                    {
+                        Some(m.value.span.start)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(c.span.start);
+            for d in &c.decorators {
+                self.visit_decorator(d);
+            }
+            if let Some(id) = &c.id {
+                self.visit_binding_identifier(id);
+            }
+            if let Some(h) = &c.heritage {
+                self.visit_expression(&h.expression);
+            }
+            for el in &c.body.body {
+                match el {
+                    ClassElement::PropertyDefinition(p) if !p.r#static => {
+                        if p.computed {
+                            self.visit_property_key(&p.key);
+                        }
+                        if let Some(v) = &p.value {
+                            self.stack.push(ctor);
+                            self.arrows.push(false);
+                            self.visit_expression(v);
+                            self.stack.pop();
+                            self.arrows.pop();
+                        }
+                    }
+                    el => self.visit_class_element(el),
+                }
+            }
         }
         fn visit_this_expression(&mut self, _: &ThisExpression) {
             if !self.collect_refs {
@@ -2048,6 +2102,23 @@ fn uses_arguments(node: FnNode, scoping: &Scoping) -> bool {
     v.found
 }
 
+/// A class member's key that is a name known statically.
+fn class_key(key: &PropertyKey, computed: bool) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(id) if !computed => Some(id.name.to_string()),
+        PropertyKey::StringLiteral(s) if !s.lone_surrogates => Some(s.value.to_string()),
+        PropertyKey::NumericLiteral(n) if n.value.fract() == 0.0 && n.value >= 0.0 && n.value < 4294967295.0 => {
+            Some(format!("{}", n.value as u64))
+        }
+        _ => None,
+    }
+}
+
+/// Expressions evaluated in order, the last one's value the result.
+fn seq_expr(xs: Vec<Expr>) -> Expr {
+    seq(xs)
+}
+
 /// `e` as a JS value.
 fn any(e: Expr) -> Expr {
     match e.ty {
@@ -2134,6 +2205,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             deferred_fields: Vec::new(),
             this_box: None,
             derived: None,
+            class_ctor: false,
             sym_hints: HashMap::new(),
             is_async: false,
             is_generator: false,
@@ -2206,6 +2278,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if forward_all {
             self.temp(Ty::Any);
             abi.push(Ty::Any);
+            // (A class inside a function: its JS entry makes the array.)
+            if self.ctor.as_ref().is_some_and(|c| c.local) {
+                self.rest = true;
+            }
         }
         // The arguments object, last (made by the JS entry).
         if matches!(node, FnNode::Function(_)) && self.caps.args_users.contains(&self.key) {
@@ -2220,9 +2296,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             self.ret_slot = Some(self.temp(Ty::Any));
         }
         let mut param_props = Vec::new();
+        // A base class inside a function: its instance is made once the
+        // captured variables its fields may use are bound (below).
+        let mut local_base = false;
         if let Some(ctor) = self.ctor.take() {
             prologue.extend(self.ctor_checks(&ctor, params.len())?);
-            if ctor.parent.is_some() || ctor.dynamic {
+            if ctor.local && !ctor.dynamic {
+                self.this_local = Some(self.temp(Ty::Any));
+                // (Its parameter properties are assigned after the
+                // parameters' defaults.)
+                param_props = ctor.param_props.clone();
+                self.derived = Some(CtorInfo { param_props: Vec::new(), ..ctor });
+                local_base = true;
+            } else if ctor.parent.is_some() || ctor.dynamic {
                 // The instance comes from `super(...)`.
                 self.this_local = Some(self.temp(Ty::Any));
                 self.derived = Some(ctor);
@@ -2286,6 +2372,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if !new_boxes.is_empty() {
             prologue.push(Stmt::NewBoxes(new_boxes));
             prologue.extend(inits);
+        }
+        if local_base {
+            let target = Expr::new(Ty::Any, ExprKind::This);
+            let inst = Expr::new(Ty::Any, ExprKind::NewFromTarget(Box::new(target)));
+            self.super_init(inst)?;
+            prologue.append(&mut self.pre);
         }
         let deferred = self.deferred_fields()?;
         prologue.extend(deferred);
@@ -2413,7 +2505,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let body = if ret == Ty::Any { box_returns(body) } else { body };
         prologue.extend(body);
         // Parameters before the first default, not counting a rest one.
-        let fixed = params.len() - self.rest as usize;
+        let fixed = params.len().saturating_sub(self.rest as usize);
         let js_length = params[..fixed].iter().take_while(|p| p.2.is_none()).count();
         // (A named function expression's `.name` is its own name, not that
         // of the binding it initializes.)
@@ -2434,7 +2526,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             value_captures: vec![false; self.captures.len()],
             captures: std::mem::take(&mut self.captures),
             is_closure: self.is_closure,
-            has_this: self.has_this,
+            has_this: self.has_this || self.class_ctor,
+            class_ctor: self.class_ctor,
             is_async: self.is_async,
             frameless: false,
             source: None,
@@ -2683,8 +2776,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     }
                     funcs.push((l, f));
                 }
-                Some(Declaration::ClassDeclaration(c)) => {
-                    return reject(c.span, "classes inside functions are not supported yet");
+                Some(Declaration::ClassDeclaration(c)) if !c.declare => {
+                    // (Captured: its box exists from the block's start, in
+                    // its TDZ until the class is made.)
+                    let id = c.id.as_ref().unwrap();
+                    let sym = id.symbol_id.get().unwrap();
+                    if self.caps.captured.contains(&sym) {
+                        boxes.push(self.declare_boxed(sym));
+                    }
                 }
                 _ => {}
             }
@@ -2756,6 +2855,21 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Statement::ExpressionStatement(e) => self.expr_stmt(&e.expression)?,
             Statement::BlockStatement(b) => Stmt::Block(self.block(&b.body)?),
             Statement::VariableDeclaration(v) => Stmt::Block(self.var_decl(v)?),
+            Statement::ClassDeclaration(c) if c.declare => return Ok(None),
+            Statement::ClassDeclaration(c) => {
+                let id = c.id.as_ref().unwrap();
+                let sym = id.symbol_id.get().unwrap();
+                // (Its name inside it is the binding: never reassigned.)
+                if self.m.scoping.get_resolved_references(sym).any(|r| r.is_write()) {
+                    return reject(id.span, format!("`{}` is reassigned", id.name));
+                }
+                let v = self.class_value(c, id.name.to_string())?;
+                let l = match self.sym_local.get(&sym) {
+                    Some(&l) if self.boxed[l] => l,
+                    _ => self.declare(sym, Ty::Any, false),
+                };
+                Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(l, Box::new(v))))
+            }
             Statement::IfStatement(i) => {
                 let test = self.cond(&i.test)?;
                 let then = self.body(&i.consequent)?;
@@ -3261,7 +3375,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             return Ok(None);
         }
         let Some(sym) = self.resolve(id) else { return Ok(None) };
-        let Some(i) = self.m.cands.iter().position(|c| c.ctor.as_ref().is_some_and(|k| k.symbol == sym)) else {
+        let Some(i) = self.m.cands.iter().position(|c| c.ctor.as_ref().is_some_and(|k| k.symbol == Some(sym))) else {
             return Ok(None);
         };
         let class = any(self.ident(id)?);
@@ -3434,7 +3548,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     self.m.homes_used.push(k);
                 }
             }
-            let cell = self.m.cell(ctor.symbol, ctor.span)?;
+            let cell = self.m.cell(ctor.symbol.unwrap(), ctor.span)?;
             let callee = Box::new(Expr::new(Ty::Any, ExprKind::Cell(cell)));
             let fixed = nparams - self.rest as usize;
             let args: Vec<Expr> = (0..fixed).map(|l| self.local(l)).collect();
@@ -3466,15 +3580,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// (`CtorInfo::dynamic`), the arguments in a list or an array.
     fn super_new(&mut self, args: Option<Vec<Expr>>, array: Option<Expr>) -> Expr {
         let ctor = self.derived.as_ref().unwrap();
-        let (class, home) = (ctor.class, ctor.home);
-        for k in [class, home] {
-            if !self.m.homes_used.contains(&k) {
-                self.m.homes_used.push(k);
+        let (class, target) = if ctor.local {
+            // (The class is the constructor running; new.target its `this`.)
+            (ExprKind::CurrentFunction, ExprKind::This)
+        } else {
+            let (class, home) = (ctor.class, ctor.home);
+            for k in [class, home] {
+                if !self.m.homes_used.contains(&k) {
+                    self.m.homes_used.push(k);
+                }
             }
-        }
+            (ExprKind::HomeValue(2 * class + 1), ExprKind::HomeValue(2 * home + 1))
+        };
+        let (class, target) = (Box::new(Expr::new(Ty::Any, class)), Box::new(Expr::new(Ty::Any, target)));
         let kind = match (args, array) {
-            (Some(args), _) => ExprKind::SuperNew { class, home, args },
-            (None, Some(a)) => ExprKind::SuperNewSpread { class, home, args: Box::new(a) },
+            (Some(args), _) => ExprKind::SuperNew { class, target, args },
+            (None, Some(a)) => ExprKind::SuperNewSpread { class, target, args: Box::new(a) },
             (None, None) => unreachable!(),
         };
         Expr::new(Ty::Any, kind)
@@ -3548,6 +3669,19 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// gets `this` (and has no class to resolve `super` in).
     /// (`text`: its source text, see `ir::Func::source`.)
     fn closure_with(&mut self, node: FnNode<'a>, name: String, method: bool, text: Span) -> R<Expr> {
+        self.closure_full(node, name, method, text, None)
+    }
+
+    /// `closure_with`, or (`ctor`) the constructor of a class inside a
+    /// function (`class_value`).
+    fn closure_full(
+        &mut self,
+        node: FnNode<'a>,
+        name: String,
+        method: bool,
+        text: Span,
+        ctor: Option<CtorInfo<'a>>,
+    ) -> R<Expr> {
         let key = node.span().start;
         if self.m.interpreted.contains(&key) {
             return reject(node.span(), "contains a function marked `interpreted`");
@@ -3560,8 +3694,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let widened = self.widened.clone();
         let mut inner = FnCx::new(&mut *self.m, caps, key, true, widened);
         inner.rest = rest;
-        inner.class = if method { None } else { self.class };
+        // (A class inside a function: no private names or `super.x` of
+        // its own; not those of the class around it either.)
+        inner.class = if method || ctor.is_some() { None } else { self.class };
         inner.has_this = method;
+        inner.class_ctor = ctor.is_some();
+        inner.ctor = ctor;
         inner.ret_int = ret == Some(Ty::I32);
         let r = inner.function(node, name, params);
         let request = inner.widen_request;
@@ -3598,6 +3736,183 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.m.closure_spans.push(node.span());
         Ok(Expr::new(Ty::Any, ExprKind::Closure(self.m.closures.len() - 1, boxes)))
     }
+    // ---- classes inside functions ----
+
+    /// A class defined inside a function (or by module code): made as the
+    /// class definition makes it, its constructor a native closure that
+    /// `new` calls (`ir::Func::class_ctor`), its methods, getters and
+    /// setters native closures defined on its prototype (or on it, static
+    /// ones), all of them over the variables of the function they see. Its
+    /// fields are public instance fields; private names, static fields and
+    /// blocks, computed keys and `super.x` keep the function interpreted.
+    /// `name`: the class's name (`name` of its constructor).
+    fn class_value(&mut self, c: &'a Class<'a>, name: String) -> R<Expr> {
+        if !c.decorators.is_empty() {
+            return reject(c.span, "decorated classes are not supported");
+        }
+        let mut ctor_method = None;
+        let mut methods = Vec::new();
+        let mut fields: Vec<(String, Option<&'a Expression<'a>>)> = Vec::new();
+        for el in &c.body.body {
+            match el {
+                ClassElement::MethodDefinition(m) => {
+                    if m.value.body.is_none() || m.r#type != MethodDefinitionType::MethodDefinition {
+                        continue; // an overload or an abstract method
+                    }
+                    if !m.decorators.is_empty() {
+                        return reject(m.span, "decorated methods are not supported");
+                    }
+                    if m.kind == MethodDefinitionKind::Constructor {
+                        ctor_method = Some(m);
+                        continue;
+                    }
+                    if matches!(m.key, PropertyKey::PrivateIdentifier(_)) {
+                        return reject(m.key.span(), "private methods of classes inside functions are not supported yet");
+                    }
+                    methods.push((m, class_key(&m.key, m.computed)));
+                }
+                ClassElement::PropertyDefinition(p) => {
+                    if p.declare || p.r#type == PropertyDefinitionType::TSAbstractPropertyDefinition {
+                        continue;
+                    }
+                    if p.r#static {
+                        return reject(p.span, "static fields of classes inside functions are not supported yet");
+                    }
+                    if !p.decorators.is_empty() {
+                        return reject(p.span, "decorated fields are not supported");
+                    }
+                    let Some(key) = class_key(&p.key, p.computed) else {
+                        return reject(p.key.span(), "private and computed field names of classes inside functions are not supported yet");
+                    };
+                    fields.push((key, p.value.as_ref()));
+                }
+                ClassElement::TSIndexSignature(_) => {}
+                other => return reject(other.span(), "static blocks and `accessor` fields of classes inside functions are not supported yet"),
+            }
+        }
+        // Its constructor.
+        let derived = c.heritage.is_some();
+        let mut param_props = Vec::new();
+        let (node, forward) = match ctor_method {
+            Some(m) => {
+                let f = &m.value;
+                for p in &f.params.items {
+                    if p.accessibility.is_some() || p.readonly || p.r#override {
+                        let BindingPattern::BindingIdentifier(b) = &p.pattern else {
+                            return reject(p.span, "destructured parameter properties are not supported");
+                        };
+                        param_props.push((b.name.to_string(), b.symbol_id.get().unwrap()));
+                    }
+                }
+                if derived && super_first(f).is_none() {
+                    return reject(
+                        f.span,
+                        "the constructor does not start with `super(...)` (with arguments that cannot see `this`)",
+                    );
+                }
+                (FnNode::Function(f), false)
+            }
+            // The default constructor: nothing to run; a derived class's
+            // passes its arguments on.
+            None => (FnNode::Segment(c.span, &[]), derived),
+        };
+        fields.splice(0..0, param_props.iter().map(|(n, _)| (n.clone(), None)));
+        let info = CtorInfo {
+            symbol: None,
+            span: c.span,
+            class: usize::MAX,
+            home: usize::MAX,
+            fields,
+            param_props,
+            parent: None,
+            dynamic: derived,
+            forward,
+            checks: Vec::new(),
+            instance_fields: Vec::new(),
+            brand: false,
+            recheck: Vec::new(),
+            local: true,
+        };
+        // Its own name inside it (a class expression's).
+        let own = match &c.id {
+            Some(id) if c.r#type == ClassType::ClassExpression => {
+                let l = self.declare(id.symbol_id.get().unwrap(), Ty::Any, false);
+                if self.boxed[l] {
+                    // (Before the functions that capture it are made.)
+                    self.pre.push(Stmt::NewBoxes(vec![l]));
+                }
+                Some(l)
+            }
+            _ => None,
+        };
+        let mut seq = Vec::new();
+        // Its superclass, first.
+        let parent = match &c.heritage {
+            Some(h) => {
+                let mark = self.pre.len();
+                let v = any(self.expr(&h.expression)?);
+                if self.pre.len() != mark {
+                    return reject(h.span(), "`await` in a class heritage is not supported");
+                }
+                let t = self.temp(Ty::Any);
+                seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(v))));
+                Some(t)
+            }
+            None => None,
+        };
+        let ctor = self.closure_full(node, name, false, c.span, Some(info))?;
+        let f = self.temp(Ty::Any);
+        seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(f, Box::new(ctor))));
+        let setup = ExprKind::ClassSetup {
+            ctor: Box::new(self.local(f)),
+            parent: parent.map(|p| Box::new(self.local(p))),
+        };
+        let proto = self.temp(Ty::Any);
+        seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(proto, Box::new(Expr::new(Ty::Any, setup)))));
+        for (m, key) in methods {
+            let kind = match m.kind {
+                MethodDefinitionKind::Get => 1,
+                MethodDefinitionKind::Set => 2,
+                _ => 0,
+            };
+            // A computed key: evaluated in order (the function is named for
+            // it when it is defined).
+            let (key, fname) = match key {
+                Some(key) => {
+                    let fname = match kind {
+                        1 => format!("get {key}"),
+                        2 => format!("set {key}"),
+                        _ => key.clone(),
+                    };
+                    (ir::Key::Atom(self.m.atom(&key)), fname)
+                }
+                None => {
+                    let e = m.key.as_expression().unwrap();
+                    let mark = self.pre.len();
+                    let k = any(self.expr(e)?);
+                    if self.pre.len() != mark {
+                        return reject(e.span(), "`await` in a computed key is not supported");
+                    }
+                    let t = self.temp(Ty::Any);
+                    let k = Expr::new(Ty::Any, ExprKind::ToPropKey(Box::new(k)));
+                    seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(k))));
+                    (ir::Key::Value(Box::new(self.local(t))), String::new())
+                }
+            };
+            // (Its text without `static`, as `toString` gives it.)
+            let text = if m.r#static { Span::new(m.span.start + "static".len() as u32, m.span.end) } else { m.span };
+            let func = self.closure_full(FnNode::Function(&m.value), fname, true, text, None)?;
+            let obj = self.local(if m.r#static { f } else { proto });
+            let define = ExprKind::DefineMethod { obj: Box::new(obj), key, func: Box::new(func), kind };
+            seq.push(Expr::new(Ty::Void, define));
+        }
+        if let Some(l) = own {
+            seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(l, Box::new(self.local(f)))));
+        }
+        seq.push(self.local(f));
+        Ok(seq_expr(seq))
+    }
+
     // ---- classes: private names and `super` ----
 
     /// The class and kind of private name `name` (with its `#`).
@@ -4239,6 +4554,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::FunctionExpression(f) => {
                 let name = f.id.as_ref().map(|id| id.name.to_string()).or(name_hint).unwrap_or_default();
                 self.closure(FnNode::Function(f), name)?
+            }
+            Expression::ClassExpression(c) => {
+                let name = c.id.as_ref().map(|id| id.name.to_string()).or(name_hint).unwrap_or_default();
+                self.class_value(c, name)?
             }
             Expression::NumericLiteral(n) => Expr::num(n.value),
             Expression::ThisExpression(_) if self.has_this => Expr::new(Ty::Any, ExprKind::This),

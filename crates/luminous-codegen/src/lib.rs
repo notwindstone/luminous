@@ -426,6 +426,11 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_arguments", &[P, Int, P, Int], &[W, W]),
         ("lum_super_construct", &[P, Int, P], &[W, W]),
         ("lum_super_construct_array", &[P, P], &[W, W]),
+        ("JS_GetFunctionOfData", &[P], &[W, W]),
+        ("lum_class_setup", &[P, P, Int], &[W, W]),
+        ("lum_define_method", &[P, P, Int, Int], &[Int]),
+        ("lum_define_method_computed", &[P, P, Int], &[Int]),
+        ("lum_new_from_target", &[P, W, W], &[W, W]),
         ("lum_object_rest", &[P, P, Int], &[W, W]),
         ("lum_define_computed", &[P, P, W, W], &[Int]),
         ("lum_object_spread", &[P, W, W, W, W], &[Int]),
@@ -1560,7 +1565,7 @@ fn ir_size(f: &ir::Func) -> usize {
 
 fn all_math(m: &ir::Module) -> Vec<MathFn> {
     let mut out = Vec::new();
-    for f in &m.funcs {
+    for f in m.funcs.iter().chain(&m.closures) {
         walk(&f.body, &mut |e| {
             if let ExprKind::Math(mf, _) = &e.kind
                 && !out.contains(mf)

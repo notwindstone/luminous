@@ -346,6 +346,10 @@ pub struct Func {
     /// do): its last parameter is the arguments object, which its JS entry
     /// makes (native code calls it only through its JS entry).
     pub arguments: bool,
+    /// The constructor of a class inside a function: a closure that `new`
+    /// calls with `this` new.target (`has_this`), and that makes and
+    /// returns the instance.
+    pub class_ctor: bool,
     /// `function*`: compiled as a resumable step function over a heap
     /// frame, as async functions are.
     pub is_generator: bool,
@@ -518,13 +522,30 @@ pub enum ExprKind {
     /// `obj.name(args)` / `obj[key](args)`, with `this` = obj.
     CallMethod(Box<Expr>, Key, Vec<Expr>),
     New(Box<Expr>, Vec<Expr>),
-    /// `super(args)` in the native constructor of top-level class `class`
-    /// whose superclass has no native constructor: the superclass (the
-    /// class's prototype, as it is then) constructed with `new.target` the
-    /// class `home` (`CtorInfo::home`).
-    SuperNew { class: usize, home: usize, args: Vec<Expr> },
+    /// `super(args)` in the native constructor of class `class` whose
+    /// superclass has no native constructor: the superclass (the class's
+    /// prototype, as it is then) constructed with `new.target` `target`.
+    SuperNew { class: Box<Expr>, target: Box<Expr>, args: Vec<Expr> },
     /// The same, the arguments in an array.
-    SuperNewSpread { class: usize, home: usize, args: Box<Expr> },
+    SuperNewSpread { class: Box<Expr>, target: Box<Expr>, args: Box<Expr> },
+    /// Home object slot `k` (`Module::homes`): a top-level class's
+    /// prototype (even `k`) or the class (odd `k`).
+    HomeValue(usize),
+    /// The function object of the closure running (a class constructor's:
+    /// the class).
+    CurrentFunction,
+    /// A class inside a function, made: its constructor (a closure with
+    /// `Func::class_ctor`) given its superclass, if it has one; evaluates
+    /// to its prototype.
+    ClassSetup { ctor: Box<Expr>, parent: Option<Box<Expr>> },
+    /// Method (`kind` 0), getter (1) or setter (2) `func` of a class inside
+    /// a function, defined on `obj` (its prototype, or the class) as a
+    /// class definition does (not enumerable).
+    /// (A computed key, `Key::Value`, is a property key; the function is
+    /// named for it.)
+    DefineMethod { obj: Box<Expr>, key: Key, func: Box<Expr>, kind: u8 },
+    /// The instance a base class's constructor makes for `new.target`.
+    NewFromTarget(Box<Expr>),
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
     /// A new instance of top-level class `class` (whose prototype is home
@@ -1173,6 +1194,8 @@ macro_rules! visitor {
                 | RegionLeave(_)
                 | SlotLoad { .. }
                 | StrLen { .. }
+                | HomeValue(_)
+                | CurrentFunction
                 | Closure(..) => {}
                 Inline { body, .. } => $stmts(body, f),
                 Predicted { expr, body, .. } => {
@@ -1253,8 +1276,33 @@ macro_rules! visitor {
                 | AsyncIterResult(a, _)
                 | CheckObject(a)
                 | Lazy(a)
-                | SuperNewSpread { args: a, .. }
+                | NewFromTarget(a)
                 | Void(a) => $name(a, f),
+                SuperNewSpread { class, target, args } => {
+                    $name(class, f);
+                    $name(target, f);
+                    $name(args, f);
+                }
+                SuperNew { class, target, args } => {
+                    $name(class, f);
+                    $name(target, f);
+                    for x in args {
+                        $name(x, f);
+                    }
+                }
+                ClassSetup { ctor, parent } => {
+                    $name(ctor, f);
+                    if let Some(p) = parent {
+                        $name(p, f);
+                    }
+                }
+                DefineMethod { obj, key, func, .. } => {
+                    $name(obj, f);
+                    if let Key::Value(k) = key {
+                        $name(k, f);
+                    }
+                    $name(func, f);
+                }
                 ArrayParts(parts) => {
                     for p in parts {
                         if let ArrPart::Value(x) | ArrPart::Spread(x) = p {
@@ -1323,7 +1371,7 @@ macro_rules! visitor {
                     $name(b, f);
                     $name(c, f);
                 }
-                Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) | SuperNew { args: xs, .. } => {
+                Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => {
                     for x in xs {
                         $name(x, f);
                     }

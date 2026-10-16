@@ -1,0 +1,80 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1151,6 +1151,10 @@
+    constructor (`this` an object of new.target's prototype) with a
+    `prototype`. */
+ JS_EXTERN int JS_SetCFunctionDataConstructor(JSContext *ctx, JSValueConst func);
++/* luminous: make a function of JS_NewCFunctionData* a class constructor:
++   `new` calls `call` with this_val new.target (it makes the instance), a
++   call without `new` throws. It has no fast entry then. */
++JS_EXTERN int JS_SetCFunctionDataClassConstructor(JSContext *ctx, JSValueConst func, JSCFunctionData *call);
+ /* luminous: `op1 + op2` (borrowed), with direct paths for strings and for a
+    string with an int32. */
+ JS_EXTERN JSValue JS_AddValues(JSContext *ctx, JSValueConst op1, JSValueConst op2);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8209,6 +8209,9 @@
+     uint8_t ordinary_ctor;
+     /* luminous: in the function object's own cell (not freed with it) */
+     uint8_t inline_record;
++    /* luminous: a class constructor (see
++       JS_SetCFunctionDataClassConstructor) */
++    uint8_t class_ctor;
+     JSValue data[];
+ } JSCFunctionDataRecord;
+ 
+@@ -8261,6 +8264,15 @@
+     s = JS_GetOpaque(func_obj, JS_CLASS_C_FUNCTION_DATA);
+     if (!s)
+         return JS_EXCEPTION; // can't really happen
++    if (unlikely(s->class_ctor)) {
++        /* luminous: its function, with this_val new.target; never called
++           without `new`. */
++        if (!(flags & JS_CALL_FLAG_CONSTRUCTOR))
++            return JS_ThrowTypeError(ctx, "class constructors must be invoked with 'new'");
++        if (js_check_stack_overflow(rt, 0))
++            return JS_ThrowStackOverflow(ctx);
++        return s->func(ctx, this_val, argc, argv, s->magic, vc(s->data));
++    }
+     if (unlikely(flags & JS_CALL_FLAG_CONSTRUCTOR) && s->ordinary_ctor) {
+         /* luminous: `this` an object of new.target's prototype, the result
+            unless the call returns an object (this_val: new.target). */
+@@ -8319,6 +8331,22 @@
+                                      JS_PROP_WRITABLE);
+ }
+ 
++/* luminous: make function `func` (of JS_NewCFunctionData*) a class
++   constructor: `new` calls `call` with this_val new.target (its result is
++   the instance), a call without `new` throws. It has no fast entry then
++   (which calls would take). */
++int JS_SetCFunctionDataClassConstructor(JSContext *ctx, JSValueConst func, JSCFunctionData *call)
++{
++    JSCFunctionDataRecord *s = JS_GetOpaque(func, JS_CLASS_C_FUNCTION_DATA);
++    if (!s)
++        return 0;
++    s->class_ctor = 1;
++    s->fast = NULL;
++    s->func = call;
++    JS_SetConstructorBit(ctx, func, true);
++    return 0;
++}
++
+ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
+                              const char *name,
+                              int length, int magic, int data_len,
+@@ -8346,6 +8374,7 @@
+     s->magic = magic;
+     s->ordinary_ctor = 0;
+     s->inline_record = 0;
++    s->class_ctor = 0;
+     for(i = 0; i < data_len; i++)
+         s->data[i] = js_dup(data[i]);
+     JS_SetOpaqueInternal(func_obj, s);
+@@ -8420,6 +8449,7 @@
+     s->data_len = data_len;
+     s->magic = magic;
+     s->ordinary_ctor = 0;
++    s->class_ctor = 0;
+     for(i = 0; i < data_len; i++)
+         s->data[i] = js_dup(data[i]);
+     JS_SetOpaqueInternal(func_obj, s);

@@ -134,8 +134,9 @@ regular call path's generated code alone.
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
 `0004-prototype-epoch.patch`, `0005-json-writers.patch`,
 `0006-native-construction.patch`, `0007-promises.patch`,
-`0008-function-source.patch` and `0009-arguments.patch`, each made
-against the tree the earlier ones give) and builds the engine without
+`0008-function-source.patch`, `0009-arguments.patch` and
+`0010-class-constructors.patch`, each made against the tree the earlier
+ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -205,6 +206,10 @@ engine's semantics:
 - `JS_NewArguments`: the (unmapped) `arguments` object of a strict
   function called with given arguments, which the JS entries of native
   functions using `arguments` make (`0009`);
+- `JS_SetCFunctionDataClassConstructor`: a C function data object as a
+  class constructor, for classes inside functions: `new` calls it with
+  `this` new.target, a call without `new` throws, and it has no fast entry
+  (which calls, native or the interpreter's, would take) (`0010`);
 - promises and jobs without allocations of their own, as JSC's (`0007`):
   the job queue is a ring of entries (a job was an allocation, freed once
   run); a promise's data is in its own cell; a pending promise's
@@ -577,6 +582,26 @@ The differential tests run every case with both.
   code that runs before it can reach it (to see it `undefined`, or in its
   TDZ). A name of its own (`var X = class X {...}`) is the binding. Other
   class expressions stay interpreted.
+- **Classes inside functions** (declarations and class expressions, in
+  functions, closures and module code): made natively each time their
+  definition runs, as the engine makes a class. The constructor is a
+  native closure over the function's variables that `new` calls from
+  anywhere (interpreted code, `Reflect.construct`, a subclass's
+  `super(...)`), with `this` new.target: a base class's makes the
+  instance of new.target's `prototype` and defines its fields in order; a
+  derived class's `super(...)` constructs the class's prototype as it is
+  then (the class is the function running), then defines its fields.
+  Calling it without `new` throws. Its superclass is checked as the class
+  definition checks it (a constructor or `null`, its `prototype` an
+  object or `null`). Methods, getters, setters and static methods (async
+  and generator ones too, computed keys evaluated in order and naming
+  their functions) are native closures defined on the prototype or the
+  class, not enumerable; TS parameter properties are assigned as for
+  top-level classes. Each evaluation is a class of its own (a class in a
+  loop sees that iteration's bindings). `toString` gives the class's and
+  the methods' source text. Elysia's class of each request's context
+  (`class Context extends Base` in a function) is one: each request
+  constructs it natively.
 - **Class constructors** of classes whose instances are plain objects
   with their fields (no accessors or computed keys, initializers that do
   not use `this` but in arrow functions that are a field's value, a
@@ -826,8 +851,9 @@ The differential tests run every case with both.
 Not yet: constructors of derived classes that run code before
 `super(...)`, and constructors using `arguments` (which stay
 interpreted), private accessors' and static private methods' direct calls,
-computed method and accessor names in object literals, classes inside
-functions, `this` outside methods, constructors and their
+computed method and accessor names in object literals, private names,
+static fields and blocks, computed field names and `super.x` in classes
+inside functions, `this` outside methods, constructors and their
 field initializers. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `luminous report file.ts` says, for every

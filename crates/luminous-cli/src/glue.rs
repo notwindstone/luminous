@@ -89,7 +89,8 @@ _Static_assert(LUM_NATIVE_STACK == {budget}u, "stack budget mismatch");
     let nall = n + m.closures.len();
     // Trailing sentinels keep arrays non-empty.
     // kind: 0 plain, 1 async, 2 generator, 3 async generator, 4 an ordinary
-    // function (a constructor: see lum_function_kind).
+    // function (a constructor: see lum_function_kind), 5 a class
+    // constructor.
     c.push_str(
         "\nstatic const struct { JSCFunctionFast *fast; const char *name; int length, kind; } lum_table[] = {\n",
     );
@@ -98,6 +99,7 @@ _Static_assert(LUM_NATIVE_STACK == {budget}u, "stack budget mismatch");
             (true, true) => 3,
             (true, false) => 2,
             (false, true) => 1,
+            (false, false) if f.class_ctor => 5,
             (false, false) => 4 * f.constructor as u8,
         };
         writeln!(c, "    {{ lum_fast_{i}, {}, {}, {kind} }},", c_str(&f.name), f.js_length).unwrap();
@@ -225,6 +227,9 @@ static JSValue lum_closure_slow(JSContext *ctx, JSValueConst this_val, int argc,
 
 /* Function.prototype.toString of a native function: its interpreted
  * fallback's, or a closure's source. */
+static JSValue lum_class_ctor_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                   int magic, JSValueConst *data);
+
 static JSValue lum_function_source(JSContext *ctx, JSCFunctionData *func, int magic, int data_len,
                                    JSValueConst *data)
 {{
@@ -254,17 +259,32 @@ static JSValue lum_function_source(JSContext *ctx, JSCFunctionData *func, int ma
         JS_FreeValue(ctx, src);
         return r;
     }}
-    if (func == lum_closure_slow && magic >= 0 && magic < {nall} && lum_sources[magic])
+    if ((func == lum_closure_slow || func == lum_class_ctor_call) && magic >= 0 && magic < {nall} &&
+        lum_sources[magic])
         return JS_NewString(ctx, lum_sources[magic]);
     return JS_UNDEFINED;
 }}
 
 /* A closure of native function `fn` over `data` (borrowed). */
+/* A class constructor's `new` (closure `magic`): its JS entry, with
+   this_val new.target. */
+static JSValue lum_class_ctor_call(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                   int magic, JSValueConst *data)
+{{
+    return lum_table[magic].fast(ctx, this_val, argc, argv, data);
+}}
+
 JSValue lum_make_closure(JSContext *ctx, int fn, int n, JSValue *data)
 {{
     int kind = lum_table[fn].kind;
     JSValue f = lum_new_closure(ctx, &lum_fn_caches[fn], lum_table[fn].fast, lum_closure_slow,
                                 lum_table[fn].name, lum_table[fn].length, fn, n, data, kind);
+    if (kind == 5) {{
+        /* A class constructor (lum_class_setup gives it its prototype). */
+        if (!JS_IsException(f))
+            JS_SetCFunctionDataClassConstructor(ctx, f, lum_class_ctor_call);
+        return f;
+    }}
     return kind <= 1 ? f : lum_function_kind(ctx, f, JS_UNDEFINED, kind);
 }}
 

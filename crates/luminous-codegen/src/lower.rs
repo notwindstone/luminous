@@ -384,6 +384,8 @@ pub(crate) struct Lower {
     exits: Exits,
     /// Methods: the receiver (borrowed).
     pub(crate) this: Option<(Value, Value)>,
+    /// Closures: their function object's data slots.
+    closure_data: Option<Value>,
     async_cx: Option<AsyncCx>,
     /// An async generator: `await` suspends to the engine (kind 3).
     async_gen: bool,
@@ -535,6 +537,7 @@ impl Lower {
             ret_block,
             exits,
             this: None,
+            closure_data,
             async_cx: None,
             async_gen: false,
             ret_slot: f.ret_slot,
@@ -3458,21 +3461,18 @@ impl Lower {
                 self.free_v(fv);
                 V::Any(r[0], r[1])
             }
-            ExprKind::SuperNew { class, home, args } => {
-                let held: Vec<V> = args
-                    .iter()
+            ExprKind::SuperNew { class, target, args } => {
+                // (The class and `new.target`, then the arguments.)
+                let held: Vec<V> = [&**class, &**target]
+                    .into_iter()
+                    .chain(args)
                     .map(|a| {
                         let v = self.expr(a);
                         self.hold(v);
                         v
                     })
                     .collect();
-                // (The class and `new.target`, then the arguments.)
-                let mut vals = vec![
-                    self.table_value(self.env.homes, 2 * class + 1),
-                    self.table_value(self.env.homes, 2 * home + 1),
-                ];
-                vals.extend(held.iter().map(|v| v.any()));
+                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
                 let v = self.values_slot(&vals);
                 let argc = self.b.ins().iconst(I32, args.len() as i64);
                 let ctx = self.ctx;
@@ -3484,20 +3484,88 @@ impl Lower {
                 }
                 V::Any(r[0], r[1])
             }
-            ExprKind::SuperNewSpread { class, home, args } => {
-                let av = self.expr(args);
-                self.hold(av);
-                let vals = [
-                    self.table_value(self.env.homes, 2 * class + 1),
-                    self.table_value(self.env.homes, 2 * home + 1),
-                    av.any(),
-                ];
+            ExprKind::HomeValue(k) => {
+                let (p, t) = self.table_value(self.env.homes, *k);
+                self.dup((p, t));
+                V::Any(p, t)
+            }
+            ExprKind::CurrentFunction => {
+                let data = self.closure_data.expect("the function of a closure");
+                let r = self.helper("JS_GetFunctionOfData", &[data]);
+                self.dup((r[0], r[1]));
+                V::Any(r[0], r[1])
+            }
+            ExprKind::ClassSetup { ctor, parent } => {
+                let fv = self.expr(ctor);
+                self.hold(fv);
+                let pv = match parent {
+                    Some(p) => self.expr(p),
+                    None => self.konst(0, TAG_UNDEFINED),
+                };
+                self.hold(pv);
+                let v = self.values_slot(&[fv.any(), pv.any()]);
+                let has = self.b.ins().iconst(I32, parent.is_some() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("lum_class_setup", &[ctx, v, has]);
+                self.check_value(r[1]);
+                for v in [pv, fv] {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(r[0], r[1])
+            }
+            ExprKind::DefineMethod { obj, key, func, kind } => {
+                let ov = self.expr(obj);
+                self.hold(ov);
+                let kv = match key {
+                    ir::Key::Value(k) => Some(self.expr(k)),
+                    ir::Key::Atom(_) => None,
+                };
+                if let Some(kv) = kv {
+                    self.hold(kv);
+                }
+                let fv = self.expr(func);
+                self.hold(fv);
+                let k = self.b.ins().iconst(I32, *kind as i64);
+                let ctx = self.ctx;
+                let r = match (key, kv) {
+                    (ir::Key::Atom(a), _) => {
+                        let v = self.values_slot(&[ov.any(), fv.any()]);
+                        let atom = self.atom(*a);
+                        self.helper("lum_define_method", &[ctx, v, atom, k])
+                    }
+                    (_, Some(kv)) => {
+                        let v = self.values_slot(&[ov.any(), fv.any(), kv.any()]);
+                        self.helper("lum_define_method_computed", &[ctx, v, k])
+                    }
+                    _ => unreachable!(),
+                };
+                self.check_int(r[0]);
+                for v in [Some(fv), kv, Some(ov)].into_iter().flatten() {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Void
+            }
+            ExprKind::NewFromTarget(x) => self.convert(x, "lum_new_from_target"),
+            ExprKind::SuperNewSpread { class, target, args } => {
+                let held: Vec<V> = [&**class, &**target, &**args]
+                    .into_iter()
+                    .map(|a| {
+                        let v = self.expr(a);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                let vals: Vec<(Value, Value)> = held.iter().map(|v| v.any()).collect();
                 let v = self.values_slot(&vals);
                 let ctx = self.ctx;
                 let r = self.helper("lum_super_construct_array", &[ctx, v]);
                 self.check_value(r[1]);
-                self.release(av);
-                self.free_v(av);
+                for v in held.into_iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
                 V::Any(r[0], r[1])
             }
             ExprKind::Object(props) => self.new_object(props, None),

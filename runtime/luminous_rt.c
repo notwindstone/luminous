@@ -1327,10 +1327,7 @@ static JSValue lum_super_new(JSContext *ctx, JSValue cls, JSValue new_target, in
     JSValue parent = JS_GetPrototype(ctx, cls), r;
     if (JS_IsException(parent))
         return parent;
-    if (!JS_IsConstructor(ctx, parent)) {
-        JS_FreeValue(ctx, parent);
-        return JS_ThrowTypeError(ctx, "parent class must be constructor");
-    }
+    /* (As the engine's `super(...)`: no check of its own.) */
     r = JS_CallConstructor2(ctx, parent, new_target, argc, (JSValueConst *)argv);
     JS_FreeValue(ctx, parent);
     return r;
@@ -1664,6 +1661,116 @@ JSValue lum_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, i
  fail:
     JS_FreeValue(ctx, func);
     return JS_EXCEPTION;
+}
+
+/* ---- classes inside functions ---- */
+
+/* A class's constructor v[0] (kind 5), given its superclass v[1] if
+   has_parent (`extends`): its prototype, as the class definition makes it,
+   which is returned; the constructor's prototype the superclass. */
+JSValue lum_class_setup(JSContext *ctx, JSValue *v, int has_parent)
+{
+    JSValue F = v[0], parent = v[1], parent_proto, proto;
+    if (!has_parent) {
+        proto = JS_NewObject(ctx);
+    } else if (JS_IsNull(parent)) {
+        proto = JS_NewObjectProto(ctx, JS_NULL);
+    } else {
+        if (!JS_IsConstructor(ctx, parent))
+            return JS_ThrowTypeError(ctx, "parent class must be constructor");
+        parent_proto = JS_GetPropertyStr(ctx, parent, "prototype");
+        if (JS_IsException(parent_proto))
+            return parent_proto;
+        if (!JS_IsNull(parent_proto) && !JS_IsObject(parent_proto)) {
+            JS_FreeValue(ctx, parent_proto);
+            return JS_ThrowTypeError(ctx, "parent prototype must be an object or null");
+        }
+        if (JS_SetPrototype(ctx, F, parent) < 0) {
+            JS_FreeValue(ctx, parent_proto);
+            return JS_EXCEPTION;
+        }
+        proto = JS_NewObjectProto(ctx, parent_proto);
+        JS_FreeValue(ctx, parent_proto);
+    }
+    if (JS_IsException(proto))
+        return proto;
+    if (JS_DefinePropertyValueStr(ctx, proto, "constructor", JS_DupValue(ctx, F),
+                                  JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW) < 0 ||
+        JS_DefinePropertyValueStr(ctx, F, "prototype", JS_DupValue(ctx, proto), JS_PROP_THROW) < 0) {
+        JS_FreeValue(ctx, proto);
+        return JS_EXCEPTION;
+    }
+    return proto;
+}
+
+/* A class's method (kind 0), getter (1) or setter (2) v[1] defined on v[0]
+   (its prototype, or the class) as `key`, as the class definition defines
+   them: not enumerable. */
+int lum_define_method(JSContext *ctx, JSValue *v, JSAtom key, int kind)
+{
+    if (kind == 0)
+        return JS_DefinePropertyValue(ctx, v[0], key, JS_DupValue(ctx, v[1]),
+                                      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW);
+    return JS_DefineProperty(ctx, v[0], key, JS_UNDEFINED, kind == 1 ? v[1] : JS_UNDEFINED,
+                             kind == 2 ? v[1] : JS_UNDEFINED,
+                             (kind == 1 ? JS_PROP_HAS_GET : JS_PROP_HAS_SET) | JS_PROP_HAS_CONFIGURABLE |
+                                 JS_PROP_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW);
+}
+
+/* The same with a computed key v[2] (a property key): the function named
+   for it, as the class definition names it. */
+int lum_define_method_computed(JSContext *ctx, JSValue *v, int kind)
+{
+    JSValue name;
+    JSAtom key;
+    int r;
+    if (JS_IsSymbol(v[2])) {
+        JSValue desc = JS_GetPropertyStr(ctx, v[2], "description");
+        if (JS_IsException(desc))
+            return -1;
+        if (JS_IsUndefined(desc)) {
+            name = JS_NewString(ctx, "");
+        } else {
+            JSValue parts[3] = { JS_NewString(ctx, "["), desc, JS_NewString(ctx, "]") };
+            name = JS_ConcatStrings(ctx, parts, 3);
+        }
+    } else {
+        name = JS_ToString(ctx, v[2]);
+    }
+    if (!JS_IsException(name) && kind) {
+        JSValue parts[2] = { JS_NewString(ctx, kind == 1 ? "get " : "set "), name };
+        name = JS_ConcatStrings(ctx, parts, 2);
+    }
+    if (JS_IsException(name) ||
+        JS_DefinePropertyValueStr(ctx, v[1], "name", name, JS_PROP_CONFIGURABLE | JS_PROP_THROW) < 0)
+        return -1;
+    key = JS_ValueToAtom(ctx, v[2]);
+    if (key == JS_ATOM_NULL)
+        return -1;
+    r = lum_define_method(ctx, v, key, kind);
+    JS_FreeAtom(ctx, key);
+    return r;
+}
+
+/* The instance a base class's constructor makes for `new_target`: an
+   object of its `prototype` (of Object.prototype if that is not an
+   object). */
+JSValue lum_new_from_target(JSContext *ctx, JSValue new_target)
+{
+    static JSAtom prototype = JS_ATOM_NULL;
+    JSValue proto, obj;
+    if (prototype == JS_ATOM_NULL)
+        prototype = JS_NewAtom(ctx, "prototype"); /* (predefined: the same in every runtime) */
+    proto = JS_GetProperty(ctx, new_target, prototype);
+    if (JS_IsException(proto))
+        return proto;
+    if (!JS_IsObject(proto)) {
+        JS_FreeValue(ctx, proto);
+        return JS_NewObject(ctx);
+    }
+    obj = JS_NewObjectProto(ctx, proto);
+    JS_FreeValue(ctx, proto);
+    return obj;
 }
 
 /* ---- super ---- */
