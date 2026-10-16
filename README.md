@@ -1,3 +1,14 @@
+i hate how people do the whole aot compiled js/ts shit. js is a dynamic language, and i believe that it's better to aot compile a strict subset of it, and interpret the non-compilable parts. not a single vibecoder thought about that while making their 100th typescript/javascript to native compiler ??? luminous still allows to use `import()`, `eval()`, and `new Function()` (which are interpreted) while compiling other parts to a machine code.
+
+sometimes the dynamic nature of javascript also makes things pretty shitty. that's why i believe there can be optional, new features/changes to the typescript semantics that allow better optimizations
+
+such as:
+
+- `int` type (`let num: int = 0`, `const huh: { value: int; ... } = ...`, etc.) that forces the variable to have a 32 bit signed integer type
+- `compiled type TObj = { ... }; const obj: TObj = { ... }` compiles the whole type into a struct that actually has a fixed layout. this way, reads/writes only use a mere memory offsets (basically 2 instructions per read instead of ~30 regular object reads)
+- arrays with annotated/inferred types `Array<{ something: { huh: string; whoa: boolean } } | string>` are faster than `Array<unknown>`
+- ...
+
 # Luminous
 
 Luminous is an ahead-of-time compiler for strict TypeScript, built on
