@@ -150,7 +150,21 @@
  /* The function object of a C function data object, from the data that its
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1334,24 +1334,55 @@
+@@ -481,8 +481,12 @@
+     uint64_t aged, promoted, aged_prev;
+     uint64_t minors;
+     /* (QJS_GC_VERIFY) the cell whose children the verification trace
+-       visits */
++       visits; the stack's words the trace scanned (the verification
++       scans the same ones: the collector's own frames differ, stale
++       words in them too) */
+     void *verify_parent;
++    uintptr_t *verify_stack;
++    size_t verify_stack_len, verify_stack_size;
+ } JSGCHeap;
+ 
+ typedef struct JSGCMarkHook {
+@@ -1334,24 +1338,55 @@
      JSValue argv[JS_JOB_MAX_ARGS];
  } JSJobEntry;
  
@@ -215,7 +229,21 @@
  #define JS_PROP_INITIAL_SIZE 2
  #define JS_PROP_INITIAL_HASH_SIZE 4 /* must be a power of two */
  
-@@ -2488,11 +2519,185 @@
+@@ -2469,9 +2504,12 @@
+     uint32_t mask = (1u << h->table_bits) - 1, i, j, k;
+     for (i = js_gc_hash(key, h->table_bits); h->table_keys[i] != key; i = (i + 1) & mask)
+         assert(h->table_keys[i] != 0);
+-    /* (Linear probing: the entries after it move up where they can.) */
++    /* (Linear probing: the entries after it move up where they can. An
++       empty slot's chunk is NULL: a key of 0, an address below the first
++       chunk, finds NULL.) */
+     for (j = i;;) {
+         h->table_keys[i] = 0;
++        h->table_chunks[i] = NULL;
+         for (;;) {
+             j = (j + 1) & mask;
+             if (h->table_keys[j] == 0) {
+@@ -2488,11 +2526,185 @@
      }
  }
  
@@ -402,7 +430,7 @@
      size_t len = size + JS_GC_CHUNK_SIZE;
      uint8_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
      uint8_t *a, *end;
-@@ -2519,7 +2724,19 @@
+@@ -2519,7 +2731,19 @@
  
  static void *js_gc_map_chunk(JSGCHeap *h)
  {
@@ -423,7 +451,7 @@
      void *c;
      if (h->region == h->region_end) {
          size_t len = 2 * JS_GC_REGION_SIZE;
-@@ -2546,7 +2763,9 @@
+@@ -2546,7 +2770,9 @@
  
  static void js_gc_unmap(void *p, size_t size)
  {
@@ -434,7 +462,7 @@
      munmap(p, size);
  #else
      free(p);
-@@ -2693,6 +2912,11 @@
+@@ -2693,11 +2919,17 @@
          js_gc_unmap(list_entry(el, JSGCChunk, link), list_entry(el, JSGCChunk, link)->size);
      list_for_each_safe(el, el1, &h->spare)
          js_gc_unmap(list_entry(el, JSGCChunk, link), list_entry(el, JSGCChunk, link)->size);
@@ -446,7 +474,25 @@
      rt->mf.js_free(rt->malloc_state.opaque, h->table_keys);
      rt->mf.js_free(rt->malloc_state.opaque, h->table_chunks);
      rt->mf.js_free(rt->malloc_state.opaque, h->stack);
-@@ -8533,17 +8757,20 @@
+     rt->mf.js_free(rt->malloc_state.opaque, h->others);
+     rt->mf.js_free(rt->malloc_state.opaque, h->remembered);
++    rt->mf.js_free(rt->malloc_state.opaque, h->verify_stack);
+     js_gc_init(rt);
+ }
+ 
+@@ -4095,6 +4327,11 @@
+         return NULL;
+     JS_REF_COUNT(ctx) = 1;
+     add_gc_object(rt, &ctx->header, JS_GC_OBJ_TYPE_JS_CONTEXT);
++    /* luminous: the block (from malloc, or an arena's block used before)
++       may hold an earlier block's bits: a set mark would tell the
++       collections that this context was traced already, its roots (the
++       global object...) left out */
++    js_rc(ctx)->mark = 0;
+ 
+     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
+                                     rt->class_count);
+@@ -8533,17 +8770,20 @@
  
  static JSContext *js_autoinit_get_realm(JSProperty *pr)
  {
@@ -469,7 +515,7 @@
  }
  
  static void js_autoinit_mark(JSRuntime *rt, JSProperty *pr,
-@@ -8652,10 +8879,10 @@
+@@ -8652,10 +8892,10 @@
  {
      if (unlikely(prop_flags & JS_PROP_TMASK)) {
          if ((prop_flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -484,7 +530,7 @@
          } else if ((prop_flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
              free_var_ref(rt, pr->u.var_ref);
          } else if ((prop_flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
-@@ -8986,10 +9213,10 @@
+@@ -8986,10 +9226,10 @@
                  if (prs->atom != JS_ATOM_NULL) {
                      if (prs->flags & JS_PROP_TMASK) {
                          if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -499,7 +545,7 @@
                          } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                              if (pr->u.var_ref && (pr->u.var_ref->is_detached ||
                                  pr->u.var_ref->is_coro)) {
-@@ -9287,6 +9514,17 @@
+@@ -9287,6 +9527,17 @@
      for (; p < e; p++) {
          uintptr_t w = *p;
          JSMallocBlockHeader *b;
@@ -517,7 +563,34 @@
          if (w < h->min_addr || w >= h->max_addr)
              continue;
          b = js_gc_find(rt, w);
-@@ -11801,7 +12039,7 @@
+@@ -9297,7 +9548,25 @@
+ 
+ static no_inline void js_gc_scan_stack_from_here(JSRuntime *rt, JS_MarkFunc *mark_func)
+ {
+-    js_gc_scan_range(rt, __builtin_frame_address(0), (void *)rt->gc_heap.stack_base, mark_func);
++    JSGCHeap *h = &rt->gc_heap;
++    const uintptr_t *start = (const uintptr_t *)(((uintptr_t)__builtin_frame_address(0) + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1));
++    if (unlikely(h->verify)) {
++        size_t n = (const uintptr_t *)h->stack_base - start;
++        if (mark_func != js_gc_trace_mark) {
++            js_gc_scan_range(rt, h->verify_stack, h->verify_stack + h->verify_stack_len, mark_func);
++            return;
++        }
++        if (n > h->verify_stack_size) {
++            uintptr_t *a = rt->mf.js_realloc(rt->malloc_state.opaque, h->verify_stack, n * sizeof(uintptr_t));
++            if (!a)
++                abort();
++            h->verify_stack = a;
++            h->verify_stack_size = n;
++        }
++        memcpy(h->verify_stack, start, n * sizeof(uintptr_t));
++        h->verify_stack_len = n;
++    }
++    js_gc_scan_range(rt, start, (void *)h->stack_base, mark_func);
+ }
+ 
+ /* The native stack, from the current frame (registers spilled in it). */
+@@ -11801,7 +12070,7 @@
      realm = js_autoinit_get_realm(pr);
      func = js_autoinit_func_table[js_autoinit_get_id(pr)];
      /* 'func' shall not modify the object properties 'pr' */
@@ -526,7 +599,7 @@
      js_autoinit_free(ctx->rt, pr);
      prs->flags &= ~JS_PROP_TMASK;
      pr->u.value = JS_UNDEFINED;
-@@ -11877,10 +12115,10 @@
+@@ -11877,10 +12146,10 @@
              /* found */
              if (unlikely(prs->flags & JS_PROP_TMASK)) {
                  if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -539,7 +612,7 @@
                          /* Note: the field could be removed in the getter */
                          func = js_dup(func);
                          return JS_CallFree(ctx, func, this_obj, 0, NULL);
-@@ -12441,10 +12679,10 @@
+@@ -12441,10 +12710,10 @@
              if (unlikely(prs->flags & JS_PROP_TMASK)) {
                  if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
                      desc->flags |= JS_PROP_GETSET;
@@ -554,7 +627,7 @@
                  } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
                      JSValue val = *pr->u.var_ref->pvalue;
                      if (unlikely(JS_IsUninitialized(val))) {
-@@ -13322,7 +13560,7 @@
+@@ -13322,7 +13591,7 @@
              assert(prop == JS_ATOM_length);
              return set_array_length(ctx, p, val, flags);
          } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -563,7 +636,7 @@
          } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
              /* JS_PROP_WRITABLE is always true for variable
                 references, but they are write protected in module name
-@@ -13447,7 +13685,7 @@
+@@ -13447,7 +13716,7 @@
          prs = find_own_property(&pr, p1, prop);
          if (prs) {
              if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -572,7 +645,7 @@
              } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                  /* Instantiate property and retry (potentially useless) */
                  if (JS_AutoInitProperty(ctx, p1, prop, pr, prs))
-@@ -13868,15 +14106,15 @@
+@@ -13868,15 +14137,15 @@
      if (unlikely(!pr))
          return -1;
      if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
@@ -592,7 +665,7 @@
          }
      } else {
          if (flags & JS_PROP_HAS_VALUE) {
-@@ -14049,34 +14287,34 @@
+@@ -14049,34 +14318,34 @@
                                    (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) |
                          JS_PROP_GETSET;
                      p->shape->special_props = true;
@@ -637,7 +710,7 @@
                      js_gc_wb(ctx->rt, p);
                  }
              } else {
-@@ -14084,10 +14322,10 @@
+@@ -14084,10 +14353,10 @@
                      /* convert to data descriptor */
                      if (js_shape_prepare_update(ctx, p, &prs))
                          return -1;
@@ -652,7 +725,7 @@
                      prs->flags &= ~(JS_PROP_TMASK | JS_PROP_WRITABLE);
                      pr->u.value = JS_UNDEFINED;
                  } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
-@@ -14267,14 +14505,28 @@
+@@ -14267,14 +14536,28 @@
      }
  
      /* Specialized CreateProperty */
@@ -685,7 +758,7 @@
      return true;
  }
  
-@@ -17677,15 +17929,15 @@
+@@ -17677,15 +17960,15 @@
                  printf("%s: ",
                         JS_AtomGetStrRT(rt, atom_buf, sizeof(atom_buf), prs->atom));
                  if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
@@ -704,7 +777,7 @@
                  } else {
                      JS_DumpValue(rt, pr->u.value);
                  }
-@@ -19652,8 +19904,8 @@
+@@ -19652,8 +19935,8 @@
  
      props[0].u.value = js_int32(argc); /* length */
      props[1].u.value = js_dup(ctx->array_proto_values); /* Symbol.iterator */
@@ -715,7 +788,7 @@
  
      val = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->arguments_shape),
                                  JS_CLASS_ARGUMENTS, props);
-@@ -33704,7 +33956,14 @@
+@@ -33704,7 +33987,14 @@
  static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
  {
      JSModuleDef *m;
@@ -730,7 +803,7 @@
      if (!m) {
          JS_FreeAtom(ctx, name);
          return NULL;
-@@ -33794,7 +34053,11 @@
+@@ -33794,7 +34084,11 @@
      JS_FreeValue(ctx, m->private_value);
      JS_FreeValue(ctx, m->attributes);
      list_del(&m->link);
@@ -742,7 +815,7 @@
  }
  
  #ifndef QJS_DISABLE_PARSER
-@@ -60718,8 +60981,8 @@
+@@ -60718,8 +61012,8 @@
      if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v) == ctor)
          r |= JS_PRISTINE_CTOR;
      prs = find_own_property(&pr, ctor, JS_ATOM_Symbol_species);
@@ -753,7 +826,7 @@
          r |= JS_PRISTINE_SPECIES;
      if (js_is_builtin(js_own_data(proto, JS_ATOM_then), (void *)js_promise_then, 0))
          r |= JS_PRISTINE_THEN;
-@@ -61015,7 +61278,7 @@
+@@ -61015,7 +61309,7 @@
      }
      type = prs->flags & JS_PROP_TMASK;
      if (kind == 0 ? type != JS_PROP_NORMAL || (prs->flags & JS_PROP_LENGTH)
@@ -762,7 +835,7 @@
          return -1;
      *pshape = js_dup_shape(p->shape);
      *pproto_shape = js_dup_shape(proto->shape);
-@@ -61072,7 +61335,7 @@
+@@ -61072,7 +61366,7 @@
      /* mode 2, 3: a getter, a setter */
      if (mode >= 2) {
          if ((flags & JS_PROP_TMASK) != JS_PROP_GETSET ||
