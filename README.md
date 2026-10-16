@@ -953,9 +953,8 @@ others:
   count, which native code reads inline.
 
 Known observable differences:
-- `f.toString()` of a native function returns native code instead of the
-  source.
-- A native function is not a constructor (`new f()` throws).
+- `f.toString()` of a native closure gives its source text printed anew
+  (without types; its whitespace may differ).
 - Native frames do not appear in `Error.stack`.
 - `Object.getOwnPropertyNames(Float64Array.prototype)` includes `length` (see
   above).
