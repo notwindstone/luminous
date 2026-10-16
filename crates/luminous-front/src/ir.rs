@@ -335,6 +335,10 @@ pub struct Func {
     /// as other functions are, its JS entry making the promise of its
     /// result (no frame).
     pub frameless: bool,
+    /// A closure's text in the bundle's source (method or accessor of an
+    /// object literal: with its key): what its `toString` gives, without
+    /// types (the others' is their interpreted fallback's).
+    pub source: Option<(u32, u32)>,
     /// The last parameter collects the remaining arguments in an array.
     pub rest: bool,
     /// `function*`: compiled as a resumable step function over a heap

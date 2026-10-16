@@ -48,8 +48,11 @@ pub const NATIVE_MODULE: &str = "luminous:native";
 pub const BIND_FN: &str = "__lum_bind";
 
 pub fn fallback_name(name: &str) -> String {
-    format!("__lum_fb_{name}")
+    format!("{FALLBACK_PREFIX}{name}")
 }
+
+/// What `fallback_name` prefixes.
+pub const FALLBACK_PREFIX: &str = "__lum_fb_";
 
 pub const INIT_FN: &str = "__lum_init";
 pub const CELLS_OBJ: &str = "__lum_m";
@@ -266,6 +269,46 @@ pub fn strip_types(source: &str, path: &Path) -> Result<String, String> {
         return Err(render(ret.diagnostics, source, path));
     }
     Ok(Codegen::new().build(&program).code)
+}
+
+/// A function's text without its types, as the erased program prints it
+/// (the text of a function or arrow expression, a function declaration, or
+/// an object literal's method or accessor, its key included): what
+/// `toString` gives for a native closure. None if it does not parse.
+pub fn function_source(text: &str) -> Option<String> {
+    // (Printed as the value of an assignment: no parentheses around it.)
+    for member in [false, true] {
+        let wrapped = if member { format!("x = {{{text}}};") } else { format!("x = {text};") };
+        let Ok(js) = strip_types(&wrapped, Path::new("function.ts")) else { continue };
+        let value = js.trim_end().strip_prefix("x = ")?.strip_suffix(';')?;
+        if !member {
+            return Some(value.to_string());
+        }
+        // (`{ key() { ... } }`: the member.)
+        let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+        return Some(inner.trim().to_string());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::function_source;
+
+    #[test]
+    fn function_sources() {
+        let cases = [
+            ("(x: number): number => x * k", "(x) => x * k"),
+            ("async function named(q: number) { return q; }", "async function named(q) {\n\treturn q;\n}"),
+            ("m(y: number) { return y + k; }", "m(y) {\n\treturn y + k;\n}"),
+            ("get g() { return k; }", "get g() {\n\treturn k;\n}"),
+            ("async a(z: string) { return z; }", "async a(z) {\n\treturn z;\n}"),
+            ("({ params: { id } }: any) => ({ id })", "({ params: { id } }) => ({ id })"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(function_source(text).as_deref(), Some(want), "{text}");
+        }
+    }
 }
 
 /// Render diagnostics of a bundle's source: each with the text of the

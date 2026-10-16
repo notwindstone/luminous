@@ -132,8 +132,9 @@ regular call path's generated code alone.
 `patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
 `0004-prototype-epoch.patch`, `0005-json-writers.patch`,
-`0006-native-construction.patch` and `0007-promises.patch`, each made
-against the tree the earlier ones give) and builds the engine without
+`0006-native-construction.patch`, `0007-promises.patch` and
+`0008-function-source.patch`, each made against the tree the earlier ones
+give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -197,6 +198,9 @@ engine's semantics:
   inline from; a new object's flags, class id and weak index set in one
   store (they were set a bit field at a time, or zeroed then set)
   (`0006`);
+- `JS_SetFunctionSourceHook`: what `Function.prototype.toString` gives for a
+  C function data object, which the generated glue answers for native
+  functions (`0008`, see below), and `JS_FunctionToString`;
 - promises and jobs without allocations of their own, as JSC's (`0007`):
   the job queue is a ring of entries (a job was an allocation, freed once
   run); a promise's data is in its own cell; a pending promise's
@@ -519,6 +523,11 @@ The differential tests run every case with both.
   Typed array elements are unboxed numbers: `s += a[i] * b[i]` over two
   `Float64Array`s is plain floating-point code. An out-of-bounds read is
   `undefined`, encoded as a reserved NaN inside native code.
+- **Source text.** `toString` of a native function gives its source, as the
+  interpreted program's does (frameworks read handlers' parameters from it):
+  a function bound to its interpreted fallback (a declaration, a method)
+  gives the fallback's; a closure, its text without types, kept in the
+  glue (printed on its own: its indentation may differ).
 - **Closures**: nested functions and arrows, including ones that outlive
   their creator and capture loop variables (one binding per iteration, as in
   JS). A captured variable never assigned after its declaration is

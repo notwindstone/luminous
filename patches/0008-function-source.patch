@@ -1,0 +1,71 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1668,6 +1668,14 @@
+                                             int length, int magic, int data_len,
+                                             JSValueConst *data, JSValueConst proto,
+                                             void **pshape);
++/* luminous: what Function.prototype.toString gives for a C function data
++   object (func, magic and data as it was made with): a string, a function
++   whose source it is, or undefined for the default (`[native code]`). */
++typedef JSValue JSFunctionSourceHook(JSContext *ctx, JSCFunctionData *func, int magic, int data_len,
++                                     JSValueConst *data);
++JS_EXTERN void JS_SetFunctionSourceHook(JSRuntime *rt, JSFunctionSourceHook *hook);
++/* Function.prototype.toString of `func` (whatever its own `toString`). */
++JS_EXTERN JSValue JS_FunctionToString(JSContext *ctx, JSValueConst func);
+ /* luminous: how native code makes those functions inline, for a shape
+    `*pshape` cached: what each starts with (its first word, shape, `length`
+    and `name`, and its record's head but `self`), its data following.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -617,6 +617,8 @@
+     JSString *json_buf;
+     int json_buf_size;
+     uint32_t job_size;
++    /* luminous: see JS_SetFunctionSourceHook */
++    JSFunctionSourceHook *function_source_hook;
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -8438,6 +8440,19 @@
+ static_assert(offsetof(JSCFunctionDataRecord, self) == JS_LAYOUT_FDATA_SELF, "");
+ static_assert(sizeof(JSCFunctionDataRecord) == sizeof(((JSFunctionTemplate *)0)->record), "");
+ 
++void JS_SetFunctionSourceHook(JSRuntime *rt, JSFunctionSourceHook *hook)
++{
++    rt->function_source_hook = hook;
++}
++
++static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
++                                    int argc, JSValueConst *argv);
++
++JSValue JS_FunctionToString(JSContext *ctx, JSValueConst func)
++{
++    return js_function_toString(ctx, func, 0, NULL);
++}
++
+ uint32_t JS_CFunctionDataTemplate(JSContext *ctx, JSCFunctionFast *fast,
+                                   JSCFunctionData *func, JSAtom name,
+                                   int length, int magic, int data_len,
+@@ -46038,6 +46053,22 @@
+         if (b->source)
+             return JS_NewStringLen(ctx, b->source, b->source_len);
+     }
++    /* luminous: a C function data object's source, if the embedder knows
++       it (a natively compiled function's): a string, or a function whose
++       source it is */
++    if (p->class_id == JS_CLASS_C_FUNCTION_DATA && ctx->rt->function_source_hook &&
++        p->u.c_function_data_record) {
++        JSCFunctionDataRecord *s = p->u.c_function_data_record;
++        JSValue r = ctx->rt->function_source_hook(ctx, s->func, s->magic, s->data_len, vc(s->data));
++        if (JS_IsException(r) || JS_IsString(r))
++            return r;
++        if (JS_IsFunction(ctx, r) && JS_VALUE_GET_PTR(r) != JS_VALUE_GET_PTR(this_val)) {
++            JSValue str = js_function_toString(ctx, r, 0, NULL);
++            JS_FreeValue(ctx, r);
++            return str;
++        }
++        JS_FreeValue(ctx, r);
++    }
+     {
+         JSValue name;
+         const char *pref, *suff;

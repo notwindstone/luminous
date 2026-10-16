@@ -358,6 +358,20 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// By native function: what `toString` gives for its closures, their
+/// source without types.
+fn closure_sources(analysis: &luminous_front::Analysis) -> Vec<Option<String>> {
+    let m = &analysis.module;
+    m.funcs
+        .iter()
+        .chain(&m.closures)
+        .map(|f| {
+            let (s, e) = f.source?;
+            luminous_front::erase::function_source(analysis.source.get(s as usize..e as usize)?)
+        })
+        .collect()
+}
+
 pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
     let (bundle, mut analysis) = analyze_with(input, fopts, &opts.embed)?;
@@ -395,7 +409,13 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
 
         std::fs::write(
             tmp.join("glue.c"),
-            glue::generate(&analysis.module, &mutable_cells(&analysis), &analysis.classes, fopts.int_wrapping),
+            glue::generate(
+                &analysis.module,
+                &mutable_cells(&analysis),
+                &analysis.classes,
+                fopts.int_wrapping,
+                &closure_sources(&analysis),
+            ),
         )?;
         std::fs::write(tmp.join("luminous_rt.c"), RT_C)?;
         std::fs::write(tmp.join("luminous_rt.h"), RT_H)?;

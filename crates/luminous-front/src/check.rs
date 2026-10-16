@@ -2289,6 +2289,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             has_this: self.has_this,
             is_async: self.is_async,
             frameless: false,
+            source: None,
             is_generator: self.is_generator,
             rest: self.rest,
             ret_slot: self.ret_slot,
@@ -3364,12 +3365,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// A nested function, compiled natively as a closure over the boxes of
     /// the variables it captures.
     fn closure(&mut self, node: FnNode<'a>, name: String) -> R<Expr> {
-        self.closure_with(node, name, false)
+        self.closure_with(node, name, false, node.span())
     }
 
     /// A nested function; `method`: a method of an object literal, which
     /// gets `this` (and has no class to resolve `super` in).
-    fn closure_with(&mut self, node: FnNode<'a>, name: String, method: bool) -> R<Expr> {
+    /// (`text`: its source text, see `ir::Func::source`.)
+    fn closure_with(&mut self, node: FnNode<'a>, name: String, method: bool, text: Span) -> R<Expr> {
         let key = node.span().start;
         if self.m.interpreted.contains(&key) {
             return reject(node.span(), "contains a function marked `interpreted`");
@@ -3387,7 +3389,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         inner.ret_int = ret == Some(Ty::I32);
         let r = inner.function(node, name, params);
         let request = inner.widen_request;
-        let f = match r {
+        let mut f = match r {
             Ok(f) => f,
             Err(e) => {
                 if e.retry {
@@ -3396,6 +3398,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 return Err(e);
             }
         };
+        f.source = Some((text.start, text.end));
         let mut boxes = Vec::new();
         for sym in self.caps.free.get(&key).cloned().unwrap_or_default() {
             match self.sym_local.get(&sym) {
@@ -4605,7 +4608,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     PropertyKind::Set => (format!("set {name}"), Part::Accessor(atom, true)),
                     _ => (name.clone(), Part::Field(atom)),
                 };
-                let v = self.closure_with(FnNode::Function(f), fname, true)?;
+                let v = self.closure_with(FnNode::Function(f), fname, true, p.span)?;
                 values.push(v);
                 parts.push(part);
                 continue;
