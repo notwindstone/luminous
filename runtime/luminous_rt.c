@@ -1276,6 +1276,23 @@ JSValue lum_construct(JSContext *ctx, JSValue f, JSValue args)
     return ret;
 }
 
+static JSValue lum_super_new(JSContext *ctx, JSValue cls, JSValue new_target, int argc, JSValue *argv);
+
+/* `lum_super_construct` with the arguments in an array: v = { class,
+   new.target, arguments }. */
+JSValue lum_super_construct_array(JSContext *ctx, JSValue *v)
+{
+    int argc, i;
+    JSValue *argv = lum_array_values(ctx, v[2], &argc), ret;
+    if (!argv)
+        return JS_EXCEPTION;
+    ret = lum_super_new(ctx, v[0], v[1], argc, argv);
+    for (i = 0; i < argc; i++)
+        JS_FreeValue(ctx, argv[i]);
+    js_free(ctx, argv);
+    return ret;
+}
+
 /* Rest parameter: the arguments from `start` on, in a new array. */
 JSValue lum_rest(JSContext *ctx, int argc, JSValue *argv, int start)
 {
@@ -1288,6 +1305,35 @@ JSValue lum_rest(JSContext *ctx, int argc, JSValue *argv, int start)
     arr = JS_NewArrayFrom(ctx, n, tab);
     js_free(ctx, tab);
     return arr;
+}
+
+/* A function's `arguments` (as `lum_rest`'s calls are made). */
+JSValue lum_arguments(JSContext *ctx, int argc, JSValue *argv, int unused)
+{
+    (void)unused;
+    return JS_NewArguments(ctx, argc, (JSValueConst *)argv);
+}
+
+/* `super(...args)` in the native constructor of class `cls` whose
+   superclass has none: the superclass (`cls`'s prototype, as it is now)
+   constructed with `new_target`. v = { cls, new_target, args... }. */
+JSValue lum_super_construct(JSContext *ctx, int argc, JSValue *v)
+{
+    return lum_super_new(ctx, v[0], v[1], argc, v + 2);
+}
+
+static JSValue lum_super_new(JSContext *ctx, JSValue cls, JSValue new_target, int argc, JSValue *argv)
+{
+    JSValue parent = JS_GetPrototype(ctx, cls), r;
+    if (JS_IsException(parent))
+        return parent;
+    if (!JS_IsConstructor(ctx, parent)) {
+        JS_FreeValue(ctx, parent);
+        return JS_ThrowTypeError(ctx, "parent class must be constructor");
+    }
+    r = JS_CallConstructor2(ctx, parent, new_target, argc, (JSValueConst *)argv);
+    JS_FreeValue(ctx, parent);
+    return r;
 }
 
 /* Object rest: v = { source, keys... }, nkeys keys (borrowed). */

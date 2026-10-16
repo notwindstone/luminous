@@ -45,7 +45,8 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
    - module code: each run of top-level statements (loops, `if`s, expression
      statements, `let` / `const` / `var` declarations) becomes a native
      function without parameters, called where the statements were. Class
-     declarations, exports and top-level `await` end a run and stay
+     declarations (and declarations of class expressions not compiled as
+     classes), exports and top-level `await` end a run and stay
      interpreted. When the checker rejects a statement, only that statement
      stays interpreted. A module binding that only its run uses is a native
      local; one that other code uses lives in a cell (see 6).
@@ -132,9 +133,9 @@ regular call path's generated code alone.
 `patches/*.patch` in order (`0001-luminous-engine-support.patch`, then
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
 `0004-prototype-epoch.patch`, `0005-json-writers.patch`,
-`0006-native-construction.patch`, `0007-promises.patch` and
-`0008-function-source.patch`, each made against the tree the earlier ones
-give) and builds the engine without
+`0006-native-construction.patch`, `0007-promises.patch`,
+`0008-function-source.patch` and `0009-arguments.patch`, each made
+against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -201,6 +202,9 @@ engine's semantics:
 - `JS_SetFunctionSourceHook`: what `Function.prototype.toString` gives for a
   C function data object, which the generated glue answers for native
   functions (`0008`, see below), and `JS_FunctionToString`;
+- `JS_NewArguments`: the (unmapped) `arguments` object of a strict
+  function called with given arguments, which the JS entries of native
+  functions using `arguments` make (`0009`);
 - promises and jobs without allocations of their own, as JSC's (`0007`):
   the job queue is a ring of entries (a job was an allocation, freed once
   run); a promise's data is in its own cell; a pending promise's
@@ -543,6 +547,15 @@ The differential tests run every case with both.
   interpreted code. An arrow function's `this` is the `this` of the method,
   constructor (after `super(...)` in a derived class) or object literal
   method it is in, captured in a box as a variable is.
+- **`arguments`** (unmapped, as in strict code: assigning a parameter
+  does not change it), also in the arrow functions inside the function,
+  which capture it in a box as they capture `this`. The function's JS
+  entry makes it from the arguments it was called with (its last
+  parameter); native code calls such a function through its JS entry.
+- **Recursion without return types**: a function without a return type
+  annotation that calls itself (or calls a function that calls it back)
+  before its return type is known returns any JS value, boxed, whatever
+  it returns (with an annotation, its own type, unboxed).
 - **Ordinary functions** (`function` declarations and expressions, not
   methods or arrows) are constructors, as in JS: a native one has a
   `prototype` (made when first read), and `new f()` makes an object of
@@ -582,12 +595,16 @@ The differential tests run every case with both.
   fields (`this.x = x`, values that run no code) makes the instance with
   them directly, so an inlined `new V(a, b)` is an object expression.
   Interpreted code keeps the class's own constructor.
-- **Constructors of derived classes** (`class B extends A`, `A` a class
-  with a native constructor) that start with their only `super(...)` call
-  (arguments that cannot see `this`, parameter defaults that are
-  literals, or object and array literals of them: `options = {}`), or
-  have none (the default one passes its arguments on). Its fields are
-  defined in order after it, and may use `this`. Each
+- **Constructors of derived classes** (`class B extends A`) that start
+  with their only `super(...)` call (arguments and parameter defaults that
+  cannot see `this`), or have none (the default one passes its arguments
+  on). Its fields are defined in order after it, and may use `this`. When
+  `A` has no native constructor (`Error` and the other built-ins, an
+  interpreted class, any other expression), `super(...)` constructs the
+  superclass as interpreted code does: the class's prototype at that
+  moment, with `new.target` the class constructed (`class HttpError
+  extends Error`, and its subclasses, are native; their instances are
+  errors, with their stack). When `A` has one, each
   superclass constructor is also compiled once per subclass to make that
   subclass's instances (`new.target` known), so `super(...)` is a direct
   call that returns the instance; the subclass's fields are then defined
@@ -596,7 +613,10 @@ The differential tests run every case with both.
   all its fields in one allocation. `new B()` first checks that each
   class of the chain still has its declared superclass as its prototype
   (`Object.setPrototypeOf(B, X)`): if not, the class is constructed as
-  interpreted code would.
+  interpreted code would. Parameter defaults that may run code (they are
+  not literals, or object and array literals of them: `options = {}`)
+  run after that check, so `super(...)` checks the chain again, and if
+  it changed constructs the superclass as interpreted code would.
 - **Class instances that do not escape** (scalar replacement, as JIT
   compilers' escape analysis): a local holding a new instance (`new V()`,
   or the result of an inlined or predicted method that makes one, such as
@@ -803,11 +823,11 @@ The differential tests run every case with both.
   generator and async methods too; `super` in them
   is not supported yet).
 
-Not yet: constructors of derived classes whose superclass is not
-compiled natively or that run code before `super(...)` (which stay
+Not yet: constructors of derived classes that run code before
+`super(...)`, and constructors using `arguments` (which stay
 interpreted), private accessors' and static private methods' direct calls,
 computed method and accessor names in object literals, classes inside
-functions, `arguments`, `this` outside methods, constructors and their
+functions, `this` outside methods, constructors and their
 field initializers. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `luminous report file.ts` says, for every

@@ -165,8 +165,13 @@ pub struct CtorInfo<'a> {
     pub param_props: Vec<(String, SymbolId)>,
     /// A derived class: its superclass.
     pub parent: Option<usize>,
+    /// A derived class whose superclass (not one of these classes, as
+    /// `Error`) has no native constructor: `super(...)` constructs it as
+    /// interpreted code would (`ir::ExprKind::SuperNew`).
+    pub dynamic: bool,
     /// A derived class without a constructor: its parameters are its
-    /// superclass's (without their defaults), passed on.
+    /// superclass's (without their defaults), passed on (`dynamic`: all
+    /// its arguments, its only parameter an array of them).
     pub forward: bool,
     /// The constructor `new` calls (`home == class`) of a derived class:
     /// the classes whose superclass must still be the one their
@@ -178,6 +183,11 @@ pub struct CtorInfo<'a> {
     pub instance_fields: Vec<String>,
     /// Its instances get its brand (it has private methods or accessors).
     pub brand: bool,
+    /// Its parameters' defaults may run code (before `super(...)`, after
+    /// the checks of `checks`): the classes it is made by, from it up, to
+    /// check again at `super(...)` (else the superclass is constructed as
+    /// interpreted code would).
+    pub recheck: Vec<(usize, usize)>,
 }
 
 impl Candidate<'_> {
@@ -308,6 +318,9 @@ pub fn check<'a>(
     // Keyed by the function's position.
     let mut widened: HashMap<u32, HashSet<SymbolId>> = HashMap::new();
     let mut ret_override: HashMap<u32, Ty> = HashMap::new();
+    // Functions without a return type that call themselves: they return any
+    // value (see `ModuleCx::signature`).
+    let mut any_ret: HashSet<u32> = HashSet::new();
     // Fixpoint: a function is native only if all its native callees are, and
     // callers must agree with the callees' actual return types.
     loop {
@@ -322,6 +335,8 @@ pub fn check<'a>(
             state: vec![State::Todo; candidates.len()],
             widened: &mut widened,
             ret_override: &mut ret_override,
+            any_ret: &mut any_ret,
+            arguments: HashMap::new(),
             ret_changed: false,
             strings: Vec::new(),
             string_ids: HashMap::new(),
@@ -1009,9 +1024,12 @@ struct CtorDef<'a> {
     param_props: Vec<(String, SymbolId)>,
     /// Its superclass (index in the `CtorDef`s).
     parent: Option<usize>,
+    dynamic: bool,
     forward: bool,
     /// It has private methods or accessors: its instances get its brand.
     brand: bool,
+    /// Its parameters' defaults may run code (`CtorInfo::recheck`).
+    impure: bool,
 }
 
 /// The constructor of a top-level class, as a native function that makes
@@ -1042,8 +1060,9 @@ fn class_ctor<'a>(
     let mut give_up = |span: Span, msg: String| {
         rejected.push((name.clone(), id.span, Reject { span, msg, retry: false, callee: false }));
     };
-    let parent = match &c.heritage {
-        None => None,
+    // (A superclass without a native constructor: `dynamic`.)
+    let (parent, dynamic) = match &c.heritage {
+        None => (None, false),
         Some(h) => {
             let found = match h.expression.without_parentheses() {
                 Expression::Identifier(r) => scoping
@@ -1052,19 +1071,10 @@ fn class_ctor<'a>(
                     .and_then(|sym| defs.iter().position(|d| d.symbol == sym)),
                 _ => None,
             };
-            let Some(p) = found else {
-                give_up(
-                    h.span(),
-                    match h.expression.without_parentheses() {
-                        Expression::Identifier(r) => format!("its superclass `{}` has no native constructor", r.name),
-                        _ => "its superclass is not named by a binding".into(),
-                    },
-                );
-                return;
-            };
-            Some(p)
+            (found, found.is_none())
         }
     };
+    let derived = parent.is_some() || dynamic;
     let mut fields = Vec::new();
     let mut ctor = None;
     let mut brand = false;
@@ -1093,7 +1103,7 @@ fn class_ctor<'a>(
                     give_up(p.span, "decorated field".into());
                     return;
                 }
-                if parent.is_none() && p.value.as_ref().is_some_and(|v| mentions_this(v) && !this_arrow(v)) {
+                if !derived && p.value.as_ref().is_some_and(|v| mentions_this(v) && !this_arrow(v)) {
                     give_up(p.span, "field initializer uses `this` (but in an arrow function that is its value)".into());
                     return;
                 }
@@ -1108,6 +1118,7 @@ fn class_ctor<'a>(
     }
     let mut param_props = Vec::new();
     let mut forward = false;
+    let mut impure = false;
     let (node, params, rest) = match ctor {
         Some(m) => {
             let f = &m.value;
@@ -1126,13 +1137,16 @@ fn class_ctor<'a>(
                     param_props.push((b.name.to_string(), b.symbol_id.get().unwrap()));
                 }
             }
-            if parent.is_some() && !super_first(f) {
-                give_up(
-                    f.span,
-                    "the constructor does not start with `super(...)` (with arguments that are plain values)"
-                        .into(),
-                );
-                return;
+            if derived {
+                let Some(i) = super_first(f) else {
+                    give_up(
+                        f.span,
+                        "the constructor does not start with `super(...)` (with arguments that cannot see `this`)"
+                            .into(),
+                    );
+                    return;
+                };
+                impure = i;
             }
             // Their fields come first, `undefined` until assigned.
             fields.splice(0..0, param_props.iter().map(|(n, _)| (n.clone(), None)));
@@ -1148,8 +1162,12 @@ fn class_ctor<'a>(
         // The default constructor: no parameters, nothing to run; a derived
         // class's passes its arguments on.
         None => match parent {
+            None if dynamic => {
+                forward = true;
+                (FnNode::Segment(c.span, &[]), Vec::new(), false)
+            }
             None => (FnNode::Segment(c.span, &[]), Vec::new(), false),
-            Some(p) if !defs[p].rest => {
+            Some(p) if !defs[p].rest && !(defs[p].dynamic && defs[p].forward) => {
                 forward = true;
                 let params = defs[p].params.iter().map(|q| Param { default: None, ..q.clone() }).collect();
                 (FnNode::Segment(c.span, &[]), params, false)
@@ -1168,8 +1186,10 @@ fn class_ctor<'a>(
         fields,
         param_props,
         parent,
+        dynamic,
         forward,
         brand,
+        impure,
     };
     // Its own (called by `new`), checking its superclasses, then its
     // superclasses' (each called by `super(...)`).
@@ -1181,11 +1201,17 @@ fn class_ctor<'a>(
         at = &defs[p];
         chain.push(at);
     }
-    let instance_fields: Vec<String> = chain
-        .iter()
-        .rev()
-        .flat_map(|d| d.fields.iter().filter(|(n, _)| !n.starts_with('#')).map(|(n, _)| n.clone()))
-        .collect();
+    // (Not known when a superclass's interpreted constructor makes the
+    // instance.)
+    let instance_fields: Vec<String> = if at.dynamic {
+        Vec::new()
+    } else {
+        chain
+            .iter()
+            .rev()
+            .flat_map(|d| d.fields.iter().filter(|(n, _)| !n.starts_with('#')).map(|(n, _)| n.clone()))
+            .collect()
+    };
     let mut make = |d: &CtorDef<'a>, checks: Vec<(usize, usize)>, instance_fields: Vec<String>| {
         let name = if d.index == index { name.clone() } else { format!("{} (constructing {name})", d.name) };
         // Called only directly by native code, with JS values.
@@ -1212,10 +1238,22 @@ fn class_ctor<'a>(
                 fields: d.fields.clone(),
                 param_props: d.param_props.clone(),
                 parent: d.parent.map(|p| defs[p].index),
+                dynamic: d.dynamic,
                 forward: d.forward,
                 checks,
                 instance_fields,
                 brand: d.brand,
+                recheck: if d.impure {
+                    let mut links = Vec::new();
+                    let mut at = d;
+                    while let Some(p) = at.parent {
+                        links.push((at.index, defs[p].index));
+                        at = &defs[p];
+                    }
+                    links
+                } else {
+                    Vec::new()
+                },
             }),
         });
     };
@@ -1229,10 +1267,10 @@ fn class_ctor<'a>(
 }
 
 /// Whether derived class constructor `f` starts with `super(args)`, its
-/// only `super(...)` call, with arguments that cannot see `this`, and
-/// parameters whose defaults are literals: nothing before the call can see
-/// the instance or reconfigure the classes it is made by.
-fn super_first(f: &Function) -> bool {
+/// only `super(...)` call, with arguments and parameter defaults that
+/// cannot see `this`: then whether a default may run code (reconfigure the
+/// classes it is made by; else they are literals).
+fn super_first(f: &Function) -> Option<bool> {
     use oxc::ast_visit::{Visit, walk};
     struct Supers(usize);
     impl<'a> Visit<'a> for Supers {
@@ -1243,20 +1281,21 @@ fn super_first(f: &Function) -> bool {
             walk::walk_call_expression(self, c);
         }
     }
-    if f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(|d| !plain_value(d))) {
-        return false;
+    if f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(mentions_this)) {
+        return None;
     }
+    let impure = f.params.items.iter().any(|p| p.initializer.as_deref().is_some_and(|d| !plain_value(d)));
     let body = f.body.as_ref().unwrap();
-    let Some(Statement::ExpressionStatement(s)) = body.statements.first() else { return false };
-    let Expression::CallExpression(call) = &s.expression else { return false };
+    let Some(Statement::ExpressionStatement(s)) = body.statements.first() else { return None };
+    let Expression::CallExpression(call) = &s.expression else { return None };
     if !matches!(call.callee, Expression::Super(_))
         || call.arguments.iter().any(|a| a.as_expression().is_none_or(mentions_this))
     {
-        return false;
+        return None;
     }
     let mut v = Supers(0);
     v.visit_function_body(body);
-    v.0 == 1
+    (v.0 == 1).then_some(impure)
 }
 
 /// A value that evaluating cannot see anything: a literal, `undefined`,
@@ -1511,6 +1550,13 @@ struct ModuleCx<'m, 'a> {
     widened: &'m mut HashMap<u32, HashSet<SymbolId>>,
     /// Actual return types that differ from the annotation.
     ret_override: &'m mut HashMap<u32, Ty>,
+    /// Functions (their span start) whose return type is `Any` whatever they
+    /// return: called by themselves (recursion) before their return type
+    /// was known.
+    any_ret: &'m mut HashSet<u32>,
+    /// Per candidate: whether it uses its `arguments` (then native code
+    /// calls it through its JS entry, which makes them).
+    arguments: HashMap<usize, bool>,
     ret_changed: bool,
     strings: Vec<String>,
     string_ids: HashMap<String, ir::StrId>,
@@ -1535,6 +1581,11 @@ struct ModuleCx<'m, 'a> {
 }
 
 impl<'m, 'a> ModuleCx<'m, 'a> {
+    fn uses_arguments(&mut self, i: usize) -> bool {
+        let (node, scoping) = (self.cands[i].node, self.scoping);
+        *self.arguments.entry(i).or_insert_with(|| uses_arguments(node, scoping))
+    }
+
     fn ensure(&mut self, i: usize) {
         if !matches!(self.state[i], State::Todo) {
             return;
@@ -1603,10 +1654,14 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
         self.ensure(i);
         match &self.state[i] {
             State::Done(f) => Ok((params, f.ret)),
-            State::InProgress => reject(
-                call_span,
-                format!("recursive call to `{}`, which has no return type annotation", self.cands[i].name),
-            ),
+            State::InProgress => {
+                // Recursion before the return type is known: any value (the
+                // function's returns are then boxed, whatever they are).
+                let key = self.cands[i].node.span().start;
+                self.any_ret.insert(key);
+                self.ret_override.insert(key, Ty::Any);
+                Ok((params, Ty::Any))
+            }
             State::Failed(_) => callee_failed(call_span, &self.cands[i].name),
             State::Todo => unreachable!(),
         }
@@ -1757,6 +1812,11 @@ struct FnCx<'x, 'm, 'a> {
     for_in_keys: Vec<(SymbolId, ir::LocalId)>,
     /// The last parameter is a rest parameter.
     rest: bool,
+    /// The function's `arguments` (its last parameter, see
+    /// `ir::Func::arguments`), and its box for the arrows inside that use
+    /// it (in those arrows: the captured box).
+    args_local: Option<ir::LocalId>,
+    args_box: Option<ir::LocalId>,
     /// Functions that suspend: where a return value waits for `finally`s.
     ret_slot: Option<ir::LocalId>,
     locals: Vec<Ty>,
@@ -1806,6 +1866,12 @@ struct CaptureInfo {
     /// Arrow functions that use the `this` of an enclosing function
     /// (directly or through nested arrows).
     this_free: HashSet<u32>,
+    /// Functions whose `arguments` they, or arrow functions inside them,
+    /// use; of those, the ones whose arrows do; the arrows that use an
+    /// enclosing function's (directly or through nested arrows).
+    args_users: HashSet<u32>,
+    args_owners: HashSet<u32>,
+    args_free: HashSet<u32>,
 }
 
 /// `cells`: module bindings a segment declares that live in cells (not
@@ -1876,6 +1942,17 @@ fn capture_info<'a>(
             if !self.collect_refs {
                 return;
             }
+            // `arguments`: as `this`.
+            if is_arguments(it, self.scoping) {
+                if let Some(k) = self.arrows.iter().rposition(|&a| !a) {
+                    self.info.args_users.insert(self.stack[k]);
+                    if k + 1 < self.stack.len() {
+                        self.info.args_owners.insert(self.stack[k]);
+                        self.info.args_free.extend(&self.stack[k + 1..]);
+                    }
+                }
+                return;
+            }
             // (Types are erased: a type parameter in an annotation is not
             // captured.)
             let Some(sym) = it
@@ -1936,6 +2013,39 @@ fn capture_info<'a>(
         }
     }
     v.info
+}
+
+/// Whether `id` is a function's `arguments` (no binding of that name).
+fn is_arguments(id: &IdentifierReference, scoping: &Scoping) -> bool {
+    id.name == "arguments" && id.reference_id.get().is_some_and(|r| scoping.get_reference(r).symbol_id().is_none())
+}
+
+/// Whether function `node` uses its own `arguments` (or arrow functions
+/// inside it do).
+fn uses_arguments(node: FnNode, scoping: &Scoping) -> bool {
+    use oxc::ast_visit::{Visit, walk};
+    use oxc::syntax::scope::ScopeFlags;
+    struct V<'s> {
+        scoping: &'s Scoping,
+        found: bool,
+        nested: bool,
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+            // (Another function's own.)
+            if !self.nested {
+                self.nested = true;
+                walk::walk_function(self, it, flags);
+            }
+        }
+        fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+            self.found |= is_arguments(it, self.scoping);
+        }
+    }
+    let FnNode::Function(f) = node else { return false };
+    let mut v = V { scoping, found: false, nested: false };
+    v.visit_function(f, ScopeFlags::Function);
+    v.found
 }
 
 /// `e` as a JS value.
@@ -2029,6 +2139,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_generator: false,
             ret_slot: None,
             rest: false,
+            args_local: None,
+            args_box: None,
             for_in_keys: Vec::new(),
             class: None,
             locals: Vec::new(),
@@ -2088,13 +2200,29 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
             }
         }
+        // A default constructor passing all its arguments on: them, in an
+        // array.
+        let forward_all = forward && self.ctor.as_ref().is_some_and(|c| c.dynamic);
+        if forward_all {
+            self.temp(Ty::Any);
+            abi.push(Ty::Any);
+        }
+        // The arguments object, last (made by the JS entry).
+        if matches!(node, FnNode::Function(_)) && self.caps.args_users.contains(&self.key) {
+            if self.ctor.is_some() {
+                return reject(node.span(), "constructors using `arguments` are not supported");
+            }
+            let l = self.temp(Ty::Any);
+            abi.push(Ty::Any);
+            self.args_local = Some(l);
+        }
         if self.suspends() {
             self.ret_slot = Some(self.temp(Ty::Any));
         }
         let mut param_props = Vec::new();
         if let Some(ctor) = self.ctor.take() {
             prologue.extend(self.ctor_checks(&ctor, params.len())?);
-            if ctor.parent.is_some() {
+            if ctor.parent.is_some() || ctor.dynamic {
                 // The instance comes from `super(...)`.
                 self.this_local = Some(self.temp(Ty::Any));
                 self.derived = Some(ctor);
@@ -2112,11 +2240,16 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let l = self.declare_boxed(sym);
                 self.captures.push(l);
             }
-            // (An arrow's `this`, last.)
+            // (An arrow's `this`, then its `arguments`, last.)
             if self.caps.this_free.contains(&self.key) {
                 let l = self.this_box_local();
                 self.captures.push(l);
                 self.this_box = Some(l);
+            }
+            if self.caps.args_free.contains(&self.key) {
+                let l = self.args_box_local();
+                self.captures.push(l);
+                self.args_box = Some(l);
             }
         }
         // Captured parameters move into boxes.
@@ -2136,6 +2269,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 inits.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, Box::new(this)))));
                 self.this_box = Some(b);
             }
+        }
+        if let Some(a) = self.args_local
+            && self.caps.args_owners.contains(&self.key)
+        {
+            let b = self.args_box_local();
+            new_boxes.push(b);
+            inits.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(b, Box::new(self.local(a))))));
+            self.args_box = Some(b);
         }
         for (sym, p) in boxed_params {
             let b = self.declare_boxed(sym);
@@ -2181,7 +2322,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let v = self.local(self.sym_local[&sym]);
             prologue.push(self.param_prop(&name, v));
         }
-        if forward {
+        if forward_all {
+            let call = self.super_new(None, Some(self.local(0)));
+            self.super_init(call)?;
+            prologue.append(&mut self.pre);
+        } else if forward {
             let args = (0..params.len()).map(|l| self.local(l)).collect();
             self.super_call(args, node.span())?;
             prologue.append(&mut self.pre);
@@ -2254,6 +2399,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if completes_list(&body) {
             ret = Some(ret.map_or(Ty::Void, |r| join(r, Ty::Void)));
         }
+        if !self.is_closure && self.m.any_ret.contains(&self.key) {
+            ret = Some(Ty::Any);
+        }
         // `undefined` is only encoded within a function; generators return
         // iterator results.
         let ret = match ret.unwrap_or(Ty::Void) {
@@ -2292,6 +2440,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             source: None,
             is_generator: self.is_generator,
             rest: self.rest,
+            arguments: self.args_local.is_some(),
             ret_slot: self.ret_slot,
             class: if self.has_this && !self.is_closure { self.class } else { None },
             hints: self.sym_local.iter().filter_map(|(sym, &l)| Some((l, *self.sym_hints.get(sym)?))).collect(),
@@ -2341,6 +2490,15 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.boxed[l] = true;
         self.mutable[l] = false;
         self.local_names[l] = Some(self.m.atom("this"));
+        l
+    }
+
+    /// The same, for `arguments`.
+    fn args_box_local(&mut self) -> ir::LocalId {
+        let l = self.temp(Ty::Any);
+        self.boxed[l] = true;
+        self.mutable[l] = false;
+        self.local_names[l] = Some(self.m.atom("arguments"));
         l
     }
 
@@ -3304,6 +3462,24 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         self.super_init(call)
     }
 
+    /// `super(args)` of a class whose superclass has no native constructor
+    /// (`CtorInfo::dynamic`), the arguments in a list or an array.
+    fn super_new(&mut self, args: Option<Vec<Expr>>, array: Option<Expr>) -> Expr {
+        let ctor = self.derived.as_ref().unwrap();
+        let (class, home) = (ctor.class, ctor.home);
+        for k in [class, home] {
+            if !self.m.homes_used.contains(&k) {
+                self.m.homes_used.push(k);
+            }
+        }
+        let kind = match (args, array) {
+            (Some(args), _) => ExprKind::SuperNew { class, home, args },
+            (None, Some(a)) => ExprKind::SuperNewSpread { class, home, args: Box::new(a) },
+            (None, None) => unreachable!(),
+        };
+        Expr::new(Ty::Any, kind)
+    }
+
     /// The direct call of the superclass's constructor (`call` makes it,
     /// given its index).
     fn super_ctor(&mut self, call: impl FnOnce(&mut Self, usize) -> R<Option<Expr>>, span: Span) -> R<Expr> {
@@ -3410,6 +3586,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             match self.this_box {
                 Some(b) => boxes.push(b),
                 None => return reject(node.span(), "arrow function uses a `this` not available here"),
+            }
+        }
+        if self.caps.args_free.contains(&key) {
+            match self.args_box {
+                Some(b) => boxes.push(b),
+                None => return reject(node.span(), "arrow function uses an `arguments` not available here"),
             }
         }
         self.m.closures.push(f);
@@ -4791,7 +4973,10 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 "NaN" => Expr::num(f64::NAN),
                 "Infinity" => Expr::num(f64::INFINITY),
                 "undefined" => undefined(),
-                "arguments" => return reject(id.span, "`arguments` is not supported"),
+                "arguments" => match self.args_local.or(self.args_box) {
+                    Some(l) => return Ok(self.local(l)),
+                    None => return reject(id.span, "`arguments` outside a function"),
+                },
                 name => {
                     let atom = self.m.atom(name);
                     Expr::new(Ty::Any, ExprKind::Global(atom))
@@ -5233,6 +5418,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             && let Expression::Identifier(id) = u.argument.without_parentheses()
             && self.resolve(id).is_none()
             && !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity")
+            && !(id.name == "arguments" && self.args_local.or(self.args_box).is_some())
         {
             // `typeof undeclared` is "undefined", not a ReferenceError.
             let atom = self.m.atom(id.name.as_str());
@@ -5465,6 +5651,55 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let [obj] = obj;
                 self.call_method(obj, key, &c.arguments)
             }
+            Expression::Super(_) if self.derived.as_ref().is_some_and(|d| d.dynamic) => {
+                let mut args = Vec::new();
+                self.push_args(&mut args, &c.arguments)?;
+                let call = self.super_new(Some(args), None);
+                self.super_init(call)
+            }
+            Expression::Super(_) if self.derived.as_ref().is_some_and(|d| !d.recheck.is_empty()) => {
+                // The arguments; then the superclass's native constructor if
+                // the classes it is made by are still each other's
+                // superclasses, else the superclass constructed as
+                // interpreted code would.
+                let mut vals = Vec::new();
+                self.push_args(&mut vals, &c.arguments)?;
+                let mut args = Vec::new();
+                for v in vals {
+                    let t = self.temp(Ty::Any);
+                    self.pre.push(Stmt::Expr(Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(v)))));
+                    args.push(self.local(t));
+                }
+                let direct = self.super_ctor(
+                    |cx, i| {
+                        let (params, _) = cx.m.signature(i, c.span)?;
+                        let fixed = params.len() - cx.m.cands[i].rest as usize;
+                        let mut out: Vec<Expr> = (0..fixed).map(|k| args.get(k).cloned().unwrap_or_else(undefined)).collect();
+                        if cx.m.cands[i].rest {
+                            out.push(Expr::new(Ty::Any, ExprKind::Array(args.get(fixed..).unwrap_or(&[]).to_vec())));
+                        }
+                        Ok(Some(Expr::new(Ty::Any, ExprKind::Call(i, out))))
+                    },
+                    c.span,
+                )?;
+                let links = self.derived.as_ref().unwrap().recheck.clone();
+                let generic = self.super_new(Some(args.clone()), None);
+                let mut ok = Expr::new(Ty::Bool, ExprKind::Bool(true));
+                for &(class, parent) in links.iter().rev() {
+                    for k in [class, parent] {
+                        if !self.m.homes_used.contains(&k) {
+                            self.m.homes_used.push(k);
+                        }
+                    }
+                    let is = Expr::new(Ty::Bool, ExprKind::ProtoIs { class, parent });
+                    ok = Expr::new(
+                        Ty::Bool,
+                        ExprKind::Cond(Box::new(is), Box::new(ok), Box::new(Expr::new(Ty::Bool, ExprKind::Bool(false)))),
+                    );
+                }
+                let call = Expr::new(Ty::Any, ExprKind::Cond(Box::new(ok), Box::new(direct), Box::new(generic)));
+                self.super_init(call)
+            }
             Expression::Super(_) if self.derived.is_some() => {
                 let call = self.super_ctor(|cx, i| cx.direct_call(i, &c.arguments, c.span, None), c.span)?;
                 self.super_init(call)
@@ -5558,10 +5793,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // Async functions and generators are called through their JS entry
         // (which returns a promise or a generator object).
         let node = self.m.cands[i].node;
-        if !self.m.cands[i].direct_callable || node.is_async() || node.is_generator() {
+        if !self.m.cands[i].direct_callable || node.is_async() || node.is_generator() || self.m.uses_arguments(i) {
             return Ok(None);
         }
         let (params, ret) = self.m.signature(i, span)?;
+        // A default constructor passing all its arguments on to an
+        // interpreted one: them, in an array.
+        if self.m.cands[i].ctor.as_ref().is_some_and(|k| k.dynamic && k.forward) {
+            if args.iter().any(|a| a.as_expression().is_none()) {
+                return Ok(None);
+            }
+            let mut all = Vec::new();
+            self.push_args(&mut all, args)?;
+            return Ok(Some(Expr::new(ret, call(i, vec![Expr::new(Ty::Any, ExprKind::Array(all))]))));
+        }
         let rest = self.m.cands[i].rest;
         let fixed = params.len() - rest as usize;
         if (!rest && args.len() > params.len()) || args.iter().any(|a| a.as_expression().is_none()) {
@@ -6174,9 +6419,16 @@ fn segment_stmt(s: &Statement, bindings: &HashMap<SymbolId, Binding>, consts: &H
                     VariableDeclarationKind::Let | VariableDeclarationKind::Const | VariableDeclarationKind::Var
                 )
                 && v.declarations.iter().all(|d| {
+                    // (A function bound to the name is a function of its
+                    // own; a class, made by the interpreter, its methods
+                    // native: the statement between two segments.)
                     !matches!(
                         d.init.as_ref().map(|i| i.without_parentheses()),
-                        Some(Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_))
+                        Some(
+                            Expression::ArrowFunctionExpression(_)
+                                | Expression::FunctionExpression(_)
+                                | Expression::ClassExpression(_)
+                        )
                     ) && d.id.get_binding_identifiers().iter().all(|id| {
                         let sym = id.symbol_id.get().unwrap();
                         !consts.contains_key(&sym) && bindings.get(&sym).is_none_or(|b| !b.exported)

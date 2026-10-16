@@ -1,0 +1,26 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1676,6 +1676,9 @@
+ JS_EXTERN void JS_SetFunctionSourceHook(JSRuntime *rt, JSFunctionSourceHook *hook);
+ /* Function.prototype.toString of `func` (whatever its own `toString`). */
+ JS_EXTERN JSValue JS_FunctionToString(JSContext *ctx, JSValueConst func);
++/* luminous: the `arguments` object of a strict function called with argv
++   (unmapped). */
++JS_EXTERN JSValue JS_NewArguments(JSContext *ctx, int argc, JSValueConst *argv);
+ /* luminous: how native code makes those functions inline, for a shape
+    `*pshape` cached: what each starts with (its first word, shape, `length`
+    and `name`, and its record's head but `self`), its data following.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -19650,6 +19650,11 @@
+     return JS_EXCEPTION;
+ }
+ 
++JSValue JS_NewArguments(JSContext *ctx, int argc, JSValueConst *argv)
++{
++    return js_build_arguments(ctx, argc, argv);
++}
++
+ #define GLOBAL_VAR_OFFSET 0x40000000
+ #define ARGUMENT_VAR_OFFSET 0x20000000
+ 

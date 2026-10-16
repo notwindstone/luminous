@@ -339,8 +339,13 @@ pub struct Func {
     /// object literal: with its key): what its `toString` gives, without
     /// types (the others' is their interpreted fallback's).
     pub source: Option<(u32, u32)>,
-    /// The last parameter collects the remaining arguments in an array.
+    /// The last parameter collects the remaining arguments in an array
+    /// (before the arguments object, if any).
     pub rest: bool,
+    /// The function uses its `arguments` (or arrow functions inside it
+    /// do): its last parameter is the arguments object, which its JS entry
+    /// makes (native code calls it only through its JS entry).
+    pub arguments: bool,
     /// `function*`: compiled as a resumable step function over a heap
     /// frame, as async functions are.
     pub is_generator: bool,
@@ -513,6 +518,13 @@ pub enum ExprKind {
     /// `obj.name(args)` / `obj[key](args)`, with `this` = obj.
     CallMethod(Box<Expr>, Key, Vec<Expr>),
     New(Box<Expr>, Vec<Expr>),
+    /// `super(args)` in the native constructor of top-level class `class`
+    /// whose superclass has no native constructor: the superclass (the
+    /// class's prototype, as it is then) constructed with `new.target` the
+    /// class `home` (`CtorInfo::home`).
+    SuperNew { class: usize, home: usize, args: Vec<Expr> },
+    /// The same, the arguments in an array.
+    SuperNewSpread { class: usize, home: usize, args: Box<Expr> },
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
     /// A new instance of top-level class `class` (whose prototype is home
@@ -1241,6 +1253,7 @@ macro_rules! visitor {
                 | AsyncIterResult(a, _)
                 | CheckObject(a)
                 | Lazy(a)
+                | SuperNewSpread { args: a, .. }
                 | Void(a) => $name(a, f),
                 ArrayParts(parts) => {
                     for p in parts {
@@ -1310,7 +1323,7 @@ macro_rules! visitor {
                     $name(b, f);
                     $name(c, f);
                 }
-                Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => {
+                Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) | SuperNew { args: xs, .. } => {
                     for x in xs {
                         $name(x, f);
                     }
@@ -1413,6 +1426,16 @@ impl Func {
     /// suspend (`await`, `yield`).
     pub fn suspends(&self) -> bool {
         (self.is_async && !self.frameless) || self.is_generator
+    }
+
+    /// The rest parameter's index.
+    pub fn rest_param(&self) -> Option<usize> {
+        self.rest.then(|| self.params.len() - 1 - self.arguments as usize)
+    }
+
+    /// The arguments object's parameter index.
+    pub fn arguments_param(&self) -> Option<usize> {
+        self.arguments.then(|| self.params.len() - 1)
     }
 }
 
@@ -2301,7 +2324,7 @@ fn inline_ok(f: &Func, size_limit: usize, method: bool) -> bool {
         })
     }
     let other = if method { !f.captures.is_empty() } else { f.is_closure || f.has_this };
-    if f.is_async || f.is_generator || other || f.rest || f.ret_slot.is_some() {
+    if f.is_async || f.is_generator || other || f.rest || f.arguments || f.ret_slot.is_some() {
         return false;
     }
     if f.boxed.iter().any(|&b| b) || !stmts_ok(&f.body) {
@@ -3190,7 +3213,7 @@ fn callback_ok(f: &Func) -> bool {
 /// A function the native loops can call or inline: an arrow function
 /// (no `this`), neither async nor a generator, without a rest parameter.
 fn callback_plain(f: &Func) -> bool {
-    f.is_closure && !f.has_this && !f.is_async && !f.is_generator && !f.rest && f.ret_slot.is_none()
+    f.is_closure && !f.has_this && !f.is_async && !f.is_generator && !f.rest && !f.arguments && f.ret_slot.is_none()
 }
 
 /// Whether a closure (its parameter types, return type, and whether it is

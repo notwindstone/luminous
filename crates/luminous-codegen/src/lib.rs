@@ -423,6 +423,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_apply", &[P, P], &[W, W]),
         ("lum_construct", &[P, W, W, W, W], &[W, W]),
         ("lum_rest", &[P, Int, P, Int], &[W, W]),
+        ("lum_arguments", &[P, Int, P, Int], &[W, W]),
+        ("lum_super_construct", &[P, Int, P], &[W, W]),
+        ("lum_super_construct_array", &[P, P], &[W, W]),
         ("lum_object_rest", &[P, P, Int], &[W, W]),
         ("lum_define_computed", &[P, P, W, W], &[Int]),
         ("lum_object_spread", &[P, W, W, W, W], &[Int]),
@@ -1057,12 +1060,16 @@ impl Codegen {
             b.ins().store(M_SLOT, t, slots, at + jsvalue::TAG_OFFSET);
         };
         let dup_value = |b: &mut FunctionBuilder, p: Value, t: Value| dup_inline(b, p, t);
-        if f.rest {
-            // The rest array; if it cannot be allocated, drop the frame.
+        // The rest array and the arguments object; if they cannot be
+        // allocated, drop the frame (the collector frees the rest array).
+        let made: Vec<(usize, &str)> = [(f.rest_param(), "lum_rest"), (f.arguments_param(), "lum_arguments")]
+            .into_iter()
+            .filter_map(|(k, h)| Some((k?, h)))
+            .collect();
+        for &(k, helper) in &made {
             let failed = b.create_block();
             b.set_cold_block(failed);
-            let k = f.params.len() - 1;
-            params[k] = rest_arg(&mut b, env.helpers["lum_rest"], js_ctx, argc, argv, k, failed);
+            params[k] = rest_arg(&mut b, env.helpers[helper], js_ctx, argc, argv, k, failed);
             let cont = b.create_block();
             b.ins().jump(cont, &[]);
             b.switch_to_block(failed);
@@ -1074,7 +1081,7 @@ impl Codegen {
             let s = layout[k];
             let local_ty = f.locals[k];
             let (p, tag) = match (t, params[k]) {
-                (_, V::Any(p, tag)) if f.rest && k + 1 == f.params.len() => (p, tag),
+                (_, V::Any(p, tag)) if made.iter().any(|&(j, _)| j == k) => (p, tag),
                 (Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_), _) => {
                     let (p, tag) = load_arg(&mut b, argc, argv, k);
                     dup_value(&mut b, p, tag);
@@ -1207,15 +1214,19 @@ impl Codegen {
             }
         }
         // A rest parameter: a new array (before any other new reference, so
-        // that failing to allocate it leaks nothing).
-        if f.rest {
-            let k = f.params.len() - 1;
+        // that failing to allocate it leaks nothing); the arguments object
+        // (the collector frees the rest array if it cannot be made).
+        if let Some(k) = f.rest_param() {
             params[k] = rest_arg(&mut b, env.helpers["lum_rest"], js_ctx, argc, argv, k, exception);
+        }
+        if let Some(k) = f.arguments_param() {
+            params[k] = rest_arg(&mut b, env.helpers["lum_arguments"], js_ctx, argc, argv, k, exception);
         }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {
             if matches!(t, Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_))
-                && !(f.rest && k + 1 == f.params.len())
+                && f.rest_param() != Some(k)
+                && f.arguments_param() != Some(k)
             {
                 let (p, tag) = load_arg(&mut b, argc, argv, k);
                 dup_inline(&mut b, p, tag);

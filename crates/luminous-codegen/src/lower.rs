@@ -3458,6 +3458,48 @@ impl Lower {
                 self.free_v(fv);
                 V::Any(r[0], r[1])
             }
+            ExprKind::SuperNew { class, home, args } => {
+                let held: Vec<V> = args
+                    .iter()
+                    .map(|a| {
+                        let v = self.expr(a);
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                // (The class and `new.target`, then the arguments.)
+                let mut vals = vec![
+                    self.table_value(self.env.homes, 2 * class + 1),
+                    self.table_value(self.env.homes, 2 * home + 1),
+                ];
+                vals.extend(held.iter().map(|v| v.any()));
+                let v = self.values_slot(&vals);
+                let argc = self.b.ins().iconst(I32, args.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("lum_super_construct", &[ctx, argc, v]);
+                self.check_value(r[1]);
+                for v in held.into_iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(r[0], r[1])
+            }
+            ExprKind::SuperNewSpread { class, home, args } => {
+                let av = self.expr(args);
+                self.hold(av);
+                let vals = [
+                    self.table_value(self.env.homes, 2 * class + 1),
+                    self.table_value(self.env.homes, 2 * home + 1),
+                    av.any(),
+                ];
+                let v = self.values_slot(&vals);
+                let ctx = self.ctx;
+                let r = self.helper("lum_super_construct_array", &[ctx, v]);
+                self.check_value(r[1]);
+                self.release(av);
+                self.free_v(av);
+                V::Any(r[0], r[1])
+            }
             ExprKind::Object(props) => self.new_object(props, None),
             ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
             ExprKind::NewInstanceFull { class, fields, brand, privates } => {
