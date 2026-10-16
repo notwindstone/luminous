@@ -9,6 +9,10 @@ such as:
 - arrays with annotated/inferred types `Array<{ something: { huh: string; whoa: boolean } } | string>` are faster than `Array<unknown>`
 - ...
 
+but NOT how bun aot does with their "as string" stuff making actual type conversions lol. though, that's still better than completely ignoring advantages typescript gives us.
+
+jit compiled code is faster for javascript because jit compilers have way more information about the code than the aot compiler of javascript. aot compiler doesn't know a shit for the javascript code, so typescript makes things way better. there are still lots of things to improve, though
+
 # Luminous
 
 Luminous is an ahead-of-time compiler for strict TypeScript, built on
