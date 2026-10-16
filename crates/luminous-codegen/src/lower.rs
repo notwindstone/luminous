@@ -1,8 +1,9 @@
 //! Lowering of function bodies to the backend-neutral IR (`mir.rs`).
 //!
 //! Values: `F64` / `Bool` are plain IR values. `Any` is a QuickJS
-//! `JSValue`: one `I64`, NaN-boxed, its tag in the high half and a
-//! reference the address / 8 in the low one (see `jsvalue`). It is
+//! `JSValue`: one `I64`, NaN-boxed (a double its own bits, any other
+//! value its tag in the high half and its payload, a reference the
+//! address / 8, in the low one: see `jsvalue`). It is
 //! *owned*: every `Any` expression evaluates to a new reference that the
 //! consumer must either store, pass on to a callee that takes ownership,
 //! or free.
@@ -668,9 +669,10 @@ impl Lower {
         val::int(&mut self.b, w)
     }
 
-    /// The int value of `i` (an `i64` in the int32 range).
+    /// The int value of `i` (an `i64` in the int32 range, or a `u32`
+    /// below 2^31).
     fn mk_int(&mut self, i: Value) -> Value {
-        self.b.ins().band_imm_u(i, 0xffff_ffffi64)
+        val::mk_int(&mut self.b, i)
     }
 
     /// The double a float value `w` holds.
@@ -2789,7 +2791,7 @@ impl Lower {
                 let r = match v {
                     V::Any(w) => {
                         // (Null and undefined: tags 2 and 3, payload 0.)
-                        let x = self.b.ins().bor_imm_u(w, val_const(1, 0));
+                        let x = self.b.ins().bor_imm_u(w, 1i64 << 32);
                         let cc = if eq { IntCC::Equal } else { IntCC::NotEqual };
                         self.b.ins().icmp_imm_s(cc, x, val_const(TAG_UNDEFINED, 0))
                     }
@@ -3044,7 +3046,8 @@ impl Lower {
                 let k1 = self.b.ins().iadd_imm_s(count, 1);
                 self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
                 let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
-                self.b.ins().store(M_SLOT, k1, prop, 0);
+                let len = self.mk_int(k1);
+                self.b.ins().store(M_SLOT, len, prop, 0);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(grow);
                 let ctx = self.ctx;
@@ -3204,8 +3207,8 @@ impl Lower {
                 let ta_len = self.b.create_block();
                 self.b.ins().brif(pristine, ta_len, &[], slow, &[]);
                 self.b.switch_to_block(ta_len);
-                // (An int value: the int32 count, tag 0 above it.)
                 let count = self.b.ins().uload32(M_HEADER, op_, layout::OBJ_ARRAY_COUNT);
+                let count = self.mk_int(count);
                 self.b.ins().jump(join, &[BlockArg::Value(count)]);
                 // Strings: the length in the header.
                 self.b.switch_to_block(not_obj);
@@ -3215,6 +3218,7 @@ impl Lower {
                 self.b.switch_to_block(string);
                 let head = self.b.ins().uload32(M_HEADER, op_, layout::STRING_LEN);
                 let len = self.b.ins().band_imm_u(head, 0x7fff_ffff);
+                let len = self.mk_int(len);
                 self.b.ins().jump(join, &[BlockArg::Value(len)]);
                 self.b.switch_to_block(slow);
                 let a = self.atom(*atom);
@@ -4968,7 +4972,8 @@ impl Lower {
                 // (`length`: an int value, the count.)
                 let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
                 let len = self.b.ins().load(I64, M_SLOT, prop, 0);
-                let ok = self.b.ins().icmp(IntCC::Equal, len, count);
+                let want = self.mk_int(count);
+                let ok = self.b.ins().icmp(IntCC::Equal, len, want);
                 let next = self.b.create_block();
                 self.b.ins().brif(ok, next, &[], slow_b, &[]);
                 self.b.switch_to_block(next);
@@ -5008,7 +5013,8 @@ impl Lower {
             // (`length`: an int value, the count.)
             let prop = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_PROP);
             let len = self.b.ins().load(I64, M_SLOT, prop, 0);
-            let ok = self.b.ins().icmp(IntCC::Equal, len, count);
+            let want = self.mk_int(count);
+            let ok = self.b.ins().icmp(IntCC::Equal, len, want);
             let next = self.b.create_block();
             self.b.ins().brif(ok, next, &[], slow_b, &[]);
             self.b.switch_to_block(next);
@@ -5194,17 +5200,13 @@ impl Lower {
             ptrs.push((o, props));
         }
         // Their fields hold numbers: floats, or int32s too.
-        let mut floats = self.b.ins().iconst(I8, 1);
-        let mut numbers = self.b.ins().iconst(I8, 1);
-        if !fields.is_empty() {
-            let mut words = Vec::new();
-            for &(o, slot) in fields {
-                let props = ptrs.iter().find(|x| x.0 == o).expect("guarded element").1;
-                words.push(self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32));
-            }
-            numbers = self.all_numbers(&words);
-            floats = self.all_floats(&words);
+        // (The second test only where the first fails.)
+        let mut words = Vec::new();
+        for &(o, slot) in fields {
+            let props = ptrs.iter().find(|x| x.0 == o).expect("guarded element").1;
+            words.push(self.b.ins().load(I64, M_SLOT, props, (slot as usize * SIZE) as i32));
         }
+        let floats = self.all_floats(&words);
         // Not the region's other objects (compared by property arrays, which
         // objects do not share).
         if !distinct.is_empty() {
@@ -5231,6 +5233,7 @@ impl Lower {
         let mixed_b = self.b.create_block();
         self.b.ins().brif(floats, float_b, &[], check, &[]);
         self.b.switch_to_block(check);
+        let numbers = self.all_numbers(&words);
         self.b.ins().brif(numbers, mixed_b, &[], fail, &[]);
         for (block, f) in [(float_b, true), (mixed_b, false)] {
             self.b.switch_to_block(block);
@@ -5606,11 +5609,11 @@ impl Lower {
         let mask = self.b.ins().ishl(m8, shift);
         let mask = self.b.ins().bor_imm_u(mask, 0xff);
         let c = self.b.ins().band(c, mask);
-        // (An int value: the code, tag 0 above it.)
         let c = self.b.ins().uextend(I64, c);
+        let c = self.mk_int(c);
         self.b.ins().jump(join, &[BlockArg::Value(c)]);
         self.b.switch_to_block(nan);
-        let nan_v = self.b.ins().iconst(I64, float_value(CANONICAL_NAN_BITS));
+        let nan_v = self.b.ins().iconst(I64, CANONICAL_NAN_BITS);
         self.b.ins().jump(join, &[BlockArg::Value(nan_v)]);
         self.b.switch_to_block(slow);
         let mut vals = vec![fw, sw];
@@ -5889,8 +5892,9 @@ impl Lower {
         let std = self.b.ins().icmp_imm_s(IntCC::NotEqual, std, 0);
         self.b.ins().brif(std, inline, &[], engine, &[]);
         self.b.switch_to_block(inline);
-        // (The new length: an int value.)
+        // (The new length.)
         let n = self.append_inline(sw, None, aw, false, engine);
+        let n = self.mk_int(n);
         self.b.ins().jump(join, &[BlockArg::Value(n)]);
         self.b.switch_to_block(engine);
         let r = self.helper("JS_ArrayPushFast", &[ctx, sw, aw]);
@@ -6048,7 +6052,7 @@ impl Lower {
 
     /// Whether `w` is `null` or `undefined` (tags 2 and 3, payload 0).
     fn is_nullish(&mut self, w: Value) -> Value {
-        let x = self.b.ins().bor_imm_u(w, val_const(1, 0));
+        let x = self.b.ins().bor_imm_u(w, 1i64 << 32);
         self.b.ins().icmp_imm_s(IntCC::Equal, x, val_const(TAG_UNDEFINED, 0))
     }
 
@@ -6141,7 +6145,7 @@ impl Lower {
         let join = self.b.create_block();
         let res = self.b.append_block_param(join, I8);
         // int / bool (tags 0 and 1): payload != 0
-        let small = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, w, val_const(TAG_BOOL + 1, 0));
+        let small = val::tag_in(&mut self.b, w, TAG_INT, TAG_BOOL);
         let int_blk = self.b.create_block();
         let other = self.b.create_block();
         self.b.ins().brif(small, int_blk, &[], other, &[]);
@@ -6186,10 +6190,12 @@ impl Lower {
     ) {
         // (A second parameter of `join`: the result's number.)
         let shadow = self.b.block_params(join).len() == 2;
-        // All int32s: none has a bit of its high half set.
-        let mut any = vals[0];
+        // All int32s: none has another high half than an int's.
+        let base = val_const(TAG_INT, 0);
+        let mut any = self.b.ins().bxor_imm_u(vals[0], base);
         for &w in &vals[1..] {
-            any = self.b.ins().bor(any, w);
+            let x = self.b.ins().bxor_imm_u(w, base);
+            any = self.b.ins().bor(any, x);
         }
         let all = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, any, 1i64 << 32);
         let int_blk = self.b.create_block();
@@ -6203,6 +6209,7 @@ impl Lower {
                 self.b.ins().brif(overflow, rest, &[], ok, &[]);
                 self.b.switch_to_block(ok);
                 let w = self.b.ins().uextend(I64, r);
+                let w = self.mk_int(w);
                 let mut args = vec![BlockArg::Value(w)];
                 if shadow {
                     args.push(BlockArg::Value(self.b.ins().fcvt_from_sint(F64, r)));
@@ -6515,8 +6522,8 @@ impl Lower {
             let back = self.b.ins().sextend(I64, i32v);
             let is_int = self.b.ins().icmp(IntCC::Equal, back, i);
             let int_w = self.b.ins().uextend(I64, i32v);
-            let u = self.b.ins().bitcast(I64, d);
-            let float_w = self.b.ins().iadd_imm_s(u, -FLOAT_OFFSET);
+            let int_w = self.mk_int(int_w);
+            let float_w = self.b.ins().bitcast(I64, d);
             return self.b.ins().select(is_int, int_w, float_w);
         }
         let u = self.b.ins().bitcast(I64, d);
@@ -6528,6 +6535,7 @@ impl Lower {
         let not_neg_zero = self.b.ins().icmp_imm_s(IntCC::NotEqual, u, i64::MIN);
         let is_int = self.b.ins().band(same, not_neg_zero);
         let int_w = self.b.ins().uextend(I64, i);
+        let int_w = self.mk_int(int_w);
         let float_w = self.box_float_raw(d);
         self.b.ins().select(is_int, int_w, float_w)
     }
@@ -7160,6 +7168,7 @@ impl Lower {
             self.b.ins().brif(fits, store, &[], wide, &[]);
             self.b.switch_to_block(store);
             let nw = self.b.ins().uextend(I64, r32);
+            let nw = self.mk_int(nw);
             self.b.ins().store(M_SLOT, nw, at, 0);
             self.b.ins().jump(join, &result(nw));
             self.b.switch_to_block(wide);
@@ -7511,9 +7520,10 @@ impl Lower {
             table.set_entry(i as u128, b);
         }
         table.emit(&mut self.b, storage, blocks[3]);
-        // int32 (an int value: tag 0 above it)
+        // int32
         self.b.switch_to_block(blocks[0]);
         let i = self.b.ins().uload32(M_STRUCT, at, 0);
+        let i = self.mk_int(i);
         self.b.ins().jump(join, &[BlockArg::Value(i)]);
         // f64
         self.b.switch_to_block(blocks[1]);
@@ -7868,9 +7878,10 @@ impl Lower {
         let count = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_COUNT);
         let size = self.b.ins().uload32(M_HEADER, ap, layout::OBJ_ARRAY_SIZE);
         let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
-        // (`length`: an int value, its int32 above 0 here.)
-        let len = self.b.ins().load(I64, M_SLOT, prop, 0);
-        let is_int = self.val_is(len, TAG_INT);
+        // (`length`: an int value, its int32 not negative here.)
+        let lw = self.b.ins().load(I64, M_SLOT, prop, 0);
+        let is_int = self.val_is(lw, TAG_INT);
+        let len = self.b.ins().band_imm_u(lw, 0xffff_ffffi64);
         let (k, at_count) = match idx {
             Some(k) => (k, self.b.ins().icmp(IntCC::Equal, k, count)),
             None => (count, self.b.ins().icmp(IntCC::Equal, len, count)),
@@ -7890,6 +7901,7 @@ impl Lower {
         let k1 = self.b.ins().iadd_imm_s(k, 1);
         let grow = self.b.ins().icmp(IntCC::UnsignedLessThan, len, k1);
         let new_len = self.b.ins().select(grow, k1, len);
+        let new_len = self.mk_int(new_len);
         self.b.ins().store(M_SLOT, new_len, prop, 0);
         let at = self.array_slot(ap, k);
         self.b.ins().store(M_SLOT, vw, at, 0);
@@ -7930,9 +7942,9 @@ impl Lower {
         self.b.ins().istore32(M_HEADER, k1, ap, layout::OBJ_ARRAY_COUNT);
         self.write_barrier(ap, vw);
         if length {
-            // (An int value.)
             let prop = self.b.ins().load(I64, M_HEADER, ap, layout::OBJ_PROP);
-            self.b.ins().store(M_SLOT, k1, prop, 0);
+            let len = self.mk_int(k1);
+            self.b.ins().store(M_SLOT, len, prop, 0);
         }
         let args: Vec<BlockArg> = args.iter().map(|&v| BlockArg::Value(v)).collect();
         self.b.ins().jump(next, &args);
@@ -7986,21 +7998,26 @@ impl Lower {
                 let x = self.b.ins().load(I32, m, at, 0);
                 self.b.ins().fcvt_from_sint(F64, x)
             }
-            // A promoted float32 NaN never has the low bits of the reserved
-            // `undefined` NaN.
+            // Any NaN may be stored: made the canonical one, the one NaN
+            // native code reads from memory with bits of its own (see
+            // `val::float`; also never the reserved `undefined` NaN).
             ArrKind::Float32 => {
                 let x = self.b.ins().load(F32, m, at, 0);
-                self.b.ins().fpromote(F64, x)
+                let d = self.b.ins().fpromote(F64, x);
+                self.canonical_nan(d)
             }
             ArrKind::Float64 => {
-                // Any NaN may be stored; never the reserved one.
-                let bits = self.b.ins().load(I64, m, at, 0);
-                let reserved = self.b.ins().icmp_imm_s(IntCC::Equal, bits, MAYBE_F64_UNDEFINED as i64);
-                let nan = self.b.ins().iconst(I64, f64::NAN.to_bits() as i64);
-                let bits = self.b.ins().select(reserved, nan, bits);
-                self.b.ins().bitcast(F64, bits)
+                let d = self.b.ins().load(F64, m, at, 0);
+                self.canonical_nan(d)
             }
         }
+    }
+
+    /// `d`, or the canonical NaN if it is a NaN.
+    fn canonical_nan(&mut self, d: Value) -> Value {
+        let nan = self.b.ins().fcmp(FloatCC::Unordered, d, d);
+        let canonical = self.b.ins().f64const(f64::from_bits(CANONICAL_NAN_BITS as u64));
+        self.b.ins().select(nan, canonical, d)
     }
 
     /// Store number `d` at `at`, converted as the engine does.

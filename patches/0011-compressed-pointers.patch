@@ -1,13 +1,14 @@
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -169,6 +169,21 @@
+@@ -169,6 +169,22 @@
     - string contents is either pure ASCII or is UTF-8 encoded.
   */
  
 +/* luminous: JS_COMPRESSED_POINTERS (64-bit builds, the default;
 +   -DJS_COMPRESSED_POINTERS=0 for 16-byte values): values are 8 bytes,
-+   NaN-boxed as on 32-bit platforms, a reference holding the address / 8
-+   in 32 bits; every cell is below 32 GB (see js_cage). */
++   NaN-boxed (a double its own bits, the other values in the NaN space),
++   a reference holding the address / 8 in 32 bits; every cell is below
++   32 GB (see js_cage). */
 +#if !defined(JS_COMPRESSED_POINTERS) && INTPTR_MAX >= INT64_MAX
 +#define JS_COMPRESSED_POINTERS 1
 +#endif
@@ -22,25 +23,87 @@
  /* Overridable purely for testing purposes; don't touch. */
  #ifndef JS_NAN_BOXING
  #if INTPTR_MAX < INT64_MAX
-@@ -256,10 +271,16 @@
+@@ -252,15 +268,53 @@
+ 
+ typedef uint64_t JSValue;
+ 
++#if defined(JS_COMPRESSED_POINTERS)
++/* luminous: a double is its own bits (a NaN made the canonical one); any
++   other value has a high half no double has, its tag plus JS_TAG_BASE
++   (0xffffffef to 0xffffffff: negative NaNs that no arithmetic makes),
++   and its payload in the low half: an int32, a bool, or a reference (the
++   address / 8, the address below 32 GB). */
++#define JS_TAG_BASE 0xfffffff8u
++#define JS_VALUE_GET_TAG(v) (int)((uint32_t)((v) >> 32) - JS_TAG_BASE)
++#define JS_MKVAL(tag, val) (((uint64_t)(uint32_t)((tag) + JS_TAG_BASE) << 32) | (uint32_t)(val))
++#define JS_VALUE_GET_PTR(v) ((void *)((uintptr_t)(uint32_t)(v) << 3))
++#define JS_MKPTR(tag, ptr) (((uint64_t)(uint32_t)((tag) + JS_TAG_BASE) << 32) | (uint32_t)((uintptr_t)(ptr) >> 3))
++#else
+ #define JS_VALUE_GET_TAG(v) (int)((v) >> 32)
++#define JS_VALUE_GET_PTR(v) (void *)(intptr_t)(v)
++#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uintptr_t)(ptr))
++#define JS_MKVAL(tag, val) (((uint64_t)(tag) << 32) | (uint32_t)(val))
++#endif
  #define JS_VALUE_GET_INT(v) (int)(v)
  #define JS_VALUE_GET_BOOL(v) (int)(v)
  #define JS_VALUE_GET_SHORT_BIG_INT(v) (int)(v)
-+#if defined(JS_COMPRESSED_POINTERS)
-+/* (A reference: the address / 8, the address below 32 GB.) */
-+#define JS_VALUE_GET_PTR(v) ((void *)((uintptr_t)(uint32_t)(v) << 3))
-+#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uint32_t)((uintptr_t)(ptr) >> 3))
-+#else
- #define JS_VALUE_GET_PTR(v) (void *)(intptr_t)(v)
-+#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uintptr_t)(ptr))
-+#endif
+-#define JS_VALUE_GET_PTR(v) (void *)(intptr_t)(v)
  
- #define JS_MKVAL(tag, val) (((uint64_t)(tag) << 32) | (uint32_t)(val))
+-#define JS_MKVAL(tag, val) (((uint64_t)(tag) << 32) | (uint32_t)(val))
 -#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uintptr_t)(ptr))
++#if defined(JS_COMPRESSED_POINTERS)
++static inline double JS_VALUE_GET_FLOAT64(JSValue v)
++{
++    union {
++        JSValue v;
++        double d;
++    } u;
++    u.v = v;
++    return u.d;
++}
++
++#define JS_NAN ((JSValue)0x7ff8000000000000)
  
++static inline JSValue __JS_NewFloat64(double d)
++{
++    union {
++        double d;
++        uint64_t u64;
++    } u;
++    u.d = d;
++    /* normalize NaN */
++    if ((u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000)
++        return JS_NAN;
++    return u.u64;
++}
++#else
  #define JS_FLOAT64_TAG_ADDEND (0x7ff80000 - JS_TAG_FIRST + 1) /* quiet NaN encoding */
  
-@@ -1299,17 +1320,30 @@
+ static inline double JS_VALUE_GET_FLOAT64(JSValue v)
+@@ -291,6 +345,7 @@
+         v = u.u64 - ((uint64_t)JS_FLOAT64_TAG_ADDEND << 32);
+     return v;
+ }
++#endif
+ 
+ #define JS_TAG_IS_FLOAT64(tag) ((unsigned)((tag) - JS_TAG_FIRST) >= (JS_TAG_FLOAT64 - JS_TAG_FIRST))
+ 
+@@ -307,9 +362,14 @@
+ 
+ static inline bool JS_VALUE_IS_NAN(JSValue v)
+ {
++#if defined(JS_COMPRESSED_POINTERS)
++    /* (Any NaN: native code may make others than the canonical one.) */
++    return JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v)) && (v & 0x7fffffffffffffff) > 0x7ff0000000000000;
++#else
+     uint32_t tag;
+     tag = JS_VALUE_GET_TAG(v);
+     return tag == (JS_NAN >> 32);
++#endif
+ }
+ 
+ #else /* !JS_NAN_BOXING */
+@@ -1299,17 +1359,30 @@
  #define JS_LAYOUT_OBJ_APPEND_FLAGS  0x20012 /* ... of an extensible fast array (JS_LayoutCheck) */
  #define JS_LAYOUT_CTX_STD_ARRAY_PROTO 32 /* uint8_t: no index properties on the array prototypes */
  /* Reading global variables inline (lum_global_get's cache). */
@@ -71,7 +134,7 @@
  #define JS_LAYOUT_GC_CELL_WORD      0xfe0000
  #define JS_LAYOUT_MALLOC_OVERHEAD   8
  JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
-@@ -1702,8 +1736,13 @@
+@@ -1702,8 +1775,13 @@
  #define JS_LAYOUT_FTMPL_FLAGS       0
  #define JS_LAYOUT_FTMPL_SHAPE       8
  #define JS_LAYOUT_FTMPL_PROPS       16

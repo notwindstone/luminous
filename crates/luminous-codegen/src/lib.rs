@@ -53,10 +53,11 @@ pub fn fast_symbol_name(id: ir::FuncId) -> String {
 pub const NATIVE_STACK_BUDGET: u64 = 4 * 1024 * 1024;
 
 /// `JSValue`s (the engine's `JS_COMPRESSED_POINTERS`): 8 bytes, NaN-boxed.
-/// The high half is the tag, the low half its payload: an int32, a bool,
-/// or a reference (the address of a cell / 8; cells are below 32 GB). A
-/// float is any other high half: its bits minus `FLOAT_OFFSET`. The
-/// generated C glue `_Static_assert`s these.
+/// A double is its own bits (no NaN but those `val::float` allows); any
+/// other value has a high half no double has (its tag plus `TAG_BASE`:
+/// 0xffffffef to 0xffffffff) and its payload in the low half: an int32, a
+/// bool, or a reference (the address of a cell / 8; cells are below 32
+/// GB). The generated C glue `_Static_assert`s these.
 pub mod jsvalue {
     pub const SIZE: usize = 8;
     /// The lowest tag (`JS_TAG_FIRST`): the tags of references are
@@ -72,70 +73,57 @@ pub mod jsvalue {
     pub const TAG_UNINITIALIZED: i64 = 4;
     pub const TAG_EXCEPTION: i64 = 6;
     pub const TAG_FLOAT64: i64 = 8;
-    /// What is added to a float value to give its double's bits
-    /// (`JS_FLOAT64_TAG_ADDEND << 32`).
-    pub const FLOAT_OFFSET: i64 = (0x7ff8_0000 - FIRST_TAG + 1) << 32;
+    /// What a tag's high half is above the tag (`JS_TAG_BASE`).
+    pub const TAG_BASE: u32 = 0xffff_fff8;
     /// The bits of the double NaN values hold.
     pub const CANONICAL_NAN_BITS: i64 = 0x7ff8_0000_0000_0000;
 
     /// The value of a tag that is no float's, with a 32-bit payload.
     pub const fn val_const(tag: i64, payload: i64) -> i64 {
-        ((tag as u64) << 32 | (payload as u64 & 0xffff_ffff)) as i64
+        (((tag as u32).wrapping_add(TAG_BASE) as u64) << 32 | (payload as u64 & 0xffff_ffff)) as i64
     }
 
-    /// The value of the float whose bits are `bits` (not a NaN but the
-    /// canonical one).
-    pub const fn float_value(bits: i64) -> i64 {
-        bits.wrapping_sub(FLOAT_OFFSET)
-    }
+    /// Values below this are floats.
+    pub const FLOATS_END: i64 = val_const(FIRST_TAG, 0);
 }
 
 /// Values (see `jsvalue`) in IR: their tests, decoding and making.
 pub(crate) mod val {
     use super::jsvalue::*;
     use crate::mir::types::{F64, I32, I64};
-    use crate::mir::{FloatCC, FunctionBuilder, IntCC, Value};
-
-    /// The high half of `w` (its tag, or a float's), as an `I32`.
-    pub fn hi(b: &mut FunctionBuilder, w: Value) -> Value {
-        let hi = b.ins().ushr_imm_u(w, 32);
-        b.ins().ireduce(I32, hi)
-    }
+    use crate::mir::{FunctionBuilder, IntCC, Value};
 
     /// Whether `w` has tag `tag`.
     pub fn is(b: &mut FunctionBuilder, w: Value, tag: i64) -> Value {
-        match tag {
-            TAG_FLOAT64 => is_float(b, w),
-            // (No tag above the object's; no int above 2^32.)
-            TAG_OBJECT => b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, w, val_const(TAG_OBJECT, 0)),
-            TAG_INT => b.ins().icmp_imm_u(IntCC::UnsignedLessThan, w, 1i64 << 32),
-            _ => {
-                let hi = b.ins().ushr_imm_u(w, 32);
-                b.ins().icmp_imm_s(IntCC::Equal, hi, tag as u32 as i64)
-            }
+        if tag == TAG_FLOAT64 {
+            return is_float(b, w);
         }
+        let hi = b.ins().ushr_imm_u(w, 32);
+        b.ins().icmp_imm_s(IntCC::Equal, hi, val_const(tag, 0) as u64 as i64 >> 32 & 0xffff_ffff)
     }
 
-    /// Whether `w` is a float (`JS_TAG_IS_FLOAT64`: its high half is none
-    /// of the tags).
+    /// Whether `w` is a float (a double, its high half below the tags').
     pub fn is_float(b: &mut FunctionBuilder, w: Value) -> Value {
-        let hi = hi(b, w);
-        let x = b.ins().iadd_imm_s(hi, -FIRST_TAG);
-        b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, x, TAG_FLOAT64 - FIRST_TAG)
+        b.ins().icmp_imm_u(IntCC::UnsignedLessThan, w, FLOATS_END)
     }
 
     /// Whether `w` is a number: an int32 or a float.
     pub fn is_number(b: &mut FunctionBuilder, w: Value) -> Value {
-        let hi = hi(b, w);
-        let x = b.ins().iadd_imm_s(hi, -FIRST_TAG);
-        let float = b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, x, TAG_FLOAT64 - FIRST_TAG);
-        let int = b.ins().icmp_imm_s(IntCC::Equal, x, TAG_INT - FIRST_TAG);
+        let float = is_float(b, w);
+        let int = is(b, w, TAG_INT);
         b.ins().bor(int, float)
+    }
+
+    /// Whether `w` has a tag in `lo..=hi` (one compare, after moving
+    /// `lo`'s values to 0).
+    pub fn tag_in(b: &mut FunctionBuilder, w: Value, lo: i64, hi: i64) -> Value {
+        let x = b.ins().iadd_imm_s(w, val_const(lo, 0).wrapping_neg());
+        b.ins().icmp_imm_u(IntCC::UnsignedLessThan, x, (hi - lo + 1) << 32)
     }
 
     /// Whether `w` is a reference (to a cell).
     pub fn is_ref(b: &mut FunctionBuilder, w: Value) -> Value {
-        b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, w, val_const(FIRST_TAG, 0))
+        tag_in(b, w, FIRST_TAG, TAG_OBJECT)
     }
 
     /// The address a reference `w` holds.
@@ -156,10 +144,16 @@ pub(crate) mod val {
         b.ins().sextend(I64, i)
     }
 
-    /// The double a float value `w` holds.
+    /// The int value of `i` (an integer in the int32 range, or a `u32`
+    /// below 2^31, in an `I64`).
+    pub fn mk_int(b: &mut FunctionBuilder, i: Value) -> Value {
+        let lo = b.ins().band_imm_u(i, 0xffff_ffffi64);
+        b.ins().bor_imm_u(lo, val_const(TAG_INT, 0))
+    }
+
+    /// The double a float value `w` holds: its bits.
     pub fn f64(b: &mut FunctionBuilder, w: Value) -> Value {
-        let bits = b.ins().iadd_imm_s(w, FLOAT_OFFSET);
-        b.ins().bitcast(F64, bits)
+        b.ins().bitcast(F64, w)
     }
 
     /// The number in `w`, an int32 or a float.
@@ -171,14 +165,14 @@ pub(crate) mod val {
         b.ins().select(is_int, fi, ff)
     }
 
-    /// The float value of `d` (NaN made the one NaN, whose bits are no
-    /// other value's).
+    /// The float value of `d`: its bits. Some NaNs' bits would be other
+    /// values' (those whose high half is a tag's, 0xffffffef and up):
+    /// native code has none. The engine's values hold only the canonical
+    /// NaN, typed array loads make theirs that one (`Lower::load_element`),
+    /// and arithmetic makes the default NaN or passes on one of those
+    /// (`MAYBE_F64_UNDEFINED`'s high half is the canonical one's too).
     pub fn float(b: &mut FunctionBuilder, d: Value) -> Value {
-        let bits = b.ins().bitcast(I64, d);
-        let nan = b.ins().fcmp(FloatCC::Unordered, d, d);
-        let canonical = b.ins().iconst(I64, CANONICAL_NAN_BITS);
-        let bits = b.ins().select(nan, canonical, bits);
-        b.ins().iadd_imm_s(bits, -FLOAT_OFFSET)
+        b.ins().bitcast(I64, d)
     }
 
     /// The bool value of `x` (an `I8` 0 or 1).
@@ -1189,7 +1183,7 @@ impl Codegen {
                 (_, V::Num(d)) if local_ty == Ty::Any => box_number(&mut b, d),
                 (_, V::Num(d)) => val::float(&mut b, d),
                 (_, V::Bool(x)) => val::boolean(&mut b, x),
-                (_, V::Int(i)) if local_ty == Ty::Any => b.ins().band_imm_u(i, 0xffff_ffffi64),
+                (_, V::Int(i)) if local_ty == Ty::Any => val::mk_int(&mut b, i),
                 (_, V::Int(i)) => {
                     let d = b.ins().fcvt_from_sint(F64, i);
                     val::float(&mut b, d)
@@ -1349,7 +1343,7 @@ impl Codegen {
             Ty::Void => b.ins().iconst(I64, jsvalue::val_const(jsvalue::TAG_UNDEFINED, 0)),
             Ty::Bool => val::boolean(&mut b, rv[0]),
             Ty::F64 => box_number(&mut b, rv[0]),
-            Ty::I32 => b.ins().band_imm_u(rv[0], 0xffff_ffffi64),
+            Ty::I32 => val::mk_int(&mut b, rv[0]),
             Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_) => rv[0],
             // The checker boxes these returns.
             Ty::MaybeF64 => unreachable!("MaybeF64 return type"),
@@ -1614,6 +1608,7 @@ fn box_number(b: &mut FunctionBuilder, d: Value) -> Value {
     let is_int = b.ins().select(small, small_int, big_int);
     let i = b.ins().fcvt_to_sint_sat(I32, d);
     let int_w = b.ins().uextend(I64, i);
+    let int_w = val::mk_int(b, int_w);
     let float_w = val::float(b, d);
     b.ins().select(is_int, int_w, float_w)
 }

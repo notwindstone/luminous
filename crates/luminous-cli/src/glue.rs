@@ -56,7 +56,7 @@ pub fn generate(
 #error "luminous needs the engine built with JS_COMPRESSED_POINTERS"
 #endif
 _Static_assert(sizeof(JSValue) == {size}, "luminous needs 8-byte JSValues");
-_Static_assert(JS_FLOAT64_TAG_ADDEND == {addend}, "unexpected float encoding");
+_Static_assert(JS_TAG_BASE == {base}u, "unexpected value encoding");
 _Static_assert(JS_TAG_INT == {int} && JS_TAG_BOOL == {bool} && JS_TAG_UNDEFINED == {undef} &&
                JS_TAG_UNINITIALIZED == {uninit} && JS_TAG_EXCEPTION == {exc} &&
                JS_TAG_FLOAT64 == {f64} && JS_TAG_STRING == {string} && JS_TAG_NULL == {null},
@@ -67,7 +67,7 @@ _Static_assert(LUM_NATIVE_STACK == {budget}u, "stack budget mismatch");
 
 "#,
         size = jsvalue::SIZE,
-        addend = jsvalue::FLOAT_OFFSET >> 32,
+        base = jsvalue::TAG_BASE,
         int = jsvalue::TAG_INT,
         bool = jsvalue::TAG_BOOL,
         undef = jsvalue::TAG_UNDEFINED,
