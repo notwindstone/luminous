@@ -1,5 +1,5 @@
-// @native ok noAnnot str obj fallsOff global useVar closure
-// @interpreted reassigned args tdz assignConst
+// @native ok noAnnot str obj fallsOff global useVar closure args
+// @interpreted reassigned tdz assignConst
 function ok(x: number): number { return x; }
 function reassigned(x: number): number { return x; }
 function noAnnot(x) { return x; }
