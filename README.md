@@ -541,11 +541,19 @@ The differential tests run every case with both.
 - **LLVM** emits LLVM IR (text) and compiles it with `clang -O3
   -march=native` (clang ≥ 15 on `PATH`, or `--clang` / `LUMINOUS_CLANG`;
   `--march` picks another CPU, e.g. `x86-64-v3` for portable executables).
-  Compiling takes seconds, and the code is optimized much further:
+  Compiling takes seconds, and the code is optimized much further. A large
+  program's IR (4 MB or more) is split into as many modules as the host
+  has threads (8 at most), each defining a run of its functions and
+  declaring the others, compiled by that many clangs at once: Beyond's
+  Hono app (186 MB of IR) builds in a third of the time (1 min 34 s
+  against 4 min 19 s on 4 cores: bundling, analysis and linking stay
+  serial), its code running the same instructions per request (67,008
+  against 67,159 as one module):
   - the functions that only native code calls are internal to the LLVM
     module, so LLVM inlines them anywhere in the program (recursive `fib` is
     partly inlined into itself), drops the unused ones and picks their
-    calling convention;
+    calling convention (in a split program, within its part: those of the
+    others are hidden, and the always-inlined ones copied into each);
   - every load and store carries its alias region as type-based alias
     analysis metadata: cell headers, `JSValue` slots (properties,
     elements, cells, frames), the engine's object headers, typed array

@@ -353,8 +353,9 @@ impl Default for Options {
 pub enum Output {
     /// A relocatable object file.
     Object(Vec<u8>),
-    /// An LLVM module (textual IR), compiled by `llvm::compile`.
-    LlvmIr(String),
+    /// LLVM modules (textual IR), compiled by `llvm::compile_parts` and
+    /// linked together.
+    LlvmIr(Vec<String>),
 }
 
 /// Lower `m` to the backend-neutral IR.
@@ -380,7 +381,7 @@ pub fn compile(m: &ir::Module, opts: &Options) -> Result<Output> {
     let module = lower_module(m)?;
     Ok(match opts.backend {
         Backend::Cranelift => Output::Object(clif::emit(&module, &opts.opt_level)?),
-        Backend::Llvm => Output::LlvmIr(llvm::emit(&module, &opts.llvm)?),
+        Backend::Llvm => Output::LlvmIr(llvm::emit_parts(&module, &opts.llvm, opts.llvm.jobs)?),
     })
 }
 

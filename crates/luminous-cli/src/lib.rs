@@ -9,7 +9,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use luminous_codegen::{Backend, Output};
+pub use luminous_codegen::Backend;
+use luminous_codegen::Output;
 use luminous_front::Analysis;
 use luminous_front::bundle::Bundle;
 use luminous_front::erase::NATIVE_MODULE;
@@ -425,16 +426,25 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         link.arg(tmp.join("main.c")).arg(tmp.join("program.c")).arg(tmp.join("glue.c")).arg(tmp.join("luminous_rt.c"));
         if has_native {
             let cg = opts.codegen()?;
-            let obj = tmp.join("native.o");
             match luminous_codegen::compile(&analysis.module, &cg)? {
-                Output::Object(bytes) => std::fs::write(&obj, bytes)?,
-                Output::LlvmIr(ir) => {
-                    let ll = tmp.join("native.ll");
-                    std::fs::write(&ll, ir)?;
-                    luminous_codegen::llvm::compile(&ll, &obj, &cg.llvm)?;
+                Output::Object(bytes) => {
+                    let obj = tmp.join("native.o");
+                    std::fs::write(&obj, bytes)?;
+                    link.arg(&obj);
+                }
+                Output::LlvmIr(parts) => {
+                    let (mut lls, mut objs) = (Vec::new(), Vec::new());
+                    for (i, ir) in parts.iter().enumerate() {
+                        let name = if parts.len() == 1 { "native".to_string() } else { format!("native{i}") };
+                        let ll = tmp.join(format!("{name}.ll"));
+                        std::fs::write(&ll, ir)?;
+                        lls.push(ll);
+                        objs.push(tmp.join(format!("{name}.o")));
+                    }
+                    luminous_codegen::llvm::compile_parts(&lls, &objs, &cg.llvm)?;
+                    link.args(&objs);
                 }
             }
-            link.arg(&obj);
         }
         // (The embedder's libraries use the engine's: before it.)
         link.args(&opts.embed.link);
