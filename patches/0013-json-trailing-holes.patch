@@ -1,0 +1,14 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -56374,6 +56374,11 @@
+             find_own_property1(p, JS_ATOM_toJSON))
+             return 0;
+         uint32_t len = p->u.array.count;
++        /* (Holes after the elements, up to a longer length, are read from
++           the prototypes: the generic path.) */
++        if (JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
++            (uint32_t)JS_VALUE_GET_INT(p->prop[0].u.value) != len)
++            return 0;
+         string_buffer_putc8(b, '[');
+         for (uint32_t i = 0; i < len; i++) {
+             if (i > 0)

@@ -134,7 +134,8 @@ regular call path's generated code alone.
 `0004-prototype-epoch.patch`, `0005-json-writers.patch`,
 `0006-native-construction.patch`, `0007-promises.patch`,
 `0008-function-source.patch`, `0009-arguments.patch`,
-`0010-class-constructors.patch` and `0011-compressed-pointers.patch`, each
+`0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
+`0012-pristine-builtins.patch` and `0013-json-trailing-holes.patch`, each
 made against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -207,6 +208,28 @@ engine's semantics:
   functions using `arguments` make (`0009`);
 - 8-byte values with compressed references (`0011`, see
   [Values](#values-8-bytes));
+- builtins that skip what the specification looks up while it is still the
+  builtins' own, as JSC's (`0012`). The bits of what the promise builtins
+  rely on (re-checked when the prototype epoch moves: no cost while
+  nothing changes) also cover %RegExp.prototype% (`exec`, `flags` and the
+  flag getters, the symbol methods), array species
+  (`Array.prototype.constructor`, `Array[Symbol.species]`) and the absence
+  of `then` on %Object.prototype%. While they hold, and for a regexp of
+  the original shape: `match`, `search` and `replace` of strings call the
+  regexp builtins directly, which read the flags from the compiled regexp
+  and call `exec` without looking it up; `exec` reads and writes
+  `lastIndex` in its slot, keeps the captures on the stack and appends to
+  its result array directly (one `str.match(re)` in a Hono request: 7,300
+  instructions, now 2,700). `slice` of an array of the original shape
+  copies its elements, and `ArraySpeciesCreate` is an array (Hono's two
+  slices: 3,800 instructions, now 2,100, all but allocation). `await` of
+  an object with no `then` on its prototype chain, and a promise resolved
+  with one, is fulfilled without looking it up (no promise made for the
+  await). `Object.keys` of a plain object of a shared shape comes from a
+  cache of the keys of its shape (900 instructions, now 380);
+- `JSON.stringify` of an array whose length is more than its elements
+  (holes at the end) by the generic path, which reads them from the
+  prototypes (`0013`: the fast path wrote only the elements);
 - `JS_SetCFunctionDataClassConstructor`: a C function data object as a
   class constructor, for classes inside functions: `new` calls it with
   `this` new.target, a call without `new` throws, and it has no fast entry
