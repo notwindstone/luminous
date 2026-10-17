@@ -110,10 +110,9 @@ machine code:
   payloads straight from the interpreter's `JSValue` slots.
 - **Inlined body.** Unless a function is large, its body is compiled straight
   into its JS entry.
-- **Result in registers.** The `JSValue` comes back in `rax:rdx` (`x0:x1` on
-  AArch64). Writing it to memory as two halves and reloading it as one 16-byte
-  value would defeat store forwarding. That stall used to be the largest cost
-  of a call.
+- **Result in a register.** The `JSValue` (8 bytes, see
+  [Values](#values-8-bytes)) comes back in `rax` (`x0` on AArch64), and
+  never touches memory on its way back into the interpreter.
 
 `bench/micro/crossing.ts` measures one call from an interpreted loop:
 
@@ -134,9 +133,9 @@ regular call path's generated code alone.
 `0002-fast-paths.patch`, `0003-promises-and-object-props.patch`,
 `0004-prototype-epoch.patch`, `0005-json-writers.patch`,
 `0006-native-construction.patch`, `0007-promises.patch`,
-`0008-function-source.patch`, `0009-arguments.patch` and
-`0010-class-constructors.patch`, each made against the tree the earlier
-ones give) and builds the engine without
+`0008-function-source.patch`, `0009-arguments.patch`,
+`0010-class-constructors.patch` and `0011-compressed-pointers.patch`, each
+made against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -206,6 +205,8 @@ engine's semantics:
 - `JS_NewArguments`: the (unmapped) `arguments` object of a strict
   function called with given arguments, which the JS entries of native
   functions using `arguments` make (`0009`);
+- 8-byte values with compressed references (`0011`, see
+  [Values](#values-8-bytes));
 - `JS_SetCFunctionDataClassConstructor`: a C function data object as a
   class constructor, for classes inside functions: `new` calls it with
   `this` new.target, a call without `new` throws, and it has no fast entry
@@ -343,8 +344,9 @@ unreachable, and never moves anything.
   properties start where other classes keep their own part, and the
   weak references to an object are listed off the runtime (the object
   keeps a 32-bit index in what was padding): a plain object is 24 bytes
-  and its properties, and `{ left, right }` with its 8-byte cell header
-  fills one 64-byte cache line (it took 112 bytes). Memory traffic is
+  and its properties (8 bytes each, see [Values](#values-8-bytes)), and
+  `{ left, right }` with its 8-byte cell header takes 48 bytes (it took
+  112). Memory traffic is
   what allocation-heavy code waits on: 32 more bytes per object cost a
   binary-trees run 14%. A chunk's pages are made resident as allocation
   runs reach them (all of a run's at once, rather than a fault each), so
@@ -396,6 +398,102 @@ unreachable, and never moves anything.
   that everything reachable is marked, naming the holder of a reference
   whose barrier is missing. The test suite runs with both;
   `QJS_GC_STATS=1` prints the counts at exit.
+
+### Values: 8 bytes
+
+QuickJS-NG's `JSValue` is 16 bytes on 64-bit platforms: a 64-bit payload
+and a 64-bit tag. Patch `0011` makes it 8 bytes: NaN-boxed, as
+JavaScriptCore's values are, with a reference to a cell holding its
+address / 8 in 32 bits, as V8's compressed pointers do.
+
+- **Encoding.** A double is its own 64 bits. Every other value has a
+  high half that no double has, its tag plus `0xfffffff8` (`0xffffffef`
+  to `0xffffffff`: negative NaNs that no arithmetic makes), and its
+  payload in the low half: an int32, a bool, or a reference. A float is
+  then any value below `0xffffffef << 32` (one compare), reading or
+  writing a float field is a plain 8-byte load or store (folded into the
+  arithmetic), an int or object test compares the high half, and a
+  reference's address is `(v & 0xffffffff) << 3`. The engine makes every
+  NaN the canonical one; native code does so for the NaNs it reads from
+  typed arrays, the only place other NaN bits can come from. (QuickJS's
+  own NaN-boxing, for 32-bit platforms, does it the other way round: tags
+  from 0 up, a double offset by an add on its way in and out, which made
+  `bench/nbody.ts` 60% slower here than with 16-byte values.)
+- **The cage.** Every cell (and module record) is below 32 GB: the first
+  runtime reserves the largest range of address space it can get there
+  (normally 4 to 32 GB, `PROT_NONE`, nothing committed), which every
+  runtime of the process shares; the collector's chunks, regions and large
+  cells are mapped out of it, and given back to it (pages released) when
+  freed.
+- **Property slots.** A property is 8 bytes: its value, or an accessor's
+  getter and setter as two 32-bit references (the data of the rare
+  lazily-initialized property is out of line). Elements, closure
+  variables, function data, async frames and the interpreter's stack hold
+  8-byte values.
+- **Native code.** A value is one register (arguments, results, block
+  parameters) and one 8-byte load or store. Async frames, which the
+  collector traces, hold only values: numbers (and integer locals) are
+  stored there as floats. A tag is no longer a register of its own, so
+  the number paths are ordered to need few tests: two int32s, else two
+  floats (one compare each), else one of each, converted by branches;
+  an operation's result carries whether it is a number, so that the
+  next test of it folds away where it came from a number path; a
+  region's guard tests a field from its high half alone (a 32-bit
+  load), so that the loop reads the field straight into a float
+  register.
+- **The collector.** A reference is 32 bits, so the conservative scan of
+  native stacks and registers looks at each half of each word, as well
+  as at the word as an address (anywhere in a cell). A half is taken for
+  a reference only where it is a cell's start, and a low half only under
+  a reference's tag (or alone): the low halves of ordinary addresses on
+  the stack land somewhere in the cage most of the time, and kept what
+  they landed in alive (a tree's subtree, in `bench/binary_trees.ts`).
+
+What it saves: peak memory (maximum resident set size) and time of the
+benchmarks that keep data, 16-byte against 8-byte values (LLVM backend,
+the median of 7 interleaved runs, the run of the table below; bun 1.4.3
+for scale):
+
+| benchmark      | 16-byte values   | 8-byte values    | bun              |
+|----------------|-----------------:|-----------------:|-----------------:|
+| heap           | 184 MB / 340 ms  | 132 MB / 219 ms  | 131 MB / 246 ms  |
+| objects        |  80 MB / 406 ms  |  63 MB / 327 ms  |  88 MB / 389 ms  |
+| records        |  66 MB / 496 ms  |  54 MB / 407 ms  |  64 MB / 594 ms  |
+| arrays         |  41 MB / 120 ms  |  34 MB / 125 ms  |  78 MB / 128 ms  |
+| shapes         |  28 MB / 142 ms  |  21 MB / 153 ms  |  45 MB / 99 ms   |
+| binary_trees   |  63 MB / 268 ms  |  57 MB / 244 ms  |  55 MB / 387 ms  |
+| logparser      | 182 MB / 934 ms  | 175 MB / 923 ms  | 222 MB / 864 ms  |
+| tokenizer      | 111 MB / 199 ms  | 147 MB / 229 ms  | 193 MB / 235 ms  |
+
+`bench/heap.ts` (300,000 records of six fields with a Map index, and a
+grid of numbers) shrinks by 28%, to bun's size; the others by 4 to 25%,
+by what of them is values (strings, which are bytes, stay as they were).
+Times move with fewer cache misses and a smaller heap to trace, and
+against that with more work per value: a reference is decoded before it
+is followed, and a tag compared from the high half. Counted with
+callgrind, the native code of `bench/nbody.ts`, `bench/objects.ts` and
+`bench/binary_trees.ts` runs 2 to 4% fewer instructions than with
+16-byte values, and `bench/raytracer.ts`, `bench/shapes.ts` and
+`bench/records.ts` 10 to 13% more; the engine's C code (most of
+`bench/logparser.ts`, in string methods) about 9% more. In time the
+differences under 10% are within this machine's drift: nbody, on 4%
+fewer instructions, ran as fast as with 16-byte values here and 10 to
+15% slower in other runs (the decoded reference is on its loads' path),
+logparser from as fast to 10% slower.
+
+tokenizer is the exception: it keeps the previous round's array of
+tokens alive through the next round. A register of the module's code
+still holds it, dead, the calls into the engine save that register on
+the stack, and the collector, which scans the stack conservatively,
+finds it there. Whether that happens depends on how registers were
+allocated: with an earlier build of the same code generator it did not,
+and the program peaked at 87 MB.
+
+Servers keep little: Beyond's (`Beyond.serve`, Hono, Elysia) peak 1 MB
+lower, at 23 to 29 MB.
+
+`-DJS_COMPRESSED_POINTERS=0` builds the engine with 16-byte values (the
+generated code needs 8-byte ones), and lifts the 32 GB limit.
 
 ## Backends
 
@@ -1261,35 +1359,38 @@ In `boundary`, the interpreted loop around the calls dominates.
 ### Against node and bun
 
 Median wall time of 7 interleaved runs (the program's own `elapsed`) and
-peak memory (maximum resident set size), LLVM backend with `--march
-x86-64-v3`, against the same program's erased JavaScript under node 22.22
-and bun 1.4.2, on a 4-core x86-64 cloud VM. Timings there drift by 10–20%
-between runs (primes, which allocates nothing, measured 1.00× bun in one
-run and 1.19× in this one); memory is stable.
+peak memory (maximum resident set size, of each program alone: measured
+from a small launcher, as a child forked from a larger process counts
+that one's pages too), LLVM backend with `--march x86-64-v3`, against the
+same program's erased JavaScript under node 22.22 and bun 1.4.3 (with
+`BUN_OPTIONS` cleared: this machine's environment sets it to `--smol`),
+on a 4-core x86-64 cloud VM. Timings there drift by 10–20% between runs,
+and more over a day (this run was about 30% slower than one a few hours
+earlier, for every runtime alike); memory is stable.
 
-| benchmark    | Luminous          | node            | bun            | time / bun | memory / bun |
-|--------------|---------------:|----------------:|---------------:|-----------:|-------------:|
-| hello world  |   –  /  5.7 MB |    –  /  43 MB  |   –  /  11 MB  |          – |        0.50× |
-| fib          |  12 ms / 5.8 MB |   42 ms / 48 MB |  24 ms / 22 MB |      0.50× |        0.27× |
-| xorshift     |  53 ms / 5.6 MB |  136 ms / 50 MB |  80 ms / 23 MB |      0.66× |        0.25× |
-| raytracer    |  33 ms / 10 MB  |   76 ms / 52 MB |  43 ms / 39 MB |      0.77× |        0.27× |
-| binary_trees | 345 ms / 63 MB  |  363 ms / 96 MB | 418 ms / 58 MB |      0.83× |        1.09× |
-| integrate    | 210 ms / 5.9 MB |  378 ms / 51 MB | 248 ms / 24 MB |      0.85× |        0.25× |
-| mandelbrot   |  29 ms / 5.6 MB |   50 ms / 50 MB |  31 ms / 23 MB |      0.94× |        0.24× |
-| logparser    | 930 ms / 181 MB | 1519 ms / 251 MB| 960 ms / 227 MB|      0.97× |        0.80× |
-| objects      | 496 ms / 71 MB  | 1204 ms / 183 MB| 490 ms / 92 MB |      1.01× |        0.77× |
-| arrays       | 190 ms / 43 MB  |  243 ms / 80 MB | 187 ms / 78 MB |      1.02× |        0.55× |
-| nbody        | 156 ms / 6.1 MB |  151 ms / 51 MB | 152 ms / 26 MB |      1.03× |        0.24× |
-| tokenizer    | 279 ms / 170 MB |  562 ms / 208 MB| 267 ms / 197 MB|      1.04× |        0.86× |
-| records      | 736 ms / 64 MB  | 1179 ms / 131 MB| 669 ms / 69 MB |      1.10× |        0.92× |
-| primes       | 224 ms / 5.6 MB |  257 ms / 49 MB | 188 ms / 23 MB |      1.19× |        0.25× |
-| shapes       | 230 ms / 28 MB  |  262 ms / 100 MB| 116 ms / 49 MB |      1.98× |        0.58× |
+| benchmark    | Luminous         | node             | bun              | time / bun | memory / bun |
+|--------------|-----------------:|-----------------:|-----------------:|-----------:|-------------:|
+| hello world  |    –  / 5.7 MB   |     –  / 43 MB   |    –  / 12 MB    |          – |        0.48× |
+| fib          |   9 ms / 5.9 MB  |   45 ms / 48 MB  |   19 ms / 19 MB  |      0.47× |        0.31× |
+| binary_trees | 244 ms / 57 MB   |  290 ms / 96 MB  |  387 ms / 55 MB  |      0.63× |        1.03× |
+| xorshift     |  50 ms / 5.7 MB  |  130 ms / 49 MB  |   76 ms / 21 MB  |      0.66× |        0.28× |
+| records      | 407 ms / 54 MB   |  885 ms / 131 MB |  594 ms / 64 MB  |      0.69× |        0.85× |
+| mandelbrot   |  23 ms / 5.7 MB  |   40 ms / 50 MB  |   30 ms / 21 MB  |      0.77× |        0.27× |
+| objects      | 327 ms / 63 MB   |  959 ms / 183 MB |  389 ms / 88 MB  |      0.84× |        0.72× |
+| heap         | 219 ms / 132 MB  |  415 ms / 169 MB |  246 ms / 131 MB |      0.89× |        1.01× |
+| raytracer    |  36 ms / 10 MB   |   58 ms / 52 MB  |   39 ms / 37 MB  |      0.92× |        0.28× |
+| integrate    | 200 ms / 5.9 MB  |  344 ms / 50 MB  |  211 ms / 22 MB  |      0.95× |        0.27× |
+| tokenizer    | 229 ms / 147 MB  |  551 ms / 210 MB |  235 ms / 193 MB |      0.97× |        0.76× |
+| arrays       | 125 ms / 34 MB   |  178 ms / 80 MB  |  128 ms / 78 MB  |      0.98× |        0.43× |
+| nbody        | 142 ms / 6.1 MB  |  126 ms / 51 MB  |  142 ms / 24 MB  |      1.00× |        0.26× |
+| logparser    | 923 ms / 175 MB  | 1234 ms / 251 MB |  864 ms / 222 MB |      1.07× |        0.79× |
+| primes       | 192 ms / 5.8 MB  |  217 ms / 49 MB  |  180 ms / 21 MB  |      1.07× |        0.28× |
+| shapes       | 153 ms / 21 MB   |  221 ms / 101 MB |   99 ms / 45 MB  |      1.55× |        0.47× |
 
-`bun --smol` changes little here (within a few percent of plain bun but
-for raytracer: 32MB, 61ms). The collector can be held to a smaller
-young generation (`QJS_GC_YOUNG_MAX`, in KB): at 2MB, objects peaks at
-36MB (bun: 92MB) and tokenizer at 92MB (bun: 197MB), taking about twice
-as long.
+`bun --smol` changes little here but for raytracer (29 MB, 57 ms) and
+arrays (65 MB). The collector can be held to a smaller young generation
+(`QJS_GC_YOUNG_MAX`, in KB): at 2MB, objects peaks at 45MB and tokenizer
+at 107MB, taking two to four times as long.
 
 ## Roadmap
 
@@ -1311,7 +1412,7 @@ what would come next:
   Method calls on receivers of several classes (`for (const s of shapes)
   s.area()`) now dispatch on the method the receiver reaches and run each
   class's method inline, with no runtime lookups left in `bench/shapes.ts`'s
-  loop (about 1.2× bun's time). Next: keep numbers unboxed across such
+  loop (about 1.5× bun's time). Next: keep numbers unboxed across such
   calls and their returns, and drop the method check where no class of the
   hierarchy can be changed at run time.
 - **Engine fast paths: allocation, strings, builtins.** Objects, class
@@ -1328,7 +1429,8 @@ what would come next:
   other builtins that profiles of real programs show.
 - **Float code (nbody, raytracer).** Speculative regions read and write
   `number` fields as doubles, and non-escaping class instances become
-  locals, so both run faster than bun. Next: scalar replacement through
+  locals: raytracer runs faster than bun, nbody as fast (its loads follow
+  a decoded reference, see [Values](#values-8-bytes)). Next: scalar replacement through
   calls that are not inlined (a `Vec` passed to and returned from a
   method), and SIMD for the pair loop of nbody-like code.
 - **Numeric regions in methods.** Regions cover `this` fields in methods
