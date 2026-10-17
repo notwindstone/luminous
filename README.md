@@ -456,14 +456,14 @@ for scale):
 
 | benchmark      | 16-byte values   | 8-byte values    | bun              |
 |----------------|-----------------:|-----------------:|-----------------:|
-| heap           | 184 MB / 340 ms  | 132 MB / 219 ms  | 131 MB / 246 ms  |
-| objects        |  80 MB / 406 ms  |  63 MB / 327 ms  |  88 MB / 389 ms  |
-| records        |  66 MB / 496 ms  |  54 MB / 407 ms  |  64 MB / 594 ms  |
-| arrays         |  41 MB / 120 ms  |  34 MB / 125 ms  |  78 MB / 128 ms  |
-| shapes         |  28 MB / 142 ms  |  21 MB / 153 ms  |  45 MB / 99 ms   |
-| binary_trees   |  63 MB / 268 ms  |  57 MB / 244 ms  |  55 MB / 387 ms  |
-| logparser      | 182 MB / 934 ms  | 175 MB / 923 ms  | 222 MB / 864 ms  |
-| tokenizer      | 111 MB / 199 ms  | 147 MB / 229 ms  | 193 MB / 235 ms  |
+| heap           | 184 MB / 312 ms  | 132 MB / 272 ms  | 131 MB / 284 ms  |
+| objects        |  80 MB / 470 ms  |  64 MB / 379 ms  |  88 MB / 442 ms  |
+| records        |  66 MB / 559 ms  |  54 MB / 463 ms  |  64 MB / 601 ms  |
+| arrays         |  41 MB / 128 ms  |  34 MB / 116 ms  |  78 MB / 135 ms  |
+| shapes         |  28 MB / 171 ms  |  21 MB / 143 ms  |  45 MB / 114 ms  |
+| binary_trees   |  63 MB / 315 ms  |  57 MB / 265 ms  |  55 MB / 412 ms  |
+| logparser      | 182 MB / 1076 ms | 175 MB / 1106 ms | 223 MB / 970 ms  |
+| tokenizer      | 111 MB / 212 ms  |  87 MB / 190 ms  | 193 MB / 266 ms  |
 
 `bench/heap.ts` (300,000 records of six fields with a Map index, and a
 grid of numbers) shrinks by 28%, to bun's size; the others by 4 to 25%,
@@ -471,23 +471,30 @@ by what of them is values (strings, which are bytes, stay as they were).
 Times move with fewer cache misses and a smaller heap to trace, and
 against that with more work per value: a reference is decoded before it
 is followed, and a tag compared from the high half. Counted with
-callgrind, the native code of `bench/nbody.ts`, `bench/objects.ts` and
-`bench/binary_trees.ts` runs 2 to 4% fewer instructions than with
-16-byte values, and `bench/raytracer.ts`, `bench/shapes.ts` and
-`bench/records.ts` 10 to 13% more; the engine's C code (most of
+callgrind, `bench/heap.ts`, `bench/binary_trees.ts`, `bench/objects.ts`
+and `bench/nbody.ts` run 2 to 6% fewer instructions than with 16-byte
+values, and `bench/raytracer.ts`, `bench/shapes.ts` and
+`bench/records.ts` 9 to 11% more; the engine's C code (most of
 `bench/logparser.ts`, in string methods) about 9% more. In time the
-differences under 10% are within this machine's drift: nbody, on 4%
-fewer instructions, ran as fast as with 16-byte values here and 10 to
-15% slower in other runs (the decoded reference is on its loads' path),
-logparser from as fast to 10% slower.
+differences under 10% are within this machine's drift: nbody, on 2%
+fewer instructions, ran from as fast as with 16-byte values to 17%
+slower (the decoded reference is on its loads' path), logparser from as
+fast to 10% slower.
 
-tokenizer is the exception: it keeps the previous round's array of
-tokens alive through the next round. A register of the module's code
-still holds it, dead, the calls into the engine save that register on
-the stack, and the collector, which scans the stack conservatively,
-finds it there. Whether that happens depends on how registers were
-allocated: with an earlier build of the same code generator it did not,
-and the program peaked at 87 MB.
+The collector scans native stacks conservatively: a dead reference that
+a register or a stack slot still holds keeps what it references alive
+until something writes over it, and how much that keeps depends on how
+registers were allocated. One build of this code generator kept
+`bench/tokenizer.ts`'s previous round's array of tokens alive through
+the next round (147 MB at peak, not 87): a callee-saved register of the
+module's code still held it, dead, and the calls into the engine saved
+that register on the stack. Keeping the JS values a loop's iterations
+declare in slots of their own, cleared at each iteration's end, does
+not rule that out (LLVM keeps copies of what it loads from them, in
+registers and its own slots), cost up to 8% in hot code, and kept more
+alive in `bench/objects.ts`, not less; what rules it out is precise
+stack maps for native frames (each value live across a call in a slot
+the collector reads, and nothing else of the frame read).
 
 Servers keep little: Beyond's (`Beyond.serve`, Hono, Elysia) peak 1 MB
 lower, at 23 to 29 MB.
@@ -1365,27 +1372,27 @@ that one's pages too), LLVM backend with `--march x86-64-v3`, against the
 same program's erased JavaScript under node 22.22 and bun 1.4.3 (with
 `BUN_OPTIONS` cleared: this machine's environment sets it to `--smol`),
 on a 4-core x86-64 cloud VM. Timings there drift by 10–20% between runs,
-and more over a day (this run was about 30% slower than one a few hours
-earlier, for every runtime alike); memory is stable.
+and more over a day (this run was 40 to 60% slower than the fastest of
+the same day, for every runtime alike); memory is stable.
 
 | benchmark    | Luminous         | node             | bun              | time / bun | memory / bun |
 |--------------|-----------------:|-----------------:|-----------------:|-----------:|-------------:|
-| hello world  |    –  / 5.7 MB   |     –  / 43 MB   |    –  / 12 MB    |          – |        0.48× |
-| fib          |   9 ms / 5.9 MB  |   45 ms / 48 MB  |   19 ms / 19 MB  |      0.47× |        0.31× |
-| binary_trees | 244 ms / 57 MB   |  290 ms / 96 MB  |  387 ms / 55 MB  |      0.63× |        1.03× |
-| xorshift     |  50 ms / 5.7 MB  |  130 ms / 49 MB  |   76 ms / 21 MB  |      0.66× |        0.28× |
-| records      | 407 ms / 54 MB   |  885 ms / 131 MB |  594 ms / 64 MB  |      0.69× |        0.85× |
-| mandelbrot   |  23 ms / 5.7 MB  |   40 ms / 50 MB  |   30 ms / 21 MB  |      0.77× |        0.27× |
-| objects      | 327 ms / 63 MB   |  959 ms / 183 MB |  389 ms / 88 MB  |      0.84× |        0.72× |
-| heap         | 219 ms / 132 MB  |  415 ms / 169 MB |  246 ms / 131 MB |      0.89× |        1.01× |
-| raytracer    |  36 ms / 10 MB   |   58 ms / 52 MB  |   39 ms / 37 MB  |      0.92× |        0.28× |
-| integrate    | 200 ms / 5.9 MB  |  344 ms / 50 MB  |  211 ms / 22 MB  |      0.95× |        0.27× |
-| tokenizer    | 229 ms / 147 MB  |  551 ms / 210 MB |  235 ms / 193 MB |      0.97× |        0.76× |
-| arrays       | 125 ms / 34 MB   |  178 ms / 80 MB  |  128 ms / 78 MB  |      0.98× |        0.43× |
-| nbody        | 142 ms / 6.1 MB  |  126 ms / 51 MB  |  142 ms / 24 MB  |      1.00× |        0.26× |
-| logparser    | 923 ms / 175 MB  | 1234 ms / 251 MB |  864 ms / 222 MB |      1.07× |        0.79× |
-| primes       | 192 ms / 5.8 MB  |  217 ms / 49 MB  |  180 ms / 21 MB  |      1.07× |        0.28× |
-| shapes       | 153 ms / 21 MB   |  221 ms / 101 MB |   99 ms / 45 MB  |      1.55× |        0.47× |
+| hello world  |    –  / 5.7 MB   |     –  / 43 MB   |    –  / 12 MB    |          – |        0.46× |
+| fib          |   9 ms / 5.8 MB  |   39 ms / 48 MB  |   19 ms / 19 MB  |      0.47× |        0.30× |
+| binary_trees | 265 ms / 57 MB   |  359 ms / 96 MB  |  412 ms / 55 MB  |      0.64× |        1.03× |
+| xorshift     |  54 ms / 5.7 MB  |  133 ms / 49 MB  |   79 ms / 21 MB  |      0.68× |        0.27× |
+| tokenizer    | 190 ms / 87 MB   |  579 ms / 210 MB |  266 ms / 193 MB |      0.71× |        0.45× |
+| records      | 463 ms / 54 MB   | 1025 ms / 132 MB |  601 ms / 64 MB  |      0.77× |        0.85× |
+| raytracer    |  31 ms / 10 MB   |   61 ms / 52 MB  |   40 ms / 38 MB  |      0.78× |        0.27× |
+| mandelbrot   |  24 ms / 5.7 MB  |   42 ms / 50 MB  |   30 ms / 22 MB  |      0.80× |        0.27× |
+| integrate    | 205 ms / 5.9 MB  |  384 ms / 50 MB  |  242 ms / 22 MB  |      0.85× |        0.26× |
+| objects      | 379 ms / 64 MB   | 1063 ms / 184 MB |  442 ms / 88 MB  |      0.86× |        0.73× |
+| arrays       | 116 ms / 34 MB   |  176 ms / 80 MB  |  135 ms / 78 MB  |      0.86× |        0.43× |
+| heap         | 272 ms / 132 MB  |  483 ms / 169 MB |  284 ms / 131 MB |      0.96× |        1.01× |
+| nbody        | 176 ms / 6.0 MB  |  143 ms / 51 MB  |  169 ms / 24 MB  |      1.04× |        0.25× |
+| primes       | 205 ms / 5.8 MB  |  239 ms / 49 MB  |  189 ms / 21 MB  |      1.08× |        0.27× |
+| logparser    | 1106 ms / 175 MB | 1383 ms / 250 MB |  970 ms / 223 MB |      1.14× |        0.79× |
+| shapes       | 143 ms / 21 MB   |  241 ms / 100 MB |  114 ms / 45 MB  |      1.25× |        0.48× |
 
 `bun --smol` changes little here but for raytracer (29 MB, 57 ms) and
 arrays (65 MB). The collector can be held to a smaller young generation
@@ -1412,7 +1419,7 @@ what would come next:
   Method calls on receivers of several classes (`for (const s of shapes)
   s.area()`) now dispatch on the method the receiver reaches and run each
   class's method inline, with no runtime lookups left in `bench/shapes.ts`'s
-  loop (about 1.5× bun's time). Next: keep numbers unboxed across such
+  loop (1.25 to 1.6× bun's time, from run to run). Next: keep numbers unboxed across such
   calls and their returns, and drop the method check where no class of the
   hierarchy can be changed at run time.
 - **Engine fast paths: allocation, strings, builtins.** Objects, class
@@ -1429,7 +1436,7 @@ what would come next:
   other builtins that profiles of real programs show.
 - **Float code (nbody, raytracer).** Speculative regions read and write
   `number` fields as doubles, and non-escaping class instances become
-  locals: raytracer runs faster than bun, nbody as fast (its loads follow
+  locals: raytracer runs faster than bun, nbody about as fast (its loads follow
   a decoded reference, see [Values](#values-8-bytes)). Next: scalar replacement through
   calls that are not inlined (a `Vec` passed to and returned from a
   method), and SIMD for the pair loop of nbody-like code.

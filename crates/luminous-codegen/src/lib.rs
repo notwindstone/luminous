@@ -93,12 +93,11 @@ pub(crate) mod val {
     use crate::mir::types::{F64, I32, I64};
     use crate::mir::{FunctionBuilder, IntCC, MemFlags, Value};
 
-    /// The high half of `w` (its tag's, but for a float), as an `I32` the
-    /// optimizer keeps (see `ConvOp::IreduceApart`): compared with 32-bit
-    /// immediates.
+    /// The high half of `w` (its tag's, but for a float), as an `I32`:
+    /// compared with 32-bit immediates.
     fn high(b: &mut FunctionBuilder, w: Value) -> Value {
         let hi = b.ins().ushr_imm_u(w, 32);
-        b.ins().ireduce_apart(I32, hi)
+        b.ins().ireduce(I32, hi)
     }
 
     /// What `high` is for tag `tag`, sign-extended.

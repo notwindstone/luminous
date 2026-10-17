@@ -343,11 +343,6 @@ pub enum ConvOp {
     Uextend,
     Sextend,
     Ireduce,
-    /// `Ireduce`, the result kept apart from how its operand was made: LLVM
-    /// then neither folds a test or decode of a value's half back into
-    /// 64-bit masks (which x86 compares through 64-bit constants), nor
-    /// merges it with other uses (a `freeze`).
-    IreduceApart,
     FromSint,
     FromUint,
     /// Saturating; NaN gives 0.
@@ -901,9 +896,6 @@ impl Ins<'_> {
     }
     pub fn ireduce(self, ty: Type, a: Value) -> Value {
         self.conv(ConvOp::Ireduce, ty, a)
-    }
-    pub fn ireduce_apart(self, ty: Type, a: Value) -> Value {
-        self.conv(ConvOp::IreduceApart, ty, a)
     }
     pub fn fcvt_from_sint(self, ty: Type, a: Value) -> Value {
         self.conv(ConvOp::FromSint, ty, a)

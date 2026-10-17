@@ -796,10 +796,6 @@ impl<'a> FnEmitter<'a> {
                     },
                     ConvOp::Sextend => format!("sext {fname} {a} to {tname}"),
                     ConvOp::Ireduce => format!("trunc {fname} {a} to {tname}"),
-                    ConvOp::IreduceApart => {
-                        self.line(format!("{name}.raw = trunc {fname} {a} to {tname}"));
-                        format!("freeze {tname} {name}.raw")
-                    }
                     ConvOp::FromSint => format!("sitofp {fname} {a} to {tname}"),
                     ConvOp::FromUint => format!("uitofp {fname} {a} to {tname}"),
                     ConvOp::ToSintSat | ConvOp::ToUintSat => {

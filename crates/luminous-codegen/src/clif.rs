@@ -417,7 +417,7 @@ impl Translator<'_, '_> {
                 match op {
                     ConvOp::Uextend => ins.uextend(t, a),
                     ConvOp::Sextend => ins.sextend(t, a),
-                    ConvOp::Ireduce | ConvOp::IreduceApart => ins.ireduce(t, a),
+                    ConvOp::Ireduce => ins.ireduce(t, a),
                     ConvOp::FromSint => ins.fcvt_from_sint(t, a),
                     ConvOp::FromUint => ins.fcvt_from_uint(t, a),
                     ConvOp::ToSintSat | ConvOp::ToSintAny => ins.fcvt_to_sint_sat(t, a),
