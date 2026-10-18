@@ -166,6 +166,18 @@ void lum_ic_refresh(LumIC *ic, void *p);
 /* A data property of String.prototype read from a string: `shape` is NULL,
  * `proto_shape` String.prototype's shape. */
 #define LUM_IC_STRING 8
+/* `instanceof`'s right operand: `alt_shape` is its shape, `kind` holds its
+ * class in bits 16-31, `slot` is its "prototype" (see lum_instanceof). */
+#define LUM_IC_INSTANCEOF 9
+/* An addition of the property at a write site, in a polymorphic entry:
+ * `alt_shape` the object's shape before, `proto_shape` after (both
+ * referenced), valid while js_proto_epoch is `epoch` (see
+ * JS_CacheAddProperty). */
+#define LUM_IC_ADD 10
+/* A property objects of a shape do not have, nor their prototypes, in a
+ * polymorphic entry: `alt_shape` (referenced), valid while js_proto_epoch is
+ * `epoch` (see JS_CacheAbsentProperty). */
+#define LUM_IC_ABSENT 11
 extern LumIC lum_ics[] __attribute__((weak));
 extern const int32_t lum_nics __attribute__((weak));
 /* Per native function: the shape of its closures (referenced) and its name
@@ -183,6 +195,7 @@ extern const int32_t lum_nfn_caches __attribute__((weak));
 JSValue lum_new_closure(JSContext *ctx, LumFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
                           const char *name, int length, int magic, int n, JSValue *data, int kind);
 JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
+int lum_instanceof(JSContext *ctx, JSValue v, JSValue ctor, LumIC *ic);
 JSValue lum_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 void lum_record_learn(JSContext *ctx, JSValue obj, int r);
 int lum_char_code_at_ok(JSContext *ctx);

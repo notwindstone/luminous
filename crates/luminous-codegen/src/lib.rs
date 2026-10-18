@@ -619,6 +619,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_DefineElement", &[P, W, P, W], &[Int]),
         ("JS_SortNative", &[P, W, P, Int], &[Int]),
         ("lum_ic_own_data", &[P, W, Int, P], &[W]),
+        ("lum_instanceof", &[P, W, W, P], &[Int]),
         ("lum_ic_get_cached", &[P, W, Int, P], &[W]),
         ("lum_record_learn", &[P, W, Int], &[]),
         ("lum_char_code_at_ok", &[P], &[Int]),

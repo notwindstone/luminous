@@ -6437,6 +6437,16 @@ impl Lower {
 
     /// A comparison of JS values or numbers (borrowed).
     fn compare_mixed(&mut self, op: AnyCmpOp, a: V, c: V) -> Value {
+        if op == AnyCmpOp::InstanceOf {
+            // Through an inline cache of the constructor (lum_instanceof).
+            let ic = self.new_ic();
+            let ctx = self.ctx;
+            let aw = self.boxed(a);
+            let cw = self.boxed(c);
+            let r = self.helper("lum_instanceof", &[ctx, aw, cw, ic]);
+            self.check_int(r[0]);
+            return self.b.ins().icmp_imm_s(IntCC::NotEqual, r[0], 0);
+        }
         let code = match op {
             AnyCmpOp::Lt => op::LT,
             AnyCmpOp::Le => op::LTE,
@@ -8733,12 +8743,23 @@ impl Lower {
     /// frame, then dispatch on the state (0: start of the body).
     pub(crate) fn enter_async(&mut self, slots: Value, state: Value, value: Value, is_throw: Value, f: &ir::Func) {
         let (layout, this_slot, _) = frame_layout(f);
+        // (A value capture's value is in its first slot, which its address
+        // then points at: the closure's data may be gone while the frame is
+        // suspended.)
+        let mut by_value = vec![false; layout.len()];
+        for (k, &cl) in f.captures.iter().enumerate() {
+            by_value[cl] = f.value_captures[k];
+        }
         for (l, &s) in layout.iter().enumerate() {
             let at = (s * SIZE) as i32;
             let w = self.b.ins().load(I64, M_SLOT, slots, at);
             match self.vars[l] {
                 LVar::Boxed { obj, slot, .. } => {
-                    let sp = self.b.ins().load(I64, M_SLOT, slots, at + SIZE as i32);
+                    let sp = if by_value[l] {
+                        self.b.ins().iadd_imm_s(slots, at as i64)
+                    } else {
+                        self.b.ins().load(I64, M_SLOT, slots, at + SIZE as i32)
+                    };
                     self.b.def_var(obj, w);
                     self.b.def_var(slot, sp);
                 }

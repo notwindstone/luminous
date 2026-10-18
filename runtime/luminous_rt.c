@@ -364,6 +364,17 @@ static int *lum_regexp_flags;
 static void *lum_cca_shape;
 static int lum_cca_slot;
 
+/* The caches given shapes since those of the others were made old: a minor
+   collection, which need not mark old cells, marks the shapes of these
+   only (some 16,000 caches in a program with Beyond's library and a
+   framework: marking them all was a fifth of each minor collection). Each
+   is listed once (lum_ic_listed), until its shapes are old; all of them
+   are marked if the list could not grow (lum_young_all). */
+static uint32_t *lum_young_ics;
+static uint32_t lum_nyoung_ics, lum_young_cap;
+static uint8_t *lum_ic_listed;
+static bool lum_young_all;
+
 static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
 {
     int i;
@@ -455,6 +466,12 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
             lum_ics[i].poly = NULL;
         }
     }
+    js_free_rt(rt, lum_young_ics);
+    js_free_rt(rt, lum_ic_listed);
+    lum_young_ics = NULL;
+    lum_ic_listed = NULL;
+    lum_nyoung_ics = lum_young_cap = 0;
+    lum_young_all = false;
 }
 
 /* The cells are reachable from native code at any time, so they are roots
@@ -472,8 +489,86 @@ static void lum_mark_statics(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func
     lum_mark_strings(rt, mark_func);
 }
 
+static void lum_mark_shape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func)
+{
+    if (shape)
+        JS_MarkCachedShape(rt, shape, mark_func);
+}
+
+static void lum_ic_mark(JSRuntime *rt, LumIC *ic, JS_MarkFunc *mark_func)
+{
+    lum_mark_shape(rt, ic->shape, mark_func);
+    lum_mark_shape(rt, ic->proto_shape, mark_func);
+    lum_mark_shape(rt, ic->mid_shape, mark_func);
+    lum_mark_shape(rt, ic->alt_shape, mark_func);
+    if (ic->poly) {
+        int k;
+        for (k = 0; k < LUM_POLY; k++) {
+            LumIC *e = &ic->poly[k];
+            lum_mark_shape(rt, e->shape, mark_func);
+            lum_mark_shape(rt, e->alt_shape, mark_func);
+            lum_mark_shape(rt, e->proto_shape, mark_func);
+            lum_mark_shape(rt, e->mid_shape, mark_func);
+            lum_mark_shape(rt, e->mid2_shape, mark_func);
+        }
+    }
+}
+
+static bool lum_old_shape(void *shape)
+{
+    return !shape || JS_IsOldCell(shape);
+}
+
+/* Whether the shapes `ic` holds are old. */
+static bool lum_ic_old(const LumIC *ic)
+{
+    int k;
+    if (!lum_old_shape(ic->shape) || !lum_old_shape(ic->proto_shape) || !lum_old_shape(ic->mid_shape) ||
+        !lum_old_shape(ic->alt_shape))
+        return false;
+    for (k = 0; ic->poly && k < LUM_POLY; k++) {
+        const LumIC *e = &ic->poly[k];
+        if (!lum_old_shape(e->shape) || !lum_old_shape(e->alt_shape) || !lum_old_shape(e->proto_shape) ||
+            !lum_old_shape(e->mid_shape) || !lum_old_shape(e->mid2_shape))
+            return false;
+    }
+    return true;
+}
+
+
+static void lum_ic_note(JSRuntime *rt, LumIC *ic)
+{
+    ptrdiff_t i = ic - lum_ics;
+    if (lum_young_all)
+        return;
+    if (i < 0 || i >= lum_ic_count()) {
+        lum_young_all = true;
+        return;
+    }
+    if (!lum_ic_listed && !(lum_ic_listed = js_mallocz_rt(rt, lum_ic_count()))) {
+        lum_young_all = true;
+        return;
+    }
+    if (lum_ic_listed[i])
+        return;
+    if (lum_nyoung_ics == lum_young_cap) {
+        uint32_t cap = lum_young_cap ? 2 * lum_young_cap : 256;
+        uint32_t *a = js_realloc_rt(rt, lum_young_ics, cap * sizeof(*a));
+        if (!a) {
+            lum_young_all = true;
+            return;
+        }
+        lum_young_ics = a;
+        lum_young_cap = cap;
+    }
+    lum_ic_listed[i] = 1;
+    lum_young_ics[lum_nyoung_ics++] = (uint32_t)i;
+}
+
 static void lum_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
+    int kind = JS_GCMarkKind(rt, mark_func);
+    uint32_t k, n;
     int i;
     for (i = 0; i < lum_fn_cache_count(); i++) {
         if (lum_fn_caches[i].shape)
@@ -495,31 +590,26 @@ static void lum_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
         if (i % LUM_RECORD_STRIDE < LUM_RECORD_SHAPES && lum_record_shapes[i])
             JS_MarkCachedShape(rt, lum_record_shapes[i], mark_func);
     }
-    for (i = 0; i < lum_ic_count(); i++) {
-        if (lum_ics[i].shape)
-            JS_MarkCachedShape(rt, lum_ics[i].shape, mark_func);
-        if (lum_ics[i].proto_shape)
-            JS_MarkCachedShape(rt, lum_ics[i].proto_shape, mark_func);
-        if (lum_ics[i].mid_shape)
-            JS_MarkCachedShape(rt, lum_ics[i].mid_shape, mark_func);
-        if (lum_ics[i].alt_shape)
-            JS_MarkCachedShape(rt, lum_ics[i].alt_shape, mark_func);
-        if (lum_ics[i].poly) {
-            int k;
-            for (k = 0; k < LUM_POLY; k++) {
-                LumIC *e = &lum_ics[i].poly[k];
-                if (e->shape)
-                    JS_MarkCachedShape(rt, e->shape, mark_func);
-                if (e->alt_shape)
-                    JS_MarkCachedShape(rt, e->alt_shape, mark_func);
-                if (e->proto_shape)
-                    JS_MarkCachedShape(rt, e->proto_shape, mark_func);
-                if (e->mid_shape)
-                    JS_MarkCachedShape(rt, e->mid_shape, mark_func);
-                if (e->mid2_shape)
-                    JS_MarkCachedShape(rt, e->mid2_shape, mark_func);
-            }
+    if (kind == JS_GC_MARK_MINOR && !lum_young_all) {
+        for (k = n = 0; k < lum_nyoung_ics; k++) {
+            uint32_t j = lum_young_ics[k];
+            lum_ic_mark(rt, &lum_ics[j], mark_func);
+            if (lum_ic_old(&lum_ics[j]))
+                lum_ic_listed[j] = 0;
+            else
+                lum_young_ics[n++] = j;
         }
+        lum_nyoung_ics = n;
+        return;
+    }
+    for (i = 0; i < lum_ic_count(); i++)
+        lum_ic_mark(rt, &lum_ics[i], mark_func);
+    /* (A major collection makes the cells it finds old.) */
+    if (kind == JS_GC_MARK_MAJOR) {
+        for (k = 0; k < lum_nyoung_ics; k++)
+            lum_ic_listed[lum_young_ics[k]] = 0;
+        lum_nyoung_ics = 0;
+        lum_young_all = false;
     }
 }
 
@@ -759,8 +849,12 @@ static int lum_ic_count(void)
    `e`: an own data property, or a data property of a prototype. */
 static bool lum_ic_polymorphic(const LumIC *e)
 {
-    return e->shape || (e->alt_shape && e->kind == LUM_IC_PROTO_DATA);
+    return e->shape ||
+        (e->alt_shape && (e->kind == LUM_IC_PROTO_DATA || e->kind == LUM_IC_ADD || e->kind == LUM_IC_ABSENT));
 }
+
+/* What a LUM_IC_ABSENT entry reads (only ever read). */
+static JSValue lum_absent = JS_UNDEFINED;
 
 /* The address of the property that cache entry `e` holds for object `p`
    of shape `shape`, or NULL (another shape, or a holder that changed): as
@@ -769,7 +863,11 @@ static JSValue *lum_ic_entry_slot(const LumIC *e, char *p, void *shape)
 {
     char *holder = p;
     if (e->shape != shape) {
-        if (e->alt_shape != shape || e->kind != LUM_IC_PROTO_DATA)
+        if (e->alt_shape != shape)
+            return NULL;
+        if (e->kind == LUM_IC_ABSENT)
+            return e->epoch == js_proto_epoch ? &lum_absent : NULL;
+        if (e->kind != LUM_IC_PROTO_DATA)
             return NULL;
         holder = *(char **)((char *)shape + JS_LAYOUT_SHAPE_PROTO);
         if (e->mid_shape) {
@@ -862,6 +960,100 @@ static bool lum_ic_poly_set(JSContext *ctx, LumIC *ic, JSValueConst obj, JSValue
     return false;
 }
 
+/* obj.prop = val (val taken) through an addition that write site `ic`
+   cached (a LUM_IC_ADD entry among its polymorphic ones): 1 if made, 0 if
+   none applies (val not taken), -1 (an exception). */
+static int lum_ic_add(JSContext *ctx, LumIC *ic, JSValueConst obj, JSValue val)
+{
+    void *shape;
+    int k;
+    if (!ic->poly || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    shape = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    for (k = 0; k < LUM_POLY; k++) {
+        LumIC *e = &ic->poly[k];
+        if (e->alt_shape == shape && e->kind == LUM_IC_ADD)
+            return e->epoch == js_proto_epoch ? JS_AddCachedProperty(ctx, obj, e->proto_shape, val) : 0;
+    }
+    return 0;
+}
+
+/* Cache the addition of `prop` that obj.prop = v made to `obj`, whose shape
+   was `before` (held): in a polymorphic entry of `ic` (native code takes
+   the primary one's `alt_shape` for an accessor's), the one of `before` or
+   a free one. Returns whether it could. */
+/* The polymorphic entry of `ic` for an epoch-checked entry of kind `kind`
+   (LUM_IC_ADD, LUM_IC_ABSENT) and shape `shape`: the one there is (made
+   again after a change to a watched prototype: *prefreshes counts it), else
+   a free one; NULL if there is none, or it was made again too many times. */
+static LumIC *lum_ic_epoch_entry(JSRuntime *rt, LumIC *ic, void *shape, uint32_t kind, uint32_t *prefreshes)
+{
+    LumIC *e = NULL;
+    int k;
+    *prefreshes = 0;
+    if (!ic->poly)
+        ic->poly = js_mallocz_rt(rt, LUM_POLY * sizeof(LumIC));
+    for (k = 0; ic->poly && k < LUM_POLY; k++) {
+        LumIC *f = &ic->poly[k];
+        if (f->alt_shape == shape && f->kind == kind) {
+            *prefreshes = f->refreshes + 1;
+            return *prefreshes > LUM_IC_REFRESHES ? NULL : f;
+        }
+        if (!e && !lum_ic_polymorphic(f))
+            e = f;
+    }
+    return e;
+}
+
+/* Fill entry `e` (of lum_ic_epoch_entry) with the shapes it takes. */
+static void lum_ic_epoch_store(JSRuntime *rt, LumIC *ic, LumIC *e, void *shape, void *proto_shape, int slot,
+                               uint32_t kind, uint32_t refreshes)
+{
+    if (e->alt_shape)
+        JS_FreeCachedShape(rt, e->alt_shape);
+    if (e->proto_shape)
+        JS_FreeCachedShape(rt, e->proto_shape);
+    e->alt_shape = shape;
+    e->proto_shape = proto_shape;
+    e->slot = slot;
+    e->kind = kind;
+    e->epoch = js_proto_epoch;
+    e->refreshes = refreshes;
+    lum_ic_note(rt, ic);
+}
+
+static bool lum_ic_fill_add(JSContext *ctx, JSValue obj, JSAtom prop, void *before, LumIC *ic)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    uint32_t refreshes;
+    LumIC *e = lum_ic_epoch_entry(rt, ic, before, LUM_IC_ADD, &refreshes);
+    void *after;
+    int slot;
+    if (!e || (slot = JS_CacheAddProperty(ctx, obj, prop, before, &after)) < 0)
+        return false;
+    lum_ic_epoch_store(rt, ic, e, JS_DupSharedShape(before), after, slot, LUM_IC_ADD, refreshes);
+    return true;
+}
+
+/* Cache that objects of obj's shape do not have `prop`, nor their
+   prototypes (in a polymorphic entry of `ic`, as lum_ic_fill_add's).
+   Returns whether it could. */
+static bool lum_ic_fill_absent(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    uint32_t refreshes;
+    LumIC *e;
+    void *shape;
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return false;
+    e = lum_ic_epoch_entry(rt, ic, *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE),
+                           LUM_IC_ABSENT, &refreshes);
+    if (!e || JS_CacheAbsentProperty(ctx, obj, prop, &shape) < 0)
+        return false;
+    lum_ic_epoch_store(rt, ic, e, shape, NULL, 0, LUM_IC_ABSENT, refreshes);
+    return true;
+}
+
 /* Whether a polymorphic site has no room for another shape: it caches
    none then (its misses do not evict each other). */
 static bool lum_ic_full(const LumIC *ic)
@@ -914,6 +1106,7 @@ static void lum_ic_store(JSContext *ctx, LumIC *ic, void *shape, void *proto_sha
     ic->epoch = 0;
     ic->value = JS_UNDEFINED;
     ic->entry = NULL;
+    lum_ic_note(rt, ic);
 }
 
 /* Cache an own data property (mode 0: read, 1: write) or accessor (2: its
@@ -950,6 +1143,7 @@ static bool lum_ic_fill_deep(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic
             e->proto_shape = shapes[3];
             e->slot = slot;
             e->kind = LUM_IC_PROTO_DATA;
+            lum_ic_note(rt, ic);
             return true;
         }
     }
@@ -1144,6 +1338,56 @@ JSValue lum_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
     return JS_GetProperty(ctx, obj, prop);
 }
 
+static __attribute__((noinline)) int lum_instanceof_miss(JSContext *ctx, JSValue v, JSValue ctor, LumIC *ic)
+{
+    void *shape;
+    int slot, r = JS_IsInstanceOf(ctx, v, ctor);
+    if (r < 0 || ic->refreshes >= LUM_IC_REFRESHES)
+        return r;
+    slot = JS_CacheInstanceOf(ctx, ctor, &shape);
+    if (slot >= 0) {
+        char *c = JS_VALUE_GET_PTR(ctor);
+        ic->refreshes++;
+        lum_ic_store(ctx, ic, shape, NULL, NULL, slot,
+                     LUM_IC_INSTANCEOF | (uint32_t)*(uint16_t *)(c + JS_LAYOUT_OBJ_CLASS_ID) << 16);
+        ic->epoch = js_proto_epoch;
+    }
+    return r;
+}
+
+/* `v instanceof ctor` (both borrowed): 1, 0, or -1 (an exception). With
+ * the constructor's shape and class cached (kind LUM_IC_INSTANCEOF), while
+ * js_proto_epoch is unchanged, its "prototype" is read from the cached slot
+ * and looked for on v's prototype chain (see JS_CacheInstanceOf). */
+int lum_instanceof(JSContext *ctx, JSValue v, JSValue ctor, LumIC *ic)
+{
+    if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT) {
+        char *c = JS_VALUE_GET_PTR(ctor);
+        if (*(void **)(c + JS_LAYOUT_OBJ_SHAPE) == ic->alt_shape && ic->epoch == js_proto_epoch &&
+            ic->kind == (LUM_IC_INSTANCEOF | (uint32_t)*(uint16_t *)(c + JS_LAYOUT_OBJ_CLASS_ID) << 16)) {
+            JSValue proto = ((JSValue *)*(char **)(c + JS_LAYOUT_OBJ_PROP))[ic->slot];
+            if (JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT) {
+                char *target = JS_VALUE_GET_PTR(proto), *p;
+                if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+                    return 0;
+                for (p = JS_VALUE_GET_PTR(v);;) {
+                    char *q = *(char **)(*(char **)(p + JS_LAYOUT_OBJ_SHAPE) + JS_LAYOUT_SHAPE_PROTO);
+                    if (q == target)
+                        return 1;
+                    if (!q) {
+                        /* (A proxy's prototype is its handler's to tell.) */
+                        if (*(uint16_t *)(p + JS_LAYOUT_OBJ_CLASS_ID) != JS_LAYOUT_CLASS_PROXY)
+                            return 0;
+                        break;
+                    }
+                    p = q;
+                }
+            }
+        }
+    }
+    return lum_instanceof_miss(ctx, v, ctor, ic);
+}
+
 /* A cache miss reading obj.prop (obj borrowed). */
 JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
 {
@@ -1152,8 +1396,8 @@ JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
     if (at)
         return JS_DupValue(ctx, *at);
     v = JS_GetProperty(ctx, obj, prop);
-    if (!JS_IsException(v) && !lum_ic_full(ic))
-        lum_ic_fill(ctx, obj, prop, 0, ic);
+    if (!JS_IsException(v) && !lum_ic_full(ic) && !lum_ic_fill(ctx, obj, prop, 0, ic) && JS_IsUndefined(v))
+        lum_ic_fill_absent(ctx, obj, prop, ic);
     return v;
 }
 
@@ -1166,12 +1410,21 @@ int lum_ic_set(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumIC *ic)
     int r;
     if (lum_ic_poly_set(ctx, ic, obj, val))
         return 0;
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
-        before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    if ((r = lum_ic_add(ctx, ic, obj, val)))
+        return r < 0 ? -1 : 0;
+    /* (A shared shape, held: an addition may free it.) */
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !lum_ic_full(ic))
+        before = JS_DupSharedShape(*(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE));
     r = JS_SetProperty(ctx, obj, prop, val);
-    if (r >= 0 && before && before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
-        !lum_ic_full(ic))
-        lum_ic_fill(ctx, obj, prop, 1, ic);
+    if (before) {
+        if (r >= 0) {
+            if (before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE))
+                lum_ic_fill(ctx, obj, prop, 1, ic);
+            else
+                lum_ic_fill_add(ctx, obj, prop, before, ic);
+        }
+        JS_FreeCachedShape(JS_GetRuntime(ctx), before);
+    }
     return r;
 }
 
@@ -2034,7 +2287,8 @@ JSValue lum_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
         !lum_ic_fill(ctx, obj, prop, 2, ic) &&
         !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_DATA, ic) &&
         !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_GETTER, ic) &&
-        !lum_ic_fill_deep(ctx, obj, prop, ic))
+        !lum_ic_fill_deep(ctx, obj, prop, ic) &&
+        !(JS_IsUndefined(v) && lum_ic_fill_absent(ctx, obj, prop, ic)))
         lum_ic_count_miss(ic);
     return v;
 }
@@ -2047,15 +2301,24 @@ int lum_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumI
     int r;
     if (lum_ic_poly_set(ctx, ic, obj, val))
         return 0;
-    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
-        before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    if ((r = lum_ic_add(ctx, ic, obj, val)))
+        return r < 0 ? -1 : 0;
+    /* (A shared shape, held: an addition may free it.) */
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !lum_ic_gave_up(ic) && !lum_ic_full(ic))
+        before = JS_DupSharedShape(*(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE));
     r = JS_SetProperty(ctx, obj, prop, val);
-    if (r >= 0 && before && !lum_ic_gave_up(ic) && !lum_ic_full(ic) &&
-        before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE) &&
-        !lum_ic_fill(ctx, obj, prop, 1, ic) &&
-        !lum_ic_fill(ctx, obj, prop, 3, ic) &&
-        !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_SETTER, ic))
+    if (before) {
+        if (r >= 0 &&
+            (before == *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE)
+                 ? !lum_ic_fill(ctx, obj, prop, 1, ic) && !lum_ic_fill(ctx, obj, prop, 3, ic) &&
+                       !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_SETTER, ic)
+                 : !lum_ic_fill_add(ctx, obj, prop, before, ic)))
+            lum_ic_count_miss(ic);
+        JS_FreeCachedShape(JS_GetRuntime(ctx), before);
+    } else if (r >= 0 && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && !lum_ic_gave_up(ic)) {
+        /* (An object's own shape: nothing to cache.) */
         lum_ic_count_miss(ic);
+    }
     return r;
 }
 

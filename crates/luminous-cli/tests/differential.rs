@@ -3,8 +3,10 @@
 //! available), and fully interpreted; all executables must print exactly the
 //! same output. `// @native a b` and `// @interpreted c` header lines pin down
 //! which functions the checker is expected to compile natively. `// @flags
-//! ...` passes options to the compiler. `LUMINOUS_BACKENDS=cranelift` (or
-//! `llvm`) restricts the native builds to one backend.
+//! ...` passes options to the compiler, `// @env NAME=value ...` sets
+//! variables for the runs (after the collector's own: see `run_case`).
+//! `LUMINOUS_BACKENDS=cranelift` (or `llvm`) restricts the native builds to
+//! one backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,6 +91,10 @@ fn run_case(case: &Path, out_dir: &Path, backends: &[String]) -> Result<(), Stri
             // that every object something holds is reached from the
             // collector's roots (see QJS_GC_VERIFY in the engine).
             run.env("QJS_GC_VERIFY", "1").env("QJS_GC_STRESS", "50");
+        }
+        for var in directive(&src, "env") {
+            let (name, value) = var.split_once('=').unwrap_or((&var, ""));
+            run.env(name, value);
         }
         let r = run.output().unwrap();
         outputs.push((

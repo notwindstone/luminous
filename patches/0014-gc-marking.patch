@@ -1,0 +1,78 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1255,6 +1255,18 @@
+                                               void **pdata);
+ JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
+ JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
++/* luminous: what `mark_func` marks for: a minor collection
++   (JS_GC_MARK_MINOR), which need not be given old cells, so that an
++   embedder may leave out the roots it knows are old (JS_IsOldCell); a
++   major one (JS_GC_MARK_MAJOR), which makes every cell it is given old;
++   or something else (a verification: JS_GC_MARK_OTHER). */
++#define JS_GC_MARK_OTHER 0
++#define JS_GC_MARK_MINOR 1
++#define JS_GC_MARK_MAJOR 2
++JS_EXTERN int JS_GCMarkKind(JSRuntime *rt, JS_MarkFunc *mark_func);
++/* luminous: whether the cell at `ptr` (a shape, an object) is old: it
++   survived the collections that make a cell old. */
++JS_EXTERN bool JS_IsOldCell(const void *ptr);
+ /* For natively compiled code: the interpreter's own iteration (for-of,
+    spread, destructuring, for-in), CopyDataProperties (object spread and
+    rest), property access with a receiver (`super.x`), and private names.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9090,12 +9090,14 @@
+         if (var_refs) {
+             for(i = 0; i < b->closure_var_count; i++) {
+                 JSVarRef *var_ref = var_refs[i];
+-                /* Detached var_refs are GC objects; open var_refs are GC
+-                   objects only when they capture a coroutine local (see
+-                   get_var_ref). Only those may be marked. */
+-                if (var_ref && (var_ref->is_detached || var_ref->is_coro)) {
++                /* luminous: every var_ref is a cell, open ones too (their
++                   children are then the coroutine's, if any: see
++                   js_gc_trace_children). Marked even while open: a young
++                   one keeps the function remembered once it is old, for
++                   when the var_ref is closed (it then has no holder but
++                   the function). */
++                if (var_ref)
+                     mark_func(rt, &var_ref->header);
+-                }
+             }
+         }
+         /* must mark the function bytecode because template objects may be
+@@ -20048,11 +20050,10 @@
+         int i;
+         if (var_refs) {
+             for(i = 0; i < p->u.array.count; i++) {
+-                /* mapped arguments hold a counted ref to each var_ref; the
+-                   ones that are GC objects (detached, or open capturing a
+-                   coroutine local) must be marked, like the other holders */
++                /* mapped arguments hold a counted ref to each var_ref:
++                   marked even while open (see js_bytecode_function_mark) */
+                 JSVarRef *vr = var_refs[i];
+-                if (vr && (vr->is_detached || vr->is_coro))
++                if (vr)
+                     mark_func(rt, &vr->header);
+             }
+         }
+@@ -61911,6 +61912,19 @@
+     mark_func(rt, &((JSShape *)shape)->header);
+ }
+ 
++int JS_GCMarkKind(JSRuntime *rt, JS_MarkFunc *mark_func)
++{
++    if (mark_func != js_gc_trace_mark)
++        return JS_GC_MARK_OTHER;
++    return rt->gc_heap.minor ? JS_GC_MARK_MINOR : JS_GC_MARK_MAJOR;
++}
++
++/* (Its header's mark: see js_gc_mark_cell.) */
++bool JS_IsOldCell(const void *ptr)
++{
++    return js_rc(ptr)->mark;
++}
++
+ /* ---- for natively compiled code (luminous) ---- */
+ 
+ JSValue JS_GetIteratorObject(JSContext *ctx, JSValueConst obj, bool is_async)

@@ -1,0 +1,504 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1167,6 +1167,16 @@
+    every object with this shape has the same property at the same index. */
+ JS_EXTERN int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                                   int mode, void **pshape);
++/* For `instanceof` with right operand `ctor`: if it is a function whose
++   @@hasInstance is Function.prototype's, with an own "prototype" data
++   property, returns that property's index and a new reference to its
++   shape (shared: JS_ShareObjectShape) in `*pshape`, else -1. The
++   prototypes of `ctor` are then watched (JS_WatchPrototype) up to
++   Function.prototype: while js_proto_epoch is unchanged, any object of
++   that shape and class is such a function, and `v instanceof` it is
++   whether the value in that slot (an object) is on `v`'s prototype
++   chain. */
++JS_EXTERN int JS_CacheInstanceOf(JSContext *ctx, JSValueConst ctor, void **pshape);
+ /* Give object `obj` a shared shape, so that its properties can be cached
+    (JS_CacheOwnProperty): for prototypes of builtins, whose shapes stop
+    being shared when their lazily created members are created. Returns 0, or
+@@ -1254,6 +1264,31 @@
+ JS_EXTERN JSValue JS_NewObjectClassDataShaped(JSContext *ctx, void *shape, JSClassID class_id, size_t size,
+                                               void **pdata);
+ JS_EXTERN void JS_FreeCachedShape(JSRuntime *rt, void *shape);
++/* A new reference to `shape` if it is shared (hashed: an object that
++   has it gets another one when it changes), else NULL (an object's own,
++   which it changes in place). */
++JS_EXTERN void *JS_DupSharedShape(void *shape);
++/* Cached additions of a property (a put-transition cache). After
++   `obj.prop = v` added `prop` to `obj`, whose shape was `before` (which the
++   caller held a reference to): if any object of shape `before` (ordinary,
++   extensible, not watched) gets the property that way, with the shape
++   `obj` has now, returns the property's index and a new reference to that
++   shape in `*pafter`, else -1. The prototypes are then watched
++   (JS_WatchPrototype), up to one that has `prop` (a writable data
++   property): the addition holds while js_proto_epoch is unchanged. */
++JS_EXTERN int JS_CacheAddProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void *before,
++                                  void **pafter);
++/* Cached reads of a property no object of a shape has (a miss cache): if
++   neither `obj` (ordinary, of a shared shape) nor its prototypes have
++   `prop`, returns 0 and a new reference to its shape in `*pshape`, else
++   -1. The prototypes are then watched (JS_WatchPrototype): while
++   js_proto_epoch is unchanged, `prop` of an object of that shape is
++   undefined. */
++JS_EXTERN int JS_CacheAbsentProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void **pshape);
++/* Such an addition to `obj` (an object whose shape is the `before` of
++   JS_CacheAddProperty), of value `val` (taken): returns 1, else 0 if `obj`
++   cannot have it so (`val` not taken), or -1 (out of memory). */
++JS_EXTERN int JS_AddCachedProperty(JSContext *ctx, JSValueConst obj, void *after, JSValue val);
+ JS_EXTERN void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func);
+ /* luminous: what `mark_func` marks for: a minor collection
+    (JS_GC_MARK_MINOR), which need not be given old cells, so that an
+@@ -1345,6 +1380,7 @@
+ #define JS_LAYOUT_CLASS_C_FUNCTION_DATA 15
+ #define JS_LAYOUT_OBJ_OPAQUE        24   /* void *: the opaque of a class object */
+ #define JS_LAYOUT_CLASS_C_FUNCTION  12
++#define JS_LAYOUT_CLASS_PROXY       51
+ #define JS_LAYOUT_STRING_KIND       4    /* uint32_t: the kind in bits 28-29 (0: characters follow) */
+ #define JS_LAYOUT_STRING_DATA       24   /* the characters of a string of kind 0 */
+ /* Allocating plain objects inline (JS_ShapeAllocInfo): what
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1449,6 +1449,10 @@
+        methods and getters): any change to it moves js_proto_epoch (see
+        JS_WatchPrototype) */
+     uint8_t is_watched : 1;
++    /* luminous: the elements of a fast array (JS_CLASS_ARRAY) follow its
++       properties in its own allocation (until they outgrow it: see
++       js_new_array_room, js_array_storage) */
++    uint8_t inline_values : 1;
+     uint16_t class_id; /* see JS_CLASS_x */
+     /* luminous: the weak references to it are listed off the runtime:
+        rt->weak_heads[weak_index] (0: none). */
+@@ -1554,6 +1558,7 @@
+ static_assert(offsetof(JSTypedArray, buffer) == JS_LAYOUT_TA_BUFFER, "");
+ static_assert(offsetof(JSArrayBuffer, immutable) == JS_LAYOUT_ABUF_IMMUTABLE, "");
+ static_assert(JS_CLASS_ARRAY == JS_LAYOUT_CLASS_ARRAY, "");
++static_assert(JS_CLASS_PROXY == JS_LAYOUT_CLASS_PROXY, "");
+ static_assert(JS_CLASS_UINT8C_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_UINT8C, "");
+ static_assert(JS_CLASS_FLOAT64_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_FLOAT64, "");
+ /* JSString.len is the low 31 bits of the first word (JS_LAYOUT_STRING_LEN). */
+@@ -1935,6 +1940,7 @@
+ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
+                               JSValue **arrpp, uint32_t *countp);
+ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len);
++static JSValue js_new_array_room(JSContext *ctx, JSShape *sh, JSProperty *props, uint32_t len);
+ static JSValue JS_CreateAsyncFromSyncIterator(JSContext *ctx,
+                                               JSValue sync_iter);
+ static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val);
+@@ -7679,14 +7685,41 @@
+     return p->prop == (JSProperty *)&p->u || p->inline_props;
+ }
+ 
++/* luminous: whether the property array of `p` is a cell of its own (a
++   raw one, which only `p` holds: see js_realloc_props), not in p's cell
++   nor storage that p's finalization frees. */
++static inline bool js_props_cell(JSObject *p)
++{
++    return !js_inline_props(p) && p->prop && js_is_gc_cell(p->prop);
++}
++
+ /* Resize the property array of `p` from `old_count` to `new_count`. */
+ static JSProperty *js_realloc_props(JSContext *ctx, JSObject *p, uint32_t old_count, uint32_t new_count)
+ {
+     JSProperty *np;
+-    if (!js_inline_props(p))
+-        return js_realloc(ctx, p->prop, sizeof(JSProperty) * new_count);
+-    if (new_count <= old_count)
++    bool in_cell = js_inline_props(p), own_cell = !in_cell && js_props_cell(p);
++    if ((in_cell || own_cell) && new_count <= old_count)
+         return p->prop;
++    if (sizeof(JSProperty) * new_count + sizeof(JSMallocBlockHeader) <= JS_ARENA_MAX_SMALL_SIZE) {
++        /* luminous: a cell of its own (a small one), which the object
++           marks: nothing to free. (No collection: as js_malloc.) */
++        np = js_gc_alloc(ctx, sizeof(JSProperty) * new_count);
++        if (!np)
++            return NULL;
++        if (min_uint32(old_count, new_count))
++            memcpy(np, p->prop, sizeof(JSProperty) * min_uint32(old_count, new_count));
++        if (!in_cell && !own_cell)
++            js_free(ctx, p->prop);
++        p->inline_props = 0;
++        js_gc_wb(ctx->rt, p);
++        return np;
++    }
++    if (!in_cell && !own_cell) {
++        np = js_realloc(ctx, p->prop, sizeof(JSProperty) * new_count);
++        if (np)
++            js_gc_set_fin(p);
++        return np;
++    }
+     np = js_malloc(ctx, sizeof(JSProperty) * new_count);
+     if (np) {
+         memcpy(np, p->prop, sizeof(JSProperty) * old_count);
+@@ -8161,7 +8194,9 @@
+        finalization) */
+     if (extra) {
+         *pextra = (uint8_t *)p + base;
+-    } else if (class_id != JS_CLASS_OBJECT) {
++    } else if (class_id != JS_CLASS_OBJECT && class_id != JS_CLASS_ARRAY) {
++        /* (An array's: once its elements are in storage of their own,
++           see expand_fast_array.) */
+         js_gc_set_fin(p);
+     }
+     return JS_MKPTR(JS_TAG_OBJECT, p);
+@@ -8308,15 +8343,11 @@
+     JSValue obj;
+     int i;
+ 
+-    obj = JS_NewArray(ctx);
++    obj = js_new_array_room(ctx, js_dup_shape(ctx->array_shape), NULL, count);
+     if (JS_IsException(obj))
+         goto exception;
+     if (count > 0) {
+         p = JS_VALUE_GET_OBJ(obj);
+-        if (expand_fast_array(ctx, p, count)) {
+-            JS_FreeValue(ctx, obj);
+-            goto exception;
+-        }
+         p->u.array.count = count;
+         p->prop[0].u.value = js_int32(count);
+         memcpy(p->u.array.u.values, values, count * sizeof(*values));
+@@ -9002,11 +9033,27 @@
+ {
+ }
+ 
++/* luminous: where the elements of a fast array (or arguments object) are:
++   in its own cell (inline_values), in a cell of their own (a raw one,
++   which only the array holds: JS_ARRAY_STORAGE_CELL, see
++   expand_fast_array), or in storage that its finalization frees
++   (JS_ARRAY_STORAGE_MALLOC). */
++#define JS_ARRAY_STORAGE_NONE 0
++#define JS_ARRAY_STORAGE_CELL 1
++#define JS_ARRAY_STORAGE_MALLOC 2
++static inline int js_array_storage(const JSObject *p)
++{
++    if (p->inline_values || !p->u.array.u.values)
++        return JS_ARRAY_STORAGE_NONE;
++    return js_is_gc_cell(p->u.array.u.values) ? JS_ARRAY_STORAGE_CELL : JS_ARRAY_STORAGE_MALLOC;
++}
++
+ static void js_array_finalizer(JSRuntime *rt, JSValueConst val)
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+ 
+-    js_free_rt(rt, p->u.array.u.values);
++    if (js_array_storage(p) == JS_ARRAY_STORAGE_MALLOC)
++        js_free_rt(rt, p->u.array.u.values);
+ }
+ 
+ static void js_array_mark(JSRuntime *rt, JSValueConst val,
+@@ -9015,6 +9062,8 @@
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     uint32_t i;
+ 
++    if (js_array_storage(p) == JS_ARRAY_STORAGE_CELL)
++        mark_func(rt, (JSGCObjectHeader *)p->u.array.u.values);
+     for(i = 0; i < p->u.array.count; i++) {
+         JS_MarkValue(rt, p->u.array.u.values[i], mark_func);
+     }
+@@ -9170,7 +9219,7 @@
+     finalizer = rt->class_array[p->class_id].finalizer;
+     if (finalizer)
+         (*finalizer)(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+-    if (p->prop && !js_inline_props(p))
++    if (p->prop && !js_inline_props(p) && !js_props_cell(p))
+         js_free_rt(rt, p->prop);
+ 
+     /* fail safe */
+@@ -9261,6 +9310,8 @@
+             int i;
+             sh = p->shape;
+             mark_func(rt, &sh->header);
++            if (js_props_cell(p))
++                mark_func(rt, (JSGCObjectHeader *)p->prop);
+             /* mark all the fields */
+             prs = get_shape_prop(sh);
+             if (likely(!sh->special_props)) {
+@@ -9279,8 +9330,9 @@
+                             if (js_ref_obj(pr->u.getset.setter))
+                                 mark_func(rt, &js_ref_obj(pr->u.getset.setter)->header);
+                         } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+-                            if (pr->u.var_ref && (pr->u.var_ref->is_detached ||
+-                                pr->u.var_ref->is_coro)) {
++                            /* (luminous: open too, as a function's: see
++                               js_bytecode_function_mark) */
++                            if (pr->u.var_ref) {
+                                 /* Note: the tag does not matter
+                                    provided it is a GC object */
+                                 mark_func(rt, &pr->u.var_ref->header);
+@@ -9531,6 +9583,8 @@
+        their header tells without the chunk's bits) */
+     if (!h->minor || !js_rc(sh)->mark)
+         js_gc_mark_cell(rt, h, sh);
++    if (unlikely(js_props_cell(p)))
++        js_gc_mark_cell(rt, h, p->prop);
+     for (pr = p->prop, end = pr + sh->prop_count; pr < end; pr++)
+         js_gc_mark_val(rt, h, pr->u.value);
+     if (unlikely(p->weak_index))
+@@ -9538,6 +9592,8 @@
+     if (p->class_id != JS_CLASS_OBJECT) {
+         if (p->class_id == JS_CLASS_ARRAY) {
+             JSValue *v = p->u.array.u.values, *e = v + p->u.array.count;
++            if (js_array_storage(p) == JS_ARRAY_STORAGE_CELL)
++                js_gc_mark_cell(rt, h, v);
+             for (; v < e; v++)
+                 js_gc_mark_val(rt, h, *v);
+         } else {
+@@ -13283,7 +13339,9 @@
+             js_gc_wb(ctx->rt, p);
+         }
+     }
+-    js_free(ctx, p->u.array.u.values);
++    if (js_array_storage(p) == JS_ARRAY_STORAGE_MALLOC)
++        js_free(ctx, p->u.array.u.values);
++    p->inline_values = 0;
+     p->u.array.count = 0;
+     p->u.array.u.values = NULL; /* fail safe */
+     p->u.array.u1.size = 0;
+@@ -13494,6 +13552,7 @@
+ {
+     uint32_t old_size, new_size;
+     JSValue *new_array_prop;
++    int storage;
+ 
+     if (unlikely(new_len > (uint32_t)INT32_MAX)) {
+         JS_ThrowOutOfMemory(ctx);
+@@ -13508,14 +13567,75 @@
+     }
+     /* luminous: room for 8 elements at least (small arrays grew 1, 2, 3...) */
+     new_size = max_uint32(new_len, max_uint32(new_size, 8));
+-    new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
+-    if (!new_array_prop)
+-        return -1;
++    storage = js_array_storage(p);
++    if (p->class_id == JS_CLASS_ARRAY &&
++        sizeof(JSValue) * new_size + sizeof(JSMallocBlockHeader) <= JS_ARENA_MAX_SMALL_SIZE) {
++        /* luminous: a cell of their own (a small one), which the array
++           marks: nothing to free. (No collection: as js_malloc.) */
++        new_array_prop = js_gc_alloc(ctx, sizeof(JSValue) * new_size);
++        if (!new_array_prop)
++            return -1;
++        if (p->u.array.count)
++            memcpy(new_array_prop, p->u.array.u.values, sizeof(JSValue) * p->u.array.count);
++        if (storage == JS_ARRAY_STORAGE_MALLOC)
++            js_free(ctx, p->u.array.u.values);
++        p->inline_values = 0;
++        p->u.array.u.values = new_array_prop;
++        p->u.array.u1.size = new_size;
++        js_gc_wb(ctx->rt, p);
++        return 0;
++    }
++    if (storage != JS_ARRAY_STORAGE_MALLOC) {
++        new_array_prop = js_malloc(ctx, sizeof(JSValue) * new_size);
++        if (!new_array_prop)
++            return -1;
++        if (p->u.array.count)
++            memcpy(new_array_prop, p->u.array.u.values, sizeof(JSValue) * p->u.array.count);
++        p->inline_values = 0;
++    } else {
++        new_array_prop = js_realloc(ctx, p->u.array.u.values, sizeof(JSValue) * new_size);
++        if (!new_array_prop)
++            return -1;
++    }
++    /* (Freed by its finalization from now on.) */
++    js_gc_set_fin(p);
+     p->u.array.u.values = new_array_prop;
+     p->u.array.u1.size = new_size;
+     return 0;
+ }
+ 
++/* luminous: the most elements a new array has room for in its own cell */
++#define JS_ARRAY_INLINE_MAX 32
++
++/* luminous: a new array (of shape `sh`, a reference taken, and properties
++   `props`, as JS_NewObjectFromShape's) with room for `len` elements and
++   none yet: in its own cell if they fit (inline_values: nothing of its own
++   to free then, so no finalization, until they outgrow it), else in
++   storage of their own. */
++static JSValue js_new_array_room(JSContext *ctx, JSShape *sh, JSProperty *props, uint32_t len)
++{
++    JSValue obj;
++    JSObject *p;
++    void *extra;
++
++    if (len == 0 || len > JS_ARRAY_INLINE_MAX) {
++        obj = JS_NewObjectFromShape(ctx, sh, JS_CLASS_ARRAY, props);
++        if (!JS_IsException(obj) && len > 0 && expand_fast_array(ctx, JS_VALUE_GET_OBJ(obj), len)) {
++            JS_FreeValue(ctx, obj);
++            return JS_EXCEPTION;
++        }
++        return obj;
++    }
++    obj = JS_NewObjectFromShapeExtra(ctx, sh, JS_CLASS_ARRAY, props, sizeof(JSValue) * len, &extra);
++    if (JS_IsException(obj))
++        return obj;
++    p = JS_VALUE_GET_OBJ(obj);
++    p->inline_values = 1;
++    p->u.array.u.values = extra;
++    p->u.array.u1.size = len;
++    return obj;
++}
++
+ /* Preconditions: 'p' must be of class JS_CLASS_ARRAY, p->fast_array =
+    true and p->extensible = true */
+ static int add_fast_array_element(JSContext *ctx, JSObject *p,
+@@ -49038,15 +49158,11 @@
+     JSObject *p;
+     int i;
+ 
+-    obj = JS_NewArray(ctx);
++    obj = js_new_array_room(ctx, js_dup_shape(ctx->array_shape), NULL, len);
+     if (JS_IsException(obj))
+         return JS_EXCEPTION;
+     if (len > 0) {
+         p = JS_VALUE_GET_OBJ(obj);
+-        if (expand_fast_array(ctx, p, len) < 0) {
+-            JS_FreeValue(ctx, obj);
+-            return JS_EXCEPTION;
+-        }
+         p->u.array.count = len;
+         for(i = 0; i < len; i++)
+             p->u.array.u.values[i] = js_dup(tab[i]);
+@@ -54192,12 +54308,9 @@
+         props[2].u.value = str_val;                 // input
+         props[3].u.value = js_dup(groups);          // groups
+         str_val = JS_UNDEFINED;
+-        obj = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->regexp_result_shape),
+-                                    JS_CLASS_ARRAY, props);
+-        if (JS_IsException(obj))
+-            goto fail;
+         /* (luminous: its elements are appended to its fast array) */
+-        if (capture_count > 0 && expand_fast_array(ctx, JS_VALUE_GET_OBJ(obj), capture_count))
++        obj = js_new_array_room(ctx, js_dup_shape(ctx->regexp_result_shape), props, capture_count);
++        if (JS_IsException(obj))
+             goto fail;
+         prop_flags = JS_PROP_C_W_E | JS_PROP_THROW;
+         for(i = 0; i < capture_count; i++) {
+@@ -61703,6 +61816,25 @@
+     return pr - p->prop;
+ }
+ 
++int JS_CacheInstanceOf(JSContext *ctx, JSValueConst ctor, void **pshape)
++{
++    JSObject *p;
++
++    if (!JS_IsFunction(ctx, ctor))
++        return -1;
++    p = JS_VALUE_GET_OBJ(ctor);
++    /* (A bound function has no "prototype": see JS_OrdinaryIsInstanceOf.) */
++    if (p->class_id == JS_CLASS_PROXY || p->is_exotic)
++        return -1;
++    /* (Watched first: a first watch gives an object another shape.) */
++    JS_WatchProtoChain(ctx, ctor, JS_ATOM_Symbol_hasInstance, 16);
++    if (!js_default_has_instance(ctx, ctor))
++        return -1;
++    /* (A builtin constructor's shape is its own.) */
++    JS_ShareObjectShape(ctx, ctor);
++    return JS_CacheOwnProperty(ctx, ctor, JS_ATOM_prototype, 0, pshape);
++}
++
+ int JS_ShareObjectShape(JSContext *ctx, JSValueConst obj)
+ {
+     JSRuntime *rt = ctx->rt;
+@@ -61890,6 +62022,7 @@
+             p->tmp_mark = 0;
+             p->is_HTMLDDA = 0;
+             p->inline_props = 0;
++            p->inline_values = 0;
+             p->class_id = JS_CLASS_OBJECT;
+             p->weak_index = 0;
+             p->shape = js_dup_shape(sh);
+@@ -61907,6 +62040,92 @@
+     js_free_shape(rt, shape);
+ }
+ 
++void *JS_DupSharedShape(void *shape)
++{
++    JSShape *sh = shape;
++    return sh->is_hashed ? js_dup_shape(sh) : NULL;
++}
++
++int JS_CacheAddProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void *before,
++                        void **pafter)
++{
++    JSObject *p, *proto;
++    JSShape *sh = before, *new_sh;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    int depth;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || __JS_AtomIsTaggedInt(prop))
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    new_sh = p->shape;
++    /* (The transition add_property makes to a shared shape: see
++       find_hashed_shape_prop.) */
++    if (p->is_exotic || p->is_watched || !sh->is_hashed || sh->watched || !new_sh->is_hashed ||
++        new_sh->watched || new_sh->proto != sh->proto || new_sh->prop_count != sh->prop_count + 1 ||
++        find_hashed_shape_prop(ctx->rt, sh, prop, JS_PROP_C_W_E) != new_sh)
++        return -1;
++    /* The prototypes up to one with a writable data property `prop`, if
++       any: ordinary objects, watched. */
++    for (proto = sh->proto, depth = 0; proto; proto = proto->shape->proto, depth++) {
++        if (depth == 8 || proto->class_id == JS_CLASS_PROXY ||
++            (proto->is_exotic && proto->class_id != JS_CLASS_ARRAY) ||
++            JS_WatchPrototype(ctx, JS_MKPTR(JS_TAG_OBJECT, proto)) < 0)
++            return -1;
++        prs = find_own_property(&pr, proto, prop);
++        if (prs) {
++            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE))
++                return -1;
++            break;
++        }
++    }
++    *pafter = js_dup_shape(new_sh);
++    return new_sh->prop_count - 1;
++}
++
++int JS_CacheAbsentProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void **pshape)
++{
++    JSObject *p, *proto;
++    int depth;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || __JS_AtomIsTaggedInt(prop))
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (p->is_exotic || !p->shape->is_hashed || find_own_property1(p, prop))
++        return -1;
++    for (proto = p->shape->proto, depth = 0; proto; proto = proto->shape->proto, depth++) {
++        if (depth == 8 || proto->class_id == JS_CLASS_PROXY ||
++            (proto->is_exotic && proto->class_id != JS_CLASS_ARRAY) ||
++            JS_WatchPrototype(ctx, JS_MKPTR(JS_TAG_OBJECT, proto)) < 0 ||
++            find_own_property1(proto, prop))
++            return -1;
++    }
++    *pshape = js_dup_shape(p->shape);
++    return 0;
++}
++
++int JS_AddCachedProperty(JSContext *ctx, JSValueConst obj, void *after, JSValue val)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSShape *sh = p->shape, *new_sh = after;
++
++    if (!p->extensible || p->is_exotic || p->is_watched)
++        return 0;
++    if (new_sh->prop_size != sh->prop_size) {
++        JSProperty *new_prop = js_realloc_props(ctx, p, sh->prop_size, new_sh->prop_size);
++        if (!new_prop) {
++            JS_FreeValue(ctx, val);
++            return -1;
++        }
++        p->prop = new_prop;
++    }
++    p->shape = js_dup_shape(new_sh);
++    js_free_shape(ctx->rt, sh);
++    p->prop[new_sh->prop_count - 1].u.value = val;
++    js_gc_wb(ctx->rt, p);
++    return 1;
++}
++
+ void JS_MarkCachedShape(JSRuntime *rt, void *shape, JS_MarkFunc *mark_func)
+ {
+     mark_func(rt, &((JSShape *)shape)->header);

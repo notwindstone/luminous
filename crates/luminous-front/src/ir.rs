@@ -2274,15 +2274,12 @@ fn find_decl<'a>(stmts: &'a [Stmt], l: LocalId, outer: &[&'a Stmt]) -> Option<(&
 }
 
 /// Whether capture `j` of closure `k` can hold the captured value itself:
-/// the closure never assigns it and does not suspend (its frame would
-/// outlive the function data), and neither do the closures it passes it to.
+/// the closure never assigns it, nor do the closures it passes it to. (A
+/// closure that suspends keeps the value in its frame: see `enter_async`.)
 fn value_capture_ok(m: &Module, k: ClosureId, j: usize) -> bool {
     let f = &m.closures[k];
     let c = f.captures[j];
-    !f.is_async
-        && !f.is_generator
-        && stmts_refs(&f.body, c).1 == 0
-        && capturing(&f.body, c).into_iter().all(|(k2, j2)| value_capture_ok(m, k2, j2))
+    stmts_refs(&f.body, c).1 == 0 && capturing(&f.body, c).into_iter().all(|(k2, j2)| value_capture_ok(m, k2, j2))
 }
 
 fn mark_value_capture(m: &mut Module, k: ClosureId, j: usize) {
@@ -2295,9 +2292,11 @@ fn mark_value_capture(m: &mut Module, k: ClosureId, j: usize) {
 
 /// Captures by value, as engines capture variables that never change: a
 /// boxed local assigned only by its declaration, used only in the
-/// statements after it (in the same list), and captured only by closures
-/// that never assign it, is no longer boxed, and its closures hold its value
-/// in their data slots instead of the box.
+/// statements after it (in the same list), or a parameter never assigned
+/// (set before any closure is made; no `arguments` object of the function
+/// is its alias), and captured only by closures that never assign it, is
+/// no longer boxed, and its closures hold its value in their data slots
+/// instead of the box.
 pub fn capture_values(m: &mut Module) {
     let nfuncs = m.funcs.len();
     for g in 0..nfuncs + m.closures.len() {
@@ -2305,6 +2304,16 @@ pub fn capture_values(m: &mut Module) {
         let mut found = Vec::new();
         for l in 0..f.locals.len() {
             if !f.boxed[l] || f.captures.contains(&l) {
+                continue;
+            }
+            if l < f.params.len() {
+                if f.arguments || stmts_refs(&f.body, l).1 != 0 {
+                    continue;
+                }
+                let caps = capturing(&f.body, l);
+                if !caps.is_empty() && caps.iter().all(|&(k, j)| value_capture_ok(m, k, j)) {
+                    found.push((l, caps));
+                }
                 continue;
             }
             // The declaration: `InitLocal(l, x)` as a statement.

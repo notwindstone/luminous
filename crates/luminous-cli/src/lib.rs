@@ -422,7 +422,10 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         std::fs::write(tmp.join("luminous_rt.h"), RT_H)?;
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
         let mut link = Command::new(cc);
-        link.args(["-O2", "-w"]).arg("-I").arg(&q.src).arg("-I").arg(&tmp);
+        // (Without a stack protector or CET markers, as the engine: see
+        // scripts/build-quickjs.sh.)
+        link.args(["-O2", "-w", "-fno-stack-protector", "-fcf-protection=none"]);
+        link.arg("-I").arg(&q.src).arg("-I").arg(&tmp);
         link.arg(tmp.join("main.c")).arg(tmp.join("program.c")).arg(tmp.join("glue.c")).arg(tmp.join("luminous_rt.c"));
         if has_native {
             let cg = opts.codegen()?;

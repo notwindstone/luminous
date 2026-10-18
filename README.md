@@ -135,8 +135,9 @@ regular call path's generated code alone.
 `0006-native-construction.patch`, `0007-promises.patch`,
 `0008-function-source.patch`, `0009-arguments.patch`,
 `0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
-`0012-pristine-builtins.patch` and `0013-json-trailing-holes.patch`, each
-made against the tree the earlier ones give) and builds the engine without
+`0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
+`0014-gc-marking.patch` and `0015-object-model.patch`, each made against
+the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -230,6 +231,23 @@ engine's semantics:
 - `JSON.stringify` of an array whose length is more than its elements
   (holes at the end) by the generic path, which reads them from the
   prototypes (`0013`: the fast path wrote only the elements);
+- what a mark function marks for (`JS_GCMarkKind`: a minor collection,
+  a major one) and whether a cell is old (`JS_IsOldCell`), so that the
+  runtime marks only the inline caches that hold young shapes in a minor
+  collection; and open variable references marked by the functions and
+  `arguments` objects holding them, as the closed ones are: a function made
+  old while one of its variables was still open lost it, young, to a minor
+  collection once the variable closed (`0014`);
+- caches for the object model, as JSC's (`0015`): `JS_CacheInstanceOf`
+  (`instanceof` by the constructor's shape and its `prototype` slot,
+  then a walk of the chain), `JS_CacheAddProperty` and
+  `JS_AddCachedProperty` (an addition as a shape transition, with the
+  prototypes watched), `JS_CacheAbsentProperty` (a property that objects
+  of a shape and their prototypes lack); an array literal's elements in
+  the array's own cell (`JS_NewArrayFrom`, `slice`, `exec`'s results);
+  and an array's elements and an object's properties, once out of its
+  cell, in a cell of their own that it marks rather than storage its
+  finalization frees (arrays need no finalization, up to 63 elements);
 - `JS_SetCFunctionDataClassConstructor`: a C function data object as a
   class constructor, for classes inside functions: `new` calls it with
   `this` new.target, a call without `new` throws, and it has no fast entry
@@ -382,7 +400,9 @@ unreachable, and never moves anything.
   meantime, as marking waits on memory more than anything.
 - **Roots.** The contexts, the job queue, the pending exception, the atoms
   referenced as atoms, mark hooks for values that C structures hold (the
-  native runtime's state and inline caches, libc's timers), and the native
+  native runtime's state and inline caches, libc's timers: a minor
+  collection marks only the caches given a young shape since the last
+  one, which are listed, rather than all of them), and the native
   stack and registers, scanned conservatively: a word pointing into a cell
   keeps it. Native code needs no stack maps: what its registers and stack
   slots hold is found.
@@ -407,10 +427,13 @@ unreachable, and never moves anything.
   again. A shape (shared, hot) is checked old by its header rather than
   its chunk's bits.
 - **Sweeping.** Dead cells are not visited, but for those with something
-  to release (class finalizers, property arrays of their own, weak
-  references, shapes, function bytecode), whose finalizers run before any
-  cell is freed: plain objects, arrays, strings and closures die without
-  being touched. A minor collection sweeps only the chunks with young
+  to release (class finalizers, large property arrays and array elements,
+  weak references, shapes, function bytecode), whose finalizers run before
+  any cell is freed: plain objects, arrays, strings and closures die
+  without being touched. An array literal's elements are in the array's
+  cell; an array's elements and an object's properties that outgrow its
+  cell move to a cell of their own (up to 504 bytes), which the object
+  marks, rather than to storage its finalization frees. A minor collection sweeps only the chunks with young
   cells.
 - **Weak references.** Strings referenced only as values leave the atom
   table once unreachable, shapes the shape hash; WeakMap entries, WeakRefs
@@ -632,13 +655,25 @@ The differential tests run every case with both.
     (a class hierarchy) keeps up to four more own or prototype data
     properties (methods up to the third prototype: a class two superclasses
     up), which its misses check before a lookup; sites that never cache
-    stop trying;
+    stop trying. Those entries also cache what a lookup would find costly:
+    an assignment that adds the property (the shape before and after, the
+    transition made directly while the prototypes, watched, are unchanged,
+    as JSC's put transitions: Hono's eight additions a request, 380
+    instructions each, now about 100), and a property that objects of a
+    shape and their prototypes lack (`init.statusText` of a plain
+    `{ status, headers }`: undefined, without trying every kind of entry
+    again);
+  - `instanceof` through a per-site cache of the right operand: its shape
+    and class, and the slot of its `prototype`, valid while its prototypes
+    (watched, up to `Function.prototype`) are unchanged; the left
+    operand's chain is then walked inline (Hono's 14 a request: 180
+    instructions each, now about 50);
   - object literals: each site caches the literal's final shape, and
     later objects are made with it directly (as JSC's allocation profiles
     do), allocated inline: a block popped from the allocator's cache for
     the shape's size class and the object's fields stored in place
     (`JS_ShapeAllocInfo`; the engine call otherwise);
-  - `typeof`, `in`, `instanceof`, `new`;
+  - `typeof`, `in`, `new`;
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them; a small
     one that calls itself has its own body inlined once, so that each call
@@ -676,7 +711,11 @@ The differential tests run every case with both.
 - **Closures**: nested functions and arrows, including ones that outlive
   their creator and capture loop variables (one binding per iteration, as in
   JS). A captured variable never assigned after its declaration is
-  captured by value: no box is allocated for it. Closures of one function
+  captured by value: no box is allocated for it. So is a parameter never
+  assigned (in a function without `arguments`), and a variable of an
+  async function or generator, whose suspended frame keeps the value
+  (Hono's compose and dispatch: 13 boxes a request, now 2; 5,300
+  instructions). Closures of one function
   share a shape, and after the first one native code makes them inline as
   it makes object literals: one cell bumped off its size class's run,
   holding the function object, its `length` and `name`, its record and
