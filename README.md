@@ -136,9 +136,9 @@ regular call path's generated code alone.
 `0008-function-source.patch`, `0009-arguments.patch`,
 `0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
 `0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
-`0014-gc-marking.patch`, `0015-object-model.patch` and
-`0016-gc-trigger-inline.patch`, each made against the tree the earlier
-ones give) and builds the engine without
+`0014-gc-marking.patch`, `0015-object-model.patch`,
+`0016-gc-trigger-inline.patch` and `0017-allocation-fast-paths.patch`,
+each made against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -251,6 +251,14 @@ engine's semantics:
   finalization frees (arrays need no finalization, up to 63 elements);
 - the collection trigger's test inline in allocations, its work out of
   line (`0016`);
+- plain objects (`JS_NewObjectProtoClass`, `Object.create`) and arrays of
+  the original shape (literals, `new Array`, `slice`, empty ones) made
+  inline, as `JS_NewObjectClassData`'s objects are: the header in one
+  store, none of the general path's per-class work (an array literal:
+  178 instructions, now 117, collections included);
+  `JS_NewArrayWithRoom`: an empty array with room in its own cell, which
+  native code makes for `[]` (4 elements: the pushes that follow need no
+  storage of their own) (`0017`);
 - `JS_SetCFunctionDataClassConstructor`: a C function data object as a
   class constructor, for classes inside functions: `new` calls it with
   `this` new.target, a call without `new` throws, and it has no fast entry
@@ -721,7 +729,9 @@ The differential tests run every case with both.
   assigned (in a function without `arguments`), and a variable of an
   async function or generator, whose suspended frame keeps the value
   (Hono's compose and dispatch: 13 boxes a request, now 2; 5,300
-  instructions). Closures of one function
+  instructions). A box is one cell: the value in the box object's own,
+  which needs no finalization (it was an object holding a separate
+  traced block). Closures of one function
   share a shape, and after the first one native code makes them inline as
   it makes object literals: one cell bumped off its size class's run,
   holding the function object, its `length` and `name`, its record and
@@ -747,7 +757,12 @@ The differential tests run every case with both.
   `prototype` (made when first read), and `new f()` makes an object of
   it, runs `f` and returns the object unless `f` returns one (so
   `function Foo() {}` with `Foo.prototype.m = ...`, older JavaScript's
-  classes, works).
+  classes, works). One that uses its `this` gets it as methods do: the
+  receiver of `o.f()`, the object `new` makes, what `call`, `apply` and
+  `bind` give, and undefined in a plain call (all compiled code is module
+  code, strict), which native callers pass (a function assigned as a
+  method that replaces itself, as Hono's router does: 1,000 instructions
+  a request it ran interpreted).
 - **Class methods, getters and setters** (`this` included; static ones
   too), with the class's
   private fields, methods and accessors (`this.#x`, `this.#m()`,
@@ -1034,8 +1049,7 @@ Not yet: constructors of derived classes that run code before
 interpreted), private accessors' and static private methods' direct calls,
 computed method and accessor names in object literals, private names,
 static fields and blocks, computed field names and `super.x` in classes
-inside functions, `this` outside methods, constructors and their
-field initializers. A
+inside functions, `new.target`. A
 function using one of these stays interpreted (and functions that call it
 call it through its binding). `luminous report file.ts` says, for every
 function, whether it is native and, if not, which construct stopped it.

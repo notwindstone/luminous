@@ -804,10 +804,13 @@ impl Lower {
     }
 
     fn store_box(&mut self, l: ir::LocalId, w: Value) {
+        let LVar::Boxed { obj, .. } = self.vars[l] else { unreachable!() };
         let slot = self.box_slot(l);
         self.b.ins().store(M_SLOT, w, slot, 0);
-        // (The slot starts the box's traced block.)
-        self.write_barrier(slot, w);
+        // (The slot is in the box object's cell.)
+        let o = self.b.use_var(obj);
+        let p = self.val_ptr(o);
+        self.write_barrier(p, w);
     }
 
     /// ReferenceError if a boxed local is still uninitialized.

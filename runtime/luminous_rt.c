@@ -118,54 +118,52 @@ int lum_define_field(JSContext *ctx, JSValue *obj, JSAtom prop, JSValue val)
     return JS_DefinePropertyValue(ctx, *obj, prop, val, JS_PROP_C_W_E | JS_PROP_THROW);
 }
 
-/* Array literal. Takes ownership of the elements. */
+/* Array literal. Takes ownership of the elements. An empty one has room
+   for a few in its own cell: it is mostly made to be pushed to. */
 JSValue lum_new_array(JSContext *ctx, int count, JSValue *values)
 {
+    if (count == 0)
+        return JS_NewArrayWithRoom(ctx, 4);
     return JS_NewArrayFrom(ctx, count, values);
 }
 
 /* ---- boxes: variables captured by closures ---- */
 
 static JSClassID lum_box_class;
+/* The shape of boxes (referenced), made with the first one. */
+static void *lum_box_shape;
 
 typedef struct LumBox {
     JSValue value;
 } LumBox;
 
-static void lum_box_finalizer(JSRuntime *rt, JSValueConst val)
-{
-    LumBox *b = JS_GetOpaque(val, lum_box_class);
-    if (b) {
-        JS_FreeValueRT(rt, b->value);
-        js_free_rt(rt, b);
-    }
-}
-
 static void lum_box_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     LumBox *b = JS_GetOpaque(val, lum_box_class);
-    /* (the box, a traced block: its value with it) */
     if (b)
-        mark_func(rt, (JSGCObjectHeader *)b);
+        JS_MarkValue(rt, b->value, mark_func);
 }
 
 /* A new box holding an uninitialized binding; *slot receives the address
-   of its value, which stays valid as long as the box object lives. */
+   of its value, which stays valid as long as the box object lives. The
+   value is in the object's own cell (nothing to finalize), which a word
+   pointing into it keeps alive: native code may hold only *slot, and
+   stores there are the object's (its write barrier). */
 JSValue lum_box_new(JSContext *ctx, JSValue **slot)
 {
-    /* (Traced: native code may hold only *slot.) */
-    LumBox *b = JS_MallocTraced(ctx, sizeof(*b));
+    void *data;
     JSValue obj;
-    if (!b)
-        return JS_EXCEPTION;
-    b->value = JS_UNINITIALIZED;
-    obj = JS_NewObjectClass(ctx, lum_box_class);
-    if (JS_IsException(obj)) {
-        js_free(ctx, b);
-        return obj;
+    if (lum_box_shape) {
+        obj = JS_NewObjectClassDataShaped(ctx, lum_box_shape, lum_box_class, sizeof(LumBox), &data);
+    } else {
+        obj = JS_NewObjectClassData(ctx, lum_box_class, sizeof(LumBox), false, &data);
+        if (!JS_IsException(obj))
+            lum_box_shape = JS_DupObjectShape(obj);
     }
-    JS_SetOpaque(obj, b);
-    *slot = &b->value;
+    if (JS_IsException(obj))
+        return obj;
+    ((LumBox *)data)->value = JS_UNINITIALIZED;
+    *slot = &((LumBox *)data)->value;
     return obj;
 }
 
@@ -394,6 +392,9 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
     if (lum_frame_shape)
         JS_FreeCachedShape(rt, lum_frame_shape);
     lum_frame_shape = NULL;
+    if (lum_box_shape)
+        JS_FreeCachedShape(rt, lum_box_shape);
+    lum_box_shape = NULL;
     for (i = 0; i < lum_ncells; i++) {
         JS_FreeValueRT(rt, lum_cells[i]);
         lum_cells[i] = JS_UNINITIALIZED;
@@ -694,7 +695,7 @@ int lum_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *
         lum_cells[i] = JS_UNINITIALIZED;
 
     {
-        JSClassDef box_def = { "LumBox", .finalizer = lum_box_finalizer, .gc_mark = lum_box_mark };
+        JSClassDef box_def = { "LumBox", .gc_mark = lum_box_mark };
         JS_NewClassID(rt, &lum_box_class);
         if (JS_NewClass(rt, lum_box_class, &box_def) < 0)
             return -1;
