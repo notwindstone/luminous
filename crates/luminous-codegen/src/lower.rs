@@ -8871,9 +8871,17 @@ impl Lower {
         let ctx = self.ctx;
         // Only locals survive a suspension.
         debug_assert!(self.temps.is_empty(), "values held across an await");
-        // Takes ownership of the value.
+        // Takes ownership of the value. The value to continue with at once
+        // (the locals still in place) when suspending could not be told
+        // apart, else "suspended".
         let r = self.helper("lum_await", &[ctx, slots, w, st]);
-        self.check_int(r[0]);
+        self.check_value(r[0]);
+        let join = self.b.create_block();
+        let vw = self.b.append_block_param(join, I64);
+        let suspend = self.b.create_block();
+        let is_suspended = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], val_const(TAG_UNINITIALIZED, 0));
+        self.b.ins().brif(is_suspended, suspend, &[], join, &[BlockArg::Value(r[0])]);
+        self.b.switch_to_block(suspend);
         self.spill_locals();
         self.suspended(0);
 
@@ -8883,18 +8891,17 @@ impl Lower {
             let cx = self.async_cx.as_ref().unwrap();
             (cx.value, cx.is_throw)
         };
-        let vw = self.b.ins().load(I64, M_SLOT, vptr, 0);
-        self.dup(vw);
+        let rw = self.b.ins().load(I64, M_SLOT, vptr, 0);
+        self.dup(rw);
         let throw = self.b.create_block();
-        let ok = self.b.create_block();
         self.b.set_cold_block(throw);
-        self.b.ins().brif(is_throw, throw, &[], ok, &[]);
+        self.b.ins().brif(is_throw, throw, &[], join, &[BlockArg::Value(rw)]);
         self.b.switch_to_block(throw);
         // A rejection is thrown at the await.
-        self.helper("JS_Throw", &[ctx, vw]);
+        self.helper("JS_Throw", &[ctx, rw]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
-        self.b.switch_to_block(ok);
+        self.b.switch_to_block(join);
         vw
     }
 

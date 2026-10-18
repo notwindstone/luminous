@@ -183,6 +183,10 @@ typedef struct LumFrame {
     JSValue promise;          /* async: its promise, settled by the frame */
     int fn, nslots;
     int state;                /* where to resume */
+    /* async: resumed (by its resumption job, which does nothing after
+       it: the entry runs it only until it first suspends): its awaits
+       may continue at once (see lum_await) */
+    int in_job;
     JSValue slots[];
 } LumFrame;
 
@@ -229,6 +233,7 @@ static JSValue lum_frame_new(JSContext *ctx, int fn, int nslots, LumFrame **pf)
     f->fn = fn;
     f->nslots = nslots;
     f->state = 0;
+    f->in_job = 0;
     for (i = 0; i < nslots; i++)
         f->slots[i] = JS_UNDEFINED;
     *pf = f;
@@ -308,21 +313,23 @@ static JSValue lum_resume_job(JSContext *ctx, int argc, JSValueConst *argv)
 {
     LumFrame *f = JS_GetOpaque(argv[0], lum_frame_class);
     JSValue value = argv[1];
+    f->in_job = 1;
     lum_async_step(ctx, f->slots, f->state, &value, JS_VALUE_GET_BOOL(argv[2]));
     return JS_UNDEFINED;
 }
 
-/* `await value` at resume point `state`: continue the frame when the value
-   settles. Takes ownership of `value`. Returns -1 on exception. */
-int lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
+/* `await value` at resume point `state`. Takes ownership of `value`.
+   Returns the value to continue with at once (a new reference) when
+   suspending could not be told apart: the frame runs last in its
+   resumption job, no other job is pending, and the value is settled (see
+   JS_AwaitNativeOrValue). Else registers the continuation and returns
+   JS_UNINITIALIZED (suspended), or JS_EXCEPTION. */
+JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 {
     LumFrame *f = lum_frame_of(slots);
-    int ret;
     f->state = state;
     /* (The reaction resumes the frame from its job: no functions.) */
-    ret = JS_AwaitNative(ctx, value, lum_resume_job, JS_MKPTR(JS_TAG_OBJECT, f->self));
-    JS_FreeValue(ctx, value);
-    return ret;
+    return JS_AwaitNativeOrValue(ctx, value, lum_resume_job, JS_MKPTR(JS_TAG_OBJECT, f->self), f->in_job);
 }
 
 /* ---- module state: cells, string constants, atoms ---- */

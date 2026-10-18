@@ -70,7 +70,7 @@ extern LumStep *const lum_steps[];
 JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots);
 void lum_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
 JSValue lum_async_settled(JSContext *ctx, JSValue v);
-int lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
+JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 
 /* Pristine objects and their shapes: typed arrays by JSTypedArrayEnum,
  * then an array; then the original array iteration objects. */

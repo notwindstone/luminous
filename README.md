@@ -137,8 +137,9 @@ regular call path's generated code alone.
 `0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
 `0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
 `0014-gc-marking.patch`, `0015-object-model.patch`,
-`0016-gc-trigger-inline.patch` and `0017-allocation-fast-paths.patch`,
-each made against the tree the earlier ones give) and builds the engine without
+`0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch` and
+`0018-await-or-value.patch`, each made against the tree the earlier ones
+give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -272,7 +273,10 @@ engine's semantics:
   holding the resolve function whose flag both share (three allocations
   per pair, two finalizers); `JS_AwaitNative`: an await whose reaction
   queues the native frame's resumption directly (no resolve and reject
-  functions, no call through the engine); `JS_NewPromiseSettledWith`:
+  functions, no call through the engine); `JS_AwaitNativeOrValue`
+  (`0018`): the value an await continues with at once, when suspending
+  could not be told apart (see async functions below);
+  `JS_NewPromiseSettledWith`:
   the promise of an async function that completed without suspending;
   `JS_NewObjectClassDataShaped`: frames allocated with their shape known.
   Fast paths, taken while the builtins they stand for are the original
@@ -1012,7 +1016,15 @@ The differential tests run every case with both.
   A call's frame (its locals across awaits) is one cell, the frame object
   with its slots after it, set once rather than zeroed and set again, with
   nothing to finalize; an await resumes it from its own job, queued where
-  the awaited promise's reaction job would be. An async function that
+  the awaited promise's reaction job would be. An await continues at once,
+  without suspending, when that could not be told apart (as Bun's AOT
+  compiler does): the frame runs last in its resumption job, no other job
+  is pending and no promise hook watches (so its resumption would be
+  queued alone and run next), and the value is a primitive or a fulfilled
+  promise of `Promise` without properties of its own (whose reaction would
+  be queued at once). `await` of a resolved promise in a loop: 338
+  instructions, now 96 (Bun's JIT 458); an await that suspends costs about
+  10 more than before. An async function that
   never awaits has no frame: it runs as other functions do, and its entry
   makes the promise of its result. `bench/micro/async.ts`, ns per
   iteration on a 4-core x86-64 VM (before these changes; bun 1.4.3):

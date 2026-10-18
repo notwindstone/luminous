@@ -1,0 +1,68 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1662,6 +1662,12 @@
+    with (data, the value, whether it was rejected) where the reaction job
+    would be: see quickjs.c. */
+ JS_EXTERN int JS_AwaitNative(JSContext *ctx, JSValueConst value, JSJobFunc *job, JSValueConst data);
++/* luminous: JS_AwaitNative taking `value`, for code that may continue at
++   once when it runs last in a job (`may_continue`): the value to continue
++   with if suspending could not be told apart, else JS_UNINITIALIZED (the
++   reaction registered) or JS_EXCEPTION: see quickjs.c. */
++JS_EXTERN JSValue JS_AwaitNativeOrValue(JSContext *ctx, JSValue value, JSJobFunc *job, JSValueConst data,
++                                        bool may_continue);
+ /* A new promise of %Promise% settled as its resolve function (its reject
+    function if is_reject) would settle it with `value` (a thenable is
+    followed): an async function's, which completed without suspending. */
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61721,6 +61721,50 @@
+     return ret;
+ }
+ 
++/* luminous: JS_AwaitNative taking `value` (the suspending path of
++   JS_AwaitNativeOrValue, out of line). */
++static __attribute__((noinline)) JSValue js_await_native_taking(JSContext *ctx, JSValue value, JSJobFunc *job,
++                                                                JSValueConst data)
++{
++    int ret = JS_AwaitNative(ctx, value, job, data);
++    JS_FreeValue(ctx, value);
++    return ret < 0 ? JS_EXCEPTION : JS_UNINITIALIZED;
++}
++
++/* luminous: JS_AwaitNative for code that may continue at once, which
++   takes `value`: the value to continue with (a new reference), or
++   JS_UNINITIALIZED once the reaction is registered, or JS_EXCEPTION.
++   `may_continue`: the caller runs last in a job (nothing follows it in
++   the job). It continues when, besides, no job is pending and no promise
++   hook watches, so that suspending would queue only its resumption, which
++   would then run next: with the value of a non-object, or of a fulfilled
++   promise of %Promise% without properties (whose reaction would be queued
++   at once). */
++JSValue JS_AwaitNativeOrValue(JSContext *ctx, JSValue value, JSJobFunc *job, JSValueConst data,
++                              bool may_continue)
++{
++    JSRuntime *rt = ctx->rt;
++    JSObject *p;
++    JSPromiseData *s;
++
++    if (may_continue && rt->job_count == 0 && !rt->promise_hook) {
++        if (!JS_IsObject(value))
++            return value;
++        p = JS_VALUE_GET_OBJ(value);
++        if (p->class_id == JS_CLASS_PROMISE) {
++            s = p->u.opaque;
++            /* (the shape of promises made without properties, held: its
++               own and its prototype's) */
++            if (s->promise_state == JS_PROMISE_FULFILLED && p->shape == ctx->promise_shape &&
++                (js_pristine(ctx) & JS_PRISTINE_CTOR)) {
++                s->is_handled = true;
++                return js_dup(s->promise_result);
++            }
++        }
++    }
++    return js_await_native_taking(ctx, value, job, data);
++}
++
+ /* A property found on the prototype of obj (an ordinary object without it
+    as an own property), or on the prototype of that prototype: its slot in
+    the holder's properties, with references to the shapes of obj, of the

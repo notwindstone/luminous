@@ -641,7 +641,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_make_closure", &[P, Int, Int, P], &[W]),
         ("lum_async_start", &[P, Int, Int, P, P], &[W]),
         ("lum_async_step", &[P, P, Int, P, Int], &[]),
-        ("lum_await", &[P, P, W, Int], &[Int]),
+        ("lum_await", &[P, P, W, Int], &[W]),
         ("lum_async_settled", &[P, W], &[W]),
         ("lum_is_promise_resolve", &[W, W], &[Int]),
         ("lum_pow", &[D, D], &[D]),
