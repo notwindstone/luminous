@@ -1,0 +1,25 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2102,7 +2102,7 @@
+ 
+ /* luminous: a collection when the heap has grown past the threshold (or, with
+    QJS_GC_STRESS=n, every n calls). */
+-static void js_trigger_gc(JSRuntime *rt, size_t size)
++static no_inline void js_trigger_gc_slow(JSRuntime *rt, size_t size)
+ {
+     JSGCHeap *h = &rt->gc_heap;
+     if (unlikely(h->stress)) {
+@@ -2117,6 +2117,13 @@
+         js_gc_collect(rt, false);
+ }
+ 
++/* (The test inline: an allocation's fast path makes no call.) */
++static inline void js_trigger_gc(JSRuntime *rt, size_t size)
++{
++    if (unlikely(rt->gc_heap.stress || rt->malloc_state.malloc_size + size > rt->malloc_gc_threshold))
++        js_trigger_gc_slow(rt, size);
++}
++
+ static size_t js_malloc_usable_size_unknown(const void *ptr)
+ {
+     return 0;

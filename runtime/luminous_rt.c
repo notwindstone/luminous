@@ -776,6 +776,11 @@ int lum_lock_builtins(JSContext *ctx)
         "    g.Date.prototype, g.Symbol.prototype, g.Error.prototype, arrayIteratorProto,\n"
         "    Object.getPrototypeOf(arrayIteratorProto), Object.getPrototypeOf(new g.Map().entries()),\n"
         "    Object.getPrototypeOf(new g.Set().values()), Object.getPrototypeOf(''[Symbol.iterator]())];\n"
+        "  var statics = ['Object', 'Array', 'Number', 'String', 'Boolean', 'Symbol', 'Function', 'Promise',\n"
+        "    'Map', 'Set', 'WeakMap', 'WeakSet', 'Date', 'RegExp', 'Error', 'BigInt', 'ArrayBuffer',\n"
+        "    'JSON', 'Math', 'Reflect'];\n"
+        "  for (var i = 0; i < statics.length; i++)\n"
+        "    if (g[statics[i]]) protos.push(g[statics[i]]);\n"
         "  for (var i = 0; i < protos.length; i++) {\n"
         "    var keys = Reflect.ownKeys(protos[i]);\n"
         "    for (var j = 0; j < keys.length; j++)\n"
@@ -811,8 +816,9 @@ int lum_lock_builtins(JSContext *ctx)
         else
             lum_shapes[i] = JS_VALUE_GET_PTR(lum_pins[i]);
     }
-    /* Their members all created (above), the builtin prototypes keep their
-       shapes: their methods can be cached. */
+    /* Their members all created (above), the builtin prototypes, and the
+       constructors and namespaces (`Object.create`, `JSON.stringify`),
+       keep their shapes: their methods can be cached. */
     {
         JSValue protos = JS_GetPropertyUint32(ctx, r, LUM_PINS);
         int64_t n = 0;

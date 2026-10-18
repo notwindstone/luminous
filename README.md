@@ -136,8 +136,9 @@ regular call path's generated code alone.
 `0008-function-source.patch`, `0009-arguments.patch`,
 `0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
 `0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
-`0014-gc-marking.patch` and `0015-object-model.patch`, each made against
-the tree the earlier ones give) and builds the engine without
+`0014-gc-marking.patch`, `0015-object-model.patch` and
+`0016-gc-trigger-inline.patch`, each made against the tree the earlier
+ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -248,6 +249,8 @@ engine's semantics:
   and an array's elements and an object's properties, once out of its
   cell, in a cell of their own that it marks rather than storage its
   finalization frees (arrays need no finalization, up to 63 elements);
+- the collection trigger's test inline in allocations, its work out of
+  line (`0016`);
 - `JS_SetCFunctionDataClassConstructor`: a C function data object as a
   class constructor, for classes inside functions: `new` calls it with
   `this` new.target, a call without `new` throws, and it has no fast entry
@@ -276,8 +279,8 @@ engine's semantics:
   the spec's: the result of each is reacted to in the same job, at the
   same place in the queue;
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
-  that inline caches skip (the global object, built-in constructors) look
-  at the index where the property was last found first;
+  that inline caches skip (the global object, objects of shapes of their
+  own) look at the index where the property was last found first;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -301,8 +304,11 @@ engine's semantics:
   its own data or declines (the general algorithm then runs). `aot type`
   objects and arrays of them are written this way (`0005`);
 - `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
-  `Array.prototype`, `Map.prototype`, …) shared shapes once their lazily
-  created members exist, so that inline caches can hold their methods;
+  `Array.prototype`, `Map.prototype`, …), constructors and namespaces
+  (`Object`, `Array`, `JSON`, `Reflect`, …) shared shapes once their
+  lazily created members exist, so that inline caches can hold their
+  methods (Elysia's `Object.create`, `JSON.stringify`: 1,000 instructions
+  a request);
   prototype caches also accept arrays, which are exotic only for their
   indices and `length`;
 - `JS_CallBuiltin`: calls a builtin (a C function object) without the
