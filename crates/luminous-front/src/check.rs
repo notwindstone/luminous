@@ -4710,6 +4710,20 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     if m.optional {
                         return reject(span, "optional chaining is not supported yet");
                     }
+                    // `Object.keys(x).length`: counted, without the array.
+                    if m.property.name == "length"
+                        && let Expression::CallExpression(c) = m.object.without_parentheses()
+                        && !c.optional
+                        && let Expression::StaticMemberExpression(cm) = c.callee.without_parentheses()
+                        && global_member(cm, self.m.scoping) == Some(("Object", "keys"))
+                        && let [arg] = &c.arguments[..]
+                        && let Some(arg) = arg.as_expression()
+                    {
+                        let obj = Expr::new(Ty::Any, ExprKind::Global(self.m.atom("Object")));
+                        let keys = self.m.atom("keys");
+                        let arg = any(self.expr(arg)?);
+                        return Ok(Expr::new(Ty::Any, ExprKind::KeysLength(Box::new(obj), keys, Box::new(arg))));
+                    }
                     let obj = self.expr(&m.object)?;
                     let atom = self.m.atom(m.property.name.as_str());
                     if self.struct_field(obj.ty, atom).is_some() || matches!(obj.ty, Ty::StructOrUndef(_)) {

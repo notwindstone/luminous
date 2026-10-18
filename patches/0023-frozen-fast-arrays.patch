@@ -1,0 +1,170 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1460,6 +1460,11 @@
+        properties in its own allocation (until they outgrow it: see
+        js_new_array_room, js_array_storage) */
+     uint8_t inline_values : 1;
++    /* luminous: a frozen fast array (JS_CLASS_ARRAY, not extensible): its
++       elements stay in u.array, read as fast, but are not writable nor
++       configurable. Writing, deleting or defining one makes it a slow array
++       first (convert_fast_array_to_array keeps them so). */
++    uint8_t frozen_array : 1;
+     uint16_t class_id; /* see JS_CLASS_x */
+     /* luminous: the weak references to it are listed off the runtime:
+        rt->weak_heads[weak_index] (0: none). */
+@@ -13022,15 +13027,15 @@
+                 uint32_t idx;
+                 idx = __JS_AtomToUInt32(prop);
+                 if (idx < p->u.array.count) {
++                    int elem_flags = p->frozen_array ? JS_PROP_ENUMERABLE :
++                        JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE;
+                     if (desc) {
+-                        desc->flags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+-                            JS_PROP_CONFIGURABLE;
++                        desc->flags = elem_flags;
+                         desc->getter = JS_UNDEFINED;
+                         desc->setter = JS_UNDEFINED;
+                         desc->value = JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
+                     } else if (flags_only) {
+-                        *pflags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+-                            JS_PROP_CONFIGURABLE;
++                        *pflags = elem_flags;
+                     }
+                     return true;
+                 }
+@@ -13488,14 +13493,16 @@
+         }
+     } else {
+         JSValue *tab = p->u.array.u.values;
++        int elem_flags = p->frozen_array ? JS_PROP_ENUMERABLE : JS_PROP_C_W_E;
+         for(i = 0; i < len; i++) {
+             /* add_property cannot fail here but
+                __JS_AtomFromUInt32(i) fails for i > INT32_MAX */
+-            pr = add_property(ctx, p, __JS_AtomFromUInt32(i), JS_PROP_C_W_E);
++            pr = add_property(ctx, p, __JS_AtomFromUInt32(i), elem_flags);
+             pr->u.value = *tab++;
+             js_gc_wb(ctx->rt, p);
+         }
+     }
++    p->frozen_array = 0;
+     if (js_array_storage(p) == JS_ARRAY_STORAGE_MALLOC)
+         js_free(ctx, p->u.array.u.values);
+     p->inline_values = 0;
+@@ -13958,6 +13965,8 @@
+                 if (__JS_AtomIsTaggedInt(prop)) {
+                     uint32_t idx = __JS_AtomToUInt32(prop);
+                     if (idx < p1->u.array.count) {
++                        if (unlikely(p1->frozen_array))
++                            goto read_only_prop;
+                         if (unlikely(p == p1))
+                             return JS_SetPropertyValue(ctx, this_obj, js_int32(idx), val, flags);
+                         else
+@@ -14203,6 +14212,8 @@
+                 /* add element */
+                 return add_fast_array_element(ctx, p, val, flags);
+             }
++            if (unlikely(p->frozen_array))
++                goto slow_path;
+             set_value(ctx, &p->u.array.u.values[idx], val);
+             JS_GC_WBV(ctx->rt, p, val);
+             break;
+@@ -14793,7 +14804,7 @@
+                 idx = __JS_AtomToUInt32(prop);
+                 if (idx < p->u.array.count) {
+                     prop_flags = get_prop_flags(flags, JS_PROP_C_W_E);
+-                    if (prop_flags != JS_PROP_C_W_E)
++                    if (prop_flags != JS_PROP_C_W_E || p->frozen_array)
+                         goto convert_to_slow_array;
+                     if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) {
+                     convert_to_slow_array:
+@@ -23769,7 +23780,8 @@
+                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
+                         p = JS_VALUE_GET_OBJ(sp[-3]);
+                         if (likely(p->class_id == JS_CLASS_ARRAY &&
+-                                   idx < (uint32_t)p->u.array.count)) {
++                                   idx < (uint32_t)p->u.array.count &&
++                                   !p->frozen_array)) {
+                             set_value(ctx, &p->u.array.u.values[idx], val);
+                             JS_GC_WBV(ctx->rt, p, val);
+                             JS_FreeValue(ctx, sp[-3]);
+@@ -46085,6 +46097,14 @@
+             return JS_ThrowTypeError(ctx, "cannot freeze resizable typed array");
+     }
+ 
++    /* luminous: a fast array keeps its elements, frozen (`frozen_array`);
++       its other properties are frozen below. */
++    if (freeze_flag && p->class_id == JS_CLASS_ARRAY && p->fast_array && !p->extensible) {
++        if (unlikely(p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY])))
++            ctx->std_array_prototype = false;
++        p->frozen_array = 1;
++    }
++
+     flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK;
+     if (JS_GetOwnPropertyNamesInternal(ctx, &props, &len, p, flags))
+         return JS_EXCEPTION;
+@@ -46093,6 +46113,10 @@
+         int prop_flags;
+         JSAtom prop = props[i].atom;
+ 
++        /* (Already frozen: the elements of a frozen fast array.) */
++        if (p->frozen_array && __JS_AtomIsTaggedInt(prop) &&
++            __JS_AtomToUInt32(prop) < p->u.array.count)
++            continue;
+         desc_flags = JS_PROP_THROW | JS_PROP_HAS_CONFIGURABLE;
+         if (freeze_flag) {
+             res = JS_GetOwnPropertyFlagsInternal(ctx, &prop_flags, p, prop);
+@@ -47139,7 +47163,7 @@
+     p = NULL;
+     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+         p = JS_VALUE_GET_OBJ(obj);
+-        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array) {
++        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || p->frozen_array) {
+             p = NULL;
+         }
+     }
+@@ -48356,7 +48380,8 @@
+     if (len > 0) {
+         newLen = len - 1;
+         /* Special case fast arrays */
+-        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
++        if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len &&
++            !JS_VALUE_GET_OBJ(obj)->frozen_array) {
+             JSObject *p = JS_VALUE_GET_OBJ(obj);
+             if (shift) {
+                 res = arrp[0];
+@@ -48546,7 +48571,8 @@
+         goto exception;
+ 
+     /* Special case fast arrays */
+-    if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
++    if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len &&
++        !JS_VALUE_GET_OBJ(obj)->frozen_array) {
+         uint32_t ll, hh;
+ 
+         if (count32 > 1) {
+@@ -49098,7 +49124,7 @@
+     if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT)
+         return 0;
+     p = JS_VALUE_GET_OBJ(arr);
+-    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array ||
++    if (p->class_id != JS_CLASS_ARRAY || !p->fast_array || p->frozen_array ||
+         JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
+         JS_VALUE_GET_INT(p->prop[0].u.value) != p->u.array.count)
+         return 0;
+@@ -49130,7 +49156,7 @@
+     }
+     for (i = n; i < len; i++)
+         tab[i] = JS_UNDEFINED;
+-    if (p->class_id == JS_CLASS_ARRAY && p->fast_array && p->u.array.count == len) {
++    if (p->class_id == JS_CLASS_ARRAY && p->fast_array && !p->frozen_array && p->u.array.count == len) {
+         for (i = 0; i < len; i++) {
+             JSValue old = p->u.array.u.values[i];
+             p->u.array.u.values[i] = tab[i];
+@@ -62653,6 +62679,7 @@
+             p->is_HTMLDDA = 0;
+             p->inline_props = 0;
+             p->inline_values = 0;
++            p->frozen_array = 0;
+             p->class_id = JS_CLASS_OBJECT;
+             p->weak_index = 0;
+             p->shape = js_dup_shape(sh);

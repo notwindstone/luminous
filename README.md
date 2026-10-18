@@ -139,7 +139,8 @@ regular call path's generated code alone.
 `0014-gc-marking.patch`, `0015-object-model.patch`,
 `0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch`,
 `0018-await-or-value.patch`, `0019-json-fast-paths.patch`,
-`0020-exotic-define-own.patch` and `0021-latin1-strings.patch`, each made
+`0020-exotic-define-own.patch`, `0021-latin1-strings.patch`,
+`0022-count-own-keys.patch` and `0023-frozen-fast-arrays.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -294,6 +295,19 @@ engine's semantics:
 - `JS_GetOwnDataHint` / `JS_GetGlobalVariableHint`: reads from objects
   that inline caches skip (the global object, objects of shapes of their
   own) look at the index where the property was last found first;
+- `JS_CountOwnKeys` (`0022`): how many keys `Object.keys` would give an
+  ordinary object or a fast array, without making them: an array's
+  elements, then the enumerable string-keyed properties of the shape,
+  counted once per shared shape (kept on it);
+- frozen fast arrays (`0023`): `Object.freeze` of a fast array keeps its
+  elements in place (it made them ordinary properties, one at a time, and
+  every read then looked them up: a loop over 1,000 frozen objects, 43–61
+  ns an element, now 13–15 ns, as an unfrozen array; bun 44–53 ns). A flag
+  on the array sends every write the engine would do in place (an element
+  store, `pop`, `shift`, `reverse`, `sort`, `copyWithin`, the interpreter's
+  own element stores) to the general path, which sees the elements as
+  read-only and non-configurable, and native code stores in place only to
+  an extensible array;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -1003,7 +1017,11 @@ The differential tests run every case with both.
   `indexOf`, `includes`, `startsWith` and `endsWith` on a string call the
   engine's implementation directly (no call frame; int32 bounds taken
   as they are) while they are the original builtins (checked at each
-  call); `===`, `!==` and `switch` against
+  call); `Object.keys(o).length` counts the keys without making the array
+  while `Object.keys` is the builtin (`JS_CountOwnKeys`, patch `0022`; an
+  object of an `aot type`, its fields present): 42–46 ns, now 13–14 ns
+  (an `aot type` object, 311–342 ns, now 14–17 ns; bun 12–20 ns);
+  `===`, `!==` and `switch` against
   string constants compare pointers, then lengths, before characters; a
   direct call with a JS value for a `number` or `boolean` parameter checks
   it at the call instead of going through the callee's JS entry. Where the
@@ -1432,6 +1450,11 @@ const v: User = await (await fetch(url)).json();
   configurable). An `int` field wraps other integers to int32 (as
   `| 0`; with `--no-int-wrapping`, a TypeError); a write that would leave
   the object matching no member is a TypeError. `Object.freeze` throws.
+  An array of them can be frozen or sealed (`Object.freeze`,
+  `Object.seal`, `Object.preventExtensions`, or `defineProperty` of its
+  elements and `length` once it is not extensible), as a whole: its
+  elements, or its length, are then read-only for native and interpreted
+  code alike, and reads stay as fast.
 - **Arrays of them.** An array literal or `new Array(n)` (or `Array(n)`)
   where `T[]` / `Array<T>` is expected makes an array that only holds
   objects of `T` (or holes): storing anything else in it is a TypeError,
@@ -1493,15 +1516,21 @@ Native code parses the text to the type directly while `JSON.parse` is
 the builtin (`lum_json_parse_as`, from a string's Latin-1 characters in
 place: `JS_GetStringLatin1`, patch `0021`): only the fields of the type are
 made, other keys and values skipped (checked, not made), numbers stored
-unboxed. Anything else (invalid JSON, a value a field cannot hold, a
+unboxed (exactly when they have at most 15 significant digits and a power
+of ten up to 22, Clinger's fast path; else `strtod`). Keys are matched
+against the field after the last one first (the order `JSON.stringify`
+writes), strings scanned 8 bytes at a time, and an object of a type of
+one member only checked for the fields it must have (each stored value was
+checked). Anything else (invalid JSON, a value a field cannot hold, a
 16-bit or concatenated string) goes the general way, so that the result
 and the errors are always the same as `JSON.parse` and the conversion's
 (the differential tests run both: `aot_json_parse.ts`). For `r.json()`, a
 host may parse the body itself (`lum_set_json_hook`; Beyond parses a
 `Request`'s or `Response`'s bytes, `lum_json_parse_utf8_as`), else the
-result of `r.json()` is converted. A small object parses about three times
-as fast as the plain parse, and 50 objects with fields the type does not
-have about as fast as bun's plain `JSON.parse` (Beyond's
+result of `r.json()` is converted. A small object (6 fields, one of them
+a nested object) parses in 329–350 ns, as bun's `JSON.parse` (343–381
+ns) and over four times as fast as the plain parse, and 50 objects with
+fields the type does not have in 31–32 µs, bun's 45–46 µs (Beyond's
 docs/performance.md).
 
 ## Getting started

@@ -241,6 +241,9 @@ const PIN_ARRAY_SORT: i32 = 34;
 const PIN_STRING_FNS: i32 = 35;
 /// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
 const PIN_MAP_FNS: i32 = 41;
+/// The `extensible` bit of an object's flags byte (`layout::OBJ_FLAGS`; see
+/// `JS_LAYOUT_OBJ_PLAIN_FLAGS`).
+const OBJ_EXTENSIBLE: i64 = 0x02;
 /// `JSON.stringify`, `JSON.parse`.
 const PIN_JSON_STRINGIFY: i32 = 46;
 const PIN_JSON_PARSE: i32 = 47;
@@ -2179,12 +2182,16 @@ impl Lower {
                 let slow = self.b.create_block();
                 self.b.set_cold_block(slow);
                 if x.ty == Ty::Struct(*k) {
-                    // An object of the layout over an element: in place.
+                    // An object of the layout over an element: in place
+                    // (unless the array is frozen or sealed: its flags).
                     let (ok, idx) = self.elem_index(key);
                     let s = self.b.ins().load(I64, M_HEADER, op_, layout::OBJ_OPAQUE);
                     let len = self.b.ins().uload32(M_STRUCT, s, 4);
                     let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                     let inb = self.b.ins().band(inb, ok);
+                    let flags = self.b.ins().uload32(M_STRUCT, s, 12);
+                    let plain = self.b.ins().icmp_imm_s(IntCC::Equal, flags, 0);
+                    let inb = self.b.ins().band(inb, plain);
                     let hit = self.b.create_block();
                     self.b.ins().brif(inb, hit, &[], slow, &[]);
                     self.b.switch_to_block(hit);
@@ -2256,6 +2263,32 @@ impl Lower {
                 let d = self.b.ins().iconst(I32, *desc as i64);
                 let r = self.helper("lum_struct_convert", &[ctx, w, d]);
                 self.check_value(r[0]);
+                V::Any(r[0])
+            }
+            ExprKind::KeysLength(o, a, arg) => {
+                // (`o.keys` is read before the argument is evaluated.)
+                let (obj, owned) = self.operand(o, &[arg]);
+                let ow = obj.any();
+                let (f, f_owned) = if self.pure_arg(arg) {
+                    let (mw, f_owned) = self.prop_get_inner(ow, None, *a, Vec::new(), true, true);
+                    (V::Any(mw), f_owned)
+                } else {
+                    let mw = self.method_get(ow, *a);
+                    self.check_value(mw);
+                    let f = V::Any(mw);
+                    self.hold(f);
+                    (f, None)
+                };
+                let held = self.expr(arg);
+                self.hold(held);
+                let vw = self.boxed(held);
+                let ctx = self.ctx;
+                let r = self.helper("lum_keys_length", &[ctx, f.any(), ow, vw]);
+                self.check_value_method(r[0], f, f_owned);
+                self.release(held);
+                self.free_v(held);
+                self.drop_method(f, f_owned);
+                self.drop_operand(obj, owned);
                 V::Any(r[0])
             }
             ExprKind::JsonMethodAs(desc, x) => {
@@ -3198,14 +3231,19 @@ impl Lower {
                 let ow = obj.any();
                 let join = self.b.create_block();
                 let slow = self.b.create_block();
-                // Overwrite a fast array element (always a writable data
-                // property).
+                // Overwrite a fast array element (a writable data property
+                // unless the array is frozen: then it is not extensible).
                 let (ok, idx) = self.elem_index(key);
                 let (op_, count) = self.array_part(ow, ok, slow);
                 let inb = self.b.ins().icmp(IntCC::UnsignedLessThan, idx, count);
+                let check = self.b.create_block();
                 let hit = self.b.create_block();
                 let beyond = self.b.create_block();
-                self.b.ins().brif(inb, hit, &[], beyond, &[]);
+                self.b.ins().brif(inb, check, &[], beyond, &[]);
+                self.b.switch_to_block(check);
+                let flags = self.b.ins().uload8(I32, M_HEADER, op_, layout::OBJ_FLAGS);
+                let extensible = self.b.ins().band_imm_u(flags, OBJ_EXTENSIBLE);
+                self.b.ins().brif(extensible, hit, &[], slow, &[]);
                 self.b.switch_to_block(hit);
                 let at = self.array_slot(op_, idx);
                 let old = self.b.ins().load(I64, M_SLOT, at, 0);

@@ -102,7 +102,9 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 /* JSON.stringify, JSON.parse. */
 #define LUM_PIN_JSON_STRINGIFY 46
 #define LUM_PIN_JSON_PARSE 47
-#define LUM_PINS 48
+/* Object.keys. */
+#define LUM_PIN_OBJECT_KEYS 48
+#define LUM_PINS 49
 JSValue lum_struct_stringify(JSContext *ctx, JSValueConst v);
 int lum_is_promise_resolve(JSValue promise, JSValue resolve);
 int lum_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
@@ -351,7 +353,8 @@ typedef struct LumStructArray {
     uint32_t layout;
     uint32_t len;
     uint32_t cap;
-    uint32_t pad;
+    uint32_t flags; /* frozen, sealed (see LUM_SARR_ELEMS_RO): native code
+                       stores in place only while 0 */
     JSValue *items;
 } LumStructArray;
 extern uint32_t lum_sarr_class;
@@ -367,3 +370,4 @@ JSValue lum_json_parse_as(JSContext *ctx, JSValueConst text, int32_t desc);
 JSValue lum_json_parse_utf8_as(JSContext *ctx, const uint8_t *buf, size_t len, int32_t desc);
 JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc);
 void lum_set_json_hook(JSContext *ctx, JSValueConst fn);
+JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, JSValueConst v);

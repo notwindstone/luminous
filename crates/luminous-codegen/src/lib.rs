@@ -609,6 +609,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_struct_convert", &[P, W, Int], &[W]),
         ("lum_json_parse_as", &[P, W, Int], &[W]),
         ("lum_json_method_as", &[P, W, Int], &[W]),
+        ("lum_keys_length", &[P, W, W, W], &[W]),
         ("lum_sarr_from", &[P, Int, W], &[W]),
         ("lum_sarr_push", &[P, W, W], &[W]),
         ("lum_super_get_ic", &[P, W, W, Int, P], &[W]),

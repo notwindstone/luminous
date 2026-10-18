@@ -1,4 +1,4 @@
-// @native errorOf parseUser parseUsers total asCast deep viaMethod fetched
+// @native errorOf parseUser parseUsers total asCast deep viaMethod fetched parsePoint parseLong
 // `JSON.parse(text)` and `await r.json()` where an `aot type` is expected:
 // the result converted to it (only its fields kept, each checked), which
 // native code parses to directly; the same objects and errors either way.
@@ -45,6 +45,15 @@ function total(us: User[]): number {
 function asCast(text: string): string {
   const s = JSON.parse(text) as Shape;
   return s.kind === "circle" ? "circle " + s.r : "square " + s.side;
+}
+
+function parsePoint(text: string): Point {
+  return JSON.parse(text);
+}
+
+aot type Long = { aVeryVeryLongFieldName: string; shortish: int; x8chars_: boolean };
+function parseLong(text: string): Long {
+  return JSON.parse(text);
 }
 
 function deep(t: Tree): int {
@@ -150,3 +159,41 @@ async function fetched(): Promise<string> {
   return JSON.stringify(a) + " " + JSON.stringify(b) + " " + err;
 }
 fetched().then((s) => console.log(s));
+
+// Numbers: the same as JSON.parse's, to the last bit.
+const nums = [
+  "0", "-0", "-0.0", "1", "12.5", "0.1", "0.3", "1e22", "1e23", "1E+2", "1e-7", "123.456e-5",
+  "9007199254740993", "123456789012345678", "12345678901234567890", "18446744073709551616",
+  "1.7976931348623157e308", "1.8e308", "5e-324", "2.2250738585072014e-308", "0e400", "1e-400",
+  "0.000000000000000000000000000001", "3.14159265358979323846", "100000000000000000000000",
+  "4.35", "-1234.5678", "1e0", "1.0", "0.1e1", "123456789012345.6", "8.98846567431158e307",
+];
+let numDiff = 0;
+for (const n of nums) {
+  const p = parsePoint(`{"x":${n},"y":0}`);
+  if (!Object.is(p.x, JSON.parse(n))) {
+    numDiff++;
+    console.log("number differs:", n, p.x, JSON.parse(n));
+  }
+}
+console.log("numbers", nums.length, numDiff);
+console.log(errorOf(() => parsePoint(`{"x":1.,"y":0}`)), errorOf(() => parsePoint(`{"x":-,"y":0}`)), errorOf(() => parsePoint(`{"x":1e,"y":0}`)));
+
+// Keys out of order, unknown, prefixes of one another, long; strings past 8 bytes.
+const longs = [
+  `{"aVeryVeryLongFieldName":"0123456789abcdefghij","shortish":1,"x8chars_":true}`,
+  `{"x8chars_":false,"shortish":2,"aVeryVeryLongFieldName":"short"}`,
+  `{"shortishX":9,"aVeryVeryLongFieldNameX":"no","shortish":3,"aVeryVeryLongFieldName":"0123456789\\n0123","x8chars_":true}`,
+  `{"aVeryVeryLongFieldNam":"no","aVeryVeryLongFieldName":"0123456789é0123","shortish":4,"x8chars_":true}`,
+  `{"aVeryVeryLongFieldName":"01234567\\u00e9","shortish":5,"x8chars_":true,"skip":"0123456789\\"0123456789"}`,
+  `{ "aVeryVeryLongFieldName" : "a" , "shortish" : 6 , "x8chars_" : true }`,
+  `{"aVeryVeryLongFieldName":"0123456789\u0001","shortish":7,"x8chars_":true}`,
+  `{"aVeryVeryLongFieldName":"0123456789abcdef","shortish":8,"x8chars_":true`,
+  `{"aVeryVeryLongFieldName":"0123456789abcdef`,
+];
+for (const t of longs) {
+  console.log(errorOf(() => {
+    const l = parseLong(t);
+    console.log(JSON.stringify(l), l.aVeryVeryLongFieldName.length);
+  }));
+}

@@ -1,0 +1,86 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1430,6 +1430,9 @@
+        it first), what JSON.stringify writes of its objects' properties
+        (JSJSONKeys), made when first needed; freed when unhashed */
+     void *json_keys;
++    /* luminous: while hashed, the number of its enumerable string-keyed
++       properties (JS_CountOwnKeys), -1 until counted */
++    int32_t keys_count;
+     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
+ };
+ 
+@@ -7456,6 +7459,38 @@
+     return (JSShapeProperty *)(void *)(sh->hash_table + sh->prop_hash_mask + 1);
+ }
+ 
++/* The number of own enumerable string-keyed properties of an ordinary
++   object or a fast array (`Object.keys(obj).length`), without making the
++   keys; -1 for any other value (an exotic object: the caller asks it). */
++int64_t JS_CountOwnKeys(JSContext *ctx, JSValueConst obj)
++{
++    JSObject *p;
++    JSShape *sh;
++    JSShapeProperty *prs;
++    int64_t n = 0;
++    int i, k;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (p->is_exotic) {
++        if (p->class_id != JS_CLASS_ARRAY || !p->fast_array)
++            return -1;
++        n = p->u.array.count;
++    }
++    sh = p->shape;
++    if (sh->is_hashed && sh->keys_count >= 0)
++        return n + sh->keys_count;
++    k = 0;
++    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++        if (prs->atom != JS_ATOM_NULL && (prs->flags & JS_PROP_ENUMERABLE) &&
++            JS_AtomGetKind(ctx, prs->atom) == JS_ATOM_KIND_STRING)
++            k++;
++    }
++    if (sh->is_hashed)
++        sh->keys_count = k;
++    return n + k;
++}
++
+ static inline void *get_alloc_from_shape(JSShape *sh)
+ {
+     return sh; /* shape sits at the allocation start */
+@@ -7543,6 +7578,7 @@
+         js_free_rt(rt, sh->json_keys);
+         sh->json_keys = NULL;
+     }
++    sh->keys_count = -1;
+     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
+     psh = &rt->shape_hash[h];
+     while (*psh != sh)
+@@ -7582,6 +7618,7 @@
+     sh->pinned = false;
+     sh->watched = false;
+     sh->json_keys = NULL;
++    sh->keys_count = -1;
+     return sh;
+ }
+ 
+@@ -7673,6 +7710,7 @@
+     sh->pinned = false;
+     sh->watched = false;
+     sh->json_keys = NULL;
++    sh->keys_count = -1;
+     if (sh->proto) {
+         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+     }
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -975,6 +975,8 @@
+ JS_EXTERN int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+ 
+ JS_EXTERN JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
++/* `Object.keys(obj).length` of an ordinary object or a fast array, else -1. */
++JS_EXTERN int64_t JS_CountOwnKeys(JSContext *ctx, JSValueConst obj);
+ /* The characters of a flat 8-bit string (Latin-1), else NULL. */
+ JS_EXTERN const uint8_t *JS_GetStringLatin1(JSValueConst val, size_t *plen);
+ /* A string of these Latin-1 characters. */
