@@ -2124,6 +2124,10 @@ int lum_private_define(JSContext *ctx, JSValue *v, JSValue val)
 /* obj[key] in a for-in: v = { iterator, obj, key } (borrowed). */
 JSValue lum_for_in_get(JSContext *ctx, JSValue *v)
 {
+    /* (v[3]: the index after the key in a shape's shared iterator, else
+       undefined) */
+    if (JS_VALUE_GET_TAG(v[3]) == JS_TAG_INT)
+        return JS_ForInGetAt(ctx, v[0], JS_VALUE_GET_INT(v[3]) - 1, v[1], v[2]);
     return JS_ForInGet(ctx, v[0], v[1], v[2]);
 }
 

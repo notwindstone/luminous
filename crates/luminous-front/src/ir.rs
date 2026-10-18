@@ -602,8 +602,15 @@ pub enum ExprKind {
     /// (while array iteration is the original one): `iter` is the array and `next` the
     /// index (an int). Evaluates to `undefined`.
     IterOpen(Box<Expr>, LocalId, LocalId, AtomId),
-    /// The `for`-`in` iterator of a value.
-    ForInIterator(Box<Expr>),
+    /// The `for`-`in` iterator of a value; local `idx` becomes 0 when it
+    /// is the shared one of the value's shape (stepped by `ForInStep` with
+    /// that index), else `undefined`.
+    ForInIterator(Box<Expr>, LocalId),
+    /// The next key of the `for`-`in` iterator in local `iter` (index `idx`,
+    /// see `ForInIterator`) over the object in local `obj`. When it is
+    /// done, or throws, `iter` becomes `undefined`; the value is then
+    /// `undefined`.
+    ForInStep(LocalId, LocalId, LocalId),
     /// The next value of the iterator in local `iter` (with `next` from
     /// `IterOpen`, or a `for`-`in` iterator without one). When the iterator is
     /// done, or throws, `iter` becomes `undefined`; the value is then
@@ -617,9 +624,9 @@ pub enum ExprKind {
     /// ToPropertyKey.
     ToPropKey(Box<Expr>),
     /// `obj[key]` in a `for`-`in` loop over the iterator in local `iter`
-    /// whose current key `key` may be (a direct read when it is, and obj has
-    /// the shape being enumerated).
-    ForInGet(LocalId, Box<Expr>, Box<Expr>),
+    /// (index `idx`) whose current key `key` may be (a direct read when it
+    /// is, and obj has the shape being enumerated).
+    ForInGet(LocalId, LocalId, Box<Expr>, Box<Expr>),
     /// Private names of classes (`Module::privates` slots, filled when the
     /// class is defined): a field's value (`obj.#x`), its assignment (to
     /// the value), a method after the brand check, a getter's result, a
@@ -1217,6 +1224,7 @@ macro_rules! visitor {
                 | GlobalOrUndefined(_)
                 | This
                 | IterStep(..)
+                | ForInStep(..)
                 | IterClose(..)
                 | IterCloseQuiet(_)
                 | SuperGetAtom(..)
@@ -1303,7 +1311,7 @@ macro_rules! visitor {
                 | Length(a, _)
                 | DeleteProp(a, _)
                 | IterOpen(a, ..)
-                | ForInIterator(a)
+                | ForInIterator(a, _)
                 | ToObject(a)
                 | ToPropKey(a)
                 | PrivateField(a, _)
@@ -1369,7 +1377,7 @@ macro_rules! visitor {
                         $name(x, f);
                     }
                 }
-                ForInGet(_, a, b) => {
+                ForInGet(_, _, a, b) => {
                     $name(a, f);
                     $name(b, f);
                 }
@@ -1553,6 +1561,8 @@ pub fn assigns_local(x: &Expr, l: LocalId) -> bool {
         found |= match e.kind {
             ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) | ExprKind::Update { local: m, .. } => m == l,
             ExprKind::IterStep(m, n) => m == l || n == Some(l),
+            ExprKind::ForInIterator(_, n) => n == l,
+            ExprKind::ForInStep(m, n, _) => m == l || n == l,
             ExprKind::AsyncIterResult(_, m) => m == l,
             ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) => m == l || n == l,
             _ => false,
@@ -1676,10 +1686,10 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         Local(l)
         | SetLocal(l, _)
         | InitLocal(l, _)
-        | ForInGet(l, ..)
         | ArrayPush(l, _)
         | AsyncIterResult(_, l)
         | IterCloseQuiet(l)
+        | ForInIterator(_, l)
         | Update { local: l, .. }
         | StrCharCode { s: l, .. }
         | StrLen { s: l }
@@ -1695,6 +1705,15 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         IterStep(a, b) => {
             f(*a);
             b.iter().for_each(|&b| f(b));
+        }
+        ForInGet(a, b, ..) => {
+            f(*a);
+            f(*b);
+        }
+        ForInStep(a, b, c) => {
+            f(*a);
+            f(*b);
+            f(*c);
         }
         Closure(_, ls) => ls.iter().for_each(|&l| f(l)),
         Inline { locals, body } | Predicted { locals, body, .. } | ArrayLoop { locals, body, .. } => {
@@ -1885,7 +1904,16 @@ pub fn scalar_replace(f: &mut Func) {
             ok[*a] = false;
             b.iter().for_each(|&b| ok[b] = false);
         }
-        ExprKind::ForInGet(a, ..) => ok[*a] = false,
+        ExprKind::ForInGet(a, b, ..) => {
+            ok[*a] = false;
+            ok[*b] = false;
+        }
+        ExprKind::ForInIterator(_, a) => ok[*a] = false,
+        ExprKind::ForInStep(a, b, c) => {
+            ok[*a] = false;
+            ok[*b] = false;
+            ok[*c] = false;
+        }
         ExprKind::AsyncIterResult(_, a) | ExprKind::IterCloseQuiet(a) => ok[*a] = false,
         ExprKind::Closure(_, ls) => ls.iter().for_each(|&l| ok[l] = false),
         ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _) => {
@@ -2109,7 +2137,16 @@ pub fn number_locals(f: &mut Func) {
             special[*a] = true;
             b.iter().for_each(|&b| special[b] = true);
         }
-        ExprKind::ForInGet(a, ..)
+        ExprKind::ForInGet(a, b, ..) => {
+            special[*a] = true;
+            special[*b] = true;
+        }
+        ExprKind::ForInStep(a, b, c) => {
+            special[*a] = true;
+            special[*b] = true;
+            special[*c] = true;
+        }
+        ExprKind::ForInIterator(_, a)
         | ExprKind::AsyncIterResult(_, a)
         | ExprKind::IterCloseQuiet(a)
         | ExprKind::ArrayPush(a, _) => special[*a] = true,
@@ -2197,12 +2234,15 @@ fn local_refs(e: &Expr, l: LocalId) -> (usize, usize) {
         ExprKind::SetLocal(m, _)
         | ExprKind::InitLocal(m, _)
         | ExprKind::Update { local: m, .. }
-        | ExprKind::ForInGet(m, _, _)
         | ExprKind::ArrayPush(m, _)
         | ExprKind::AsyncIterResult(_, m)
+        | ExprKind::ForInIterator(_, m)
         | ExprKind::IterCloseQuiet(m) => (0, (*m == l) as usize),
-        ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) => (0, (*m == l || *n == l) as usize),
+        ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) | ExprKind::ForInGet(m, n, ..) => {
+            (0, (*m == l || *n == l) as usize)
+        }
         ExprKind::IterStep(m, n) => (0, (*m == l || *n == Some(l)) as usize),
+        ExprKind::ForInStep(m, n, o) => ((*o == l) as usize, (*m == l || *n == l) as usize),
         _ => (0, 0),
     }
 }
@@ -2456,13 +2496,18 @@ fn shift_locals(e: &mut Expr, base: LocalId) {
         | ExprKind::SetLocal(l, _)
         | ExprKind::InitLocal(l, _)
         | ExprKind::Update { local: l, .. }
-        | ExprKind::ForInGet(l, _, _)
         | ExprKind::ArrayPush(l, _)
         | ExprKind::AsyncIterResult(_, l)
+        | ExprKind::ForInIterator(_, l)
         | ExprKind::IterCloseQuiet(l) => *l += base,
-        ExprKind::IterOpen(_, l, m, _) | ExprKind::IterClose(l, m) => {
+        ExprKind::IterOpen(_, l, m, _) | ExprKind::IterClose(l, m) | ExprKind::ForInGet(l, m, ..) => {
             *l += base;
             *m += base;
+        }
+        ExprKind::ForInStep(l, m, n) => {
+            *l += base;
+            *m += base;
+            *n += base;
         }
         ExprKind::IterStep(l, m) => {
             *l += base;
@@ -2486,13 +2531,18 @@ fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
         | ExprKind::SetLocal(l, _)
         | ExprKind::InitLocal(l, _)
         | ExprKind::Update { local: l, .. }
-        | ExprKind::ForInGet(l, _, _)
         | ExprKind::ArrayPush(l, _)
         | ExprKind::AsyncIterResult(_, l)
+        | ExprKind::ForInIterator(_, l)
         | ExprKind::IterCloseQuiet(l) => m(l),
-        ExprKind::IterOpen(_, l, n, _) | ExprKind::IterClose(l, n) => {
+        ExprKind::IterOpen(_, l, n, _) | ExprKind::IterClose(l, n) | ExprKind::ForInGet(l, n, ..) => {
             m(l);
             m(n);
+        }
+        ExprKind::ForInStep(l, n, o) => {
+            m(l);
+            m(n);
+            m(o);
         }
         ExprKind::IterStep(l, n) => {
             m(l);

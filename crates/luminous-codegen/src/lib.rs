@@ -230,6 +230,9 @@ pub mod layout {
     pub const FDATA_DATA: i32 = 32;
     pub const CLASS_C_FUNCTION_DATA: i64 = 15;
     pub const OBJ_OPAQUE: i32 = 24;
+    // Stepping a shape's shared for-in iterator (see `JS_ForInStart`).
+    pub const FORIN_SHAPE: i32 = 24;
+    pub const FORIN_KEYS: i32 = 40;
     // Making closures inline (see `JS_CFunctionDataTemplate`).
     pub const FDATA_SELF: i32 = 16;
     pub const OBJ_CLASS_SIZE: i32 = 48;
@@ -282,6 +285,8 @@ pub mod layout {
         ("FDATA_DATA", FDATA_DATA as i64),
         ("CLASS_C_FUNCTION_DATA", CLASS_C_FUNCTION_DATA),
         ("OBJ_OPAQUE", OBJ_OPAQUE as i64),
+        ("FORIN_SHAPE", FORIN_SHAPE as i64),
+        ("FORIN_KEYS", FORIN_KEYS as i64),
         ("FDATA_SELF", FDATA_SELF as i64),
         ("OBJ_CLASS_SIZE", OBJ_CLASS_SIZE as i64),
         ("FTMPL_FLAGS", FTMPL_FLAGS as i64),
@@ -542,7 +547,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_set_elem", &[P, P], &[Int]),
         ("lum_ic_get", &[P, W, Int, P], &[W]),
         ("JS_GetIteratorObject", &[P, W, Int], &[W]),
-        ("JS_ForInIteratorObject", &[P, W], &[W]),
+        ("JS_ForInStart", &[P, W, P], &[W]),
+        ("JS_ForInHas", &[P, W, W, Int], &[Int]),
         ("JS_IteratorStep", &[P, W, W, Int, P, P], &[W]),
         ("JS_ForInStep", &[P, W, P], &[W]),
         ("JS_IteratorCloseCompletion", &[P, W, Int], &[Int]),

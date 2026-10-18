@@ -140,7 +140,8 @@ regular call path's generated code alone.
 `0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch`,
 `0018-await-or-value.patch`, `0019-json-fast-paths.patch`,
 `0020-exotic-define-own.patch`, `0021-latin1-strings.patch`,
-`0022-count-own-keys.patch` and `0023-frozen-fast-arrays.patch`, each made
+`0022-count-own-keys.patch`, `0023-frozen-fast-arrays.patch` and
+`0024-json-parse-and-for-in.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -308,6 +309,27 @@ engine's semantics:
   own element stores) to the general path, which sees the elements as
   read-only and non-configurable, and native code stores in place only to
   an extensible array;
+- `JSON.parse` from the text's bytes in place (`0024`: a string's own
+  Latin-1 characters, else its UTF-8), the values made directly: numbers
+  exactly without `strtod` where they can be (int32s as such: it made every
+  number a double), strings scanned 8 bytes at a time, and objects made
+  with the shape of the last object whose first key was the same, or of
+  the array element before, as V8 follows transitions: each key compared
+  with the shape's (no atom looked up) and the values stored in its slots.
+  Anything else (an error, a reviver, deep nesting) runs the general
+  parser, so that the values and errors are its own. A 6-field object with
+  a nested one: 13,013 instructions, now 3,053 (1,470 ns, now 308–311 ns;
+  bun 360–363 ns); `JS_ParseJSONUTF8Fast` parses bytes that need not end
+  with a NUL (a body). The reviver's parse records were not traced by the
+  collector: an object only they held (a value a duplicate key replaced)
+  was freed while they still referred to it; a mark hook now marks them;
+- for-in by shape (`0024`): the keys of a shape enumerated by it, with
+  their slots, are an iterator of the shape's, shared, cached by the
+  context while its prototypes, watched, are unchanged; a loop's iterator
+  is in its own cell (it was a separate allocation, freed by a finalizer),
+  and native code steps a shape's shared one itself (`JS_ForInStart`):
+  `for (const k in o) n++` over 5 keys, 1,512 instructions, now 293
+  (144–152 ns, now 25–30 ns; bun 11–22 ns);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -1084,8 +1106,12 @@ The differential tests run every case with both.
   iteration is the original one, and native generators are resumed directly
   while `%GeneratorPrototype%.next` is the original one (both checked when a
   loop starts). `for`-`in` walks the object's shape when it can (no index
-  keys, nothing enumerable on the prototype chain), and `obj[k]` with the
-  loop key reads the slot directly while the shape is unchanged.
+  keys, nothing enumerable on the prototype chain): the shape's keys,
+  shared by every loop over objects of it (`JS_ForInStart`), are read by
+  index in the loop itself, with no call or allocation while the object
+  keeps its shape (if it changes, each key is looked up again, as the
+  engine does); `obj[k]` with the loop key reads the slot directly while
+  the shape is unchanged.
 - **Destructuring** in declarations, parameters, `catch`, loop heads and
   assignments; **spread** in calls, `new`, and array and object literals;
   **rest** parameters and elements; **optional chaining**; computed keys in
@@ -1529,8 +1555,8 @@ host may parse the body itself (`lum_set_json_hook`; Beyond parses a
 `Request`'s or `Response`'s bytes, `lum_json_parse_utf8_as`), else the
 result of `r.json()` is converted. A small object (6 fields, one of them
 a nested object) parses in 329–350 ns, as bun's `JSON.parse` (343–381
-ns) and over four times as fast as the plain parse, and 50 objects with
-fields the type does not have in 31–32 µs, bun's 45–46 µs (Beyond's
+ns), and 50 objects with fields the type does not have in 31–32 µs,
+bun's 45–46 µs; about as fast as the plain parse since `0024` (Beyond's
 docs/performance.md).
 
 ## Getting started

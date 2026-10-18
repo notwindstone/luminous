@@ -3836,7 +3836,24 @@ impl Lower {
                 self.iter_open(x, *iter, *next, *atom);
                 self.konst(0, TAG_UNDEFINED)
             }
-            ExprKind::ForInIterator(x) => self.convert(x, "JS_ForInIteratorObject"),
+            ExprKind::ForInIterator(x, idx) => {
+                let v = self.expr(x);
+                self.hold(v);
+                let w = v.any();
+                let ctx = self.ctx;
+                let flag = self.done_slot();
+                let r = self.helper("JS_ForInStart", &[ctx, w, flag]);
+                self.check_value(r[0]);
+                self.release(v);
+                self.free_v(v);
+                // A shape's shared iterator: stepped from index 0.
+                let shared = self.b.ins().load(I32, Self::mem(), flag, 0);
+                let zero = self.konst(0, TAG_INT).any();
+                let undef = self.konst(0, TAG_UNDEFINED).any();
+                let i = self.b.ins().select(shared, zero, undef);
+                self.set_local(*idx, V::Any(i));
+                V::Any(r[0])
+            }
             ExprKind::ToObject(x) => self.convert(x, "JS_ToObject"),
             ExprKind::PrivateField(o, slot) => {
                 let (obj, owned) = self.operand(o, &[]);
@@ -3981,11 +3998,12 @@ impl Lower {
                 self.free_v(key);
                 v
             }
-            ExprKind::ForInGet(iter, o, k) => {
+            ExprKind::ForInGet(iter, idx, o, k) => {
                 let (obj, owned) = self.operand(o, &[k]);
                 let (key, key_owned) = self.operand(k, &[]);
                 let it = self.use_local(*iter).any();
-                let slot = self.values_slot(&[it, obj.any(), key.any()]);
+                let ix = self.use_local(*idx).any();
+                let slot = self.values_slot(&[it, obj.any(), key.any(), ix]);
                 let ctx = self.ctx;
                 let r = self.helper("lum_for_in_get", &[ctx, slot]);
                 self.check_value(r[0]);
@@ -4004,6 +4022,7 @@ impl Lower {
                 self.konst(0, TAG_UNDEFINED)
             }
             ExprKind::IterStep(iter, next) => self.iter_step(*iter, *next),
+            ExprKind::ForInStep(iter, idx, obj) => self.for_in_step(*iter, *idx, *obj),
             ExprKind::IterClose(iter, next) => {
                 self.close_iter(*iter, *next);
                 self.konst(0, TAG_UNDEFINED)
@@ -7390,6 +7409,97 @@ impl Lower {
         let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
         self.b.ins().brif(done, finished, &[], join, &[BlockArg::Value(r)]);
         // Done, or thrown: the iterator is not closed after either.
+        self.b.switch_to_block(finished);
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.set_local(iter, u);
+        self.b.ins().jump(join, &[BlockArg::Value(u.any())]);
+        self.b.switch_to_block(failed);
+        let u = self.konst(0, TAG_UNDEFINED);
+        self.set_local(iter, u);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(join);
+        V::Any(rw)
+    }
+
+    /// See `ExprKind::ForInStep`.
+    fn for_in_step(&mut self, iter: ir::LocalId, idx: ir::LocalId, obj: ir::LocalId) -> V {
+        let iw = self.use_local(iter).any();
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let finished = self.b.create_block();
+        let failed = self.b.create_block();
+        self.b.set_cold_block(failed);
+        // Done already: `undefined`.
+        let undef = val_const(TAG_UNDEFINED, 0);
+        let live = self.b.ins().icmp_imm_s(IntCC::NotEqual, iw, undef);
+        let step = self.b.create_block();
+        let u = self.konst(0, TAG_UNDEFINED).any();
+        self.b.ins().brif(live, step, &[], join, &[BlockArg::Value(u)]);
+        self.b.switch_to_block(step);
+        let nw = self.use_local(idx).any();
+        let shared = self.val_is(nw, TAG_INT);
+        let keys = self.b.create_block();
+        let generic = self.b.create_block();
+        self.b.ins().brif(shared, keys, &[], generic, &[]);
+        // A shape's shared iterator: key `idx` of its keys ([key, slot...])
+        // while the object has the shape, else while it has the key.
+        self.b.switch_to_block(keys);
+        let i0 = self.b.ins().band_imm_u(nw, 0xffff_ffffi64);
+        let ip = self.val_ptr(iw);
+        let it = self.b.ins().load(I64, M_HEADER, ip, layout::OBJ_OPAQUE);
+        let kw = self.b.ins().load(I64, M_HEADER, it, layout::FORIN_KEYS);
+        let shape = self.b.ins().load(I64, M_HEADER, it, layout::FORIN_SHAPE);
+        let kp = self.val_ptr(kw);
+        let count = self.b.ins().uload32(M_HEADER, kp, layout::OBJ_ARRAY_COUNT);
+        let vals = self.b.ins().load(I64, M_HEADER, kp, layout::OBJ_ARRAY_VALUES);
+        let ow = self.use_local(obj).any();
+        let op = self.val_ptr(ow);
+        let head = self.b.create_block();
+        let i = self.b.append_block_param(head, I64);
+        self.b.ins().jump(head, &[BlockArg::Value(i0)]);
+        self.b.switch_to_block(head);
+        let two = self.b.ins().ishl_imm_u(i, 1);
+        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, two, count);
+        let next = self.b.create_block();
+        self.b.ins().brif(more, next, &[], finished, &[]);
+        self.b.switch_to_block(next);
+        let off = self.b.ins().ishl_imm_u(i, 4);
+        let at = self.b.ins().iadd(vals, off);
+        let key = self.b.ins().load(I64, M_SLOT, at, 0);
+        let osh = self.b.ins().load(I64, M_HEADER, op, layout::OBJ_SHAPE);
+        let same = self.b.ins().icmp(IntCC::Equal, osh, shape);
+        let hit = self.b.create_block();
+        let check = self.b.create_block();
+        self.b.set_cold_block(check);
+        self.b.ins().brif(same, hit, &[], check, &[]);
+        self.b.switch_to_block(check);
+        let i32v = self.b.ins().ireduce(I32, i);
+        let r = self.helper("JS_ForInHas", &[ctx, ow, iw, i32v])[0];
+        let neg = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0);
+        let checked = self.b.create_block();
+        self.b.ins().brif(neg, failed, &[], checked, &[]);
+        self.b.switch_to_block(checked);
+        let skip = self.b.ins().iadd_imm_s(i, 1);
+        self.b.ins().brif(r, hit, &[], head, &[BlockArg::Value(skip)]);
+        self.b.switch_to_block(hit);
+        let n1 = self.b.ins().iadd_imm_s(i, 1);
+        let n1 = self.mk_int(n1);
+        self.set_local(idx, V::Any(n1));
+        self.dup(key);
+        self.b.ins().jump(join, &[BlockArg::Value(key)]);
+        // Any other iterator.
+        self.b.switch_to_block(generic);
+        let done_addr = self.done_slot();
+        let r = self.helper("JS_ForInStep", &[ctx, iw, done_addr])[0];
+        let exc = self.b.ins().icmp_imm_s(IntCC::Equal, r, val_const(TAG_EXCEPTION, 0));
+        let ok = self.b.create_block();
+        self.b.ins().brif(exc, failed, &[], ok, &[]);
+        self.b.switch_to_block(ok);
+        let done = self.b.ins().load(I32, Self::mem(), done_addr, 0);
+        self.b.ins().brif(done, finished, &[], join, &[BlockArg::Value(r)]);
+        // Done, or thrown.
         self.b.switch_to_block(finished);
         let u = self.konst(0, TAG_UNDEFINED);
         self.set_local(iter, u);

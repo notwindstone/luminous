@@ -128,12 +128,17 @@ fn mentions(stmts: &[Stmt], n: usize) -> Vec<usize> {
         | ExprKind::InitLocal(l, _)
         | ExprKind::Update { local: l, .. }
         | ExprKind::ArrayPush(l, _)
-        | ExprKind::ForInGet(l, ..)
         | ExprKind::AsyncIterResult(_, l)
+        | ExprKind::ForInIterator(_, l)
         | ExprKind::IterCloseQuiet(l) => add(*l),
-        ExprKind::IterOpen(_, a, b, _) | ExprKind::IterClose(a, b) => {
+        ExprKind::IterOpen(_, a, b, _) | ExprKind::IterClose(a, b) | ExprKind::ForInGet(a, b, ..) => {
             add(*a);
             add(*b);
+        }
+        ExprKind::ForInStep(a, b, c) => {
+            add(*a);
+            add(*b);
+            add(*c);
         }
         ExprKind::IterStep(a, b) => {
             add(*a);

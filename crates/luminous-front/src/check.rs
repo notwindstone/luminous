@@ -1858,7 +1858,7 @@ struct FnCx<'x, 'm, 'a> {
     /// What the type annotations of parameters and variables say they hold.
     sym_hints: HashMap<SymbolId, ir::Hint>,
     /// Enclosing `for`-`in` loops: their key variable and iterator.
-    for_in_keys: Vec<(SymbolId, ir::LocalId)>,
+    for_in_keys: Vec<(SymbolId, ir::LocalId, ir::LocalId)>,
     /// The last parameter is a rest parameter.
     rest: bool,
     /// The function's `arguments` (its last parameter, see
@@ -4421,18 +4421,22 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         let mut out = Vec::new();
         // The iterated value (with `let` / `const` bindings in their TDZ).
         let v = self.eval_into(right, &mut out)?;
-        let (iter, next) = if is_of {
+        // (for-in: the object, and the index in its shape's keys)
+        let (iter, next, idx, obj) = if is_of {
             let (i, n) = self.open_iterator(v, &mut out);
-            (i, Some(n))
+            (i, Some(n), 0, 0)
         } else {
-            let i = self.temp(Ty::Any);
-            out.push(Stmt::Expr(set(i, Expr::new(Ty::Any, ExprKind::ForInIterator(Box::new(any(v)))))));
-            (i, None)
+            let (i, idx, o) = (self.temp(Ty::Any), self.temp(Ty::Any), self.temp(Ty::Any));
+            out.push(Stmt::Expr(set(o, any(v))));
+            let start = ExprKind::ForInIterator(Box::new(self.local(o)), idx);
+            out.push(Stmt::Expr(set(i, Expr::new(Ty::Any, start))));
+            (i, None, idx, o)
         };
         let lp = self.lp(label, JumpKind::Loop, |cx, id| {
             let value = cx.temp(Ty::Any);
+            let step = if is_of { ExprKind::IterStep(iter, next) } else { ExprKind::ForInStep(iter, idx, obj) };
             let mut body = vec![
-                Stmt::Expr(set(value, Expr::new(Ty::Any, ExprKind::IterStep(iter, next)))),
+                Stmt::Expr(set(value, Expr::new(Ty::Any, step))),
                 Stmt::If(cx.is_undefined(iter), vec![Stmt::Break(id)], vec![]),
             ];
             // Each iteration binds the loop variable anew.
@@ -4461,7 +4465,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 _ => None,
             };
             if let Some(sym) = key_sym {
-                cx.for_in_keys.push((sym, iter));
+                cx.for_in_keys.push((sym, iter, idx));
             }
             let r = cx.body(stmt_body);
             if key_sym.is_some() {
@@ -4743,14 +4747,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 if let Expression::Identifier(id) = m.expression.without_parentheses()
                     && let Some(sym) = self.resolve(id)
-                    && let Some(&(_, iter)) = self.for_in_keys.iter().rev().find(|(s, _)| *s == sym)
+                    && let Some(&(_, iter, idx)) = self.for_in_keys.iter().rev().find(|(s, ..)| *s == sym)
                 {
                     let mut obj = [any(self.expr(&m.object)?)];
                     let mark = self.pre.len();
                     let key = any(self.ident(id)?);
                     self.order(&mut obj, mark);
                     let [obj] = obj;
-                    return Ok(Expr::new(Ty::Any, ExprKind::ForInGet(iter, Box::new(obj), Box::new(key))));
+                    return Ok(Expr::new(Ty::Any, ExprKind::ForInGet(iter, idx, Box::new(obj), Box::new(key))));
                 }
                 let mut obj = [self.expr(&m.object)?];
                 let mark = self.pre.len();

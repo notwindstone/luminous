@@ -1,0 +1,1112 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -868,6 +868,15 @@
+         JSShape *shape;
+         JSValue keys;
+     } keys_cache[16];
++    /* luminous: JSON.parse's objects' shapes, by their first key (held, as
++       keys_cache's: see js_json_parse_fast) */
++    JSShape *json_shapes[64];
++    /* luminous: for-in by shape (js_for_in_shared): the shared iterator of
++       a shape (its keys), and the js_proto_epoch it was valid at */
++    struct {
++        JSValue iter;
++        uint64_t epoch;
++    } for_in_cache[16];
+ };
+ 
+ typedef union JSFloat64Union {
+@@ -1186,6 +1195,11 @@
+        (referenced), from `idx`; `slot` is the last key's. */
+     JSShape *shape;
+     uint32_t slot;
++    /* luminous: with `shape`, its keys (js_for_in_shared: [key, slot, key,
++       slot...], strings and int32s), or undefined. The iterator is in its
++       object's own cell. A shape's shared iterator (`obj` undefined) is
++       stepped by native code with an index of its own. */
++    JSValue keys;
+ } JSForInIterator;
+ 
+ typedef struct JSRegExp {
+@@ -1547,6 +1561,9 @@
+ static_assert((int)offsetof(JSMallocBlockHeader, ref_count) - (int)offsetof(JSMallocBlockHeader, user_data) == JS_LAYOUT_REF_COUNT, "");
+ static_assert(offsetof(JSObject, class_id) == JS_LAYOUT_OBJ_CLASS_ID, "");
+ static_assert(offsetof(JSObject, shape) == JS_LAYOUT_OBJ_SHAPE, "");
++static_assert(offsetof(JSObject, u.for_in_iterator) == JS_LAYOUT_OBJ_OPAQUE, "");
++static_assert(offsetof(JSForInIterator, shape) == JS_LAYOUT_FORIN_SHAPE, "");
++static_assert(offsetof(JSForInIterator, keys) == JS_LAYOUT_FORIN_KEYS, "");
+ static_assert(offsetof(JSShape, proto) == JS_LAYOUT_SHAPE_PROTO, "");
+ static_assert(offsetof(JSObject, prop) == JS_LAYOUT_OBJ_PROP, "");
+ static_assert(offsetof(JSObject, u.array.u1.typed_array) == JS_LAYOUT_OBJ_TYPED_ARRAY, "");
+@@ -1708,7 +1725,6 @@
+ static void js_bound_function_finalizer(JSRuntime *rt, JSValueConst val);
+ static void js_bound_function_mark(JSRuntime *rt, JSValueConst val,
+                                 JS_MarkFunc *mark_func);
+-static void js_for_in_iterator_finalizer(JSRuntime *rt, JSValueConst val);
+ static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
+                                 JS_MarkFunc *mark_func);
+ static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val);
+@@ -3769,7 +3785,7 @@
+     { JS_ATOM_Function, js_c_function_data_finalizer, js_c_function_data_mark }, /* JS_CLASS_C_FUNCTION_DATA */
+     { JS_ATOM_Function, js_c_closure_finalizer, NULL},                           /* JS_CLASS_C_CLOSURE */
+     { JS_ATOM_GeneratorFunction, js_bytecode_function_finalizer, js_bytecode_function_mark },  /* JS_CLASS_GENERATOR_FUNCTION */
+-    { JS_ATOM_ForInIterator, js_for_in_iterator_finalizer, js_for_in_iterator_mark },      /* JS_CLASS_FOR_IN_ITERATOR */
++    { JS_ATOM_ForInIterator, NULL, js_for_in_iterator_mark },      /* JS_CLASS_FOR_IN_ITERATOR */
+     { JS_ATOM_RegExp, js_regexp_finalizer, js_regexp_mark },                              /* JS_CLASS_REGEXP */
+     { JS_ATOM_ArrayBuffer, js_array_buffer_finalizer, NULL },                   /* JS_CLASS_ARRAY_BUFFER */
+     { JS_ATOM_SharedArrayBuffer, js_array_buffer_finalizer, NULL },             /* JS_CLASS_SHARED_ARRAY_BUFFER */
+@@ -4578,6 +4594,12 @@
+             JS_MarkValue(rt, ctx->keys_cache[i].keys, mark_func);
+         }
+     }
++    for(i = 0; i < countof(ctx->json_shapes); i++) {
++        if (ctx->json_shapes[i])
++            mark_func(rt, &ctx->json_shapes[i]->header);
++    }
++    for(i = 0; i < countof(ctx->for_in_cache); i++)
++        JS_MarkValue(rt, ctx->for_in_cache[i].iter, mark_func);
+ 
+     if (ctx->resolving_func_shape)
+         mark_func(rt, &ctx->resolving_func_shape->header);
+@@ -4683,6 +4705,10 @@
+             JS_FreeValue(ctx, ctx->keys_cache[i].keys);
+         }
+     }
++    for(i = 0; i < countof(ctx->json_shapes); i++)
++        js_free_shape_null(ctx->rt, ctx->json_shapes[i]);
++    for(i = 0; i < countof(ctx->for_in_cache); i++)
++        JS_FreeValue(ctx, ctx->for_in_cache[i].iter);
+ 
+     js_free_rt(ctx->rt, ctx);
+ }
+@@ -9344,16 +9370,8 @@
+         JS_MarkValue(rt, bf->argv[i], mark_func);
+ }
+ 
+-static void js_for_in_iterator_finalizer(JSRuntime *rt, JSValueConst val)
+-{
+-    JSObject *p = JS_VALUE_GET_OBJ(val);
+-    JSForInIterator *it = p->u.for_in_iterator;
+-    JS_FreeValueRT(rt, it->obj);
+-    if (it->shape)
+-        js_free_shape(rt, it->shape);
+-    js_free_rt(rt, it);
+-}
+-
++/* luminous: no finalizer: the iterator is in its object's cell (the
++   references it took are not given back: see js_free_shape) */
+ static void js_for_in_iterator_mark(JSRuntime *rt, JSValueConst val,
+                                 JS_MarkFunc *mark_func)
+ {
+@@ -9362,6 +9380,7 @@
+     JS_MarkValue(rt, it->obj, mark_func);
+     if (it->shape)
+         mark_func(rt, &it->shape->header);
++    JS_MarkValue(rt, it->keys, mark_func);
+ }
+ 
+ /* luminous: the finalization of a dead object (one with its fin bit: a class
+@@ -20420,38 +20439,76 @@
+         rt->atom_array[atom]->atom_type == JS_ATOM_TYPE_STRING;
+ }
+ 
+-static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
++static JSValue js_for_in_shared(JSContext *ctx, JSObject *p);
++
++/* luminous: a new for-in iterator of `obj` (taken), in its object's own
++   cell, with room for the properties of the slow path's keys */
++static JSValue js_for_in_iterator_new(JSContext *ctx, JSValue obj, JSForInIterator **pit)
++{
++    JSShape *sh = find_hashed_shape_proto(ctx->rt, NULL);
++    JSForInIterator *it;
++    JSValue enum_obj;
++
++    if (sh) {
++        sh = js_dup_shape(sh);
++    } else {
++        sh = js_new_shape(ctx, NULL);
++        if (!sh) {
++            JS_FreeValue(ctx, obj);
++            return JS_EXCEPTION;
++        }
++    }
++    enum_obj = js_new_object_data(ctx, sh, JS_CLASS_FOR_IN_ITERATOR, sizeof(*it), true, (void **)&it);
++    if (JS_IsException(enum_obj)) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
++    it->is_array = false;
++    it->obj = obj;
++    it->idx = 0;
++    it->shape = NULL;
++    it->slot = 0;
++    it->keys = JS_UNDEFINED;
++    *pit = it;
++    return enum_obj;
++}
++
++/* luminous: `by_shape`: an object enumerated by its shape gets its
++   shape's keys (else the caller found it is not) */
++static JSValue build_for_in_iterator2(JSContext *ctx, JSValue obj, bool by_shape)
+ {
+     JSObject *p;
+     JSPropertyEnum *tab_atom;
+     int i;
+-    JSValue enum_obj, obj1;
++    JSValue enum_obj, obj1, shared;
+     JSForInIterator *it;
+     uint32_t tag, tab_atom_count;
+ 
+     tag = JS_VALUE_GET_TAG(obj);
+     if (tag != JS_TAG_OBJECT && tag != JS_TAG_NULL && tag != JS_TAG_UNDEFINED) {
+         obj = JS_ToObjectFree(ctx, obj);
++        if (JS_IsException(obj))
++            return obj;
+     }
+ 
+-    it = js_malloc(ctx, sizeof(*it));
+-    if (!it) {
++    /* luminous: an object enumerated by its shape: its keys (cached) */
++    shared = tag == JS_TAG_OBJECT && by_shape ? js_for_in_shared(ctx, JS_VALUE_GET_OBJ(obj)) : JS_UNDEFINED;
++    if (JS_IsException(shared)) {
+         JS_FreeValue(ctx, obj);
+-        return JS_EXCEPTION;
++        return shared;
+     }
+-    enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
++    enum_obj = js_for_in_iterator_new(ctx, obj, &it);
+     if (JS_IsException(enum_obj)) {
+-        js_free(ctx, it);
+-        JS_FreeValue(ctx, obj);
+-        return JS_EXCEPTION;
++        JS_FreeValue(ctx, shared);
++        return enum_obj;
++    }
++    if (!JS_IsUndefined(shared)) {
++        JSForInIterator *sit = JS_VALUE_GET_OBJ(shared)->u.for_in_iterator;
++        it->shape = js_dup_shape(sit->shape);
++        it->keys = js_dup(sit->keys);
++        JS_FreeValue(ctx, shared);
++        return enum_obj;
+     }
+-    it->is_array = false;
+-    it->obj = obj;
+-    it->idx = 0;
+-    it->shape = NULL;
+-    it->slot = 0;
+-    p = JS_VALUE_GET_OBJ(enum_obj);
+-    p->u.for_in_iterator = it;
+ 
+     if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)
+         return enum_obj;
+@@ -20543,6 +20600,11 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue build_for_in_iterator(JSContext *ctx, JSValue obj)
++{
++    return build_for_in_iterator2(ctx, obj, true);
++}
++
+ /* obj -> enum_obj */
+ static __exception int js_for_in_start(JSContext *ctx, JSValue *sp)
+ {
+@@ -20571,7 +20633,23 @@
+     it = p->u.for_in_iterator;
+ 
+     for(;;) {
+-        if (it->shape) {
++        if (!JS_IsUndefined(it->keys)) {
++            /* luminous: the keys of a shape (cached), present while the
++               object has it */
++            JSObject *ka = JS_VALUE_GET_OBJ(it->keys);
++            JSValue key;
++            if (it->idx * 2 >= ka->u.array.count || JS_IsUndefined(it->obj))
++                goto done;
++            key = ka->u.array.u.values[it->idx * 2];
++            it->slot = JS_VALUE_GET_INT(ka->u.array.u.values[it->idx * 2 + 1]);
++            it->idx++;
++            if (likely(JS_VALUE_GET_OBJ(it->obj)->shape == it->shape)) {
++                sp[0] = js_dup(key);
++                sp[1] = JS_FALSE;
++                return 0;
++            }
++            prop = get_shape_prop(it->shape)[it->slot].atom;
++        } else if (it->shape) {
+             /* the keys of a shape: present while the object has it */
+             JSShapeProperty *prs;
+             if (it->idx >= it->shape->prop_count)
+@@ -55685,6 +55763,30 @@
+     return NULL;
+ }
+ 
++/* luminous: the records are in malloc'd memory, which the collector does
++   not see: while they live, a mark hook marks their values (else a value
++   that only its record holds, an object a later duplicate key or the
++   reviver replaced, is freed before the record). */
++static void json_mark_parse_record(JSRuntime *rt, JSONParseRecord *pr, JS_MarkFunc *mark_func)
++{
++    int i;
++    JS_MarkValue(rt, pr->value, mark_func);
++    if (JS_VALUE_GET_TAG(pr->value) != JS_TAG_OBJECT)
++        return;
++    if (JS_VALUE_GET_OBJ(pr->value)->class_id == JS_CLASS_ARRAY) {
++        for(i = 0; i < pr->u.array.count; i++)
++            json_mark_parse_record(rt, &pr->u.array.elements[i], mark_func);
++    } else {
++        for(i = 0; i < pr->u.obj.count; i++)
++            json_mark_parse_record(rt, &pr->u.obj.entries[i].parse_record, mark_func);
++    }
++}
++
++static void json_mark_parse_records(JSRuntime *rt, void *opaque, JS_MarkFunc *mark_func)
++{
++    json_mark_parse_record(rt, opaque, mark_func);
++}
++
+ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
+ {
+     int i;
+@@ -55923,9 +56025,15 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue js_json_parse_fast(JSContext *ctx, const uint8_t *buf, size_t len, bool utf8);
++
+ /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
+ JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len, const char *filename)
+ {
++    /* (luminous: the fast path, else the general parser) */
++    JSValue v = js_json_parse_fast(ctx, (const uint8_t *)buf, buf_len, true);
++    if (!JS_IsUninitialized(v))
++        return v;
+     return JS_ParseJSON_internal(ctx, buf, buf_len, filename, NULL);
+ }
+ 
+@@ -56035,17 +56143,591 @@
+     return JS_EXCEPTION;
+ }
+ 
++/* ---- luminous: JSON.parse's fast path ----
++   The text's bytes parsed in place (a string's own Latin-1 characters, or
++   UTF-8), making the values directly: numbers exact without strtod where
++   they can be (int32s as such), strings scanned 8 bytes at a time, and
++   objects made with the shape of the last object whose keys began the same
++   way (ctx->json_shapes, by the first key) or of the array element before
++   (V8 follows the same transitions): each key is then compared with the
++   shape's, no atom looked up, and the values stored in the slots. Anything
++   else (an error, nesting deeper than JSON_FAST_DEPTH) returns
++   JS_UNINITIALIZED, and the general parser runs: the values and the errors
++   are always its own. */
++
++#define JSON_FAST_DEPTH 512
++
++typedef struct JSONFast {
++    JSContext *ctx;
++    const uint8_t *p, *end;
++    bool utf8; /* else Latin-1 characters */
++    bool strict; /* (UTF-8) no encoded surrogates: as a decoder reads it */
++} JSONFast;
++
++#define JF_ONES 0x0101010101010101ull
++#define JF_HIGHS 0x8080808080808080ull
++
++/* Of the 8 bytes at p (in a string), how many come before a quote, a
++   backslash, a control character or a non-ASCII byte. */
++static inline int jf_plain8(const uint8_t *p)
++{
++    uint64_t w, q, b, t;
++    memcpy(&w, p, 8);
++    q = w ^ ('"' * JF_ONES);
++    b = w ^ ('\\' * JF_ONES);
++    /* (bit 7 of each such byte; exact up to the first) */
++    t = (((q - JF_ONES) & ~q) | ((b - JF_ONES) & ~b) | ((w - 0x20 * JF_ONES) & ~w) | w) & JF_HIGHS;
++    if (!t)
++        return 8;
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++    return __builtin_ctzll(t) >> 3;
++#else
++    return 0;
++#endif
++}
++
++static inline void jf_ws(JSONFast *jf)
++{
++    while (jf->p < jf->end && *jf->p <= ' ' &&
++           (*jf->p == ' ' || *jf->p == '\n' || *jf->p == '\r' || *jf->p == '\t'))
++        jf->p++;
++}
++
++/* Character c, after any whitespace: passed. */
++static inline bool jf_char(JSONFast *jf, uint8_t c)
++{
++    if (jf->p < jf->end && *jf->p == c)
++        return jf->p++, true;
++    jf_ws(jf);
++    if (jf->p < jf->end && *jf->p == c)
++        return jf->p++, true;
++    return false;
++}
++
++/* The end of the plain characters from p (no quote, backslash or control
++   character, nor non-ASCII ones in UTF-8). */
++static inline const uint8_t *jf_scan(JSONFast *jf, const uint8_t *p)
++{
++    const uint8_t *end = jf->end;
++    for (;;) {
++        uint8_t c;
++        if (end - p >= 8) {
++            int n = jf_plain8(p);
++            p += n;
++            if (n == 8)
++                continue;
++        }
++        if (p >= end)
++            return p;
++        c = *p;
++        if (c == '"' || c == '\\' || c < 0x20 || (c >= 0x80 && jf->utf8))
++            return p;
++        p++;
++    }
++}
++
++/* The string at jf->p (its opening quote), as json_parse_string makes it. */
++static int jf_string(JSONFast *jf, JSValue *pv)
++{
++    JSContext *ctx = jf->ctx;
++    const uint8_t *start = jf->p + 1, *p = jf_scan(jf, start), *end = jf->end, *p_next;
++    StringBuffer b_s, *b = &b_s;
++    uint32_t c;
++    int i;
++    if (p < end && *p == '"') {
++        *pv = p > start ? js_new_string8_len(ctx, (const char *)start, p - start) : js_empty_string(ctx->rt);
++        jf->p = p + 1;
++        return JS_IsException(*pv) ? -1 : 0;
++    }
++    /* With escapes (or UTF-8): as json_parse_string. */
++    if (string_buffer_init(ctx, b, max_int(16, (int)(p - start) * 2)) ||
++        string_buffer_write8(b, start, p - start))
++        goto fail;
++    for (;;) {
++        const uint8_t *q = jf_scan(jf, p);
++        if (q > p && string_buffer_write8(b, p, q - p))
++            goto fail;
++        p = q;
++        if (p >= end)
++            goto fail;
++        c = *p++;
++        if (c == '"')
++            break;
++        if (c < 0x20)
++            goto fail;
++        if (c == '\\') {
++            if (p >= end)
++                goto fail;
++            switch (c = *p++) {
++            case 'b': c = '\b'; break;
++            case 'f': c = '\f'; break;
++            case 'n': c = '\n'; break;
++            case 'r': c = '\r'; break;
++            case 't': c = '\t'; break;
++            case '"': case '\\': case '/': break;
++            case 'u':
++                if (end - p < 4)
++                    goto fail;
++                for (c = 0, i = 0; i < 4; i++) {
++                    int h = from_hex(*p++);
++                    if (h < 0)
++                        goto fail;
++                    c = (c << 4) | h;
++                }
++                break;
++            default:
++                goto fail;
++            }
++        } else if (c >= 0x80) {
++            /* (UTF-8: jf_scan stops at them) */
++            if (end - (p - 1) < 4)
++                goto fail;
++            c = utf8_decode(p - 1, &p_next);
++            if (p_next == p || (jf->strict && c >= 0xd800 && c <= 0xdfff))
++                goto fail;
++            p = p_next;
++        }
++        if (string_buffer_putc(b, c))
++            goto fail;
++    }
++    *pv = string_buffer_end(b);
++    jf->p = p;
++    return JS_IsException(*pv) ? -1 : 0;
++ fail:
++    string_buffer_free(b);
++    return -1;
++}
++
++static const double jf_pow10[] = {
++    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
++    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
++};
++
++static no_inline double jf_strtod(JSContext *ctx, const uint8_t *s, size_t n, bool *ok)
++{
++    char small[64], *t = n < sizeof(small) ? small : js_malloc(ctx, n + 1);
++    double d;
++    if (!t) {
++        *ok = false;
++        return 0;
++    }
++    memcpy(t, s, n);
++    t[n] = '\0';
++    d = strtod(t, NULL);
++    if (t != small)
++        js_free(ctx, t);
++    return d;
++}
++
++/* The number at jf->p: an int32 if it is one written as an integer, else
++   strtod's double (exactly, without it, for up to 15 significant digits
++   and a power of ten up to 22: Clinger's fast path). */
++static int jf_number(JSONFast *jf, JSValue *pv)
++{
++    const uint8_t *p = jf->p, *start = p, *end = jf->end;
++    bool neg = false, all = true, integer = true, ok = true;
++    uint64_t m = 0; /* the digits (all of them if `all`), times 10^e */
++    int nd = 0, e = 0;
++    double d;
++    if (p < end && *p == '-')
++        neg = true, p++;
++    if (p >= end || !is_digit(*p))
++        return -1;
++    if (*p == '0' && p + 1 < end && is_digit(p[1]))
++        return -1;
++    for (; p < end && is_digit(*p); p++) {
++        if (nd < 19)
++            m = m * 10 + (*p - '0'), nd += m != 0;
++        else
++            all = false;
++    }
++    if (p < end && *p == '.') {
++        integer = false;
++        if (++p >= end || !is_digit(*p))
++            return -1;
++        for (; p < end && is_digit(*p); p++) {
++            if (nd < 19)
++                m = m * 10 + (*p - '0'), nd += m != 0, e--;
++            else
++                all = false;
++        }
++    }
++    if (p < end && (*p == 'e' || *p == 'E')) {
++        bool eneg = false;
++        int x = 0;
++        integer = false;
++        p++;
++        if (p < end && (*p == '+' || *p == '-'))
++            eneg = *p++ == '-';
++        if (p >= end || !is_digit(*p))
++            return -1;
++        for (; p < end && is_digit(*p); p++) {
++            if (x < 100000)
++                x = x * 10 + (*p - '0');
++        }
++        e += eneg ? -x : x;
++    }
++    jf->p = p;
++    if (integer && all && m <= (neg ? 2147483648u : 2147483647u) && !(neg && m == 0)) {
++        *pv = js_int32(neg ? (int32_t)-(int64_t)m : (int32_t)m);
++        return 0;
++    }
++    if (all && (m == 0 || e == 0 || (nd <= 15 && e >= -22 && e <= 22))) {
++        d = (double)m;
++        if (m && e)
++            d = e < 0 ? d / jf_pow10[-e] : d * jf_pow10[e];
++        if (neg)
++            d = -d;
++    } else {
++        d = jf_strtod(jf->ctx, start, p - start, &ok);
++        if (!ok)
++            return -1;
++    }
++    *pv = js_float64(d);
++    return 0;
++}
++
++/* Whether atom a is the key of these (plain) characters. */
++static inline bool jf_atom_is(JSRuntime *rt, JSAtom a, const uint8_t *k, uint32_t n)
++{
++    JSString *s;
++    const uint8_t *c;
++    uint32_t i;
++    if (__JS_AtomIsTaggedInt(a))
++        return false;
++    s = rt->atom_array[a];
++    if (s->len != n || s->is_wide_char)
++        return false;
++    c = str8(s);
++    for (i = 0; i < n; i++) {
++        if (c[i] != k[i])
++            return false;
++    }
++    return true;
++}
++
++/* The atom of a key of these (plain) characters (a reference). */
++static JSAtom jf_atom(JSContext *ctx, const uint8_t *k, uint32_t n)
++{
++    JSValue str;
++    if (n == 0 || !is_digit(*k)) {
++        /* (else it may be an index: JS_NewAtomStr) */
++        JSAtom a = __JS_FindAtom(ctx->rt, (const char *)k, n, JS_ATOM_TYPE_STRING);
++        if (a != JS_ATOM_NULL)
++            return a;
++    }
++    str = js_new_string8_len(ctx, (const char *)k, n);
++    if (JS_IsException(str))
++        return JS_ATOM_NULL;
++    return JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(str));
++}
++
++static inline uint32_t jf_slot(const uint8_t *k, uint32_t n)
++{
++    uint32_t h = n * 0x9e3779b1u;
++    if (n)
++        h += (k[0] | (uint32_t)k[n - 1] << 8 | (uint32_t)k[n >> 1] << 16) * 0x85ebca77u;
++    return h >> (32 - 6);
++}
++
++static int jf_value(JSONFast *jf, JSValue *pv, JSShape *hint, int depth);
++
++/* The object being made with its shape's first `count` keys: as made key
++   by key instead (its shape's transitions). */
++static int jf_unshape(JSContext *ctx, JSValue *pobj, uint32_t count)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(*pobj), *p2;
++    JSShapeProperty *prs = get_shape_prop(p->shape);
++    JSValue obj2 = JS_NewObject(ctx);
++    uint32_t j;
++    if (JS_IsException(obj2))
++        return -1;
++    p2 = JS_VALUE_GET_OBJ(obj2);
++    for (j = 0; j < count; j++) {
++        JSProperty *pr = add_property(ctx, p2, prs[j].atom, JS_PROP_C_W_E);
++        if (!pr) {
++            JS_FreeValue(ctx, obj2);
++            return -1;
++        }
++        pr->u.value = p->prop[j].u.value;
++        p->prop[j].u.value = JS_UNDEFINED;
++        JS_GC_WBV(ctx->rt, p2, pr->u.value);
++    }
++    JS_FreeValue(ctx, *pobj);
++    *pobj = obj2;
++    return 0;
++}
++
++/* The object at jf->p (its brace); `hint`: the shape of the object before
++   it in an array, if any. */
++static int jf_object(JSONFast *jf, JSValue *pv, JSShape *hint, int depth)
++{
++    JSContext *ctx = jf->ctx;
++    JSRuntime *rt = ctx->rt;
++    JSValue obj = JS_UNDEFINED, v;
++    JSObject *p = NULL;
++    JSShape *sh = NULL; /* (the object's, while its keys are its shape's) */
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    uint32_t i, n, slot = UINT32_MAX;
++    const uint8_t *k, *q;
++    JSAtom atom = JS_ATOM_NULL;
++
++    jf->p++;
++    jf_ws(jf);
++    if (jf->p < jf->end && *jf->p == '}') {
++        jf->p++;
++        *pv = JS_NewObject(ctx);
++        return JS_IsException(*pv) ? -1 : 0;
++    }
++    for (i = 0;; i++) {
++        bool plain;
++        if (jf->p >= jf->end || *jf->p != '"')
++            goto fail;
++        k = jf->p + 1;
++        q = jf_scan(jf, k);
++        n = q - k;
++        plain = q < jf->end && *q == '"';
++        if (plain) {
++            jf->p = q + 1;
++        } else {
++            /* (escapes, or UTF-8) */
++            JSValue key;
++            if (jf_string(jf, &key) < 0)
++                goto fail;
++            atom = JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(key));
++            if (atom == JS_ATOM_NULL)
++                goto fail;
++        }
++        if (i == 0) {
++            if (plain) {
++                slot = jf_slot(k, n);
++                if (hint && hint->prop_count && jf_atom_is(rt, get_shape_prop(hint)->atom, k, n))
++                    sh = hint;
++                else if ((sh = ctx->json_shapes[slot]) && !jf_atom_is(rt, get_shape_prop(sh)->atom, k, n))
++                    sh = NULL;
++            }
++            if (sh) {
++                obj = js_new_plain_object(ctx, js_dup_shape(sh));
++            } else {
++                obj = JS_NewObject(ctx);
++            }
++            if (JS_IsException(obj))
++                goto fail;
++            p = JS_VALUE_GET_OBJ(obj);
++        } else if (sh && (!plain || i >= sh->prop_count ||
++                          !jf_atom_is(rt, get_shape_prop(sh)[i].atom, k, n))) {
++            if (jf_unshape(ctx, &obj, i) < 0)
++                goto fail;
++            p = JS_VALUE_GET_OBJ(obj);
++            sh = NULL;
++        }
++        if (!sh && atom == JS_ATOM_NULL && (atom = jf_atom(ctx, k, n)) == JS_ATOM_NULL)
++            goto fail;
++        if (!jf_char(jf, ':'))
++            goto fail;
++        jf_ws(jf);
++        if (jf_value(jf, &v, NULL, depth + 1) < 0)
++            goto fail;
++        if (sh) {
++            p->prop[i].u.value = v;
++        } else {
++            /* (a key again: CreateDataProperty replaces the value) */
++            prs = find_own_property(&pr, p, atom);
++            if (prs) {
++                JSValue old = pr->u.value;
++                pr->u.value = v;
++                JS_FreeValue(ctx, old);
++            } else {
++                pr = add_property(ctx, p, atom, JS_PROP_C_W_E);
++                if (!pr) {
++                    JS_FreeValue(ctx, v);
++                    goto fail;
++                }
++                pr->u.value = v;
++            }
++            JS_FreeAtom(ctx, atom);
++            atom = JS_ATOM_NULL;
++        }
++        JS_GC_WBV(rt, p, v);
++        if (jf_char(jf, ','))
++            jf_ws(jf);
++        else if (jf_char(jf, '}'))
++            break;
++        else
++            goto fail;
++    }
++    if (sh && i + 1 != sh->prop_count) {
++        if (jf_unshape(ctx, &obj, i + 1) < 0)
++            goto fail;
++        p = JS_VALUE_GET_OBJ(obj);
++        sh = NULL;
++    }
++    /* The shape for the next object whose first key is this one. */
++    if (slot != UINT32_MAX && ctx->json_shapes[slot] != p->shape && p->shape->is_hashed) {
++        js_free_shape_null(rt, ctx->json_shapes[slot]);
++        ctx->json_shapes[slot] = js_dup_shape(p->shape);
++    }
++    *pv = obj;
++    return 0;
++ fail:
++    if (atom != JS_ATOM_NULL)
++        JS_FreeAtom(ctx, atom);
++    JS_FreeValue(ctx, obj);
++    return -1;
++}
++
++/* The array at jf->p (its bracket). */
++static int jf_array(JSONFast *jf, JSValue *pv, int depth)
++{
++    JSContext *ctx = jf->ctx;
++    /* (On the stack: the collector sees them.) */
++    JSValue tmp[16], arr = JS_UNDEFINED, v;
++    JSShape *hint = NULL;
++    uint32_t n = 0, i;
++
++    jf->p++;
++    jf_ws(jf);
++    if (jf->p < jf->end && *jf->p == ']') {
++        jf->p++;
++        *pv = JS_NewArray(ctx);
++        return JS_IsException(*pv) ? -1 : 0;
++    }
++    for (;;) {
++        if (jf_value(jf, &v, hint, depth + 1) < 0)
++            goto fail;
++        hint = JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_OBJECT ?
++            JS_VALUE_GET_OBJ(v)->shape : NULL;
++        if (JS_IsUndefined(arr) && n < countof(tmp)) {
++            tmp[n++] = v;
++        } else {
++            if (JS_IsUndefined(arr)) {
++                arr = JS_NewArrayFrom(ctx, n, tmp);
++                n = 0;
++                if (JS_IsException(arr)) {
++                    JS_FreeValue(ctx, v);
++                    return -1;
++                }
++            }
++            if (add_fast_array_element(ctx, JS_VALUE_GET_OBJ(arr), v, 0) < 0)
++                goto fail;
++        }
++        if (jf_char(jf, ','))
++            jf_ws(jf);
++        else if (jf_char(jf, ']'))
++            break;
++        else
++            goto fail;
++    }
++    if (JS_IsUndefined(arr))
++        arr = JS_NewArrayFrom(ctx, n, tmp);
++    *pv = arr;
++    return JS_IsException(arr) ? -1 : 0;
++ fail:
++    for (i = 0; i < n; i++)
++        JS_FreeValue(ctx, tmp[i]);
++    JS_FreeValue(ctx, arr);
++    return -1;
++}
++
++static int jf_value(JSONFast *jf, JSValue *pv, JSShape *hint, int depth)
++{
++    const uint8_t *p = jf->p;
++    size_t left = jf->end - p;
++    if (!left)
++        return -1;
++    switch (*p) {
++    case '{':
++        if (depth > JSON_FAST_DEPTH || js_check_stack_overflow(jf->ctx->rt, 0))
++            return -1;
++        return jf_object(jf, pv, hint, depth);
++    case '[':
++        if (depth > JSON_FAST_DEPTH || js_check_stack_overflow(jf->ctx->rt, 0))
++            return -1;
++        return jf_array(jf, pv, depth);
++    case '"':
++        return jf_string(jf, pv);
++    case 't':
++        if (left < 4 || memcmp(p, "true", 4))
++            return -1;
++        jf->p += 4;
++        *pv = JS_TRUE;
++        return 0;
++    case 'f':
++        if (left < 5 || memcmp(p, "false", 5))
++            return -1;
++        jf->p += 5;
++        *pv = JS_FALSE;
++        return 0;
++    case 'n':
++        if (left < 4 || memcmp(p, "null", 4))
++            return -1;
++        jf->p += 4;
++        *pv = JS_NULL;
++        return 0;
++    default:
++        return jf_number(jf, pv);
++    }
++}
++
++/* The value of the JSON text that jf reads, or JS_UNINITIALIZED, no
++   exception pending, if the general parser must run. */
++static JSValue jf_run(JSONFast *jf)
++{
++    JSContext *ctx = jf->ctx;
++    JSValue v;
++    jf_ws(jf);
++    if (jf_value(jf, &v, NULL, 0) < 0)
++        goto fail;
++    jf_ws(jf);
++    if (jf->p != jf->end) {
++        JS_FreeValue(ctx, v);
++        goto fail;
++    }
++    return v;
++ fail:
++    if (JS_HasException(ctx))
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    return JS_UNINITIALIZED;
++}
++
++/* The JSON text at buf (len bytes: UTF-8, NUL-terminated, if utf8, else
++   Latin-1 characters), as jf_run. */
++static JSValue js_json_parse_fast(JSContext *ctx, const uint8_t *buf, size_t len, bool utf8)
++{
++    JSONFast jf = { ctx, buf, buf + len, utf8, false };
++    return jf_run(&jf);
++}
++
++/* luminous: JSON.parse of the text these UTF-8 bytes decode to (they need
++   not end with a NUL), as the fast path parses it: the value, or
++   JS_UNINITIALIZED (nothing pending) when the bytes are anything else
++   (invalid UTF-8 or JSON included: decode them, then JSON.parse). */
++JSValue JS_ParseJSONUTF8Fast(JSContext *ctx, const uint8_t *buf, size_t len)
++{
++    JSONFast jf = { ctx, buf, buf + len, true, true };
++    return jf_run(&jf);
++}
++
+ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+ {
+     JSValue obj;
+     const char *str;
+     size_t len;
++    bool reviver = argc > 1 && JS_IsFunction(ctx, argv[1]);
++    const uint8_t *latin1 = reviver ? NULL : JS_GetStringLatin1(argv[0], &len);
+ 
++    /* (luminous: the fast path, from a string's characters in place) */
++    if (latin1) {
++        obj = js_json_parse_fast(ctx, latin1, len, false);
++        if (!JS_IsUninitialized(obj))
++            return obj;
++    }
+     str = JS_ToCStringLen(ctx, &len, argv[0]);
+     if (!str)
+         return JS_EXCEPTION;
+-    if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
++    if (reviver) {
+         JSONParseRecord pr_s, *pr = &pr_s, *pr1;
+         JSValue root;
+         JSValueConst reviver;
+@@ -56057,6 +56739,11 @@
+             goto fail;
+         json_parse_record_init_obj(ctx, pr, root);
+         size = 0;
++        if (JS_AddGCMarkHook(ctx->rt, json_mark_parse_records, pr) < 0) {
++            json_free_parse_record(ctx, pr);
++            JS_FreeValue(ctx, root);
++            goto fail;
++        }
+         pr1 = json_parse_record_add(ctx, pr, JS_ATOM_empty_string, &size);
+         if (!pr1)
+             goto fail1;
+@@ -56069,6 +56756,7 @@
+                                    JS_PROP_C_W_E) < 0) {
+         fail1:
+             json_free_parse_record(ctx, pr);
++            JS_RemoveGCMarkHook(ctx->rt, json_mark_parse_records, pr);
+             JS_FreeValue(ctx, root);
+             goto fail;
+         }
+@@ -56076,9 +56764,12 @@
+         obj = internalize_json_property(ctx, root, JS_ATOM_empty_string,
+                                         reviver, str, pr);
+         json_free_parse_record(ctx, pr);
++        JS_RemoveGCMarkHook(ctx->rt, json_mark_parse_records, pr);
+         JS_FreeValue(ctx, root);
+     } else {
+-        obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
++        obj = latin1 ? JS_UNINITIALIZED : js_json_parse_fast(ctx, (const uint8_t *)str, len, true);
++        if (JS_IsUninitialized(obj))
++            obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
+     }
+     JS_FreeCString(ctx, str);
+     return obj;
+@@ -62865,30 +63556,114 @@
+     return true;
+ }
+ 
+-JSValue JS_ForInIteratorObject(JSContext *ctx, JSValueConst obj)
++/* luminous: the shared iterator of the shape of p, if p is enumerated by
++   its shape (js_for_in_by_shape), else undefined: the shape (held) and its
++   keys, [key, slot, key, slot...] (a fast array: read only), cached by
++   the context. It holds while the object has the shape and its
++   prototypes, watched, are unchanged (js_proto_epoch). */
++static JSValue js_for_in_shared(JSContext *ctx, JSObject *p)
+ {
+-    JSValue enum_obj;
++    JSShape *sh = p->shape;
++    JSShapeProperty *prs;
++    JSObject *proto, *ka;
+     JSForInIterator *it;
+-    JSObject *p;
++    JSValue keys, iter;
++    uint32_t i, n;
++    bool watched = true;
++    int h = ((uintptr_t)sh >> 4) & (countof(ctx->for_in_cache) - 1);
++    JSValue c = ctx->for_in_cache[h].iter;
++    bool same = JS_IsObject(c) && JS_VALUE_GET_OBJ(c)->u.for_in_iterator->shape == sh;
++
++    if (same && ctx->for_in_cache[h].epoch == js_proto_epoch)
++        return js_dup(c);
++    if (!js_for_in_by_shape(ctx, p))
++        return JS_UNDEFINED;
++    for (proto = sh->proto; proto; proto = proto->shape->proto) {
++        if (JS_WatchPrototype(ctx, JS_MKPTR(JS_TAG_OBJECT, proto)) < 0)
++            watched = false;
++    }
++    if (same) {
++        /* (the prototypes changed, but not their enumerable keys) */
++        if (watched)
++            ctx->for_in_cache[h].epoch = js_proto_epoch;
++        return js_dup(c);
++    }
++    for (i = n = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++        if (prs->atom != JS_ATOM_NULL && (prs->flags & JS_PROP_ENUMERABLE) &&
++            js_for_in_string_atom(ctx->rt, prs->atom))
++            n++;
++    }
++    keys = js_allocate_fast_array(ctx, 2 * (int64_t)n);
++    if (JS_IsException(keys))
++        return keys;
++    ka = JS_VALUE_GET_OBJ(keys);
++    for (i = n = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
++        if (prs->atom != JS_ATOM_NULL && (prs->flags & JS_PROP_ENUMERABLE) &&
++            js_for_in_string_atom(ctx->rt, prs->atom)) {
++            ka->u.array.u.values[n++] = JS_AtomToString(ctx, prs->atom);
++            ka->u.array.u.values[n++] = js_int32(i);
++        }
++    }
++    iter = js_for_in_iterator_new(ctx, JS_UNDEFINED, &it);
++    if (JS_IsException(iter)) {
++        JS_FreeValue(ctx, keys);
++        return iter;
++    }
++    it->shape = js_dup_shape(sh);
++    it->keys = keys;
++    if (watched) {
++        JS_FreeValue(ctx, ctx->for_in_cache[h].iter);
++        ctx->for_in_cache[h].iter = js_dup(iter);
++        ctx->for_in_cache[h].epoch = js_proto_epoch;
++    }
++    return iter;
++}
+ 
+-    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || !js_for_in_by_shape(ctx, JS_VALUE_GET_OBJ(obj)))
+-        return build_for_in_iterator(ctx, js_dup(obj));
+-    p = JS_VALUE_GET_OBJ(obj);
+-    it = js_malloc(ctx, sizeof(*it));
+-    if (!it)
+-        return JS_EXCEPTION;
+-    enum_obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_FOR_IN_ITERATOR);
+-    if (JS_IsException(enum_obj)) {
+-        js_free(ctx, it);
+-        return JS_EXCEPTION;
++JSValue JS_ForInIteratorObject(JSContext *ctx, JSValueConst obj)
++{
++    return build_for_in_iterator(ctx, js_dup(obj));
++}
++
++JSValue JS_ForInStart(JSContext *ctx, JSValueConst obj, int *pshared)
++{
++    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
++        JSValue shared = js_for_in_shared(ctx, JS_VALUE_GET_OBJ(obj));
++        if (!JS_IsUndefined(shared)) {
++            *pshared = 1;
++            return shared;
++        }
+     }
+-    it->is_array = false;
+-    it->obj = js_dup(obj);
+-    it->idx = 0;
+-    it->slot = 0;
+-    it->shape = js_dup_shape(p->shape);
+-    JS_VALUE_GET_OBJ(enum_obj)->u.for_in_iterator = it;
+-    return enum_obj;
++    *pshared = 0;
++    return build_for_in_iterator2(ctx, js_dup(obj), false);
++}
++
++int JS_ForInHas(JSContext *ctx, JSValueConst obj, JSValueConst iter, int32_t i)
++{
++    JSForInIterator *it = JS_VALUE_GET_OBJ(iter)->u.for_in_iterator;
++    JSObject *ka = JS_VALUE_GET_OBJ(it->keys);
++    int32_t slot = JS_VALUE_GET_INT(ka->u.array.u.values[2 * i + 1]);
++    /* (as js_for_in_next: a proxy's keys are not looked up again) */
++    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY)
++        return 1;
++    return JS_HasProperty(ctx, obj, get_shape_prop(it->shape)[slot].atom);
++}
++
++JSValue JS_ForInGetAt(JSContext *ctx, JSValueConst iter, int32_t i, JSValueConst obj, JSValueConst key)
++{
++    /* `obj[key]` where key is key i of a shared iterator and obj has its
++       shape: the property is in that slot */
++    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(key) == JS_TAG_STRING) {
++        JSForInIterator *it = JS_VALUE_GET_OBJ(iter)->u.for_in_iterator;
++        JSObject *p = JS_VALUE_GET_OBJ(obj), *ka = JS_VALUE_GET_OBJ(it->keys);
++        if (p->shape == it->shape && i >= 0 && 2 * (uint32_t)i < ka->u.array.count) {
++            int32_t slot = JS_VALUE_GET_INT(ka->u.array.u.values[2 * i + 1]);
++            JSShapeProperty *prs = &get_shape_prop(it->shape)[slot];
++            if ((prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++                JS_VALUE_GET_PTR(key) == ctx->rt->atom_array[prs->atom])
++                return js_dup(p->prop[slot].u.value);
++        }
++    }
++    return JS_GetPropertyValue(ctx, obj, js_dup(key));
+ }
+ 
+ JSValue JS_ForInGet(JSContext *ctx, JSValueConst enum_obj, JSValueConst obj, JSValueConst key)
+@@ -62917,6 +63692,24 @@
+ JSValue JS_ForInStep(JSContext *ctx, JSValueConst enum_obj, int *pdone)
+ {
+     JSValue sp[3];
++    /* luminous: the next of a shape's cached keys, while the object has it */
++    if (likely(JS_VALUE_GET_TAG(enum_obj) == JS_TAG_OBJECT &&
++               JS_VALUE_GET_OBJ(enum_obj)->class_id == JS_CLASS_FOR_IN_ITERATOR)) {
++        JSForInIterator *it = JS_VALUE_GET_OBJ(enum_obj)->u.for_in_iterator;
++        if (!JS_IsUndefined(it->keys) && JS_IsObject(it->obj) &&
++            JS_VALUE_GET_OBJ(it->obj)->shape == it->shape) {
++            JSObject *ka = JS_VALUE_GET_OBJ(it->keys);
++            uint32_t i = it->idx;
++            if (i * 2 >= ka->u.array.count) {
++                *pdone = 1;
++                return JS_UNDEFINED;
++            }
++            it->slot = JS_VALUE_GET_INT(ka->u.array.u.values[2 * i + 1]);
++            it->idx = i + 1;
++            *pdone = 0;
++            return js_dup(ka->u.array.u.values[2 * i]);
++        }
++    }
+     sp[0] = unsafe_unconst(enum_obj);
+     if (js_for_in_next(ctx, sp + 1))
+         return JS_EXCEPTION;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1323,6 +1323,18 @@
+                                          bool is_exception_pending);
+ JS_EXTERN JSValue JS_ForInIteratorObject(JSContext *ctx, JSValueConst obj);
+ JS_EXTERN JSValue JS_ForInStep(JSContext *ctx, JSValueConst enum_obj, int *pdone);
++/* luminous: for-in over obj from native code: the iterator, and *pshared 1
++   if it is the shared one of obj's shape (the keys of the shape, stepped
++   with an index of the caller's: key i at [2i] of its keys, at
++   JS_LAYOUT_FORIN_KEYS of its JSForInIterator, while obj has the shape at
++   JS_LAYOUT_FORIN_SHAPE; else whether obj still has it, JS_ForInHas), else
++   0 (JS_ForInStep). */
++JS_EXTERN JSValue JS_ForInStart(JSContext *ctx, JSValueConst obj, int *pshared);
++JS_EXTERN int JS_ForInHas(JSContext *ctx, JSValueConst obj, JSValueConst iter, int32_t i);
++/* obj[key] in a for-in over a shared iterator, key i: fast while obj has its
++   shape and key is that key. */
++JS_EXTERN JSValue JS_ForInGetAt(JSContext *ctx, JSValueConst iter, int32_t i, JSValueConst obj,
++                                JSValueConst key);
+ /* obj[key] in a for-in over `enum_obj` (a JS_ForInIteratorObject), fast when
+    key is its current key and obj has the shape it enumerates. */
+ JS_EXTERN JSValue JS_ForInGet(JSContext *ctx, JSValueConst enum_obj, JSValueConst obj,
+@@ -1389,6 +1401,8 @@
+ #define JS_LAYOUT_FDATA_DATA        32   /* JSValue[]: the function data */
+ #define JS_LAYOUT_CLASS_C_FUNCTION_DATA 15
+ #define JS_LAYOUT_OBJ_OPAQUE        24   /* void *: the opaque of a class object */
++#define JS_LAYOUT_FORIN_SHAPE       24   /* JSShape *, of a JSForInIterator (JS_ForInStart) */
++#define JS_LAYOUT_FORIN_KEYS        40   /* JSValue: its keys and their slots */
+ #define JS_LAYOUT_CLASS_C_FUNCTION  12
+ #define JS_LAYOUT_CLASS_PROXY       51
+ #define JS_LAYOUT_STRING_KIND       4    /* uint32_t: the kind in bits 28-29 (0: characters follow) */
+@@ -1466,6 +1480,9 @@
+ /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
+ JS_EXTERN JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len,
+                                const char *filename);
++/* luminous: JSON.parse of the text UTF-8 bytes decode to, when the fast
++   path takes them, else JS_UNINITIALIZED (decode them, then parse). */
++JS_EXTERN JSValue JS_ParseJSONUTF8Fast(JSContext *ctx, const uint8_t *buf, size_t len);
+ JS_EXTERN JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+                                    JSValueConst replacer, JSValueConst space0);
+ /* luminous: JSON.stringify without a replacer or indentation writes the
