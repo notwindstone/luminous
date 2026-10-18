@@ -337,6 +337,15 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state)
 static JSClassID lum_state_class;
 static int lum_structs_init(JSContext *ctx);
 static void lum_structs_free(JSRuntime *rt);
+/* `aot type`s from JSON (see lum_struct_convert). Per field
+ * (lum_struct_atom_base): the desc + 1 of the objects or arrays it holds
+ * in every member that has it, else 0. */
+static int32_t *lum_field_sub;
+static int lum_field_sub_init(JSContext *ctx, int total);
+/* `r.json()` where its result is converted: (r, desc) => a promise, or
+ * undefined (then r.json() is called). Set by the host. */
+static JSValue lum_json_hook = JS_UNDEFINED;
+static JSAtom lum_atom_json;
 static int lum_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
 static JSAtom lum_atom_iterator = JS_ATOM_NULL, lum_atom_next = JS_ATOM_NULL, lum_atom_string_length = JS_ATOM_NULL,
@@ -594,6 +603,7 @@ static void lum_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
         JS_MarkValue(rt, lum_homes[i], mark_func);
     for (i = 0; i < LUM_PINS; i++)
         JS_MarkValue(rt, lum_pins[i], mark_func);
+    JS_MarkValue(rt, lum_json_hook, mark_func);
     for (i = 0; i < lum_record_count() * LUM_RECORD_STRIDE; i++) {
         if (i % LUM_RECORD_STRIDE < LUM_RECORD_SHAPES && lum_record_shapes[i])
             JS_MarkCachedShape(rt, lum_record_shapes[i], mark_func);
@@ -807,7 +817,7 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.String.prototype.slice, g.String.prototype.substring, g.String.prototype.indexOf,\n"
         "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
-        "             g.Set.prototype.has, g.JSON.stringify);\n"
+        "             g.Set.prototype.has, g.JSON.stringify, g.JSON.parse);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -2593,12 +2603,23 @@ static JSValue lum_field_get(JSContext *ctx, LumStruct *s, const LumFieldDesc *f
 
 static LumStructArray *lum_sarr_of(JSValueConst v);
 
+/* An absent field's storage: `undefined`, or zero. */
+static void lum_field_clear(LumStruct *s, const LumFieldDesc *f)
+{
+    if (f->storage == LUM_ST_VALUE)
+        *(JSValue *)lum_field_at(s, f) = JS_UNDEFINED;
+    else
+        memset(lum_field_at(s, f), 0, lum_field_size(f));
+}
+
 static bool lum_value_fits(JSContext *ctx, const LumTypeDesc *t, JSValueConst v)
 {
     int tag = JS_VALUE_GET_NORM_TAG(v);
     LumStruct *s;
     LumStructArray *a;
     uint32_t i;
+    if (tag == JS_TAG_NULL && t->nullable)
+        return true;
     switch (t->kind) {
     case LUM_FT_INT:
         if (tag == JS_TAG_INT)
@@ -2658,6 +2679,14 @@ static int lum_put_raw(JSContext *ctx, JSValueConst obj, LumStruct *s, int fi, J
     const LumFieldDesc *f = &l->fields[fi];
     void *at = lum_field_at(s, f);
     *old = JS_UNDEFINED;
+    if (JS_IsUndefined(v) && (l->optional & (1u << fi))) {
+        /* An optional field given `undefined`: absent. */
+        if (f->storage == LUM_ST_VALUE)
+            *old = *(JSValue *)at;
+        lum_field_clear(s, f);
+        s->mask &= ~(1u << fi);
+        return 0;
+    }
     if (f->storage == LUM_ST_INT32) {
         /* Integers wrap to int32 (unless `--no-int-wrapping`). */
         int tag = JS_VALUE_GET_NORM_TAG(v);
@@ -2699,16 +2728,17 @@ static int lum_put_raw(JSContext *ctx, JSValueConst obj, LumStruct *s, int fi, J
     return 0;
 }
 
-/* Whether s matches a member: has its fields, with its types. */
+/* Whether s matches a member: has its fields (but optional ones), with its
+ * types. */
 static bool lum_struct_matches(JSContext *ctx, LumStruct *s)
 {
     const LumLayoutDesc *l = &lum_layouts[s->layout];
     uint32_t m, fi;
     for (m = 0; m < l->nmembers; m++) {
         const LumMemberDesc *mem = &l->members[m];
-        bool ok = (mem->mask & ~s->mask) == 0;
+        bool ok = (mem->mask & ~mem->optional & ~s->mask) == 0;
         for (fi = 0; ok && fi < l->nfields; fi++) {
-            if (!(mem->mask & (1u << fi)))
+            if (!(mem->mask & s->mask & (1u << fi)))
                 continue;
             JSValue v = lum_field_get(ctx, s, &l->fields[fi]);
             ok = lum_value_fits(ctx, &mem->types[fi], v);
@@ -2757,27 +2787,34 @@ int lum_struct_validate(JSContext *ctx, JSValue obj)
     return -1;
 }
 
-/* A write of field `field` (v taken): it must be present, and the object
- * must still match a member afterwards (else it is left as it was). */
+/* A write of field `field` (v taken): it must be present, or optional
+ * (`undefined` makes it absent), and the object must still match a member
+ * afterwards (else it is left as it was). */
 int lum_struct_set(JSContext *ctx, JSValue obj, int field, JSValue v)
 {
     LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
     const LumLayoutDesc *l = &lum_layouts[s->layout];
     const LumFieldDesc *f = &l->fields[field];
+    uint32_t bit = 1u << field, mask = s->mask;
     uint64_t saved[2];
     JSValue old;
-    if (!(s->mask & (1u << field))) {
+    if (!(mask & bit) && !(l->optional & bit)) {
         JS_FreeValue(ctx, v);
         JS_ThrowTypeError(ctx, "cannot add `%s` to an object of aot type `%s`", f->name, l->name);
         return -1;
     }
     memcpy(saved, lum_field_at(s, f), lum_field_size(f));
-    if (lum_put_raw(ctx, obj, s, field, v, &old) < 0)
+    s->mask |= bit;
+    if (lum_put_raw(ctx, obj, s, field, v, &old) < 0) {
+        s->mask = mask;
         return -1;
-    if (l->validate && !f->simple && !lum_struct_matches(ctx, s)) {
+    }
+    if (s->mask != mask ? !lum_struct_matches(ctx, s) : l->validate && !f->simple && !lum_struct_matches(ctx, s)) {
         if (f->storage == LUM_ST_VALUE)
             JS_FreeValue(ctx, *(JSValue *)lum_field_at(s, f));
         memcpy(lum_field_at(s, f), saved, lum_field_size(f));
+        s->mask = mask;
+        /* (`old` is back in the field.) */
         JS_ThrowTypeError(ctx, "the object would not be of aot type `%s`", l->name);
         return -1;
     }
@@ -2803,6 +2840,8 @@ static int lum_struct_get_own(JSContext *ctx, JSPropertyDescriptor *desc, JSValu
         return 0;
     if (desc) {
         desc->flags = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+        if (lum_layouts[s->layout].optional & (1u << lum_field_index(s->layout, prop)))
+            desc->flags |= JS_PROP_CONFIGURABLE;
         desc->value = v;
         desc->getter = JS_UNDEFINED;
         desc->setter = JS_UNDEFINED;
@@ -2832,11 +2871,28 @@ static int lum_struct_own_names(JSContext *ctx, JSPropertyEnum **ptab, uint32_t 
     return 0;
 }
 
+/* `delete`: of an optional field, if the object still matches a member. */
 static int lum_struct_delete(JSContext *ctx, JSValueConst obj, JSAtom prop)
 {
     LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
+    const LumLayoutDesc *l = &lum_layouts[s->layout];
     int fi = lum_field_index(s->layout, prop);
-    return !(fi >= 0 && (s->mask & (1u << fi)));
+    uint32_t bit, mask = s->mask;
+    uint64_t saved[2];
+    JSValue old;
+    if (fi < 0 || !(mask & (bit = 1u << fi)))
+        return true;
+    if (!(l->optional & bit))
+        return false;
+    memcpy(saved, lum_field_at(s, &l->fields[fi]), lum_field_size(&l->fields[fi]));
+    lum_put_raw(ctx, obj, s, fi, JS_UNDEFINED, &old);
+    if (!lum_struct_matches(ctx, s)) {
+        memcpy(lum_field_at(s, &l->fields[fi]), saved, lum_field_size(&l->fields[fi]));
+        s->mask = mask;
+        return false;
+    }
+    JS_FreeValue(ctx, old);
+    return true;
 }
 
 static int lum_struct_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst val,
@@ -2845,12 +2901,13 @@ static int lum_struct_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSVa
     LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
     const LumLayoutDesc *l = &lum_layouts[s->layout];
     int fi = lum_field_index(s->layout, prop);
-    if (fi < 0 || !(s->mask & (1u << fi))) {
+    if (fi < 0 || !((s->mask | l->optional) & (1u << fi))) {
         JS_ThrowTypeError(ctx, "cannot add a property to an object of aot type `%s`", l->name);
         return -1;
     }
+    /* (An optional field can be deleted: it is configurable.) */
     if ((flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) ||
-        ((flags & JS_PROP_HAS_CONFIGURABLE) && (flags & JS_PROP_CONFIGURABLE)) ||
+        ((flags & JS_PROP_HAS_CONFIGURABLE) && !(flags & JS_PROP_CONFIGURABLE) != !(l->optional & (1u << fi))) ||
         ((flags & JS_PROP_HAS_ENUMERABLE) && !(flags & JS_PROP_ENUMERABLE)) ||
         ((flags & JS_PROP_HAS_WRITABLE) && !(flags & JS_PROP_WRITABLE))) {
         JS_ThrowTypeError(ctx, "cannot redefine `%s` of an object of aot type `%s`", l->fields[fi].name, l->name);
@@ -3082,7 +3139,7 @@ static int lum_structs_init(JSContext *ctx)
         for (f = 0; f < lum_layouts[i].nfields; f++)
             lum_struct_atoms[lum_struct_atom_base[i] + f] = JS_NewAtom(ctx, lum_layouts[i].fields[f].name);
     }
-    if (lum_struct_json_init(ctx, total) < 0 || lum_sarr_init(ctx) < 0)
+    if (lum_struct_json_init(ctx, total) < 0 || lum_sarr_init(ctx) < 0 || lum_field_sub_init(ctx, total) < 0)
         return -1;
     lum_struct_lit_values = js_mallocz(ctx, sizeof(JSValue) * (lum_nstruct_lits ? lum_nstruct_lits : 1));
     for (i = 0; i < lum_nstruct_lits; i++)
@@ -3103,6 +3160,12 @@ static void lum_structs_free(JSRuntime *rt)
         js_free_rt(rt, lum_struct_json_keys[i].text);
     js_free_rt(rt, lum_struct_json_keys);
     lum_struct_json_keys = NULL;
+    js_free_rt(rt, lum_field_sub);
+    lum_field_sub = NULL;
+    JS_FreeValueRT(rt, lum_json_hook);
+    lum_json_hook = JS_UNDEFINED;
+    JS_FreeAtomRT(rt, lum_atom_json);
+    lum_atom_json = JS_ATOM_NULL;
     for (i = 0; i < lum_nstruct_lits; i++)
         JS_FreeValueRT(rt, lum_struct_lit_values[i]);
     js_free_rt(rt, lum_struct_atoms);
@@ -3388,6 +3451,10 @@ static int lum_sarr_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValu
     }
     if (!(flags & JS_PROP_HAS_VALUE))
         return true;
+    if (idx >= a->len && !JS_IsExtensible(ctx, obj)) {
+        JS_ThrowTypeError(ctx, "object is not extensible");
+        return -1;
+    }
     return lum_sarr_set(ctx, obj, idx, JS_DupValue(ctx, val)) < 0 ? -1 : true;
 }
 
@@ -3488,6 +3555,740 @@ JSValue lum_regexp(JSContext *ctx, int pattern, int flags)
 
 /* The string constants (atoms' strings), the `aot type` literal strings
    and the regular expression literals' bytecode. */
+/* ---- `aot type`s from JSON: `JSON.parse(text)` and `await r.json()`
+ * where an object of an `aot type` (or an array of them) is expected.
+ * `desc` names what: layout * 2, + 1 for an array of its objects. ----
+ *
+ * The value is converted (lum_struct_convert): an object of the layout
+ * from an object's own fields of the layout (others ignored; each checked
+ * as a store would, then the object as a literal), an array of them from
+ * an array, nested objects and arrays the same way. Typed parsing
+ * (lum_jp_*) makes the same objects straight from the text, reading only
+ * the fields of the layouts and skipping the rest; if it meets anything
+ * else (bad JSON, a value a field cannot hold), the general way runs
+ * instead, so that its errors are the same. */
+
+static int lum_field_sub_init(JSContext *ctx, int total)
+{
+    int n = lum_layout_count(), i;
+    uint32_t f, m;
+    lum_field_sub = js_mallocz(ctx, sizeof(int32_t) * (total ? total : 1));
+    if (!lum_field_sub)
+        return -1;
+    for (i = 0; i < n; i++) {
+        const LumLayoutDesc *l = &lum_layouts[i];
+        for (f = 0; f < l->nfields; f++) {
+            int32_t sub = -1;
+            for (m = 0; m < l->nmembers && sub != 0; m++) {
+                const LumTypeDesc *t = &l->members[m].types[f];
+                int32_t d;
+                if (t->kind == LUM_FT_ABSENT)
+                    continue;
+                d = t->kind == LUM_FT_STRUCT ? t->layout * 2 + 1 : t->kind == LUM_FT_ARRAY ? t->layout * 2 + 2 : 0;
+                sub = sub < 0 || sub == d ? d : 0;
+            }
+            lum_field_sub[lum_struct_atom_base[i] + f] = sub < 0 ? 0 : sub;
+        }
+    }
+    lum_atom_json = JS_NewAtom(ctx, "json");
+    return 0;
+}
+
+static JSValue lum_convert(JSContext *ctx, JSValue v, int32_t desc, int depth)
+{
+    uint32_t k = desc >> 1, base, fi;
+    const LumLayoutDesc *l = &lum_layouts[k];
+    JSValue obj;
+    LumStruct *s;
+    if (depth > 1000) {
+        JS_FreeValue(ctx, v);
+        return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
+    }
+    if (desc & 1) {
+        LumStructArray *a = lum_sarr_of(v);
+        int64_t len, i;
+        if (a && a->layout == k)
+            return v;
+        if (!JS_IsArray(v)) {
+            JS_FreeValue(ctx, v);
+            return JS_ThrowTypeError(ctx, "not an array of aot type `%s`", l->name);
+        }
+        if (JS_GetLength(ctx, v, &len) < 0)
+            goto fail;
+        obj = lum_sarr_new(ctx, k, 0);
+        if (JS_IsException(obj))
+            goto fail;
+        for (i = 0; i < len; i++) {
+            JSValue el = JS_GetPropertyInt64(ctx, v, i);
+            if (JS_IsException(el))
+                goto fail_obj;
+            el = lum_convert(ctx, el, k * 2, depth + 1);
+            if (JS_IsException(el) || lum_sarr_push(ctx, obj, el) < 0)
+                goto fail_obj;
+        }
+        JS_FreeValue(ctx, v);
+        return obj;
+    }
+    s = lum_struct_of(v);
+    if (s && s->layout == k)
+        return v;
+    if (!JS_IsObject(v)) {
+        JS_FreeValue(ctx, v);
+        return JS_ThrowTypeError(ctx, "not an object of aot type `%s`", l->name);
+    }
+    obj = lum_struct_new(ctx, k, 0);
+    if (JS_IsException(obj))
+        goto fail;
+    s = JS_GetOpaque(obj, lum_struct_class);
+    base = lum_struct_atom_base[k];
+    for (fi = 0; fi < l->nfields; fi++) {
+        JSAtom atom = lum_struct_atoms[base + fi];
+        int32_t sub = lum_field_sub[base + fi];
+        JSValue fv, old;
+        int has = JS_GetOwnProperty(ctx, NULL, v, atom);
+        if (has < 0)
+            goto fail_obj;
+        if (!has)
+            continue;
+        fv = JS_GetProperty(ctx, v, atom);
+        if (JS_IsException(fv))
+            goto fail_obj;
+        if (sub && JS_IsObject(fv)) {
+            fv = lum_convert(ctx, fv, sub - 1, depth + 1);
+            if (JS_IsException(fv))
+                goto fail_obj;
+        }
+        s->mask |= 1u << fi;
+        if (lum_put_raw(ctx, obj, s, fi, fv, &old) < 0)
+            goto fail_obj;
+        JS_FreeValue(ctx, old);
+    }
+    JS_FreeValue(ctx, v);
+    if (lum_struct_validate(ctx, obj) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
+ fail_obj:
+    JS_FreeValue(ctx, obj);
+ fail:
+    JS_FreeValue(ctx, v);
+    return JS_EXCEPTION;
+}
+
+/* `v` (taken) as an object of layout desc >> 1 (an array of them if desc
+ * is odd): itself if one, else converted; TypeError if it cannot be. */
+JSValue lum_struct_convert(JSContext *ctx, JSValue v, int32_t desc)
+{
+    return lum_convert(ctx, v, desc, 0);
+}
+
+/* __lum_as(desc, v) (interpreted code). */
+JSValue lum_struct_as(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    int32_t desc;
+    if (argc < 2 || JS_ToInt32(ctx, &desc, argv[0]) < 0 || desc < 0 || (desc >> 1) >= lum_layout_count())
+        return JS_ThrowTypeError(ctx, "__lum_as: bad layout");
+    return lum_struct_convert(ctx, JS_DupValue(ctx, argv[1]), desc);
+}
+
+typedef struct LumJP {
+    JSContext *ctx;
+    const uint8_t *p, *end;
+    bool utf8; /* else Latin-1 (a JS string's characters) */
+    uint16_t *buf;
+    size_t buf_len, buf_cap;
+} LumJP;
+
+static inline bool lum_jp_digit(uint8_t c)
+{
+    return c >= '0' && c <= '9';
+}
+
+static inline void lum_jp_ws(LumJP *jp)
+{
+    while (jp->p < jp->end && (*jp->p == ' ' || *jp->p == '\n' || *jp->p == '\r' || *jp->p == '\t'))
+        jp->p++;
+}
+
+static bool lum_jp_lit(LumJP *jp, const char *lit, size_t n)
+{
+    if ((size_t)(jp->end - jp->p) < n || memcmp(jp->p, lit, n))
+        return false;
+    jp->p += n;
+    return true;
+}
+
+/* A UTF-8 sequence at p (< end): its code point and length, or -1 if
+ * not valid (overlong, a surrogate, past U+10FFFF, cut). */
+static int lum_utf8_char(const uint8_t *p, const uint8_t *end, uint32_t *cp)
+{
+    uint32_t c = p[0], n, i;
+    if (c < 0x80)
+        return *cp = c, 1;
+    if (c >= 0xc2 && c <= 0xdf)
+        n = 2, c &= 0x1f;
+    else if (c >= 0xe0 && c <= 0xef)
+        n = 3, c &= 0x0f;
+    else if (c >= 0xf0 && c <= 0xf4)
+        n = 4, c &= 0x07;
+    else
+        return -1;
+    if ((size_t)(end - p) < n)
+        return -1;
+    for (i = 1; i < n; i++) {
+        if ((p[i] & 0xc0) != 0x80)
+            return -1;
+        c = (c << 6) | (p[i] & 0x3f);
+    }
+    if ((n == 3 && (c < 0x800 || (c >= 0xd800 && c <= 0xdfff))) || (n == 4 && (c < 0x10000 || c > 0x10ffff)))
+        return -1;
+    *cp = c;
+    return n;
+}
+
+static int lum_jp_unit(LumJP *jp, uint32_t u)
+{
+    if (jp->buf_len == jp->buf_cap) {
+        size_t cap = jp->buf_cap ? jp->buf_cap * 2 : 64;
+        uint16_t *b = js_realloc(jp->ctx, jp->buf, cap * sizeof(uint16_t));
+        if (!b)
+            return -1;
+        jp->buf = b;
+        jp->buf_cap = cap;
+    }
+    jp->buf[jp->buf_len++] = u;
+    return 0;
+}
+
+static int lum_jp_hex4(const uint8_t *p, const uint8_t *end, uint32_t *u)
+{
+    uint32_t v = 0, i;
+    if (end - p < 4)
+        return -1;
+    for (i = 0; i < 4; i++) {
+        uint8_t c = p[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9')
+            v |= c - '0';
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'f')
+            v |= (c | 0x20) - 'a' + 10;
+        else
+            return -1;
+    }
+    *u = v;
+    return 0;
+}
+
+/* The string at jp->p (its opening quote): its value in *out. */
+static int lum_jp_string(LumJP *jp, JSValue *out)
+{
+    const uint8_t *p = jp->p + 1, *start = p, *end = jp->end;
+    bool ascii = true, narrow = true;
+    size_t i;
+    for (;;) {
+        uint8_t c;
+        if (p >= end)
+            return -1;
+        c = *p;
+        if (c == '"')
+            break;
+        if (c == '\\')
+            goto escaped;
+        if (c < 0x20)
+            return -1;
+        ascii &= c < 0x80;
+        p++;
+    }
+    if (ascii || !jp->utf8) {
+        *out = JS_NewStringLatin1(jp->ctx, start, p - start);
+    } else {
+        const uint8_t *q = start;
+        uint32_t cp;
+        while (q < p) {
+            int n = lum_utf8_char(q, p, &cp);
+            if (n < 0)
+                return -1;
+            q += n;
+        }
+        *out = JS_NewStringLen(jp->ctx, (const char *)start, p - start);
+    }
+    jp->p = p + 1;
+    return JS_IsException(*out) ? -1 : 0;
+ escaped:
+    /* With escapes: as UTF-16 code units. */
+    jp->buf_len = 0;
+    for (p = start; p < end && *p != '"';) {
+        uint32_t u = *p;
+        if (u < 0x20)
+            return -1;
+        if (u == '\\') {
+            if (++p >= end)
+                return -1;
+            switch (*p++) {
+            case '"': u = '"'; break;
+            case '\\': u = '\\'; break;
+            case '/': u = '/'; break;
+            case 'b': u = '\b'; break;
+            case 'f': u = '\f'; break;
+            case 'n': u = '\n'; break;
+            case 'r': u = '\r'; break;
+            case 't': u = '\t'; break;
+            case 'u':
+                if (lum_jp_hex4(p, end, &u) < 0)
+                    return -1;
+                p += 4;
+                break;
+            default:
+                return -1;
+            }
+        } else if (u >= 0x80 && jp->utf8) {
+            int n = lum_utf8_char(p, end, &u);
+            if (n < 0)
+                return -1;
+            p += n;
+            if (u > 0xffff) {
+                u -= 0x10000;
+                if (lum_jp_unit(jp, 0xd800 | (u >> 10)) < 0)
+                    return -1;
+                u = 0xdc00 | (u & 0x3ff);
+            }
+        } else {
+            p++;
+        }
+        if (lum_jp_unit(jp, u) < 0)
+            return -1;
+    }
+    if (p >= end)
+        return -1;
+    for (i = 0; i < jp->buf_len; i++)
+        narrow &= jp->buf[i] < 0x100;
+    if (narrow) {
+        uint8_t small[256], *b = jp->buf_len <= sizeof(small) ? small : js_malloc(jp->ctx, jp->buf_len);
+        if (!b)
+            return -1;
+        for (i = 0; i < jp->buf_len; i++)
+            b[i] = jp->buf[i];
+        *out = JS_NewStringLatin1(jp->ctx, b, jp->buf_len);
+        if (b != small)
+            js_free(jp->ctx, b);
+    } else {
+        *out = JS_NewStringUTF16(jp->ctx, jp->buf, jp->buf_len);
+    }
+    jp->p = p + 1;
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+/* The number at jp->p, as JSON.parse reads it. */
+static int lum_jp_number(LumJP *jp, double *d)
+{
+    const uint8_t *p = jp->p, *start = p, *end = jp->end;
+    bool neg = false, simple = true;
+    uint64_t m = 0;
+    int nd = 0;
+    if (p < end && *p == '-')
+        neg = true, p++;
+    if (p >= end || !lum_jp_digit(*p))
+        return -1;
+    if (*p == '0' && p + 1 < end && lum_jp_digit(p[1]))
+        return -1;
+    while (p < end && lum_jp_digit(*p)) {
+        if (nd < 19)
+            m = m * 10 + (*p - '0');
+        nd++;
+        p++;
+    }
+    if (p < end && *p == '.') {
+        simple = false;
+        if (++p >= end || !lum_jp_digit(*p))
+            return -1;
+        while (p < end && lum_jp_digit(*p))
+            p++;
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        simple = false;
+        p++;
+        if (p < end && (*p == '+' || *p == '-'))
+            p++;
+        if (p >= end || !lum_jp_digit(*p))
+            return -1;
+        while (p < end && lum_jp_digit(*p))
+            p++;
+    }
+    if (simple && nd <= 15) {
+        *d = neg ? -(double)m : (double)m;
+    } else {
+        char small[64], *b;
+        size_t n = p - start;
+        b = n < sizeof(small) ? small : js_malloc(jp->ctx, n + 1);
+        if (!b)
+            return -1;
+        memcpy(b, start, n);
+        b[n] = '\0';
+        *d = strtod(b, NULL);
+        if (b != small)
+            js_free(jp->ctx, b);
+    }
+    jp->p = p;
+    return 0;
+}
+
+/* Any value (checked, not made). */
+static int lum_jp_skip(LumJP *jp, int depth)
+{
+    double d;
+    if (depth > 1000 || jp->p >= jp->end)
+        return -1;
+    switch (*jp->p) {
+    case '"': {
+        const uint8_t *p = jp->p + 1;
+        uint32_t u;
+        for (;;) {
+            if (p >= jp->end || *p < 0x20)
+                return -1;
+            if (*p == '"')
+                break;
+            if (*p == '\\') {
+                if (++p >= jp->end)
+                    return -1;
+                if (*p == 'u') {
+                    if (lum_jp_hex4(p + 1, jp->end, &u) < 0)
+                        return -1;
+                    p += 5;
+                } else if (strchr("\"\\/bfnrt", *p) && *p) {
+                    p++;
+                } else {
+                    return -1;
+                }
+            } else if (*p >= 0x80 && jp->utf8) {
+                int n = lum_utf8_char(p, jp->end, &u);
+                if (n < 0)
+                    return -1;
+                p += n;
+            } else {
+                p++;
+            }
+        }
+        jp->p = p + 1;
+        return 0;
+    }
+    case '{':
+        jp->p++;
+        lum_jp_ws(jp);
+        if (jp->p < jp->end && *jp->p == '}')
+            return jp->p++, 0;
+        for (;;) {
+            if (jp->p >= jp->end || *jp->p != '"' || lum_jp_skip(jp, depth + 1) < 0)
+                return -1;
+            lum_jp_ws(jp);
+            if (jp->p >= jp->end || *jp->p++ != ':')
+                return -1;
+            lum_jp_ws(jp);
+            if (lum_jp_skip(jp, depth + 1) < 0)
+                return -1;
+            lum_jp_ws(jp);
+            if (jp->p >= jp->end)
+                return -1;
+            if (*jp->p == '}')
+                return jp->p++, 0;
+            if (*jp->p++ != ',')
+                return -1;
+            lum_jp_ws(jp);
+        }
+    case '[':
+        jp->p++;
+        lum_jp_ws(jp);
+        if (jp->p < jp->end && *jp->p == ']')
+            return jp->p++, 0;
+        for (;;) {
+            if (lum_jp_skip(jp, depth + 1) < 0)
+                return -1;
+            lum_jp_ws(jp);
+            if (jp->p >= jp->end)
+                return -1;
+            if (*jp->p == ']')
+                return jp->p++, 0;
+            if (*jp->p++ != ',')
+                return -1;
+            lum_jp_ws(jp);
+        }
+    case 't':
+        return lum_jp_lit(jp, "true", 4) ? 0 : -1;
+    case 'f':
+        return lum_jp_lit(jp, "false", 5) ? 0 : -1;
+    case 'n':
+        return lum_jp_lit(jp, "null", 4) ? 0 : -1;
+    default:
+        return lum_jp_number(jp, &d);
+    }
+}
+
+static int lum_jp_object(LumJP *jp, uint32_t k, JSValue *out, int depth);
+static int lum_jp_array(LumJP *jp, uint32_t k, JSValue *out, int depth);
+
+/* The key at jp->p: field *fi of layout k, or -1 if none. */
+static int lum_jp_key(LumJP *jp, uint32_t k, int *fi)
+{
+    const LumLayoutDesc *l = &lum_layouts[k];
+    uint32_t base = lum_struct_atom_base[k], i;
+    const uint8_t *p = jp->p + 1, *start = p;
+    JSValue key;
+    JSAtom atom;
+    while (p < jp->end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80)
+        p++;
+    if (p < jp->end && *p == '"') {
+        size_t n = p - start;
+        *fi = -1;
+        for (i = 0; i < l->nfields; i++) {
+            const LumJSONKey *jk = &lum_struct_json_keys[base + i];
+            if (jk->text && jk->len - 4 == n && !memcmp(jk->text + 2, start, n)) {
+                *fi = i;
+                break;
+            }
+        }
+        if (*fi < 0) {
+            /* (A name that needs escapes in JSON.) */
+            for (i = 0; i < l->nfields; i++) {
+                if (!lum_struct_json_keys[base + i].text && strlen(l->fields[i].name) == n &&
+                    !memcmp(l->fields[i].name, start, n)) {
+                    *fi = i;
+                    break;
+                }
+            }
+        }
+        jp->p = p + 1;
+        return 0;
+    }
+    if (lum_jp_string(jp, &key) < 0)
+        return -1;
+    atom = JS_ValueToAtom(jp->ctx, key);
+    JS_FreeValue(jp->ctx, key);
+    if (atom == JS_ATOM_NULL)
+        return -1;
+    *fi = lum_field_index(k, atom);
+    JS_FreeAtom(jp->ctx, atom);
+    return 0;
+}
+
+/* The value at jp->p for field fi of obj (s its data). */
+static int lum_jp_field(LumJP *jp, JSValue obj, LumStruct *s, int fi, int depth)
+{
+    const LumLayoutDesc *l = &lum_layouts[s->layout];
+    const LumFieldDesc *f = &l->fields[fi];
+    int32_t sub = lum_field_sub[lum_struct_atom_base[s->layout] + fi];
+    uint32_t bit = 1u << fi;
+    JSValue v, old;
+    double d;
+    switch (*jp->p) {
+    case '{':
+        if (!sub || ((sub - 1) & 1) || lum_jp_object(jp, (sub - 1) >> 1, &v, depth + 1) < 0)
+            return -1;
+        break;
+    case '[':
+        if (!sub || !((sub - 1) & 1) || lum_jp_array(jp, (sub - 1) >> 1, &v, depth + 1) < 0)
+            return -1;
+        break;
+    case '"':
+        if (lum_jp_string(jp, &v) < 0)
+            return -1;
+        break;
+    case 't':
+    case 'f':
+        if (lum_jp_lit(jp, "true", 4))
+            v = JS_TRUE;
+        else if (lum_jp_lit(jp, "false", 5))
+            v = JS_FALSE;
+        else
+            return -1;
+        if (f->storage == LUM_ST_BOOL) {
+            /* (Every member that has it holds a boolean.) */
+            *(uint8_t *)lum_field_at(s, f) = JS_VALUE_GET_BOOL(v);
+            s->mask |= bit;
+            return 0;
+        }
+        break;
+    case 'n':
+        if (!lum_jp_lit(jp, "null", 4))
+            return -1;
+        v = JS_NULL;
+        break;
+    default:
+        if (lum_jp_number(jp, &d) < 0)
+            return -1;
+        if (f->storage == LUM_ST_F64) {
+            /* (Every member that has it holds a number.) */
+            *(double *)lum_field_at(s, f) = d;
+            s->mask |= bit;
+            return 0;
+        }
+        if (f->storage == LUM_ST_INT32 && d == (double)(int32_t)d && !(d == 0 && signbit(d))) {
+            *(int32_t *)lum_field_at(s, f) = (int32_t)d;
+            s->mask |= bit;
+            return 0;
+        }
+        v = JS_NewFloat64(jp->ctx, d);
+        break;
+    }
+    s->mask |= bit;
+    if (lum_put_raw(jp->ctx, obj, s, fi, v, &old) < 0)
+        return -1;
+    JS_FreeValue(jp->ctx, old);
+    return 0;
+}
+
+/* The object at jp->p, as an object of layout k. */
+static int lum_jp_object(LumJP *jp, uint32_t k, JSValue *out, int depth)
+{
+    JSValue obj;
+    LumStruct *s;
+    if (depth > 1000 || jp->p >= jp->end || *jp->p != '{')
+        return -1;
+    obj = lum_struct_new(jp->ctx, k, 0);
+    if (JS_IsException(obj))
+        return -1;
+    s = JS_GetOpaque(obj, lum_struct_class);
+    jp->p++;
+    lum_jp_ws(jp);
+    if (jp->p < jp->end && *jp->p == '}') {
+        jp->p++;
+    } else {
+        for (;;) {
+            int fi;
+            if (jp->p >= jp->end || *jp->p != '"' || lum_jp_key(jp, k, &fi) < 0)
+                goto fail;
+            lum_jp_ws(jp);
+            if (jp->p >= jp->end || *jp->p++ != ':')
+                goto fail;
+            lum_jp_ws(jp);
+            if (fi < 0 ? lum_jp_skip(jp, depth + 1) < 0 : lum_jp_field(jp, obj, s, fi, depth) < 0)
+                goto fail;
+            lum_jp_ws(jp);
+            if (jp->p >= jp->end)
+                goto fail;
+            if (*jp->p == '}') {
+                jp->p++;
+                break;
+            }
+            if (*jp->p++ != ',')
+                goto fail;
+            lum_jp_ws(jp);
+        }
+    }
+    if (!lum_struct_matches(jp->ctx, s))
+        goto fail;
+    *out = obj;
+    return 0;
+ fail:
+    JS_FreeValue(jp->ctx, obj);
+    return -1;
+}
+
+/* The array at jp->p, as an array of objects of layout k. */
+static int lum_jp_array(LumJP *jp, uint32_t k, JSValue *out, int depth)
+{
+    JSValue arr, el;
+    if (depth > 1000 || jp->p >= jp->end || *jp->p != '[')
+        return -1;
+    arr = lum_sarr_new(jp->ctx, k, 0);
+    if (JS_IsException(arr))
+        return -1;
+    jp->p++;
+    lum_jp_ws(jp);
+    if (jp->p < jp->end && *jp->p == ']') {
+        jp->p++;
+        *out = arr;
+        return 0;
+    }
+    for (;;) {
+        if (lum_jp_object(jp, k, &el, depth + 1) < 0 || lum_sarr_push(jp->ctx, arr, el) < 0)
+            goto fail;
+        lum_jp_ws(jp);
+        if (jp->p >= jp->end)
+            goto fail;
+        if (*jp->p == ']') {
+            jp->p++;
+            break;
+        }
+        if (*jp->p++ != ',')
+            goto fail;
+        lum_jp_ws(jp);
+    }
+    *out = arr;
+    return 0;
+ fail:
+    JS_FreeValue(jp->ctx, arr);
+    return -1;
+}
+
+/* Typed parsing of buf: the value, or JS_UNINITIALIZED if it met anything
+ * the general way must handle (no exception then). */
+static JSValue lum_jp_run(JSContext *ctx, const uint8_t *buf, size_t len, bool utf8, int32_t desc)
+{
+    LumJP jp = { ctx, buf, buf + len, utf8, NULL, 0, 0 };
+    JSValue v = JS_UNDEFINED;
+    int r;
+    lum_jp_ws(&jp);
+    r = desc & 1 ? lum_jp_array(&jp, desc >> 1, &v, 0) : lum_jp_object(&jp, desc >> 1, &v, 0);
+    lum_jp_ws(&jp);
+    if (r == 0 && jp.p != jp.end) {
+        JS_FreeValue(ctx, v);
+        r = -1;
+    }
+    js_free(ctx, jp.buf);
+    if (r < 0) {
+        if (JS_HasException(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_UNINITIALIZED;
+    }
+    return v;
+}
+
+/* JSON.parse(text) (the original) as desc: typed parsing of its
+ * characters, else the general way. */
+JSValue lum_json_parse_as(JSContext *ctx, JSValueConst text, int32_t desc)
+{
+    size_t len;
+    const uint8_t *b = JS_GetStringLatin1(text, &len);
+    JSValue v;
+    if (b) {
+        v = lum_jp_run(ctx, b, len, false, desc);
+        if (!JS_IsUninitialized(v))
+            return v;
+    }
+    v = JS_Call(ctx, lum_pins[LUM_PIN_JSON_PARSE], JS_UNDEFINED, 1, &text);
+    if (JS_IsException(v))
+        return v;
+    return lum_struct_convert(ctx, v, desc);
+}
+
+/* Typed parsing of UTF-8 JSON (a body): the value, or JS_UNINITIALIZED
+ * (then the host parses it the general way and converts it). */
+JSValue lum_json_parse_utf8_as(JSContext *ctx, const uint8_t *buf, size_t len, int32_t desc)
+{
+    return lum_jp_run(ctx, buf, len, true, desc);
+}
+
+/* `r.json()` whose result is converted to desc: the host's typed parsing
+ * (lum_set_json_hook) if it takes r, else r.json(). */
+JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc)
+{
+    if (!JS_IsUndefined(lum_json_hook)) {
+        JSValueConst args[2] = { recv, JS_NewInt32(ctx, desc) };
+        JSValue r = JS_Call(ctx, lum_json_hook, JS_UNDEFINED, 2, args);
+        if (!JS_IsUndefined(r))
+            return r;
+    }
+    return JS_Invoke(ctx, recv, lum_atom_json, 0, NULL);
+}
+
+void lum_set_json_hook(JSContext *ctx, JSValueConst fn)
+{
+    JSValue old = lum_json_hook;
+    lum_json_hook = JS_DupValue(ctx, fn);
+    JS_FreeValue(ctx, old);
+}
+
+
 static void lum_mark_strings(JSRuntime *rt, JS_MarkFunc *mark_func)
 {
     int i;

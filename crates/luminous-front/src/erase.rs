@@ -60,6 +60,7 @@ pub const METHOD_FN: &str = "__lum_method";
 pub const CLASS_FN: &str = "__lum_class";
 pub const STRUCT_FN: &str = "__lum_struct";
 pub const SARR_FN: &str = "__lum_sarr";
+pub const AS_FN: &str = "__lum_as";
 
 /// A JS string literal for `s`.
 fn js_string(s: &str) -> String {
@@ -140,6 +141,12 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     }
     for &((s, e), k) in &a.array_sites {
         prefixes.entry(s as usize).or_default().push(format!("{SARR_FN}({k}, "));
+        suffixes.entry(e as usize).or_default().insert(0, ")".into());
+    }
+    // `JSON.parse(text)`, `await r.json()` where an `aot type` is expected:
+    // the value converted (native code parses it to the type directly).
+    for &((s, e), d) in &a.as_sites {
+        prefixes.entry(s as usize).or_default().push(format!("{AS_FN}({d}, "));
         suffixes.entry(e as usize).or_default().insert(0, ")".into());
     }
     // Native module code: its statements become one call (a native
@@ -234,7 +241,7 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // the builtins) even when nothing else is needed: named imports that end
     // up unused are elided by type stripping.
     let mut head = format!(
-        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN}, {CLASS_FN}, {STRUCT_FN}, {SARR_FN} }} from \"{NATIVE_MODULE}\";"
+        "import \"{NATIVE_MODULE}\"; import {{ {BIND_FN}, {INIT_FN}, {CELLS_OBJ}, {METHOD_FN}, {CLASS_FN}, {STRUCT_FN}, {SARR_FN}, {AS_FN} }} from \"{NATIVE_MODULE}\";"
     );
     for h in header {
         head.push(' ');

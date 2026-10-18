@@ -161,6 +161,9 @@ pub struct Analysis {
     pub struct_sites: Vec<((u32, u32), u32)>,
     /// Arrays of objects of an `aot type`: span and layout.
     pub array_sites: Vec<((u32, u32), u32)>,
+    /// `JSON.parse(text)` and `await r.json()` whose result is converted to
+    /// an `aot type` (see `structs::Structs::parse_sites`): span and desc.
+    pub as_sites: Vec<((u32, u32), i32)>,
 }
 
 pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, String> {
@@ -349,6 +352,9 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
     struct_sites.sort();
     let mut array_sites: Vec<((u32, u32), u32)> = structs.array_sites.iter().map(|(&s, &(e, k))| ((s, e), k)).collect();
     array_sites.sort();
+    let mut as_sites: Vec<((u32, u32), i32)> =
+        structs.parse_sites.iter().chain(&structs.json_sites).map(|(&s, &(e, d))| ((s, e), d)).collect();
+    as_sites.sort();
     Ok(Analysis {
         source: source.clone(),
         module: out.module,
@@ -361,6 +367,7 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
         int_wraps,
         struct_sites,
         array_sites,
+        as_sites,
     })
 }
 

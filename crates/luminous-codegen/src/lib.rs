@@ -606,6 +606,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_struct_validate", &[P, W], &[Int]),
         ("lum_struct_set", &[P, W, Int, W], &[Int]),
         ("lum_struct_coerce", &[P, Int, Int, W], &[W]),
+        ("lum_struct_convert", &[P, W, Int], &[W]),
+        ("lum_json_parse_as", &[P, W, Int], &[W]),
+        ("lum_json_method_as", &[P, W, Int], &[W]),
         ("lum_sarr_from", &[P, Int, W], &[W]),
         ("lum_sarr_push", &[P, W, W], &[W]),
         ("lum_super_get_ic", &[P, W, W, Int, P], &[W]),
@@ -685,6 +688,8 @@ struct Codegen {
     value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     /// The atoms `Promise` and `resolve`, if used.
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
+    /// The atom `parse`, if used.
+    json_parse: Option<ir::AtomId>,
     methods: std::rc::Rc<HashMap<ir::AtomId, lower::Method>>,
     nothrow: std::rc::Rc<Vec<bool>>,
     /// Return types, by `FuncId`.
@@ -810,6 +815,7 @@ impl Codegen {
                 .iter()
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
+            json_parse: m.atoms.iter().position(|a| a == "parse"),
             nothrow: std::rc::Rc::new(m.funcs.iter().map(ir::nothrow_leaf).collect()),
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
@@ -867,6 +873,7 @@ impl Codegen {
             params: self.params.clone(),
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
+            json_parse: self.json_parse,
             methods: self.methods.clone(),
             nothrow: self.nothrow.clone(),
             fast: self.fast_funcs.clone(),
@@ -1586,6 +1593,25 @@ fn unbox_arg(
             let p = val::ptr(b, w);
             let ok = struct_check(b, p, k, struct_class);
             let yes = b.create_block();
+            b.ins().brif(ok, yes, &[], decline, &[]);
+            b.switch_to_block(yes);
+            V::Void
+        }
+        Ty::StructOrUndef(k) => {
+            // Only checked: an object of this layout, `null` or `undefined`.
+            let is_obj = val::is(b, w, jsvalue::TAG_OBJECT);
+            let obj = b.create_block();
+            let other = b.create_block();
+            let yes = b.create_block();
+            b.ins().brif(is_obj, obj, &[], other, &[]);
+            b.switch_to_block(other);
+            let is_undef = val::is(b, w, jsvalue::TAG_UNDEFINED);
+            let is_null = val::is(b, w, jsvalue::TAG_NULL);
+            let nullish = b.ins().bor(is_undef, is_null);
+            b.ins().brif(nullish, yes, &[], decline, &[]);
+            b.switch_to_block(obj);
+            let p = val::ptr(b, w);
+            let ok = struct_check(b, p, k, struct_class);
             b.ins().brif(ok, yes, &[], decline, &[]);
             b.switch_to_block(yes);
             V::Void

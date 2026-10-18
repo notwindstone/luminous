@@ -241,8 +241,9 @@ const PIN_ARRAY_SORT: i32 = 34;
 const PIN_STRING_FNS: i32 = 35;
 /// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
 const PIN_MAP_FNS: i32 = 41;
-/// `JSON.stringify`.
+/// `JSON.stringify`, `JSON.parse`.
 const PIN_JSON_STRINGIFY: i32 = 46;
+const PIN_JSON_PARSE: i32 = 47;
 /// `LUM_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -287,6 +288,8 @@ pub(crate) struct Env {
     pub value_captures: std::rc::Rc<Vec<Vec<bool>>>,
     /// The atoms `Promise` and `resolve`, if used.
     pub promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
+    /// The atom `parse`, if used (`JSON.parse` converted to an `aot type`).
+    pub json_parse: Option<ir::AtomId>,
     /// Atoms naming builtin methods with fast paths.
     pub methods: std::rc::Rc<HashMap<ir::AtomId, Method>>,
     /// Per function: it can neither throw nor call (see `nothrow_leaf`).
@@ -2238,6 +2241,34 @@ impl Lower {
                 self.release(v);
                 v
             }
+            ExprKind::StructConvert(desc, x) => {
+                // `JSON.parse(text)`: parsed to the type while the builtin.
+                if let ExprKind::CallMethod(o, Key::Atom(a), args) = &x.kind
+                    && Some(*a) == self.env.json_parse
+                    && args.len() == 1
+                    && self.preds.is_empty()
+                {
+                    return self.json_parse_as(*desc, o, *a, &args[0]);
+                }
+                let v = self.expr(x);
+                let w = self.boxed(v);
+                let ctx = self.ctx;
+                let d = self.b.ins().iconst(I32, *desc as i64);
+                let r = self.helper("lum_struct_convert", &[ctx, w, d]);
+                self.check_value(r[0]);
+                V::Any(r[0])
+            }
+            ExprKind::JsonMethodAs(desc, x) => {
+                let v = self.expr(x);
+                self.hold(v);
+                let ctx = self.ctx;
+                let d = self.b.ins().iconst(I32, *desc as i64);
+                let r = self.helper("lum_json_method_as", &[ctx, v.any(), d]);
+                self.check_value(r[0]);
+                self.release(v);
+                self.free_v(v);
+                V::Any(r[0])
+            }
             ExprKind::StructCoerce(k, fi, x) => {
                 let v = self.expr(x);
                 let want = e.ty;
@@ -2563,6 +2594,25 @@ impl Lower {
                             self.b.switch_to_block(obj);
                             let p = self.val_ptr(w);
                             crate::struct_check(&mut self.b, p, k, sc)
+                        }
+                        ir::ArgCheck::StructOrNullish(k) => {
+                            let done = self.b.create_block();
+                            let r = self.b.append_block_param(done, I8);
+                            let is_obj = self.val_is(w, TAG_OBJECT);
+                            let obj = self.b.create_block();
+                            let other = self.b.create_block();
+                            self.b.ins().brif(is_obj, obj, &[], other, &[]);
+                            self.b.switch_to_block(other);
+                            let is_undef = self.val_is(w, TAG_UNDEFINED);
+                            let is_null = self.val_is(w, TAG_NULL);
+                            let nullish = self.b.ins().bor(is_undef, is_null);
+                            self.b.ins().jump(done, &[BlockArg::Value(nullish)]);
+                            self.b.switch_to_block(obj);
+                            let p = self.val_ptr(w);
+                            let ok = crate::struct_check(&mut self.b, p, k, sc);
+                            self.b.ins().jump(done, &[BlockArg::Value(ok)]);
+                            self.b.switch_to_block(done);
+                            r
                         }
                         ir::ArgCheck::Number => {
                             direct[i] = V::Num(self.number_of(w));
@@ -3981,8 +4031,25 @@ impl Lower {
     /// `obj.field` of an object of layout `k` (borrowed): typed if the field
     /// is in every member, else a JS value (`undefined` if absent).
     fn struct_load(&mut self, k: u32, fi: u32, p: Value) -> V {
-        if self.env.layouts[k as usize].fields[fi as usize].universal {
+        let f = &self.env.layouts[k as usize].fields[fi as usize];
+        if f.universal {
             return self.struct_field_value(k, fi, p, false);
+        }
+        if f.ty == Ty::MaybeF64 {
+            // A number, or `undefined` if absent: unboxed.
+            let join = self.b.create_block();
+            let d = self.b.append_block_param(join, F64);
+            let s = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_OPAQUE);
+            let mask = self.b.ins().load(I32, M_STRUCT, s, 4);
+            let bit = self.b.ins().band_imm_u(mask, 1i64 << fi);
+            let present = self.b.create_block();
+            let undef = self.b.ins().f64const(f64::from_bits(MAYBE_F64_UNDEFINED));
+            self.b.ins().brif(bit, present, &[], join, &[BlockArg::Value(undef)]);
+            self.b.switch_to_block(present);
+            let V::Num(v) = self.struct_field_value(k, fi, p, false) else { unreachable!("a numeric field") };
+            self.b.ins().jump(join, &[BlockArg::Value(v)]);
+            self.b.switch_to_block(join);
+            return V::Num(d);
         }
         let join = self.b.create_block();
         let rw = self.b.append_block_param(join, I64);
@@ -5797,6 +5864,68 @@ impl Lower {
         self.release(held);
         self.free_v(held);
         self.drop_method(f, f_owned);
+        V::Any(rw)
+    }
+
+    /// `o.parse(text)` (`JSON.parse`) converted to `desc`: while it is the
+    /// builtin, the text parsed to the type (`lum_json_parse_as`), else
+    /// called and its result converted.
+    fn json_parse_as(&mut self, desc: i32, o: &Expr, a: ir::AtomId, arg: &Expr) -> V {
+        let (obj, owned) = self.operand(o, &[arg]);
+        let ow = obj.any();
+        let (f, f_owned) = if self.pure_arg(arg) {
+            let (mw, f_owned) = self.prop_get_inner(ow, None, a, Vec::new(), true, true);
+            (V::Any(mw), f_owned)
+        } else {
+            let mw = self.method_get(ow, a);
+            self.check_value(mw);
+            let f = V::Any(mw);
+            self.hold(f);
+            (f, None)
+        };
+        let held = self.expr(arg);
+        self.hold(held);
+        let vw = self.boxed(held);
+        let fw = f.any();
+        let ctx = self.ctx;
+        let d = self.b.ins().iconst(I32, desc as i64);
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, PIN_JSON_PARSE * 8);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
+        let direct = self.b.create_block();
+        self.b.ins().brif(same, direct, &[], slow, &[]);
+        self.b.switch_to_block(direct);
+        let r = self.helper("lum_json_parse_as", &[ctx, vw, d]);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+        self.b.switch_to_block(slow);
+        let vals = vec![fw, ow, vw];
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        // (A borrowed method is held while it runs.)
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup(fw);
+        }
+        let gw = self.call_linked(fw, ow, 1, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
+        if borrowed {
+            self.free(fw);
+        }
+        self.check_value_method(gw, f, f_owned);
+        let r = self.helper("lum_struct_convert", &[ctx, gw, d]);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+        self.b.switch_to_block(join);
+        self.release(held);
+        self.free_v(held);
+        self.drop_method(f, f_owned);
+        self.drop_operand(obj, owned);
         V::Any(rw)
     }
 

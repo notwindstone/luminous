@@ -38,7 +38,8 @@ pub enum Ty {
     Struct(u32),
     /// An array of objects of layout `k` (`LumStructArray`; like `Any`).
     StructArr(u32),
-    /// An element of such an array: an object of layout `k` or `undefined`.
+    /// An element of such an array, or a field or parameter that may be
+    /// absent or null: an object of layout `k`, or `undefined` / `null`.
     StructOrUndef(u32),
 }
 
@@ -204,6 +205,18 @@ pub enum FieldType {
     Struct(u32),
     /// An array of objects of this layout (`LumStructArray`).
     Array(u32),
+    /// This type, or `null`.
+    Nullable(Box<FieldType>),
+}
+
+impl FieldType {
+    /// The type without `null`.
+    pub fn base(&self) -> &FieldType {
+        match self {
+            FieldType::Nullable(t) => t,
+            t => t,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -212,9 +225,11 @@ pub struct LayoutField {
     pub storage: Storage,
     /// Byte offset in the object's data.
     pub offset: u32,
-    /// Present in every member (so in every object).
+    /// Present in every member, and optional in none (so in every object).
     pub universal: bool,
-    /// The type a read gives, when it is present.
+    /// The type a read gives: of the value if `universal`, else also
+    /// `undefined` (`MaybeF64` for numbers, `StructOrUndef` for objects of
+    /// an `aot type`, else `Any`).
     pub ty: Ty,
     /// Of the same type in every member: a write cannot change which member
     /// the object matches.
@@ -225,6 +240,8 @@ pub struct LayoutField {
 pub struct LayoutMember {
     /// The member's fields (bit `i`: field `i`).
     pub mask: u32,
+    /// Those that may be absent (`x?: T`, `x: T | undefined`).
+    pub optional: u32,
     /// Per field (`Absent` outside `mask`).
     pub types: Vec<FieldType>,
 }
@@ -907,6 +924,14 @@ pub enum ExprKind {
     /// The same for a store of property `atom`: else what JS throws setting
     /// it on `undefined`.
     NonNullSet(AtomId, Box<Expr>),
+    /// A value as an object of `aot type` layout `desc >> 1` (an array of
+    /// them if `desc` is odd): itself if one, else converted
+    /// (`lum_struct_convert`). Of `JSON.parse(text)`, which then parses to
+    /// the type directly while it is the builtin.
+    StructConvert(i32, Box<Expr>),
+    /// `r.json()` whose result is converted to `desc` (`lum_json_method_as`:
+    /// the host may parse the body to the type directly).
+    JsonMethodAs(i32, Box<Expr>),
     /// A value converted for field `field` of layout `layout` as a store
     /// would convert it (an `int` wraps; TypeError if not of its type): of
     /// the field's type (see `scalar_replace_structs`).
@@ -1050,6 +1075,8 @@ pub enum CmpOp {
 pub enum ArgCheck {
     /// An object of this `aot type` layout.
     Struct(u32),
+    /// One, or `null` or `undefined`.
+    StructOrNullish(u32),
     /// A number (for an unboxed `number` parameter).
     Number,
     /// A boolean.
@@ -1242,7 +1269,9 @@ macro_rules! visitor {
                 | StructArrFrom(_, a)
                 | StructArrLen(a)
                 | NonNull(_, a)
-                | NonNullSet(_, a) => {
+                | NonNullSet(_, a)
+                | StructConvert(_, a)
+                | JsonMethodAs(_, a) => {
                     $name(a, f)
                 }
                 StructArrGet(_, a, b) | StructArrPush(_, a, b) => {
@@ -3383,7 +3412,8 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
             l >= f.params.len()
                 && !f.boxed[l]
                 && f.ret_slot != Some(l)
-                && matches!(f.locals[l], Ty::Struct(k) if layouts[k as usize].members.len() == 1)
+                && matches!(f.locals[l], Ty::Struct(k) if layouts[k as usize].members.len() == 1
+                    && layouts[k as usize].fields.iter().all(|f| f.universal))
         })
         .collect();
     let mut inits = vec![0; n];

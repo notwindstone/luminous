@@ -12,7 +12,7 @@ use std::fmt::Write;
 use luminous_codegen::{NATIVE_STACK_BUDGET, jsvalue, layout};
 use luminous_front::ClassDecl;
 use luminous_front::erase::{
-    BIND_FN, CELLS_OBJ, CLASS_FN, FALLBACK_PREFIX, INIT_FN, METHOD_FN, NATIVE_MODULE, SARR_FN, STRUCT_FN,
+    AS_FN, BIND_FN, CELLS_OBJ, CLASS_FN, FALLBACK_PREFIX, INIT_FN, METHOD_FN, NATIVE_MODULE, SARR_FN, STRUCT_FN,
 };
 use luminous_front::ir;
 
@@ -414,6 +414,8 @@ static int lum_module_init(JSContext *ctx, JSModuleDef *m)
         return -1;
     if (JS_SetModuleExport(ctx, m, "{SARR_FN}", JS_NewCFunction(ctx, lum_sarr_js, "{SARR_FN}", 2)) < 0)
         return -1;
+    if (JS_SetModuleExport(ctx, m, "{AS_FN}", JS_NewCFunction(ctx, lum_struct_as, "{AS_FN}", 2)) < 0)
+        return -1;
     return 0;
 }}
 
@@ -438,6 +440,7 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     JS_AddModuleExport(ctx, m, "{CLASS_FN}");
     JS_AddModuleExport(ctx, m, "{STRUCT_FN}");
     JS_AddModuleExport(ctx, m, "{SARR_FN}");
+    JS_AddModuleExport(ctx, m, "{AS_FN}");
     return m;
 }}
 "#
@@ -570,7 +573,8 @@ fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
         for (j, mem) in l.members.iter().enumerate() {
             writeln!(c, "static const LumTypeDesc lum_types_{k}_{j}[] = {{").unwrap();
             for t in &mem.types {
-                let (kind, nlits, layout, base) = match t {
+                let nullable = matches!(t, ir::FieldType::Nullable(_)) as u8;
+                let (kind, nlits, layout, base) = match t.base() {
                     ir::FieldType::Absent => (0, 0, 0, 0),
                     ir::FieldType::Int => (1, 0, 0, 0),
                     ir::FieldType::Number => (2, 0, 0, 0),
@@ -583,31 +587,33 @@ fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
                     }
                     ir::FieldType::Struct(s) => (6, 0, *s, 0),
                     ir::FieldType::Array(s) => (7, 0, *s, 0),
+                    ir::FieldType::Nullable(_) => unreachable!("one `null`"),
                 };
-                writeln!(c, "    {{ {kind}, {nlits}, {layout}, {base} }},").unwrap();
+                writeln!(c, "    {{ {kind}, {nullable}, {layout}, {nlits}, {base} }},").unwrap();
             }
-            c.push_str("    { 0, 0, 0, 0 },\n};\n");
+            c.push_str("    { 0, 0, 0, 0, 0 },\n};\n");
         }
         writeln!(c, "static const LumMemberDesc lum_members_{k}[] = {{").unwrap();
         for (j, mem) in l.members.iter().enumerate() {
-            writeln!(c, "    {{ {}u, lum_types_{k}_{j} }},", mem.mask).unwrap();
+            writeln!(c, "    {{ {}u, {}u, lum_types_{k}_{j} }},", mem.mask, mem.optional).unwrap();
         }
-        c.push_str("    { 0, NULL },\n};\n");
+        c.push_str("    { 0, 0, NULL },\n};\n");
     }
     c.push_str("const LumLayoutDesc lum_layouts[] = {\n");
     for (k, l) in m.layouts.iter().enumerate() {
         writeln!(
             c,
-            "    {{ {}, {}, {}, {}, {}, lum_fields_{k}, lum_members_{k} }},",
+            "    {{ {}, {}, {}, {}, {}, {}u, lum_fields_{k}, lum_members_{k} }},",
             c_str(&l.name),
             l.fields.len(),
             l.size,
             l.members.len(),
-            (l.members.len() > 1) as u8
+            (l.members.len() > 1) as u8,
+            l.members.iter().fold(0, |a, m| a | m.optional)
         )
         .unwrap();
     }
-    c.push_str("    { NULL, 0, 0, 0, 0, NULL, NULL },\n};\n");
+    c.push_str("    { NULL, 0, 0, 0, 0, 0, NULL, NULL },\n};\n");
     writeln!(c, "const int32_t lum_nlayouts = {};", m.layouts.len()).unwrap();
     let mut writers = Vec::new();
     for (k, l) in m.layouts.iter().enumerate() {

@@ -1,0 +1,46 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6350,6 +6350,30 @@
+     return JS_MKPTR(JS_TAG_STRING, str);
+ }
+ 
++/* The characters of a flat 8-bit string (Latin-1), else NULL (a 16-bit
++   string, a rope, not a string). */
++const uint8_t *JS_GetStringLatin1(JSValueConst val, size_t *plen)
++{
++    JSString *p;
++    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
++        return NULL;
++    p = JS_VALUE_GET_STRING(val);
++    if (p->is_wide_char)
++        return NULL;
++    *plen = p->len;
++    return str8(p);
++}
++
++/* A string of these Latin-1 characters. */
++JSValue JS_NewStringLatin1(JSContext *ctx, const uint8_t *buf, size_t len)
++{
++    if (len == 0)
++        return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    if (len > JS_STRING_LEN_MAX)
++        return JS_ThrowRangeError(ctx, "invalid string length");
++    return js_new_string8_len(ctx, (const char *)buf, len);
++}
++
+ /* create a string from a UTF-8 buffer */
+ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+ {
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -975,6 +975,10 @@
+ JS_EXTERN int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
+ 
+ JS_EXTERN JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
++/* The characters of a flat 8-bit string (Latin-1), else NULL. */
++JS_EXTERN const uint8_t *JS_GetStringLatin1(JSValueConst val, size_t *plen);
++/* A string of these Latin-1 characters. */
++JS_EXTERN JSValue JS_NewStringLatin1(JSContext *ctx, const uint8_t *buf, size_t len);
+ static inline JSValue JS_NewString(JSContext *ctx, const char *str) {
+     return JS_NewStringLen(ctx, str, strlen(str));
+ }

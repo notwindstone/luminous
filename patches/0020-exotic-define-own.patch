@@ -1,0 +1,40 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -13798,6 +13798,18 @@
+     JS_FreeValue(ctx, desc->value);
+ }
+ 
++/* Whether `p` is an exotic object (not an array) whose class defines its
++ * own properties: adding one is then its decision, even when it is not
++ * extensible (an object of an `aot type` with optional fields). */
++static bool js_defines_own(JSContext *ctx, JSObject *p)
++{
++    const JSClassExoticMethods *em;
++    if (!p->is_exotic || p->class_id == JS_CLASS_ARRAY)
++        return false;
++    em = ctx->rt->class_array[p->class_id].exotic;
++    return em && em->define_own_property && !em->set_property;
++}
++
+ /* return -1 in case of exception or true or false. Warning: 'val' is
+    freed by the function. 'flags' is a bitmask of JS_PROP_NO_ADD,
+    JS_PROP_THROW or JS_PROP_THROW_STRICT. If JS_PROP_NO_ADD is set,
+@@ -14008,7 +14020,8 @@
+     }
+ 
+     if (p == JS_VALUE_GET_OBJ(obj)) {
+-        if (unlikely(!p->extensible)) {
++        /* (An exotic object that defines its own properties decides.) */
++        if (unlikely(!p->extensible) && !js_defines_own(ctx, p)) {
+             ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
+             goto done;
+         }
+@@ -14053,7 +14066,7 @@
+                                 JS_UNDEFINED, JS_UNDEFINED,
+                                 JS_PROP_HAS_VALUE);
+     } else {
+-        if (unlikely(!p->extensible)) {
++        if (unlikely(!p->extensible) && !js_defines_own(ctx, p)) {
+             ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
+             goto done;
+         }

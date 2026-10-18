@@ -46,6 +46,12 @@ pub struct Structs {
     /// Bindings declared `T[]` (`let` / `const`) that only ever hold such
     /// arrays: what they hold is always one (or they are in their TDZ).
     pub sure_arrays: HashMap<SymbolId, u32>,
+    /// `JSON.parse(text)` where an object of an `aot type` (or an array of
+    /// them) is expected: by span start, the span end and what (`desc`:
+    /// layout * 2, + 1 for an array).
+    pub parse_sites: HashMap<u32, (u32, i32)>,
+    /// `await r.json()` there: by the `await`'s span start.
+    pub json_sites: HashMap<u32, (u32, i32)>,
 }
 
 thread_local! {
@@ -55,6 +61,13 @@ thread_local! {
     /// The `aot type`s that are arrays (`aot type D = C[]`): their
     /// elements' layouts.
     static ARRAY_NAMES: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    /// The `aot type`s that also hold `null` or `undefined`.
+    static NULLABLE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// Whether the `aot type` of this name also holds `null` or `undefined`.
+pub fn struct_nullable(name: &str) -> bool {
+    NULLABLE.with(|n| n.borrow().contains(name))
 }
 
 /// The layout of the `aot type` of this name.
@@ -84,15 +97,44 @@ fn array_element<'t, 'a>(t: &'t TSType<'a>) -> Option<&'t TSType<'a>> {
     }
 }
 
-/// Whether `t` is object types written in place, combined with `|` and `&`.
+/// Whether `t` is object types written in place, combined with `|` and `&`
+/// (and `null` / `undefined`).
 fn inline_object(t: &TSType) -> bool {
     match t {
         TSType::TSTypeLiteral(_) => true,
         TSType::TSParenthesizedType(p) => inline_object(&p.type_annotation),
-        TSType::TSUnionType(u) => u.types.iter().all(inline_object),
+        TSType::TSUnionType(u) => {
+            u.types.iter().all(|t| inline_object(t) || nullish(t).is_some()) && u.types.iter().any(inline_object)
+        }
         TSType::TSIntersectionType(i) => i.types.iter().all(inline_object),
         _ => false,
     }
+}
+
+/// `null` (true) or `undefined` (false).
+fn nullish(t: &TSType) -> Option<bool> {
+    match t {
+        TSType::TSNullKeyword(_) => Some(true),
+        TSType::TSUndefinedKeyword(_) => Some(false),
+        TSType::TSParenthesizedType(p) => nullish(&p.type_annotation),
+        _ => None,
+    }
+}
+
+/// A union with `null` or `undefined` in it: its other types, and whether
+/// it has `null`, `undefined`.
+fn nullish_parts<'t, 'a>(t: &'t TSType<'a>) -> Option<(Vec<&'t TSType<'a>>, bool, bool)> {
+    fn leaves<'t, 'a>(t: &'t TSType<'a>, out: &mut Vec<&'t TSType<'a>>) {
+        match t {
+            TSType::TSParenthesizedType(p) => leaves(&p.type_annotation, out),
+            TSType::TSUnionType(u) => u.types.iter().for_each(|t| leaves(t, out)),
+            t => out.push(t),
+        }
+    }
+    let mut all = Vec::new();
+    leaves(t, &mut all);
+    let (null, undef) = (all.iter().any(|t| nullish(t) == Some(true)), all.iter().any(|t| nullish(t) == Some(false)));
+    (null || undef).then(|| (all.into_iter().filter(|t| nullish(t).is_none()).collect(), null, undef))
 }
 
 /// Resolve the `aot type`s (the type aliases starting at `marked`) and find
@@ -100,6 +142,8 @@ fn inline_object(t: &TSType) -> bool {
 pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (Structs, Vec<OxcDiagnostic>) {
     let mut errors = Vec::new();
     let mut decls: Vec<&TSTypeAliasDeclaration> = Vec::new();
+    // Plain type aliases (`type Y = A[]`), which may name `aot type`s.
+    let mut plain: HashMap<String, &TSType> = HashMap::new();
     for s in &program.body {
         let d = match s {
             Statement::TSTypeAliasDeclaration(d) => d,
@@ -111,6 +155,8 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         };
         if marked.contains(&d.span.start) {
             decls.push(d);
+        } else if d.type_parameters.is_none() {
+            plain.insert(d.id.name.to_string(), &d.type_annotation);
         }
     }
     for &at in marked {
@@ -131,9 +177,20 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
     let array_decls: HashMap<String, &TSType> =
         arrays.iter().map(|d| (d.id.name.to_string(), array_element(&d.type_annotation).unwrap())).collect();
 
+    let decl_nullish: Vec<(bool, bool)> =
+        decls.iter().map(|d| nullish_parts(&d.type_annotation).map_or((false, false), |(_, n, u)| (n, u))).collect();
+    NULLABLE.with(|n| {
+        *n.borrow_mut() = decls
+            .iter()
+            .zip(&decl_nullish)
+            .filter(|(_, (n, u))| *n || *u)
+            .map(|(d, _)| d.id.name.to_string())
+            .collect()
+    });
     let mut r = Resolver {
         decls: &decls,
         ids: &ids,
+        decl_nullish: &decl_nullish,
         arrays: &array_decls,
         stack: Vec::new(),
         path: Vec::new(),
@@ -148,7 +205,11 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         }
         r.stack.push(i as u32);
         r.path = vec![d.id.name.to_string()];
-        let members = r.members(&d.type_annotation).unwrap_or_default();
+        let members = r.members(&d.type_annotation);
+        if members.as_ref().is_some_and(|m| m.is_empty()) {
+            r.err::<()>(d.span, "an `aot type` needs an object type");
+        }
+        let members = members.unwrap_or_default();
         r.stack.pop();
         layouts.push(layout(d.id.name.as_str(), &members, d.span, &mut r.errors));
     }
@@ -162,7 +223,22 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
             array_ids.insert(d.id.name.to_string(), k);
         }
     }
-    ARRAY_NAMES.with(|n| *n.borrow_mut() = array_ids.clone());
+    // Plain aliases of `aot type`s and of arrays of them are the same types
+    // (for bindings, parameters and return types).
+    let (mut site_ids, mut site_arrays) = (ids.clone(), array_ids.clone());
+    for name in plain.keys() {
+        match alias_site(name, &plain, &ids, &array_ids, 0) {
+            Some(SiteTy::Struct(k)) if !ids.contains_key(name) => {
+                site_ids.insert(name.clone(), k);
+            }
+            Some(SiteTy::Array(k)) if !array_ids.contains_key(name) => {
+                site_arrays.insert(name.clone(), k);
+            }
+            _ => {}
+        }
+    }
+    NAMES.with(|n| *n.borrow_mut() = site_ids.clone());
+    ARRAY_NAMES.with(|n| *n.borrow_mut() = site_arrays.clone());
     for (name, members, span) in std::mem::take(&mut r.anon) {
         layouts.push(layout(&name, &members, span, &mut r.errors));
     }
@@ -173,8 +249,8 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
 
     let mut decl_types = DeclTypes {
         scoping,
-        ids: &ids,
-        arrays: &array_ids,
+        ids: &site_ids,
+        arrays: &site_arrays,
         vars: HashMap::new(),
         fns: HashMap::new(),
         lexical: HashSet::new(),
@@ -188,6 +264,8 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         returns: Vec::new(),
         sites: HashMap::new(),
         array_sites: HashMap::new(),
+        parse_sites: HashMap::new(),
+        json_sites: HashMap::new(),
         writes: HashMap::new(),
         errors: Vec::new(),
     };
@@ -195,7 +273,50 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
     errors.append(&mut sites.errors);
     let sure_arrays = sure_arrays(scoping, &decl_types, &sites.writes);
     let (struct_sites, array_sites) = (sites.sites, sites.array_sites);
-    (Structs { layouts, sites: struct_sites, array_sites, sure_arrays }, errors)
+    let (parse_sites, json_sites) = (sites.parse_sites, sites.json_sites);
+    (Structs { layouts, sites: struct_sites, array_sites, sure_arrays, parse_sites, json_sites }, errors)
+}
+
+/// What plain type alias `name` is, if an `aot type` (or an alias of one)
+/// or an array of objects of one.
+fn alias_site(
+    name: &str,
+    plain: &HashMap<String, &TSType>,
+    ids: &HashMap<String, u32>,
+    arrays: &HashMap<String, u32>,
+    depth: u32,
+) -> Option<SiteTy> {
+    fn of(
+        t: &TSType,
+        plain: &HashMap<String, &TSType>,
+        ids: &HashMap<String, u32>,
+        arrays: &HashMap<String, u32>,
+        depth: u32,
+    ) -> Option<SiteTy> {
+        if let Some(el) = array_element(t) {
+            return match of(el, plain, ids, arrays, depth)? {
+                SiteTy::Struct(k) => Some(SiteTy::Array(k)),
+                SiteTy::Array(_) => None,
+            };
+        }
+        match t {
+            TSType::TSParenthesizedType(p) => of(&p.type_annotation, plain, ids, arrays, depth),
+            TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
+                let TSTypeName::IdentifierReference(id) = &r.type_name else { return None };
+                let name = id.name.as_str();
+                match (ids.get(name), arrays.get(name)) {
+                    (Some(&k), _) => Some(SiteTy::Struct(k)),
+                    (None, Some(&k)) => Some(SiteTy::Array(k)),
+                    (None, None) => alias_site(name, plain, ids, arrays, depth + 1),
+                }
+            }
+            _ => None,
+        }
+    }
+    if depth > 16 {
+        return None;
+    }
+    of(plain.get(name)?, plain, ids, arrays, depth)
 }
 
 /// What a write to a binding stores, for `sure_arrays`.
@@ -242,11 +363,14 @@ fn sure_arrays(scoping: &Scoping, types: &DeclTypes, writes: &HashMap<SymbolId, 
 }
 
 /// A member being resolved: its fields.
-type RawMember = Vec<(String, FieldType)>;
+/// (name, type, optional)
+type RawMember = Vec<(String, FieldType, bool)>;
 
 struct Resolver<'d, 'a> {
     decls: &'d [&'d TSTypeAliasDeclaration<'a>],
     ids: &'d HashMap<String, u32>,
+    /// Per object `aot type`: whether it also holds `null`, `undefined`.
+    decl_nullish: &'d [(bool, bool)],
     /// The array `aot type`s: their element types.
     arrays: &'d HashMap<String, &'d TSType<'a>>,
     /// The `aot type`s being resolved (references to them are cycles).
@@ -275,9 +399,6 @@ impl Resolver<'_, '_> {
                     let TSSignature::TSPropertySignature(p) = sig else {
                         return self.err(sig.span(), "an `aot type` can only have fields");
                     };
-                    if p.optional {
-                        return self.err(p.span, "optional fields are not supported in an `aot type`");
-                    }
                     let name = match &p.key {
                         PropertyKey::StaticIdentifier(id) if !p.computed => id.name.to_string(),
                         PropertyKey::StringLiteral(s) => s.value.to_string(),
@@ -289,17 +410,18 @@ impl Resolver<'_, '_> {
                     self.path.push(name.clone());
                     let ty = self.field_type(&ann.type_annotation);
                     self.path.pop();
-                    let ty = ty?;
-                    if fields.iter().any(|(n, _)| *n == name) {
+                    let (ty, optional) = ty?;
+                    if fields.iter().any(|(n, _, _)| *n == name) {
                         return self.err(p.span, "duplicate field");
                     }
-                    fields.push((name, ty));
+                    fields.push((name, ty, optional || p.optional));
                 }
                 Some(vec![fields])
             }
             TSType::TSUnionType(u) => {
+                // (`null` and `undefined` are the type's, not members.)
                 let mut out = Vec::new();
-                for t in &u.types {
+                for t in u.types.iter().filter(|t| nullish(t).is_none()) {
                     out.extend(self.members(t)?);
                 }
                 Some(out)
@@ -312,13 +434,13 @@ impl Resolver<'_, '_> {
                     for a in &acc {
                         for b in &parts {
                             let mut m = a.clone();
-                            for (name, ty) in b {
-                                match m.iter().find(|(n, _)| n == name) {
-                                    Some((_, t0)) if t0 != ty => {
+                            for (name, ty, opt) in b {
+                                match m.iter().position(|(n, _, _)| n == name) {
+                                    Some(j) if m[j].1 != *ty => {
                                         return self.err(i.span, &format!("`{name}` has two different types"));
                                     }
-                                    Some(_) => {}
-                                    None => m.push((name.clone(), ty.clone())),
+                                    Some(j) => m[j].2 &= *opt,
+                                    None => m.push((name.clone(), ty.clone(), *opt)),
                                 }
                             }
                             next.push(m);
@@ -359,7 +481,9 @@ impl Resolver<'_, '_> {
         }
     }
 
-    fn field_type(&mut self, t: &TSType) -> Option<FieldType> {
+    /// A field's type, and whether it may be absent (`T | undefined`, or
+    /// an `aot type` that holds `undefined`).
+    fn field_type(&mut self, t: &TSType) -> Option<(FieldType, bool)> {
         let literal = |t: &TSType| match t {
             TSType::TSLiteralType(l) => match &l.literal {
                 TSLiteral::StringLiteral(s) => Some(s.value.to_string()),
@@ -367,47 +491,82 @@ impl Resolver<'_, '_> {
             },
             _ => None,
         };
-        match t {
-            TSType::TSNumberKeyword(_) => Some(FieldType::Number),
-            TSType::TSBooleanKeyword(_) => Some(FieldType::Bool),
-            TSType::TSStringKeyword(_) => Some(FieldType::String),
-            TSType::TSParenthesizedType(p) => self.field_type(&p.type_annotation),
-            TSType::TSLiteralType(_) if literal(t).is_some() => Some(FieldType::Literals(vec![literal(t).unwrap()])),
+        let with = |ty: FieldType, null: bool, undef: bool| {
+            let ty = match ty {
+                FieldType::Nullable(_) => ty,
+                ty if null => FieldType::Nullable(Box::new(ty)),
+                ty => ty,
+            };
+            Some((ty, undef))
+        };
+        // `T | null`, `T | undefined`.
+        if let Some((rest, null, undef)) = nullish_parts(t) {
+            let (ty, opt) = match rest.as_slice() {
+                [] => return self.unsupported(t),
+                [one] => self.field_type(one)?,
+                many if many.iter().all(|t| literal(t).is_some()) => {
+                    (FieldType::Literals(many.iter().map(|t| literal(t).unwrap()).collect()), false)
+                }
+                _ if inline_object(t) => (FieldType::Struct(self.anonymous(t, "")?), false),
+                _ => return self.unsupported(t),
+            };
+            return with(ty, null, undef || opt);
+        }
+        let ty = match t {
+            TSType::TSNumberKeyword(_) => FieldType::Number,
+            TSType::TSBooleanKeyword(_) => FieldType::Bool,
+            TSType::TSStringKeyword(_) => FieldType::String,
+            TSType::TSParenthesizedType(p) => return self.field_type(&p.type_annotation),
+            TSType::TSLiteralType(_) if literal(t).is_some() => FieldType::Literals(vec![literal(t).unwrap()]),
             TSType::TSUnionType(u) if u.types.iter().all(|t| literal(t).is_some()) => {
-                Some(FieldType::Literals(u.types.iter().map(|t| literal(t).unwrap()).collect()))
+                FieldType::Literals(u.types.iter().map(|t| literal(t).unwrap()).collect())
             }
-            t if inline_object(t) => self.anonymous(t, "").map(FieldType::Struct),
-            t if array_element(t).is_some() => self.element(array_element(t).unwrap()).map(FieldType::Array),
+            t if inline_object(t) => FieldType::Struct(self.anonymous(t, "")?),
+            t if array_element(t).is_some() => FieldType::Array(self.element(array_element(t).unwrap())?),
             TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
                 let TSTypeName::IdentifierReference(id) = &r.type_name else { return self.unsupported(t) };
                 match id.name.as_str() {
-                    "int" => Some(FieldType::Int),
-                    "double" => Some(FieldType::Number),
+                    "int" => FieldType::Int,
+                    "double" => FieldType::Number,
                     name => match (self.ids.get(name), self.arrays.get(name)) {
-                        (Some(&k), _) => Some(FieldType::Struct(k)),
+                        (Some(&k), _) => {
+                            let (null, undef) = self.decl_nullish[k as usize];
+                            return with(FieldType::Struct(k), null, undef);
+                        }
                         (None, Some(&el)) => {
                             let path = std::mem::replace(&mut self.path, vec![name.to_string()]);
                             let k = self.element(el);
                             self.path = path;
-                            k.map(FieldType::Array)
+                            FieldType::Array(k?)
                         }
-                        (None, None) => self.unsupported(t),
+                        (None, None) => return self.unsupported(t),
                     },
                 }
             }
-            _ => self.unsupported(t),
-        }
+            _ => return self.unsupported(t),
+        };
+        Some((ty, false))
     }
 
     /// The layout of the elements of an array in an `aot type`: an object
     /// `aot type`, or object types written in place.
     fn element(&mut self, t: &TSType) -> Option<u32> {
+        if nullish_parts(t).is_some() {
+            return self.err(t.span(), "the elements of an array in an `aot type` cannot be `null` or `undefined`");
+        }
         match t {
             TSType::TSParenthesizedType(p) => self.element(&p.type_annotation),
             t if inline_object(t) => self.anonymous(t, "[]"),
             TSType::TSTypeReference(r) if r.type_arguments.is_none() => match &r.type_name {
                 TSTypeName::IdentifierReference(id) if self.ids.contains_key(id.name.as_str()) => {
-                    Some(self.ids[id.name.as_str()])
+                    let k = self.ids[id.name.as_str()];
+                    if self.decl_nullish[k as usize] != (false, false) {
+                        return self.err(
+                            t.span(),
+                            "the elements of an array in an `aot type` cannot be `null` or `undefined`",
+                        );
+                    }
+                    Some(k)
                 }
                 _ => self.unsupported_element(t),
             },
@@ -458,7 +617,7 @@ impl Resolver<'_, '_> {
 fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDiagnostic>) -> Layout {
     let mut names: Vec<String> = Vec::new();
     for m in members {
-        for (n, _) in m {
+        for (n, _, _) in m {
             if !names.contains(n) {
                 names.push(n.clone());
             }
@@ -472,15 +631,18 @@ fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDia
     let members: Vec<LayoutMember> = members
         .iter()
         .map(|m| {
-            let mut mask = 0;
+            let (mut mask, mut optional) = (0, 0);
             let mut types = vec![FieldType::Absent; names.len()];
-            for (n, t) in m {
+            for (n, t, opt) in m {
                 if let Some(i) = names.iter().position(|x| x == n) {
                     mask |= 1 << i;
+                    if *opt {
+                        optional |= 1 << i;
+                    }
                     types[i] = t.clone();
                 }
             }
-            LayoutMember { mask, types }
+            LayoutMember { mask, optional, types }
         })
         .collect();
     let mut offset = 0u32;
@@ -490,8 +652,11 @@ fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDia
         .map(|(i, n)| {
             let ts: Vec<&FieldType> =
                 members.iter().map(|m| &m.types[i]).filter(|t| **t != FieldType::Absent).collect();
-            let universal = ts.len() == members.len();
-            let storage = if ts.iter().all(|t| **t == FieldType::Int) {
+            let universal = ts.len() == members.len() && members.iter().all(|m| m.optional & (1 << i) == 0);
+            let storage = if ts.iter().any(|t| matches!(t, FieldType::Nullable(_))) {
+                // (`null` is a JS value.)
+                Storage::Value
+            } else if ts.iter().all(|t| **t == FieldType::Int) {
                 Storage::Int32
             } else if ts.iter().all(|t| matches!(t, FieldType::Int | FieldType::Number)) {
                 Storage::F64
@@ -501,16 +666,23 @@ fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDia
                 Storage::Value
             };
             let same = ts.windows(2).all(|w| w[0] == w[1]);
+            // An object of one `aot type`, maybe `null`, in every member.
+            let one_struct = match ts[0].base() {
+                FieldType::Struct(k) if ts.iter().all(|t| *t.base() == FieldType::Struct(*k)) => Some(*k),
+                _ => None,
+            };
             let ty = match (universal, storage) {
-                (false, _) => Ty::Any,
                 (true, Storage::Int32) => Ty::I32,
                 (true, Storage::F64) => Ty::F64,
                 (true, Storage::Bool) => Ty::Bool,
                 (true, Storage::Value) => match ts[0] {
                     FieldType::Struct(k) if same => Ty::Struct(*k),
                     FieldType::Array(k) if same => Ty::StructArr(*k),
-                    _ => Ty::Any,
+                    _ => one_struct.map_or(Ty::Any, Ty::StructOrUndef),
                 },
+                // May be absent: `undefined` then.
+                (false, Storage::Int32 | Storage::F64) => Ty::MaybeF64,
+                (false, _) => one_struct.map_or(Ty::Any, Ty::StructOrUndef),
             };
             let (size, align) = match storage {
                 Storage::Int32 => (4, 4),
@@ -654,6 +826,8 @@ struct Sites<'s> {
     returns: Vec<Option<SiteTy>>,
     sites: HashMap<u32, (u32, u32)>,
     array_sites: HashMap<u32, (u32, u32)>,
+    parse_sites: HashMap<u32, (u32, i32)>,
+    json_sites: HashMap<u32, (u32, i32)>,
     /// Writes of the bindings declared `T[]`.
     writes: HashMap<SymbolId, Vec<Write>>,
     errors: Vec<OxcDiagnostic>,
@@ -695,6 +869,25 @@ impl Sites<'_> {
         matches!(e.without_parentheses(), Expression::Identifier(id) if id.name == "Array" && self.symbol(id).is_none())
     }
 
+    /// `JSON.parse(text)` (the global `JSON`, one argument).
+    fn is_json_parse(&self, c: &CallExpression) -> bool {
+        matches!(c.callee.without_parentheses(), Expression::StaticMemberExpression(m)
+            if m.property.name == "parse" && !m.optional
+                && matches!(m.object.without_parentheses(), Expression::Identifier(id)
+                    if id.name == "JSON" && self.symbol(id).is_none()))
+            && !c.optional
+            && c.arguments.len() == 1
+            && c.arguments[0].as_expression().is_some()
+    }
+
+    /// `r.json()` (any `r`).
+    fn is_json_call(e: &Expression) -> bool {
+        matches!(e.without_parentheses(), Expression::CallExpression(c)
+            if !c.optional && c.arguments.is_empty()
+                && matches!(c.callee.without_parentheses(), Expression::StaticMemberExpression(m)
+                    if m.property.name == "json" && !m.optional))
+    }
+
     /// What storing `e` in a binding declared `T[]` stores.
     fn write_of(&self, e: &Expression) -> Write {
         let e = e.without_parentheses();
@@ -731,6 +924,12 @@ impl Sites<'_> {
                 self.mark(&c.alternate, ty);
             }
             (Expression::ObjectExpression(o), SiteTy::Struct(k)) => self.literal(o, k),
+            (Expression::CallExpression(c), _) if self.is_json_parse(c) => {
+                self.parse_sites.insert(c.span.start, (c.span.end, desc(ty)));
+            }
+            (Expression::AwaitExpression(a), _) if Self::is_json_call(&a.argument) => {
+                self.json_sites.insert(a.span.start, (a.span.end, desc(ty)));
+            }
             (Expression::NewExpression(n), SiteTy::Array(k)) if self.is_array_ctor(&n.callee) => {
                 self.array_sites.insert(n.span.start, (n.span.end, k));
             }
@@ -798,16 +997,17 @@ impl Sites<'_> {
         let values_fit = |m: &LayoutMember| {
             (0..layout.fields.len()).all(|i| match (&m.types[i], values[i]) {
                 (FieldType::Absent, _) | (_, None) => true,
-                (t, Some(v)) => literal_fits(t, v) != Some(false),
+                (t, Some(v)) => literal_fits(t, m.optional & (1 << i) != 0, v) != Some(false),
             })
         };
-        if !layout.members.iter().any(|m| m.mask & !mask == 0 && values_fit(m)) {
+        let required = |m: &LayoutMember| m.mask & !m.optional;
+        if !layout.members.iter().any(|m| required(m) & !mask == 0 && values_fit(m)) {
             // The fields missing for the closest member its values fit.
             let missing = layout
                 .members
                 .iter()
                 .filter(|m| values_fit(m))
-                .map(|m| m.mask & !mask)
+                .map(|m| required(m) & !mask)
                 .min_by_key(|b| b.count_ones())
                 .filter(|b| *b != 0)
                 .map(|b| {
@@ -823,10 +1023,10 @@ impl Sites<'_> {
         // Other fields: of a type some member allows.
         for (i, v) in values.iter().enumerate() {
             if let Some(v) = v
-                && !layout
-                    .members
-                    .iter()
-                    .any(|m| m.types[i] != FieldType::Absent && literal_fits(&m.types[i], v) != Some(false))
+                && !layout.members.iter().any(|m| {
+                    m.types[i] != FieldType::Absent
+                        && literal_fits(&m.types[i], m.optional & (1 << i) != 0, v) != Some(false)
+                })
             {
                 self.err(v.span(), format!("`{}` of `{name}` cannot hold this value", layout.fields[i].name));
             }
@@ -838,10 +1038,18 @@ impl Sites<'_> {
     }
 }
 
+/// What a parse site makes (`Structs::parse_sites`).
+fn desc(ty: SiteTy) -> i32 {
+    match ty {
+        SiteTy::Struct(k) => k as i32 * 2,
+        SiteTy::Array(k) => k as i32 * 2 + 1,
+    }
+}
+
 /// What field `i` of layout `l` holds in every member that has it, if an
 /// object of an `aot type` or an array of them.
 fn field_site_at(l: &Layout, i: usize) -> Option<SiteTy> {
-    let mut ts = l.members.iter().map(|m| &m.types[i]).filter(|t| **t != FieldType::Absent);
+    let mut ts = l.members.iter().map(|m| m.types[i].base()).filter(|t| **t != FieldType::Absent);
     let first = ts.next()?;
     let site = match first {
         FieldType::Struct(k) => SiteTy::Struct(*k),
@@ -851,8 +1059,15 @@ fn field_site_at(l: &Layout, i: usize) -> Option<SiteTy> {
     ts.all(|t| t == first).then_some(site)
 }
 
-/// Whether a literal value fits a field type (`None`: not a literal).
-fn literal_fits(t: &FieldType, v: &Expression) -> Option<bool> {
+/// Whether a literal value fits a field type (of a field that may be
+/// absent: `optional`; `None`: not a literal).
+fn literal_fits(t: &FieldType, optional: bool, v: &Expression) -> Option<bool> {
+    match v.without_parentheses() {
+        Expression::NullLiteral(_) => return Some(matches!(t, FieldType::Nullable(_))),
+        Expression::Identifier(id) if id.name == "undefined" => return Some(optional),
+        _ => {}
+    }
+    let t = t.base();
     let num = match v.without_parentheses() {
         Expression::NumericLiteral(n) => Some(n.value),
         Expression::UnaryExpression(u) if u.operator == UnaryOperator::UnaryNegation => match &u.argument {
@@ -975,6 +1190,19 @@ impl<'a> Visit<'a> for Sites<'_> {
         self.returns.push(ret);
         walk::walk_arrow_function_expression(self, f);
         self.returns.pop();
+    }
+
+    fn visit_ts_as_expression(&mut self, a: &TSAsExpression<'a>) {
+        // `JSON.parse(text) as T`, `(await r.json()) as T`: parse sites.
+        let parse = match a.expression.without_parentheses() {
+            Expression::CallExpression(c) => self.is_json_parse(c),
+            Expression::AwaitExpression(aw) => Self::is_json_call(&aw.argument),
+            _ => false,
+        };
+        if parse && let Some(t) = site_ty(&a.type_annotation, self.types.ids, self.types.arrays) {
+            self.mark(&a.expression, t);
+        }
+        walk::walk_ts_as_expression(self, a);
     }
 
     fn visit_return_statement(&mut self, r: &ReturnStatement<'a>) {

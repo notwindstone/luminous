@@ -99,9 +99,10 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define LUM_PIN_STRING_FNS 35
 /* Map.prototype.get, set, has, Set.prototype.add, has (JS_CallMapFn). */
 #define LUM_PIN_MAP_FNS 41
-/* JSON.stringify. */
+/* JSON.stringify, JSON.parse. */
 #define LUM_PIN_JSON_STRINGIFY 46
-#define LUM_PINS 47
+#define LUM_PIN_JSON_PARSE 47
+#define LUM_PINS 48
 JSValue lum_struct_stringify(JSContext *ctx, JSValueConst v);
 int lum_is_promise_resolve(JSValue promise, JSValue resolve);
 int lum_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
@@ -286,13 +287,15 @@ typedef struct LumFieldDesc {
 
 typedef struct LumTypeDesc {
     uint8_t kind;
-    uint8_t nlits;
+    uint8_t nullable;  /* or `null` */
     uint16_t layout;   /* LUM_FT_STRUCT, LUM_FT_ARRAY */
+    uint16_t nlits;
     uint32_t lit_base; /* LUM_FT_LITERALS: first in lum_struct_lits */
 } LumTypeDesc;
 
 typedef struct LumMemberDesc {
     uint32_t mask;
+    uint32_t optional; /* fields that may be absent */
     const LumTypeDesc *types; /* per field */
 } LumMemberDesc;
 
@@ -302,6 +305,7 @@ typedef struct LumLayoutDesc {
     uint32_t size;
     uint32_t nmembers;
     uint32_t validate; /* writes or literals may change the member matched */
+    uint32_t optional; /* fields optional in some member: may be added, deleted */
     const LumFieldDesc *fields;
     const LumMemberDesc *members;
 } LumLayoutDesc;
@@ -355,3 +359,11 @@ JSValue lum_sarr_from(JSContext *ctx, int layout, JSValue src);
 int lum_sarr_set(JSContext *ctx, JSValue obj, int64_t idx, JSValue v);
 int64_t lum_sarr_push(JSContext *ctx, JSValue obj, JSValue v);
 JSValue lum_sarr_js(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+
+/* `aot type`s from JSON (desc: layout * 2, + 1 for an array of its objects). */
+JSValue lum_struct_convert(JSContext *ctx, JSValue v, int32_t desc);
+JSValue lum_struct_as(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+JSValue lum_json_parse_as(JSContext *ctx, JSValueConst text, int32_t desc);
+JSValue lum_json_parse_utf8_as(JSContext *ctx, const uint8_t *buf, size_t len, int32_t desc);
+JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc);
+void lum_set_json_hook(JSContext *ctx, JSValueConst fn);

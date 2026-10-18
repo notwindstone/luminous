@@ -359,6 +359,8 @@ pub fn check<'a>(
             layouts: &structs.layouts,
             struct_sites: &structs.sites,
             array_sites: &structs.array_sites,
+            parse_sites: &structs.parse_sites,
+            json_sites: &structs.json_sites,
             sure_arrays: &structs.sure_arrays,
         };
         for i in 0..candidates.len() {
@@ -1509,6 +1511,7 @@ fn ts_type(t: &TSType) -> Option<Ty> {
                 "double" => Some(Ty::F64),
                 name if r.type_arguments.is_some() => ArrKind::from_name(name).map(Ty::Arr),
                 name => match (crate::structs::struct_named(name), crate::structs::array_named(name)) {
+                    (Some(k), _) if crate::structs::struct_nullable(name) => Some(Ty::StructOrUndef(k)),
                     (Some(k), _) => Some(Ty::Struct(k)),
                     (None, Some(k)) => Some(Ty::StructArr(k)),
                     (None, None) => ArrKind::from_name(name).map(Ty::Arr),
@@ -1541,8 +1544,9 @@ fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
     for p in &params.items {
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
         let ty = match annotated {
-            Some(t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_)))
-                if p.initializer.is_none()
+            Some(
+                t @ (Ty::F64 | Ty::I32 | Ty::Bool | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_)),
+            ) if p.initializer.is_none()
                     && !p.optional
                     && matches!(p.pattern, BindingPattern::BindingIdentifier(_)) =>
             {
@@ -1611,6 +1615,10 @@ struct ModuleCx<'m, 'a> {
     layouts: &'m [ir::Layout],
     struct_sites: &'m HashMap<u32, (u32, u32)>,
     array_sites: &'m HashMap<u32, (u32, u32)>,
+    /// `JSON.parse(text)` and `await r.json()` converted to an `aot type`
+    /// (span start: span end, desc).
+    parse_sites: &'m HashMap<u32, (u32, i32)>,
+    json_sites: &'m HashMap<u32, (u32, i32)>,
     sure_arrays: &'m HashMap<SymbolId, u32>,
 }
 
@@ -3000,7 +3008,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 if self.in_finally > 0 {
                     return reject(r.span, "`return` inside `finally` is not supported");
                 }
-                if let Some(Expression::AwaitExpression(aw)) = r.argument.as_ref().map(|a| a.without_parentheses()) {
+                if let Some(Expression::AwaitExpression(aw)) = r.argument.as_ref().map(|a| a.without_parentheses())
+                    && self.json_site(aw).is_none()
+                {
                     let value = any(self.expr(&aw.argument)?);
                     self.returns.push(Ty::Any);
                     if self.is_async && self.is_generator {
@@ -3055,7 +3065,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Expression::YieldExpression(y) => self.yield_stmt(y, ir::AwaitTarget::Discard),
             Expression::AssignmentExpression(a)
                 if a.operator == AssignmentOperator::Assign
-                    && matches!(a.right.without_parentheses(), Expression::AwaitExpression(_)) =>
+                    && matches!(a.right.without_parentheses(),
+                        Expression::AwaitExpression(aw) if self.json_site(aw).is_none()) =>
             {
                 let Expression::AwaitExpression(aw) = a.right.without_parentheses() else { unreachable!() };
                 let local = match &a.left {
@@ -3333,7 +3344,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 out.push(Stmt::Expr(init_cell(k, init, is_var)));
                 continue;
             }
-            if let Some(Expression::AwaitExpression(aw)) = d.init.as_ref().map(|i| i.without_parentheses()) {
+            if let Some(Expression::AwaitExpression(aw)) = d.init.as_ref().map(|i| i.without_parentheses())
+                && self.json_site(aw).is_none()
+            {
                 let value = any(self.expr(&aw.argument)?);
                 let l = match self.sym_local.get(&sym) {
                     Some(&l) if is_var || self.boxed[l] => l,
@@ -4577,7 +4590,33 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let arr = any(self.expr_plain(e)?);
             return Ok(Expr::new(Ty::StructArr(k), ExprKind::StructArrFrom(k, Box::new(arr))));
         }
+        // `JSON.parse(text)` converted to an `aot type`.
+        if let Expression::CallExpression(_) = e
+            && let Some(&(end, desc)) = self.m.parse_sites.get(&span.start)
+            && end == span.end
+        {
+            let call = any(self.expr_plain(e)?);
+            return Ok(Expr::new(desc_ty(desc), ExprKind::StructConvert(desc, Box::new(call))));
+        }
+        // `await r.json()` converted to one: awaited (as `await` is), then
+        // converted.
+        if let Expression::AwaitExpression(aw) = e
+            && let Some(desc) = self.json_site(aw)
+        {
+            let Expression::CallExpression(c) = aw.argument.without_parentheses() else { unreachable!() };
+            let Expression::StaticMemberExpression(m) = c.callee.without_parentheses() else { unreachable!() };
+            let recv = any(self.expr(&m.object)?);
+            let value = Expr::new(Ty::Any, ExprKind::JsonMethodAs(desc, Box::new(recv)));
+            let t = self.temp(Ty::Any);
+            self.pre.push(Stmt::Await { value, target: ir::AwaitTarget::Set(t) });
+            return Ok(Expr::new(desc_ty(desc), ExprKind::StructConvert(desc, Box::new(self.local(t)))));
+        }
         self.expr_plain(e)
+    }
+
+    /// The desc of `await r.json()` converted to an `aot type`, if it is.
+    fn json_site(&self, aw: &AwaitExpression) -> Option<i32> {
+        self.m.json_sites.get(&aw.span.start).filter(|&&(e, _)| e == aw.span.end).map(|&(_, d)| d)
     }
 
     fn expr_plain(&mut self, e: &'a Expression<'a>) -> R<Expr> {
@@ -5031,6 +5070,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     /// they are for unboxed fields, else a JS value.
     fn struct_value(&self, k: u32, i: u32, v: Expr) -> Expr {
         match self.m.layouts[k as usize].fields[i as usize].storage {
+            // (`undefined` as a `MaybeF64` is not a number: the runtime checks.)
+            ir::Storage::Int32 | ir::Storage::F64 if v.ty == Ty::MaybeF64 => any(v),
             ir::Storage::Int32 | ir::Storage::F64 if num(v.ty) || v.ty == Ty::Any => to_f64(v),
             ir::Storage::Bool if matches!(v.ty, Ty::Bool | Ty::Any) => v,
             _ => any(v),
@@ -5056,8 +5097,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             return self.get_prop(obj, atom);
         }
         if let Some((k, i)) = self.struct_field(obj.ty, atom) {
-            let f = &self.m.layouts[k as usize].fields[i as usize];
-            let ty = if f.universal { f.ty } else { Ty::Any };
+            let ty = self.m.layouts[k as usize].fields[i as usize].ty;
             return Expr::new(ty, ExprKind::StructGet(k, Box::new(obj), i));
         }
         Expr::new(Ty::Any, ExprKind::GetProp(Box::new(any(obj)), atom))
@@ -6239,6 +6279,12 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     checks.push((k, ir::ArgCheck::Struct(l)));
                     any(x)
                 }
+                // An object of this one (or `null` / `undefined`) for a parameter that holds it.
+                (Ty::StructOrUndef(l), Ty::Struct(l2)) if l == l2 => Expr { ty: p, ..x },
+                (Ty::StructOrUndef(l), Ty::Any) if callee.is_some() => {
+                    checks.push((k, ir::ArgCheck::StructOrNullish(l)));
+                    any(x)
+                }
                 // A JS value for a `number` or `boolean` parameter: checked
                 // at the call, as the function's entry would.
                 (Ty::F64 | Ty::MaybeF64, Ty::Any) if callee.is_some() => {
@@ -6426,6 +6472,12 @@ fn num(t: Ty) -> bool {
 }
 
 /// A `num` value converted with ToNumber: the same bits.
+/// What a value converted to `desc` is (see `ExprKind::StructConvert`).
+fn desc_ty(desc: i32) -> Ty {
+    let k = (desc >> 1) as u32;
+    if desc & 1 == 1 { Ty::StructArr(k) } else { Ty::Struct(k) }
+}
+
 fn to_f64(x: Expr) -> Expr {
     if x.ty == Ty::MaybeF64 { Expr { ty: Ty::F64, ..x } } else { x }
 }

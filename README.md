@@ -138,7 +138,8 @@ regular call path's generated code alone.
 `0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
 `0014-gc-marking.patch`, `0015-object-model.patch`,
 `0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch`,
-`0018-await-or-value.patch` and `0019-json-fast-paths.patch`, each made
+`0018-await-or-value.patch`, `0019-json-fast-paths.patch`,
+`0020-exotic-define-own.patch` and `0021-latin1-strings.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -1382,9 +1383,13 @@ aot type C = { nested: { notNested: string } };
 aot type D = C[];
 aot type E = { on: boolean; items: D; more: { id: int }[]; tree: Tree };
 aot type Tree = { label: string; children: Tree[] };
+aot type User = { name: string; age?: int; email: string | null; boss: User | null };
+aot type Maybe = { x: number } | null | undefined;
 
 const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
 const e: E = { on: true, items: [{ nested: { notNested: "a" } }], more: [], tree: { label: "t", children: [] } };
+const u: User = JSON.parse(text);              // parsed to the type: only its fields
+const v: User = await (await fetch(url)).json();
 ```
 
 - **Members and fields.** An `aot type` is object types combined with `|`
@@ -1394,14 +1399,24 @@ const e: E = { on: true, items: [{ nested: { notNested: "a" } }], more: [], tree
   written in place (`nested: { notNested: string }`: an `aot type` of its
   own, `C.nested` in errors) or an array of objects of one of these
   (`T[]`, `Array<T>`, `{ id: int }[]`). An `aot type` can also name such an
-  array (`aot type D = C[]`), for fields, bindings and parameters. No
-  optional fields, methods, index signatures or type parameters.
+  array (`aot type D = C[]`), for fields, bindings and parameters; so can
+  a plain alias (`type Y = Array<A>` is `A[]`). A field may be optional
+  (`age?: int`, or `int | undefined`) and may hold `null` (`string | null`,
+  `User | null`); an `aot type` may also hold `null` or `undefined`
+  (`Maybe` above: a parameter of it takes either, checked on entry). No
+  methods, index signatures or type parameters, and no arrays of
+  something that may be `null`.
 - **One layout.** All the members' fields share one layout, with a mask of
   the fields an object has. An object is valid when it has every field of
   some member, with that member's types, and its other fields belong to
   some member (so `{ a } | { b }` holds `{ a }`, `{ b }` and `{ a, b }`).
   Fields that every member stores the same way are unboxed: an `int` is an
-  int32, a `number` a double, a `boolean` a byte.
+  int32, a `number` a double, a `boolean` a byte. An optional field is
+  absent from an object until set (its bit in the mask clear); reading it
+  gives `undefined` then, and native code reads an optional number as a
+  number-or-`undefined` double, unboxed. Setting it to `undefined` or
+  deleting it makes it absent again. A field that may hold `null` holds a
+  JS value.
 - **Made by literals.** An object literal where an `aot type` is expected
   makes one: the initializer of a binding declared with it, a value
   assigned to one or to such a field, a returned value, an argument for
@@ -1413,7 +1428,8 @@ const e: E = { on: true, items: [{ nested: { notNested: "a" } }], more: [], tree
   object (`JSON.stringify`, `Object.keys`, spread, `in` all work) that is
   not extensible: fields cannot be added, deleted or redefined, and a field
   only takes values of its type, else a TypeError, from native or
-  interpreted code alike. An `int` field wraps other integers to int32 (as
+  interpreted code alike (optional fields are added and deleted: they are
+  configurable). An `int` field wraps other integers to int32 (as
   `| 0`; with `--no-int-wrapping`, a TypeError); a write that would leave
   the object matching no member is a TypeError. `Object.freeze` throws.
 - **Arrays of them.** An array literal or `new Array(n)` (or `Array(n)`)
@@ -1462,6 +1478,31 @@ const e: E = { on: true, items: [{ nested: { notNested: "a" } }], more: [], tree
   x86-64 VM: about 200 ns, as bun 1.4.3 (190–230 ns; 2.2 µs before the
   writers; the same plain object, 230–320 ns), and an array of 100 of them
   12–15 µs, about half of bun's (22–29 µs; 170 µs before; plain, 23–29 µs).
+
+### From JSON
+
+`JSON.parse(text)` and `await r.json()` where an `aot type` (or an array of
+them) is expected (a binding, a returned value, an argument, a field, an
+element, or `as T`) give one: the value converted, each field of the type
+read from the object's own properties (others ignored), checked as a store
+would check it, and nested objects and arrays converted the same way; a
+value that does not fit is a TypeError (the first field, in the type's
+order, that does not), as is one missing a field.
+
+Native code parses the text to the type directly while `JSON.parse` is
+the builtin (`lum_json_parse_as`, from a string's Latin-1 characters in
+place: `JS_GetStringLatin1`, patch `0021`): only the fields of the type are
+made, other keys and values skipped (checked, not made), numbers stored
+unboxed. Anything else (invalid JSON, a value a field cannot hold, a
+16-bit or concatenated string) goes the general way, so that the result
+and the errors are always the same as `JSON.parse` and the conversion's
+(the differential tests run both: `aot_json_parse.ts`). For `r.json()`, a
+host may parse the body itself (`lum_set_json_hook`; Beyond parses a
+`Request`'s or `Response`'s bytes, `lum_json_parse_utf8_as`), else the
+result of `r.json()` is converted. A small object parses about three times
+as fast as the plain parse, and 50 objects with fields the type does not
+have about as fast as bun's plain `JSON.parse` (Beyond's
+docs/performance.md).
 
 ## Getting started
 
