@@ -582,6 +582,7 @@ fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
                         (5, ls.len(), 0, base)
                     }
                     ir::FieldType::Struct(s) => (6, 0, *s, 0),
+                    ir::FieldType::Array(s) => (7, 0, *s, 0),
                 };
                 writeln!(c, "    {{ {kind}, {nlits}, {layout}, {base} }},").unwrap();
             }

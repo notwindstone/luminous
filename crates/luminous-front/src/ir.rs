@@ -202,6 +202,8 @@ pub enum FieldType {
     Literals(Vec<String>),
     /// An object of this layout.
     Struct(u32),
+    /// An array of objects of this layout (`LumStructArray`).
+    Array(u32),
 }
 
 #[derive(Clone, Debug)]

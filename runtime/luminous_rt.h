@@ -275,6 +275,7 @@ int lum_runtime_init(JSContext *ctx, JSValue *state, JSValue *init_fn, JSValue *
 #define LUM_FT_STRING 4
 #define LUM_FT_LITERALS 5
 #define LUM_FT_STRUCT 6
+#define LUM_FT_ARRAY 7 /* an array of objects of `layout` (LumStructArray) */
 
 typedef struct LumFieldDesc {
     const char *name;
@@ -286,7 +287,7 @@ typedef struct LumFieldDesc {
 typedef struct LumTypeDesc {
     uint8_t kind;
     uint8_t nlits;
-    uint16_t layout;   /* LUM_FT_STRUCT */
+    uint16_t layout;   /* LUM_FT_STRUCT, LUM_FT_ARRAY */
     uint32_t lit_base; /* LUM_FT_LITERALS: first in lum_struct_lits */
 } LumTypeDesc;
 

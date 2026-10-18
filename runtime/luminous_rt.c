@@ -2591,10 +2591,13 @@ static JSValue lum_field_get(JSContext *ctx, LumStruct *s, const LumFieldDesc *f
     }
 }
 
+static LumStructArray *lum_sarr_of(JSValueConst v);
+
 static bool lum_value_fits(JSContext *ctx, const LumTypeDesc *t, JSValueConst v)
 {
     int tag = JS_VALUE_GET_NORM_TAG(v);
     LumStruct *s;
+    LumStructArray *a;
     uint32_t i;
     switch (t->kind) {
     case LUM_FT_INT:
@@ -2622,6 +2625,9 @@ static bool lum_value_fits(JSContext *ctx, const LumTypeDesc *t, JSValueConst v)
     case LUM_FT_STRUCT:
         s = lum_struct_of(v);
         return s && s->layout == t->layout;
+    case LUM_FT_ARRAY:
+        a = lum_sarr_of(v);
+        return a && a->layout == t->layout;
     default:
         return false;
     }

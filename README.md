@@ -1378,14 +1378,24 @@ aot type Point = {
 aot type AB = { a: number } | { b: string };   // { a }, { b } and { a, b }
 aot type XY = { x: int } & { y: number };        // one member: { x, y }
 
+aot type C = { nested: { notNested: string } };
+aot type D = C[];
+aot type E = { on: boolean; items: D; more: { id: int }[]; tree: Tree };
+aot type Tree = { label: string; children: Tree[] };
+
 const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
+const e: E = { on: true, items: [{ nested: { notNested: "a" } }], more: [], tree: { label: "t", children: [] } };
 ```
 
 - **Members and fields.** An `aot type` is object types combined with `|`
   and `&` (and other `aot type`s), at the top level of the module. Fields
-  are `int`, `number` / `double`, `boolean`, `string`, string literals or
-  another `aot type`; no optional fields, methods, index signatures or
-  type parameters.
+  are `int`, `number` / `double`, `boolean`, `string`, string literals,
+  another `aot type` (its own included: `children: Tree[]`), object types
+  written in place (`nested: { notNested: string }`: an `aot type` of its
+  own, `C.nested` in errors) or an array of objects of one of these
+  (`T[]`, `Array<T>`, `{ id: int }[]`). An `aot type` can also name such an
+  array (`aot type D = C[]`), for fields, bindings and parameters. No
+  optional fields, methods, index signatures or type parameters.
 - **One layout.** All the members' fields share one layout, with a mask of
   the fields an object has. An object is valid when it has every field of
   some member, with that member's types, and its other fields belong to
@@ -1415,7 +1425,11 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   element as an object of `T` or `undefined` (reading a field of
   `undefined` throws as in JS), and so field reads through it are typed.
   A `let` / `const` declared `T[]` that is only ever assigned such arrays
-  is typed everywhere, module bindings included.
+  is typed everywhere, module bindings included. A field of an array type
+  holds such an array: an array literal in its place makes one, and
+  storing any other array there (a plain one included, even of objects of
+  `T`) is a TypeError; `xs[i].f`, `xs.length` and `xs.push(...)` through
+  it are typed as for a binding.
 - **Native code** reads and writes fields at fixed offsets: on a value of a
   declared `aot type` (a literal, a parameter, a field, an element of an
   array of them: `xs[i].x = v` checks the element is an object after

@@ -1507,9 +1507,11 @@ fn ts_type(t: &TSType) -> Option<Ty> {
                 // checked to hold int32 values.
                 "int" => Some(Ty::I32),
                 "double" => Some(Ty::F64),
-                name => match crate::structs::struct_named(name) {
-                    Some(k) if r.type_arguments.is_none() => Some(Ty::Struct(k)),
-                    _ => ArrKind::from_name(name).map(Ty::Arr),
+                name if r.type_arguments.is_some() => ArrKind::from_name(name).map(Ty::Arr),
+                name => match (crate::structs::struct_named(name), crate::structs::array_named(name)) {
+                    (Some(k), _) => Some(Ty::Struct(k)),
+                    (None, Some(k)) => Some(Ty::StructArr(k)),
+                    (None, None) => ArrKind::from_name(name).map(Ty::Arr),
                 },
             },
             _ => None,

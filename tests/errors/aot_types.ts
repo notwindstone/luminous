@@ -5,11 +5,16 @@
 // @error `a` has two different types
 // @error an `aot type` can only have fields
 // @error an `aot type` must be declared at the top level of the module
+// @error unsupported element type of an array in an `aot type`
+// @error `D` is an array, not an object type
 type int = number;
 type B = { b: number };
 
 aot type Opt = { x?: number };
 aot type Arr = { xs: number[] };
+aot type Mixed = { m: Arr | { y: int } };
+aot type D = Arr[];
+aot type FromArray = D | { a: int };
 aot type UsesPlain = { a: int } | B;
 aot type Self = { a: int } & Self;
 aot type Clash = { a: int } & { a: string };

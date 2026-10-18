@@ -6,8 +6,11 @@
 //! ```
 //!
 //! An `aot type` is a union of members (object types, `&` merging them),
-//! whose fields are `int`, `number`, `boolean`, `string`, string literals or
-//! other `aot type`s. It becomes one layout (`ir::Layout`) with every field
+//! whose fields are `int`, `number`, `boolean`, `string`, string literals,
+//! other `aot type`s, object types written in place (each an `aot type` of
+//! its own, named after where it is: `C.nested`) or arrays of objects of
+//! these (`T[]`, `Array<T>`). An `aot type` can also name such an array
+//! (`aot type D = C[]`). An object `aot type` becomes one layout (`ir::Layout`) with every field
 //! of every member and a mask of the fields an object has: so `{ a } | { b }`
 //! holds `{ a }`, `{ b }` and `{ a, b }` alike. Objects of an `aot type` are
 //! made by object literals where the type is expected (`literal_sites`):
@@ -49,11 +52,47 @@ thread_local! {
     /// `aot type` names, for `struct_named` (type annotations are read
     /// without context).
     static NAMES: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    /// The `aot type`s that are arrays (`aot type D = C[]`): their
+    /// elements' layouts.
+    static ARRAY_NAMES: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
 }
 
 /// The layout of the `aot type` of this name.
 pub fn struct_named(name: &str) -> Option<u32> {
     NAMES.with(|n| n.borrow().get(name).copied())
+}
+
+/// The layout of the elements of the array `aot type` of this name.
+pub fn array_named(name: &str) -> Option<u32> {
+    ARRAY_NAMES.with(|n| n.borrow().get(name).copied())
+}
+
+/// The element type of an array type (`T[]`, `Array<T>`, `ReadonlyArray<T>`).
+fn array_element<'t, 'a>(t: &'t TSType<'a>) -> Option<&'t TSType<'a>> {
+    match t {
+        TSType::TSParenthesizedType(p) => array_element(&p.type_annotation),
+        TSType::TSArrayType(a) => Some(&a.element_type),
+        TSType::TSTypeReference(r) => match (&r.type_name, &r.type_arguments) {
+            (TSTypeName::IdentifierReference(id), Some(args))
+                if matches!(id.name.as_str(), "Array" | "ReadonlyArray") && args.params.len() == 1 =>
+            {
+                Some(&args.params[0])
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `t` is object types written in place, combined with `|` and `&`.
+fn inline_object(t: &TSType) -> bool {
+    match t {
+        TSType::TSTypeLiteral(_) => true,
+        TSType::TSParenthesizedType(p) => inline_object(&p.type_annotation),
+        TSType::TSUnionType(u) => u.types.iter().all(inline_object),
+        TSType::TSIntersectionType(i) => i.types.iter().all(inline_object),
+        _ => false,
+    }
 }
 
 /// Resolve the `aot type`s (the type aliases starting at `marked`) and find
@@ -83,19 +122,49 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
         }
     }
     decls.sort_by_key(|d| d.span.start);
+    // Object `aot type`s are layouts 0.., in order; then the object types
+    // written in place, as they are found.
+    let (arrays, decls): (Vec<&TSTypeAliasDeclaration>, Vec<&TSTypeAliasDeclaration>) =
+        decls.into_iter().partition(|d| array_element(&d.type_annotation).is_some());
     let ids: HashMap<String, u32> = decls.iter().enumerate().map(|(i, d)| (d.id.name.to_string(), i as u32)).collect();
     NAMES.with(|n| *n.borrow_mut() = ids.clone());
+    let array_decls: HashMap<String, &TSType> =
+        arrays.iter().map(|d| (d.id.name.to_string(), array_element(&d.type_annotation).unwrap())).collect();
 
-    let mut r = Resolver { decls: &decls, ids: &ids, stack: Vec::new(), errors: Vec::new() };
+    let mut r = Resolver {
+        decls: &decls,
+        ids: &ids,
+        arrays: &array_decls,
+        stack: Vec::new(),
+        path: Vec::new(),
+        anon: Vec::new(),
+        anon_at: HashMap::new(),
+        errors: Vec::new(),
+    };
     let mut layouts = Vec::new();
     for (i, d) in decls.iter().enumerate() {
         if let Some(p) = &d.type_parameters {
             r.err::<()>(p.span, "an `aot type` cannot have type parameters");
         }
         r.stack.push(i as u32);
+        r.path = vec![d.id.name.to_string()];
         let members = r.members(&d.type_annotation).unwrap_or_default();
         r.stack.pop();
         layouts.push(layout(d.id.name.as_str(), &members, d.span, &mut r.errors));
+    }
+    let mut array_ids = HashMap::new();
+    for d in &arrays {
+        if let Some(p) = &d.type_parameters {
+            r.err::<()>(p.span, "an `aot type` cannot have type parameters");
+        }
+        r.path = vec![d.id.name.to_string()];
+        if let Some(k) = r.element(array_decls[d.id.name.as_str()]) {
+            array_ids.insert(d.id.name.to_string(), k);
+        }
+    }
+    ARRAY_NAMES.with(|n| *n.borrow_mut() = array_ids.clone());
+    for (name, members, span) in std::mem::take(&mut r.anon) {
+        layouts.push(layout(&name, &members, span, &mut r.errors));
     }
     errors.append(&mut r.errors);
     if !errors.is_empty() {
@@ -105,6 +174,7 @@ pub fn analyze(program: &Program, scoping: &Scoping, marked: &HashSet<u32>) -> (
     let mut decl_types = DeclTypes {
         scoping,
         ids: &ids,
+        arrays: &array_ids,
         vars: HashMap::new(),
         fns: HashMap::new(),
         lexical: HashSet::new(),
@@ -177,8 +247,17 @@ type RawMember = Vec<(String, FieldType)>;
 struct Resolver<'d, 'a> {
     decls: &'d [&'d TSTypeAliasDeclaration<'a>],
     ids: &'d HashMap<String, u32>,
+    /// The array `aot type`s: their element types.
+    arrays: &'d HashMap<String, &'d TSType<'a>>,
     /// The `aot type`s being resolved (references to them are cycles).
     stack: Vec<u32>,
+    /// Where the type being resolved is written: its `aot type`, then the
+    /// fields in it (which name the object types written in place).
+    path: Vec<String>,
+    /// The object types written in place (layouts `ids.len()..`): name,
+    /// members and span; by span start, their layouts.
+    anon: Vec<(String, Vec<RawMember>, Span)>,
+    anon_at: HashMap<u32, u32>,
     errors: Vec<OxcDiagnostic>,
 }
 
@@ -207,7 +286,10 @@ impl Resolver<'_, '_> {
                     let Some(ann) = &p.type_annotation else {
                         return self.err(p.span, "a field of an `aot type` needs a type");
                     };
-                    let ty = self.field_type(&ann.type_annotation)?;
+                    self.path.push(name.clone());
+                    let ty = self.field_type(&ann.type_annotation);
+                    self.path.pop();
+                    let ty = ty?;
                     if fields.iter().any(|(n, _)| *n == name) {
                         return self.err(p.span, "duplicate field");
                     }
@@ -251,6 +333,9 @@ impl Resolver<'_, '_> {
                 let TSTypeName::IdentifierReference(id) = &r.type_name else {
                     return self.err(r.span, "not an `aot type`");
                 };
+                if self.arrays.contains_key(id.name.as_str()) {
+                    return self.err(r.span, &format!("`{}` is an array, not an object type", id.name));
+                }
                 let Some(&k) = self.ids.get(id.name.as_str()) else {
                     return self.err(
                         r.span,
@@ -264,7 +349,9 @@ impl Resolver<'_, '_> {
                     return self.err(r.span, "an `aot type` cannot contain itself");
                 }
                 self.stack.push(k);
+                let path = std::mem::replace(&mut self.path, vec![id.name.to_string()]);
                 let ms = self.members(&self.decls[k as usize].type_annotation);
+                self.path = path;
                 self.stack.pop();
                 ms
             }
@@ -289,14 +376,22 @@ impl Resolver<'_, '_> {
             TSType::TSUnionType(u) if u.types.iter().all(|t| literal(t).is_some()) => {
                 Some(FieldType::Literals(u.types.iter().map(|t| literal(t).unwrap()).collect()))
             }
+            t if inline_object(t) => self.anonymous(t, "").map(FieldType::Struct),
+            t if array_element(t).is_some() => self.element(array_element(t).unwrap()).map(FieldType::Array),
             TSType::TSTypeReference(r) if r.type_arguments.is_none() => {
                 let TSTypeName::IdentifierReference(id) = &r.type_name else { return self.unsupported(t) };
                 match id.name.as_str() {
                     "int" => Some(FieldType::Int),
                     "double" => Some(FieldType::Number),
-                    name => match self.ids.get(name) {
-                        Some(&k) => Some(FieldType::Struct(k)),
-                        None => self.unsupported(t),
+                    name => match (self.ids.get(name), self.arrays.get(name)) {
+                        (Some(&k), _) => Some(FieldType::Struct(k)),
+                        (None, Some(&el)) => {
+                            let path = std::mem::replace(&mut self.path, vec![name.to_string()]);
+                            let k = self.element(el);
+                            self.path = path;
+                            k.map(FieldType::Array)
+                        }
+                        (None, None) => self.unsupported(t),
                     },
                 }
             }
@@ -304,11 +399,56 @@ impl Resolver<'_, '_> {
         }
     }
 
+    /// The layout of the elements of an array in an `aot type`: an object
+    /// `aot type`, or object types written in place.
+    fn element(&mut self, t: &TSType) -> Option<u32> {
+        match t {
+            TSType::TSParenthesizedType(p) => self.element(&p.type_annotation),
+            t if inline_object(t) => self.anonymous(t, "[]"),
+            TSType::TSTypeReference(r) if r.type_arguments.is_none() => match &r.type_name {
+                TSTypeName::IdentifierReference(id) if self.ids.contains_key(id.name.as_str()) => {
+                    Some(self.ids[id.name.as_str()])
+                }
+                _ => self.unsupported_element(t),
+            },
+            _ => self.unsupported_element(t),
+        }
+    }
+
+    /// The layout of object types written in place (`t`), named after
+    /// where they are (`C.nested`, `C.items[]`).
+    fn anonymous(&mut self, t: &TSType, suffix: &str) -> Option<u32> {
+        if let Some(&k) = self.anon_at.get(&t.span().start) {
+            return Some(k);
+        }
+        let k = (self.ids.len() + self.anon.len()) as u32;
+        let name = self.path.join(".") + suffix;
+        self.anon_at.insert(t.span().start, k);
+        self.anon.push((name.clone(), Vec::new(), t.span()));
+        let path = std::mem::replace(&mut self.path, vec![name]);
+        let members = self.members(t);
+        self.path = path;
+        self.anon[k as usize - self.ids.len()].1 = members?;
+        Some(k)
+    }
+
+    fn unsupported_element<T>(&mut self, t: &TSType) -> Option<T> {
+        self.errors.push(
+            OxcDiagnostic::error("unsupported element type of an array in an `aot type`")
+                .with_label(t.span())
+                .with_help("the elements are objects of an `aot type`, or of object types written in place"),
+        );
+        None
+    }
+
     fn unsupported<T>(&mut self, t: &TSType) -> Option<T> {
         self.errors.push(
             OxcDiagnostic::error("unsupported field type in an `aot type`")
                 .with_label(t.span())
-                .with_help("fields are `int`, `number`, `double`, `boolean`, `string`, string literals or `aot type`s"),
+                .with_help(
+                    "fields are `int`, `number`, `double`, `boolean`, `string`, string literals, `aot type`s, \
+                     object types, or arrays of objects (`T[]`)",
+                ),
         );
         None
     }
@@ -368,6 +508,7 @@ fn layout(name: &str, members: &[RawMember], span: Span, errors: &mut Vec<OxcDia
                 (true, Storage::Bool) => Ty::Bool,
                 (true, Storage::Value) => match ts[0] {
                     FieldType::Struct(k) if same => Ty::Struct(*k),
+                    FieldType::Array(k) if same => Ty::StructArr(*k),
                     _ => Ty::Any,
                 },
             };
@@ -394,7 +535,9 @@ enum SiteTy {
     Array(u32),
 }
 
-fn site_ty(t: &TSType, ids: &HashMap<String, u32>) -> Option<SiteTy> {
+/// What annotation `t` says a binding holds (`arrays`: the array `aot
+/// type`s' element layouts).
+fn site_ty(t: &TSType, ids: &HashMap<String, u32>, arrays: &HashMap<String, u32>) -> Option<SiteTy> {
     let named = |t: &TSType| match t {
         TSType::TSTypeReference(r) if r.type_arguments.is_none() => match &r.type_name {
             TSTypeName::IdentifierReference(id) => ids.get(id.name.as_str()).copied(),
@@ -403,13 +546,16 @@ fn site_ty(t: &TSType, ids: &HashMap<String, u32>) -> Option<SiteTy> {
         _ => None,
     };
     match t {
-        TSType::TSParenthesizedType(p) => site_ty(&p.type_annotation, ids),
+        TSType::TSParenthesizedType(p) => site_ty(&p.type_annotation, ids, arrays),
         TSType::TSArrayType(a) => named(&a.element_type).map(SiteTy::Array),
         TSType::TSTypeReference(r) => match (&r.type_name, &r.type_arguments) {
             (TSTypeName::IdentifierReference(id), Some(args))
                 if matches!(id.name.as_str(), "Array" | "ReadonlyArray") && args.params.len() == 1 =>
             {
                 named(&args.params[0]).map(SiteTy::Array)
+            }
+            (TSTypeName::IdentifierReference(id), None) if arrays.contains_key(id.name.as_str()) => {
+                Some(SiteTy::Array(arrays[id.name.as_str()]))
             }
             _ => named(t).map(SiteTy::Struct),
         },
@@ -422,6 +568,7 @@ fn site_ty(t: &TSType, ids: &HashMap<String, u32>) -> Option<SiteTy> {
 struct DeclTypes<'s> {
     scoping: &'s Scoping,
     ids: &'s HashMap<String, u32>,
+    arrays: &'s HashMap<String, u32>,
     vars: HashMap<SymbolId, SiteTy>,
     fns: HashMap<SymbolId, (Vec<Option<SiteTy>>, Option<SiteTy>)>,
     /// `let` / `const` bindings, and the declared bindings with an initializer.
@@ -438,9 +585,9 @@ impl DeclTypes<'_> {
         let ps = params
             .items
             .iter()
-            .map(|p| p.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids)))
+            .map(|p| p.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids, self.arrays)))
             .collect();
-        (ps, ret.and_then(|a| site_ty(&a.type_annotation, self.ids)))
+        (ps, ret.and_then(|a| site_ty(&a.type_annotation, self.ids, self.arrays)))
     }
 }
 
@@ -455,7 +602,7 @@ impl<'a> Visit<'a> for DeclTypes<'_> {
             if d.init.is_some() {
                 self.inits.insert(sym);
             }
-            if let Some(t) = d.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids)) {
+            if let Some(t) = d.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids, self.arrays)) {
                 self.vars.insert(sym, t);
             }
             match d.init.as_ref().map(|e| e.without_parentheses()) {
@@ -476,7 +623,7 @@ impl<'a> Visit<'a> for DeclTypes<'_> {
     fn visit_formal_parameter(&mut self, p: &FormalParameter<'a>) {
         if let BindingPattern::BindingIdentifier(id) = &p.pattern
             && let Some(sym) = id.symbol_id.get()
-            && let Some(t) = p.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids))
+            && let Some(t) = p.type_annotation.as_ref().and_then(|a| site_ty(&a.type_annotation, self.ids, self.arrays))
         {
             self.vars.insert(sym, t);
         }
@@ -517,27 +664,30 @@ impl Sites<'_> {
         self.scoping.get_reference(id.reference_id.get()?).symbol_id()
     }
 
-    /// What the declarations say `e` holds: a binding, or a field of an
-    /// `aot type` that holds one.
+    /// What the declarations say `e` holds: a binding, a field of an
+    /// `aot type` that holds one or an array of them, or an element of such
+    /// an array.
     fn declared(&self, e: &Expression) -> Option<SiteTy> {
         match e.without_parentheses() {
             Expression::Identifier(id) => self.symbol(id).and_then(|s| self.types.vars.get(&s)).copied(),
             Expression::StaticMemberExpression(m) => match self.declared(&m.object)? {
-                SiteTy::Struct(k) => self.struct_field(k, m.property.name.as_str()).map(SiteTy::Struct),
+                SiteTy::Struct(k) => self.field_site(k, m.property.name.as_str()),
                 SiteTy::Array(_) => None,
+            },
+            Expression::ComputedMemberExpression(m) => match self.declared(&m.object)? {
+                SiteTy::Array(k) => Some(SiteTy::Struct(k)),
+                SiteTy::Struct(_) => None,
             },
             _ => None,
         }
     }
 
-    /// The `aot type` that field `name` of layout `k` holds in every member
-    /// that has it.
-    fn struct_field(&self, k: u32, name: &str) -> Option<u32> {
+    /// What field `name` of layout `k` holds in every member that has it,
+    /// if an object of an `aot type` or an array of them.
+    fn field_site(&self, k: u32, name: &str) -> Option<SiteTy> {
         let l = &self.layouts[k as usize];
         let i = l.fields.iter().position(|f| f.name == name)?;
-        let mut ts = l.members.iter().map(|m| &m.types[i]).filter(|t| **t != FieldType::Absent);
-        let FieldType::Struct(k2) = ts.next()? else { return None };
-        ts.all(|t| *t == FieldType::Struct(*k2)).then_some(*k2)
+        field_site_at(l, i)
     }
 
     /// The global `Array` (not shadowed).
@@ -638,13 +788,10 @@ impl Sites<'_> {
             }
             mask |= 1 << i;
             values[i] = Some(&p.value);
-            // A nested literal: of the field's `aot type`, if one.
-            let ts: Vec<&FieldType> =
-                layout.members.iter().map(|m| &m.types[i]).filter(|t| **t != FieldType::Absent).collect();
-            if let FieldType::Struct(k2) = ts[0]
-                && ts.iter().all(|t| **t == FieldType::Struct(*k2))
-            {
-                nested.push((&p.value, *k2));
+            // A nested literal: of the field's `aot type` (or an array of
+            // them), if one.
+            if let Some(t) = field_site_at(layout, i) {
+                nested.push((&p.value, t));
             }
         }
         // Some member whose fields it has, with literal values of its types.
@@ -685,10 +832,23 @@ impl Sites<'_> {
             }
         }
         self.sites.insert(o.span.start, (o.span.end, k));
-        for (v, k2) in nested {
-            self.mark(v, SiteTy::Struct(k2));
+        for (v, t) in nested {
+            self.mark(v, t);
         }
     }
+}
+
+/// What field `i` of layout `l` holds in every member that has it, if an
+/// object of an `aot type` or an array of them.
+fn field_site_at(l: &Layout, i: usize) -> Option<SiteTy> {
+    let mut ts = l.members.iter().map(|m| &m.types[i]).filter(|t| **t != FieldType::Absent);
+    let first = ts.next()?;
+    let site = match first {
+        FieldType::Struct(k) => SiteTy::Struct(*k),
+        FieldType::Array(k) => SiteTy::Array(*k),
+        _ => return None,
+    };
+    ts.all(|t| t == first).then_some(site)
 }
 
 /// Whether a literal value fits a field type (`None`: not a literal).
@@ -716,6 +876,7 @@ fn literal_fits(t: &FieldType, v: &Expression) -> Option<bool> {
         }),
         Expression::BooleanLiteral(_) => Some(*t == FieldType::Bool),
         Expression::ObjectExpression(_) => Some(matches!(t, FieldType::Struct(_))),
+        Expression::ArrayExpression(_) => Some(matches!(t, FieldType::Array(_))),
         _ => None,
     }
 }
@@ -751,9 +912,9 @@ impl<'a> Visit<'a> for Sites<'_> {
                 }
                 AssignmentTarget::StaticMemberExpression(m) => {
                     if let Some(SiteTy::Struct(k)) = self.declared(&m.object)
-                        && let Some(k2) = self.struct_field(k, m.property.name.as_str())
+                        && let Some(t) = self.field_site(k, m.property.name.as_str())
                     {
-                        self.mark(&a.right, SiteTy::Struct(k2));
+                        self.mark(&a.right, t);
                     }
                 }
                 _ => {}
@@ -798,14 +959,14 @@ impl<'a> Visit<'a> for Sites<'_> {
     }
 
     fn visit_function(&mut self, f: &Function<'a>, flags: ScopeFlags) {
-        let ret = f.return_type.as_ref().and_then(|a| site_ty(&a.type_annotation, self.types.ids));
+        let ret = f.return_type.as_ref().and_then(|a| site_ty(&a.type_annotation, self.types.ids, self.types.arrays));
         self.returns.push(ret);
         walk::walk_function(self, f, flags);
         self.returns.pop();
     }
 
     fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
-        let ret = f.return_type.as_ref().and_then(|a| site_ty(&a.type_annotation, self.types.ids));
+        let ret = f.return_type.as_ref().and_then(|a| site_ty(&a.type_annotation, self.types.ids, self.types.arrays));
         if let Some(t) = ret
             && let Some(e) = f.body.as_expression()
         {
