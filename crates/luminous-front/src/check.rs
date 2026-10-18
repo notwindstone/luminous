@@ -548,7 +548,9 @@ fn collect_toplevel<'a>(
                 name,
                 node,
                 symbol: Some(symbol),
-                has_this: false,
+                // (An ordinary function's `this`: the receiver of a call, or
+                // the instance `new` makes.)
+                has_this: matches!(node, FnNode::Function(f) if function_uses_this(f)),
                 site,
                 direct_callable,
                 params,
@@ -1330,6 +1332,29 @@ fn this_arrow(e: &Expression) -> bool {
     matches!(e.without_parentheses(), Expression::ArrowFunctionExpression(_))
 }
 
+/// Whether an ordinary function uses its own `this`: in its parameters or
+/// body, outside nested non-arrow functions (conservatively: in a class).
+fn function_uses_this(f: &Function) -> bool {
+    use oxc::ast_visit::Visit;
+    use oxc::syntax::scope::ScopeFlags;
+    struct Finder(bool);
+    impl<'a> Visit<'a> for Finder {
+        fn visit_this_expression(&mut self, _: &ThisExpression) {
+            self.0 = true;
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+        fn visit_class(&mut self, _: &Class<'a>) {
+            self.0 = true;
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_formal_parameters(&f.params);
+    if let Some(body) = &f.body {
+        finder.visit_function_body(body);
+    }
+    finder.0
+}
+
 /// Whether `this` appears in `e` outside nested non-arrow functions.
 fn mentions_this(e: &Expression) -> bool {
     use oxc::ast_visit::Visit;
@@ -1616,6 +1641,7 @@ impl<'m, 'a> ModuleCx<'m, 'a> {
             fx.rest = rest;
             fx.class = class;
             fx.has_this = has_this;
+            fx.ordinary_this = has_this && class.is_none() && ctor.is_none();
             fx.ctor = ctor.clone();
             fx.ret_int = ret_annot == Some(Ty::I32);
             fx.seg_cells = cells.clone();
@@ -1795,6 +1821,9 @@ struct FnCx<'x, 'm, 'a> {
     is_closure: bool,
     /// Methods: `this` is the receiver.
     has_this: bool,
+    /// An ordinary function (not a method) with a `this`: still a
+    /// constructor.
+    ordinary_this: bool,
     is_async: bool,
     is_generator: bool,
     /// Methods (and the closures in them): their class, and whether the
@@ -2200,6 +2229,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             key,
             is_closure,
             has_this: false,
+            ordinary_this: false,
             ctor: None,
             this_local: None,
             deferred_fields: Vec::new(),
@@ -2513,7 +2543,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             FnNode::Function(f) if let Some(id) = &f.id => id.name.to_string(),
             _ => name,
         };
-        let constructor = matches!(node, FnNode::Function(f) if !f.r#async && !f.generator) && !self.has_this;
+        let constructor = matches!(node, FnNode::Function(f) if !f.r#async && !f.generator)
+            && (!self.has_this || self.ordinary_this);
         let mut func = ir::Func {
             constructor,
             name,
@@ -3697,7 +3728,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // (A class inside a function: no private names or `super.x` of
         // its own; not those of the class around it either.)
         inner.class = if method || ctor.is_some() { None } else { self.class };
-        inner.has_this = method;
+        let ordinary_this = !method && ctor.is_none() && matches!(node, FnNode::Function(f) if function_uses_this(f));
+        inner.has_this = method || ordinary_this;
+        inner.ordinary_this = ordinary_this;
         inner.class_ctor = ctor.is_some();
         inner.ctor = ctor;
         inner.ret_int = ret == Some(Ty::I32);
@@ -6105,6 +6138,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         callee: Option<&'a IdentifierReference<'a>>,
         this: Option<Expr>,
     ) -> R<Option<Expr>> {
+        // (An ordinary function using `this`, called plainly: undefined.)
+        let this = this.or_else(|| self.m.cands[i].has_this.then(undefined));
         let call = |i: usize, out: Vec<Expr>| match &this {
             Some(t) => ExprKind::CallDirectThis(i, Box::new(t.clone()), out),
             None => ExprKind::Call(i, out),
@@ -6208,6 +6243,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             });
         }
         if !checks.is_empty() {
+            // (Checked calls pass no `this`: through the JS entry.)
+            if this.is_some() {
+                self.pre.truncate(start);
+                return Ok(None);
+            }
             let callee = any(self.ident(callee.unwrap())?);
             let call = ExprKind::CallChecked { func: i, callee: Box::new(callee), args: out, checks };
             return Ok(Some(Expr::new(Ty::Any, call)));
@@ -6577,6 +6617,7 @@ fn describe_expr(e: &Expression) -> &'static str {
         Expression::TaggedTemplateExpression(_) => "tagged template",
         Expression::PrivateFieldExpression(_) | Expression::PrivateInExpression(_) => "private field",
         Expression::Super(_) => "super",
+        Expression::NewTarget(_) => "new.target",
         _ => "this expression kind",
     }
 }

@@ -90,7 +90,7 @@ function dynamic(...xs: number[]): number {
   let c: int = 2147483647;
   for (const x of xs) c += x | 0;
   c++;
-  return (this === undefined ? xs.length : -1) + c;
+  return (new.target === undefined ? xs.length : -1) + c;
 }
 
 console.log(counts());

@@ -1,5 +1,5 @@
 // @error `aot` function `count` cannot be compiled natively
-// @error unsupported expression: this
+// @error unsupported expression: new.target
 const count = aot function (): number {
-  return this === undefined ? 0 : 1;
+  return new.target === undefined ? 0 : 1;
 };
