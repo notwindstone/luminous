@@ -99,7 +99,10 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define LUM_PIN_STRING_FNS 35
 /* Map.prototype.get, set, has, Set.prototype.add, has (JS_CallMapFn). */
 #define LUM_PIN_MAP_FNS 41
-#define LUM_PINS 46
+/* JSON.stringify. */
+#define LUM_PIN_JSON_STRINGIFY 46
+#define LUM_PINS 47
+JSValue lum_struct_stringify(JSContext *ctx, JSValueConst v);
 int lum_is_promise_resolve(JSValue promise, JSValue resolve);
 int lum_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
 JSValue lum_function_kind(JSContext *ctx, JSValue func, JSValueConst fallback, int kind);
@@ -312,6 +315,19 @@ typedef struct LumStruct {
 
 extern const LumLayoutDesc lum_layouts[] __attribute__((weak));
 extern const int32_t lum_nlayouts __attribute__((weak));
+/* Per layout: the function that writes its objects' JSON (generated with
+ * the layouts; NULL when a key needs escapes). */
+extern JSJSONRecordFunc *const lum_layout_json[] __attribute__((weak));
+/* The JSON of an object of an `aot type` (`s`) the general way, from field
+ * `from` on (`first`: no field written yet; `from` 0: from its `{`). */
+int lum_struct_json_from(JSContext *ctx, JSJSONWriter *w, const LumStruct *s, int depth, uint32_t from, int first);
+/* Whether a field holding v is written by JSON.stringify (not undefined, a
+ * symbol or a function). */
+static inline int lum_json_present(JSContext *ctx, JSValueConst v)
+{
+    int tag = JS_VALUE_GET_NORM_TAG(v);
+    return tag != JS_TAG_UNDEFINED && tag != JS_TAG_SYMBOL && !(tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v));
+}
 extern const char *const lum_struct_lits[] __attribute__((weak));
 extern const int32_t lum_nstruct_lits __attribute__((weak));
 extern uint32_t lum_struct_class;

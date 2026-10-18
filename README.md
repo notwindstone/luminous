@@ -137,9 +137,9 @@ regular call path's generated code alone.
 `0010-class-constructors.patch`, `0011-compressed-pointers.patch`,
 `0012-pristine-builtins.patch`, `0013-json-trailing-holes.patch`,
 `0014-gc-marking.patch`, `0015-object-model.patch`,
-`0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch` and
-`0018-await-or-value.patch`, each made against the tree the earlier ones
-give) and builds the engine without
+`0016-gc-trigger-inline.patch`, `0017-allocation-fast-paths.patch`,
+`0018-await-or-value.patch` and `0019-json-fast-paths.patch`, each made
+against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
 inline into each other), and without straight-line vectorization. The patch adds API and a few fast paths that keep the
@@ -308,13 +308,32 @@ engine's semantics:
   without making strings: integers two digits at a time, and decimals of
   up to 8 fraction digits as the shortest that reads back exactly (checked
   with one division per digit count; others go to the engine's `js_dtoa`);
-  ropes (strings built by `+`) are written too (`0005`);
+  ropes (strings built by `+`) are written too (`0005`). A hashed shape
+  (one shared by its objects, which a change unhashes first) keeps what
+  JSON writes of its objects' properties, `,"key":` for each, made the
+  first time: an object of it is written key by key from that, each key
+  and number, short string, boolean or `null` in room reserved once, with
+  no per-key checks (atom kind, index keys, flags, escapes). Dates are
+  written as `toISOString` writes them, without calling `toJSON`, while
+  `Date.prototype`'s `toJSON`, `toISOString`, `valueOf` and
+  `@@toPrimitive` are the builtins (`toISOString` itself no longer goes
+  through `printf`), and whether `Object.prototype` and `Array.prototype`
+  have a `toJSON` is a watched bit rather than a lookup per object
+  (`0019`). A 4-property object (`{ id, name, x, y }`): 2,035
+  instructions, now 788 (bun 1.4.3: 1,311; Bun's AOT compiler, untyped:
+  1,293); with two Dates: 23,551, now 1,429 (bun 12,524; Bun's AOT
+  compiler 1,687);
 - `JS_SetJSONWriter` and `JS_JSONWrite8` / `Int` / `Number` / `Value`: the
   same fast path hands an object of a registered class (no properties in
   its shape; `Object.prototype`, `null` or `Array.prototype` as its
   prototype, without `toJSON`) to the class's writer, which writes it from
   its own data or declines (the general algorithm then runs). `aot type`
   objects and arrays of them are written this way (`0005`);
+  `JS_JSONStringifyData` / `JS_JSONStringifyWith`: the fast path called
+  directly, the latter with a function writing a record of such an object;
+  `JS_JSONRoom` / `JS_JSONCommit` and the `JS_JSONPut*` writers: room in
+  the output for code outside the engine, which writes into it directly
+  (`0019`);
 - `JS_ShareObjectShape`: gives the builtin prototypes (`String.prototype`,
   `Array.prototype`, `Map.prototype`, …), constructors and namespaces
   (`Object`, `Array`, `JSON`, `Reflect`, …) shared shapes once their
@@ -1398,8 +1417,10 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   A `let` / `const` declared `T[]` that is only ever assigned such arrays
   is typed everywhere, module bindings included.
 - **Native code** reads and writes fields at fixed offsets: on a value of a
-  declared `aot type` (a literal, a parameter, a field), `p.x` is one load
-  of an int32 and arithmetic on it stays in integers. Elsewhere (an element
+  declared `aot type` (a literal, a parameter, a field, an element of an
+  array of them: `xs[i].x = v` checks the element is an object after
+  evaluating `v`, as JS does), `p.x` is one load of an int32 and arithmetic
+  on it stays in integers. Elsewhere (an element
   of a plain array), property caches recognize the object's layout. An
   object that does not escape is not allocated at all: its fields become
   locals, with the same checks on stores. In a loop that runs no other code
@@ -1410,9 +1431,16 @@ const p: Point = { x: 0, y: 0, z: 0, kind: "colored", color: "#fff" };
   to be one (an element of an untyped array) checks it at the call and
   calls the native function directly.
 - **JSON.** `JSON.stringify` (without a replacer or indentation) writes an
-  object of an `aot type` from its fields, in their order, with each key
-  encoded once when the program starts (`,"name":`), and an array of them
-  element by element, holes as `null` (`JS_SetJSONWriter`, patch 0005).
+  object of an `aot type` from its fields, in their order, and an array of
+  them element by element, holes as `null` (`JS_SetJSONWriter`, patch
+  0005). Each layout has a writer generated with the program (as Bun's AOT
+  compiler makes one per type): straight-line C, keys as constants, values
+  read at their offsets, numbers, booleans and strings of up to 16
+  characters written in room reserved once (`0019`); a layout whose keys
+  need escapes is written field by field. Native code calls
+  `JSON.stringify` directly while it is the builtin, and where the value
+  is statically of an `aot type`, its layout's writer: `{ id, name, x, y }`
+  1,466 instructions, now 577, as Bun's AOT compiler with the type (578).
   The output is the general algorithm's; a `toJSON` on `Object.prototype`
   or `Array.prototype`, another prototype for an array, or nesting deeper
   than 32 sends the whole call to the general algorithm.

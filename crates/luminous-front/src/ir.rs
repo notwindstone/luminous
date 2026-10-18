@@ -902,6 +902,9 @@ pub enum ExprKind {
     /// JS throws reading property `atom` of it, or converting it to an
     /// object (`None`).
     NonNull(Option<AtomId>, Box<Expr>),
+    /// The same for a store of property `atom`: else what JS throws setting
+    /// it on `undefined`.
+    NonNullSet(AtomId, Box<Expr>),
     /// A value converted for field `field` of layout `layout` as a store
     /// would convert it (an `int` wraps; TypeError if not of its type): of
     /// the field's type (see `scalar_replace_structs`).
@@ -1232,7 +1235,12 @@ macro_rules! visitor {
                         $name(x, f);
                     }
                 }
-                StructGet(_, a, _) | StructCoerce(_, _, a) | StructArrFrom(_, a) | StructArrLen(a) | NonNull(_, a) => {
+                StructGet(_, a, _)
+                | StructCoerce(_, _, a)
+                | StructArrFrom(_, a)
+                | StructArrLen(a)
+                | NonNull(_, a)
+                | NonNullSet(_, a) => {
                     $name(a, f)
                 }
                 StructArrGet(_, a, b) | StructArrPush(_, a, b) => {
@@ -2580,7 +2588,9 @@ fn expr_hint(m: &Module, f: &Func, hints: &HashMap<LocalId, Hint>, x: &Expr) -> 
     match &x.kind {
         ExprKind::This => f.class.filter(|&(_, s)| f.has_this && !s).map(|(c, _)| Hint::Class(c)),
         ExprKind::Local(l) => hints.get(l).copied(),
-        ExprKind::Box(e) | ExprKind::NonNull(_, e) | ExprKind::Predicted { expr: e, .. } => expr_hint(m, f, hints, e),
+        ExprKind::Box(e) | ExprKind::NonNull(_, e) | ExprKind::NonNullSet(_, e) | ExprKind::Predicted { expr: e, .. } => {
+            expr_hint(m, f, hints, e)
+        }
         ExprKind::Seq(xs) => expr_hint(m, f, hints, xs.last()?),
         ExprKind::NewInstance { class, .. } | ExprKind::NewInstanceFull { class, .. } => Some(Hint::Class(*class)),
         ExprKind::Call(g, _) | ExprKind::CallChecked { func: g, .. } | ExprKind::CallDirectThis(g, ..) => {

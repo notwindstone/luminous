@@ -200,6 +200,8 @@ pub(crate) enum Method {
     /// `Map.prototype.get`, `set`, `has` (or `Set.prototype.has`),
     /// `Set.prototype.add` (`JS_CallMapFn`), with at most two arguments.
     MapFn(i32),
+    /// `JSON.stringify` (one argument).
+    JsonStringify,
 }
 
 impl Method {
@@ -217,6 +219,7 @@ impl Method {
             "set" => Some(Method::MapFn(1)),
             "has" => Some(Method::MapFn(2)),
             "add" => Some(Method::MapFn(3)),
+            "stringify" => Some(Method::JsonStringify),
             _ => None,
         }
     }
@@ -238,6 +241,8 @@ const PIN_ARRAY_SORT: i32 = 34;
 const PIN_STRING_FNS: i32 = 35;
 /// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
 const PIN_MAP_FNS: i32 = 41;
+/// `JSON.stringify`.
+const PIN_JSON_STRINGIFY: i32 = 46;
 /// `LUM_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -2226,6 +2231,13 @@ impl Lower {
                 self.release(v);
                 v
             }
+            ExprKind::NonNullSet(atom, x) => {
+                let v = self.expr(x);
+                self.hold(v);
+                self.non_null_set(*atom, v.any());
+                self.release(v);
+                v
+            }
             ExprKind::StructCoerce(k, fi, x) => {
                 let v = self.expr(x);
                 let want = e.ty;
@@ -3410,7 +3422,7 @@ impl Lower {
                 // reference while nothing can run before that (the arguments
                 // are pure).
                 let fits = |m: Method| match m {
-                    Method::ArrayPush => args.len() == 1,
+                    Method::ArrayPush | Method::JsonStringify => args.len() == 1,
                     Method::StringFn(_) | Method::MapFn(_) => args.len() <= 2,
                     Method::CharCodeAt => true,
                 };
@@ -3425,6 +3437,7 @@ impl Lower {
                         Method::ArrayPush => self.array_push(fv, f_owned, obj, &args[0]),
                         Method::StringFn(k) => self.string_fn(k, fv, f_owned, obj, args),
                         Method::MapFn(k) => self.map_fn(k, fv, f_owned, obj, args),
+                        Method::JsonStringify => self.json_stringify(fv, f_owned, obj, &args[0]),
                     };
                     self.drop_operand(obj, owned);
                     return r;
@@ -3449,7 +3462,8 @@ impl Lower {
                     Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, None, obj, &args[0]),
                     Some(Method::StringFn(k)) if args.len() <= 2 => self.string_fn(k, fv, None, obj, args),
                     Some(Method::MapFn(k)) if args.len() <= 2 => self.map_fn(k, fv, None, obj, args),
-                    Some(Method::ArrayPush | Method::StringFn(_) | Method::MapFn(_)) | None => {
+                    Some(Method::JsonStringify) if args.len() == 1 => self.json_stringify(fv, None, obj, &args[0]),
+                    Some(Method::ArrayPush | Method::StringFn(_) | Method::MapFn(_) | Method::JsonStringify) | None => {
                         self.call_values(fv, obj, args, pred)
                     }
                 };
@@ -5721,6 +5735,71 @@ impl Lower {
         V::Any(rw)
     }
 
+    /// `JSON.stringify(v)` with `f` (held) the method read: while it is the
+    /// original builtin, the engine's fast path for plain data without a
+    /// call frame (`JS_JSONStringifyData`); else, or when `v` is not such
+    /// data, called. Frees `f`.
+    fn json_stringify(&mut self, f: V, f_owned: Option<Value>, this: V, arg: &Expr) -> V {
+        let held = self.expr(arg);
+        self.hold(held);
+        let vw = self.boxed(held);
+        let fw = f.any();
+        let sw = this.any();
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, PIN_JSON_STRINGIFY * 8);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
+        let direct = self.b.create_block();
+        self.b.ins().brif(same, direct, &[], slow, &[]);
+        self.b.switch_to_block(direct);
+        let ctx = self.ctx;
+        // (An object of an `aot type`, or `undefined`, also as a JS value
+        // for the call: written from its fields.)
+        let typed = |t: Ty| matches!(t, Ty::Struct(_) | Ty::StructOrUndef(_));
+        let is_struct = typed(arg.ty)
+            || match &arg.kind {
+                ExprKind::StructArrGet(..)
+                | ExprKind::StructNew { .. }
+                | ExprKind::NonNull(..)
+                | ExprKind::NonNullSet(..) => true,
+                ExprKind::Local(l) => typed(self.locals[*l]),
+                _ => false,
+            };
+        let entry = if is_struct { "lum_struct_stringify" } else { "JS_JSONStringifyData" };
+        let r = self.helper(entry, &[ctx, vw]);
+        let not_data = self.b.ins().icmp_imm_s(IntCC::Equal, r[0], val_const(TAG_UNINITIALIZED, 0));
+        let done = self.b.create_block();
+        self.b.ins().brif(not_data, slow, &[], done, &[]);
+        self.b.switch_to_block(done);
+        self.check_value_method(r[0], f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+        self.b.switch_to_block(slow);
+        let vals = vec![fw, sw, vw];
+        let slot = self.values_slot(&vals);
+        let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+        let argc = self.b.ins().iconst(I32, 1);
+        // (A borrowed method is held while it runs.)
+        let borrowed = f_owned.is_some();
+        if borrowed {
+            self.dup(fw);
+        }
+        let gw = self.call_linked(fw, sw, 1, argv, false, |l| l.helper("lum_call", &[ctx, slot, argc, argv])[0]);
+        if borrowed {
+            self.free(fw);
+        }
+        self.check_value_method(gw, f, f_owned);
+        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
+        self.b.switch_to_block(join);
+        self.release(held);
+        self.free_v(held);
+        self.drop_method(f, f_owned);
+        V::Any(rw)
+    }
+
     /// `this.get(k)`, `set(k, v)`, `has(k)`, `add(k)` with `f` (held) the
     /// method read: directly (`JS_CallMapFn`) while it is the original
     /// builtin and `this` a Map (a Set for `add`, either for `has`), else
@@ -6932,13 +7011,17 @@ impl Lower {
         }
         // The same, checked to be an object (an element of an array of an
         // `aot type`).
-        if let ExprKind::NonNull(atom, x) = &e.kind
+        if let ExprKind::NonNull(_, x) | ExprKind::NonNullSet(_, x) = &e.kind
             && let ExprKind::Local(l) = x.kind
             && let LVar::Val(..) = self.vars[l]
             && !later.iter().any(|x| ir::assigns_local(x, l))
         {
             let v = self.use_local(l);
-            self.non_null(*atom, v.any());
+            match &e.kind {
+                ExprKind::NonNull(atom, _) => self.non_null(*atom, v.any()),
+                ExprKind::NonNullSet(atom, _) => self.non_null_set(*atom, v.any()),
+                _ => unreachable!(),
+            }
             return (v, false);
         }
         let v = self.expr(e);
@@ -6966,6 +7049,25 @@ impl Lower {
         };
         self.check_value(r[0]);
         self.free(r[0]);
+        let edge = self.throw_edge();
+        self.b.ins().jump(edge, &[]);
+        self.b.switch_to_block(ok);
+    }
+
+    /// Continue if `w` (an object or `undefined`) is an object, else throw
+    /// what JS throws setting property `atom` of it.
+    fn non_null_set(&mut self, atom: ir::AtomId, w: Value) {
+        let ok = self.b.create_block();
+        let bad = self.b.create_block();
+        self.b.set_cold_block(bad);
+        let is_obj = self.val_is(w, TAG_OBJECT);
+        self.b.ins().brif(is_obj, ok, &[], bad, &[]);
+        self.b.switch_to_block(bad);
+        let ctx = self.ctx;
+        let a = self.atom(atom);
+        let undef = self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+        let r = self.helper("JS_SetProperty", &[ctx, w, a, undef]);
+        self.check_int(r[0]);
         let edge = self.throw_edge();
         self.b.ins().jump(edge, &[]);
         self.b.switch_to_block(ok);

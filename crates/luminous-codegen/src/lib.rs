@@ -527,6 +527,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_ToFloat64", &[P, P, W], &[Int]),
         ("JS_ToString", &[P, W], &[W]),
         ("JS_GetProperty", &[P, W, Int], &[W]),
+        ("JS_JSONStringifyData", &[P, W], &[W]),
+        ("lum_struct_stringify", &[P, W], &[W]),
         ("JS_SetProperty", &[P, W, Int, W], &[Int]),
         ("JS_DefinePropertyValue", &[P, W, Int, W, Int], &[Int]),
         ("JS_GetPropertyValue", &[P, W, W], &[W]),

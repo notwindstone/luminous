@@ -446,6 +446,111 @@ JSModuleDef *js_init_module_{MODULE_CNAME}(JSContext *ctx, const char *name)
     c
 }
 
+/// The function writing the JSON of the objects of layout `k` (as the
+/// general way, `lum_struct_json_from`, writes them): its name, or `None`
+/// when a key needs escapes. Straight-line code: keys as constants, values
+/// at their offsets, the room for each run of fields up to a JS value
+/// (a string or an object) reserved at once; where room cannot be had (the
+/// output has 16-bit characters), the general way continues.
+fn json_writer(c: &mut String, k: usize, l: &ir::Layout) -> Option<String> {
+    let plain = |n: &str| n.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\');
+    if !l.fields.iter().all(|f| plain(&f.name)) {
+        return None;
+    }
+    let name = format!("lum_json_{k}");
+    let max_value = |st: ir::Storage| match st {
+        ir::Storage::Int32 => 11,
+        ir::Storage::F64 => 32,
+        ir::Storage::Bool => 5,
+        ir::Storage::Value => 18,
+    };
+    // The room for the fields from `i` on, with JS values as short strings
+    // (JS_JSONPutShortString, 18 characters), and the closing brace.
+    let room = |i: usize| -> usize { l.fields[i..].iter().map(|f| f.name.len() + 4 + max_value(f.storage)).sum::<usize>() + 1 };
+    writeln!(c, "static int {name}(JSContext *ctx, JSJSONWriter *w, const void *rec, int depth)\n{{").unwrap();
+    c.push_str("    const LumStruct *s = rec;\n    const uint8_t *d = (const uint8_t *)s->data;\n");
+    c.push_str("    uint8_t *p, *q;\n    int first = 1, r;\n    JSValue v;\n");
+    c.push_str("    (void)first; (void)r; (void)v; (void)d; (void)q;\n");
+    writeln!(c, "    if (!(p = JS_JSONRoom(w, {})))", 1 + room(0)).unwrap();
+    c.push_str("        return lum_struct_json_from(ctx, w, s, depth, 0, 1);\n    *p++ = '{';\n");
+    // Whether a field before is written for sure (then a key has its
+    // comma), or may be (then `first` tells).
+    let (mut certain, mut possible) = (false, false);
+    for (i, f) in l.fields.iter().enumerate() {
+        let off = f.offset;
+        let key = format!(",\"{}\":", f.name);
+        let put_key = |c: &mut String, indent: &str, certain: bool, possible: bool| {
+            if certain {
+                writeln!(c, "{indent}memcpy(p, {}, {}); p += {};", c_str(&key), key.len(), key.len()).unwrap();
+            } else if !possible {
+                writeln!(c, "{indent}memcpy(p, {}, {}); p += {};", c_str(&key[1..]), key.len() - 1, key.len() - 1)
+                    .unwrap();
+            } else {
+                writeln!(
+                    c,
+                    "{indent}if (first) {{ memcpy(p, {}, {}); p += {}; }} else {{ memcpy(p, {}, {}); p += {}; }}",
+                    c_str(&key[1..]),
+                    key.len() - 1,
+                    key.len() - 1,
+                    c_str(&key),
+                    key.len(),
+                    key.len()
+                )
+                .unwrap();
+            }
+            writeln!(c, "{indent}first = 0;").unwrap();
+        };
+        let cond = if f.universal { None } else { Some(format!("s->mask & {}u", 1u32 << i)) };
+        match f.storage {
+            ir::Storage::Value => {
+                writeln!(c, "    v = *(const JSValue *)(d + {off});").unwrap();
+                match &cond {
+                    Some(m) => writeln!(c, "    if (({m}) && lum_json_present(ctx, v)) {{").unwrap(),
+                    None => c.push_str("    if (lum_json_present(ctx, v)) {\n"),
+                }
+                put_key(c, "        ", certain, possible);
+                c.push_str("        if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING && (q = JS_JSONPutShortString(p, v))) {\n");
+                c.push_str("            p = q;\n        } else {\n");
+                c.push_str("            JS_JSONCommit(w, p);\n            r = JS_JSONWriteValue(ctx, w, v, depth + 1);\n");
+                c.push_str("            if (r <= 0)\n                return r;\n");
+                writeln!(c, "            if (!(p = JS_JSONRoom(w, {})))", room(i + 1)).unwrap();
+                writeln!(c, "                return lum_struct_json_from(ctx, w, s, depth, {}, 0);", i + 1).unwrap();
+                c.push_str("        }\n    }\n");
+                possible = true;
+            }
+            st => {
+                let indent = if cond.is_some() { "        " } else { "    " };
+                if let Some(m) = &cond {
+                    writeln!(c, "    if ({m}) {{").unwrap();
+                }
+                put_key(c, indent, certain, possible);
+                match st {
+                    ir::Storage::Int32 => {
+                        writeln!(c, "{indent}p = JS_JSONPutInt(p, *(const int32_t *)(d + {off}));").unwrap()
+                    }
+                    ir::Storage::F64 => {
+                        writeln!(c, "{indent}p = JS_JSONPutDouble(p, *(const double *)(d + {off}));").unwrap()
+                    }
+                    _ => writeln!(
+                        c,
+                        "{indent}if (d[{off}]) {{ memcpy(p, \"true\", 4); p += 4; }} else {{ memcpy(p, \"false\", 5); p += 5; }}"
+                    )
+                    .unwrap(),
+                }
+                if cond.is_some() {
+                    c.push_str("    }\n");
+                    possible = true;
+                } else {
+                    certain = true;
+                    possible = true;
+                }
+            }
+        }
+    }
+    c.push_str("    *p++ = '}';\n    JS_JSONCommit(w, p);\n    return 1;\n}\n");
+    Some(name)
+}
+
 /// The `aot type` layouts (`LumLayoutDesc`), and the literal strings
 /// their fields may hold.
 fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
@@ -503,6 +608,15 @@ fn layouts(c: &mut String, m: &ir::Module, int_wrapping: bool) {
     }
     c.push_str("    { NULL, 0, 0, 0, 0, NULL, NULL },\n};\n");
     writeln!(c, "const int32_t lum_nlayouts = {};", m.layouts.len()).unwrap();
+    let mut writers = Vec::new();
+    for (k, l) in m.layouts.iter().enumerate() {
+        writers.push(json_writer(c, k, l));
+    }
+    c.push_str("JSJSONRecordFunc *const lum_layout_json[] = {\n");
+    for w in &writers {
+        writeln!(c, "    {},", w.as_deref().unwrap_or("NULL")).unwrap();
+    }
+    c.push_str("    NULL,\n};\n");
     c.push_str("const char *const lum_struct_lits[] = {\n");
     for s in &lits {
         writeln!(c, "    {},", c_str(s)).unwrap();

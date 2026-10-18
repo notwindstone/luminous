@@ -1,0 +1,976 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1477,6 +1477,119 @@
+ JS_EXTERN int JS_JSONWriteInt(JSJSONWriter *w, int32_t v);
+ JS_EXTERN int JS_JSONWriteNumber(JSContext *ctx, JSJSONWriter *w, double d);
+ JS_EXTERN int JS_JSONWriteValue(JSContext *ctx, JSJSONWriter *w, JSValueConst v, int depth);
++/* luminous: writing JSON directly into a writer, for code outside the
++   engine: JS_JSONRoom gives room for n more characters (where they go, or
++   NULL when the writer has 16-bit characters or cannot grow: write with
++   the JS_JSONWrite functions then), and JS_JSONCommit takes where the
++   written characters end. The writer is the engine's string buffer
++   (JSJSONWriterView: its string, header then 8-bit characters). */
++#define JS_LAYOUT_STRING_CHARS 24
++typedef struct JSJSONWriterView {
++    JSContext *ctx;
++    void *str;
++    int len;
++    int size;
++    int is_wide_char;
++    int error_status;
++} JSJSONWriterView;
++JS_EXTERN uint8_t *JS_JSONRoomSlow(JSJSONWriter *w, int n);
++static inline uint8_t *JS_JSONRoom(JSJSONWriter *w, int n)
++{
++    JSJSONWriterView *v = (JSJSONWriterView *)w;
++    if (__builtin_expect(!v->is_wide_char && v->len + n <= v->size, 1))
++        return (uint8_t *)v->str + JS_LAYOUT_STRING_CHARS + v->len;
++    return JS_JSONRoomSlow(w, n);
++}
++static inline void JS_JSONCommit(JSJSONWriter *w, uint8_t *end)
++{
++    JSJSONWriterView *v = (JSJSONWriterView *)w;
++    v->len = (int)(end - ((uint8_t *)v->str + JS_LAYOUT_STRING_CHARS));
++}
++/* An int32 (at most 11 characters) or a number (at most 32) at p, as JSON
++   writes it: where it ends. */
++JS_EXTERN uint8_t *JS_JSONPutIntSlow(uint8_t *p, int32_t v);
++JS_EXTERN uint8_t *JS_JSONPutDoubleSlow(uint8_t *p, double d);
++static inline uint8_t *JS_JSONPutInt(uint8_t *p, int32_t v)
++{
++    if ((uint32_t)v < 10) {
++        *p = (uint8_t)('0' + v);
++        return p + 1;
++    }
++    if ((uint32_t)v < 100) {
++        p[0] = (uint8_t)('0' + v / 10);
++        p[1] = (uint8_t)('0' + v % 10);
++        return p + 2;
++    }
++    return JS_JSONPutIntSlow(p, v);
++}
++static inline uint8_t *JS_JSONPutDouble(uint8_t *p, double d)
++{
++    if (d >= -2147483648.0 && d <= 2147483647.0 && d == (double)(int32_t)d)
++        return JS_JSONPutInt(p, (int32_t)d); /* (-0 too: "0") */
++    return JS_JSONPutDoubleSlow(p, d);
++}
++/* A string of at most 16 8-bit characters that JSON writes as they are
++   (no escapes), quoted at p (at most 18 characters): where it ends, else
++   NULL. A string's header: its length (31 bits) and whether its characters
++   are 16-bit (the top bit), then its kind (bits 28-29 of the second word: 0
++   when the characters follow the header); JS_LayoutCheck checks. */
++#define JS_LAYOUT_STRING_KIND_WORD 4
++#define JS_LAYOUT_STRING_KIND_SHIFT 28
++static inline int JS_JSONWordPlain(uint64_t w)
++{
++    const uint64_t ones = 0x0101010101010101ULL, high = 0x8080808080808080ULL;
++    uint64_t q = w ^ (ones * '"'), s = w ^ (ones * '\\');
++    uint64_t bad = ((w - ones * 0x20) & ~w) | ((q - ones) & ~q) | ((s - ones) & ~s) | w;
++    return (bad & high) == 0;
++}
++static inline uint8_t *JS_JSONPutShortString(uint8_t *p, JSValueConst v)
++{
++    const uint8_t *s = (const uint8_t *)JS_VALUE_GET_PTR(v);
++    uint32_t n, kind;
++    uint64_t a, b;
++    memcpy(&n, s, 4);
++    memcpy(&kind, s + JS_LAYOUT_STRING_KIND_WORD, 4);
++    if (n > 16 || ((kind >> JS_LAYOUT_STRING_KIND_SHIFT) & 3) != 0)
++        return NULL; /* (16-bit characters: n over 2^31) */
++    s += JS_LAYOUT_STRING_CHARS;
++    p[0] = '"';
++    if (n >= 8) {
++        memcpy(&a, s, 8);
++        memcpy(&b, s + n - 8, 8);
++        if (!(JS_JSONWordPlain(a) & JS_JSONWordPlain(b)))
++            return NULL;
++        memcpy(p + 1, &a, 8);
++        memcpy(p + 1 + n - 8, &b, 8);
++    } else if (n >= 4) {
++        uint32_t x, y;
++        memcpy(&x, s, 4);
++        memcpy(&y, s + n - 4, 4);
++        if (!JS_JSONWordPlain(x | (uint64_t)y << 32))
++            return NULL;
++        memcpy(p + 1, &x, 4);
++        memcpy(p + 1 + n - 4, &y, 4);
++    } else if (n > 0) {
++        if (!JS_JSONWordPlain(0x4141414141000000ULL | s[0] | (uint32_t)s[n / 2] << 8 | (uint32_t)s[n - 1] << 16))
++            return NULL;
++        p[1] = s[0];
++        p[1 + n / 2] = s[n / 2];
++        p[n] = s[n - 1];
++    }
++    p[n + 1] = '"';
++    return p + n + 2;
++}
++/* A record's JSON, written by a function of the class with the JSON
++   writer (as JSJSONWriteFunc): 1, 0 (a value is not data), -1. */
++typedef int JSJSONRecordFunc(JSContext *ctx, JSJSONWriter *w, const void *rec, int depth);
++/* luminous: JSON.stringify(v), without a replacer or indentation, when v
++   is plain data (the fast path's), else JS_UNINITIALIZED (the general
++   algorithm then runs from the start: nothing observable happened). */
++JS_EXTERN JSValue JS_JSONStringifyData(JSContext *ctx, JSValueConst v);
++/* luminous: the same for an object of a class with a JSON writer, as
++   fn writes its record `rec` (JS_UNINITIALIZED: as JS_JSONStringifyData,
++   also when the object has own properties, a prototype other than
++   Object.prototype, null or Array.prototype, or a toJSON may apply). */
++JS_EXTERN JSValue JS_JSONStringifyWith(JSContext *ctx, JSValueConst obj, JSJSONRecordFunc *fn, const void *rec);
+ 
+ /* Manages the backing memory of an externally created ArrayBuffer.
+    When 'size' is zero, 'ptr' must be freed and NULL returned. Otherwise the
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1426,6 +1426,10 @@
+     int deleted_prop_count;
+     JSShape *shape_hash_next; /* in JSRuntime.shape_hash[h] list */
+     JSObject *proto;
++    /* luminous: while the shape is hashed (so unchanged: a change unhashes
++       it first), what JSON.stringify writes of its objects' properties
++       (JSJSONKeys), made when first needed; freed when unhashed */
++    void *json_keys;
+     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
+ };
+ 
+@@ -1917,6 +1921,10 @@
+ #define JS_PRISTINE_ARRAY_SPECIES 64 /* %Array.prototype%.constructor is %Array%,
+                                         %Array%[@@species] the getter returning `this` */
+ #define JS_PRISTINE_NO_THEN    128 /* %Object.prototype% has no `then` */
++#define JS_PRISTINE_NO_TOJSON  256 /* %Object.prototype% and %Array.prototype% have no
++                                      `toJSON` */
++#define JS_PRISTINE_DATE_JSON  512 /* %Date.prototype%'s toJSON, toISOString, valueOf and
++                                      @@toPrimitive are the builtins */
+ static int js_pristine_update(JSContext *ctx);
+ /* Which of JS_PRISTINE_* hold. */
+ static inline int js_pristine(JSContext *ctx);
+@@ -7507,6 +7515,10 @@
+     uint32_t h;
+     JSShape **psh;
+ 
++    if (sh->json_keys) {
++        js_free_rt(rt, sh->json_keys);
++        sh->json_keys = NULL;
++    }
+     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
+     psh = &rt->shape_hash[h];
+     while (*psh != sh)
+@@ -7545,6 +7557,7 @@
+     sh->special_props = false;
+     sh->pinned = false;
+     sh->watched = false;
++    sh->json_keys = NULL;
+     return sh;
+ }
+ 
+@@ -7635,6 +7648,7 @@
+     sh->is_hashed = false;
+     sh->pinned = false;
+     sh->watched = false;
++    sh->json_keys = NULL;
+     if (sh->proto) {
+         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+     }
+@@ -56315,10 +56329,12 @@
+     return str8(b->str) + b->len;
+ }
+ 
+-static inline uint8_t *js_json_room8(StringBuffer *b, int n)
++/* (The fast path's buffer is a string of the normal kind, 8-bit until
++   widened: its characters follow its header.) */
++static inline __attribute__((always_inline)) uint8_t *js_json_room8(StringBuffer *b, int n)
+ {
+     if (likely(!b->is_wide_char && b->len + n <= b->size))
+-        return str8(b->str) + b->len;
++        return (uint8_t *)&b->str[1] + b->len;
+     return js_json_room8_slow(b, n);
+ }
+ 
+@@ -56348,7 +56364,7 @@
+     }
+ }
+ 
+-static inline int js_json_put8(StringBuffer *b, const uint8_t *s, int n)
++static inline __attribute__((always_inline)) int js_json_put8(StringBuffer *b, const uint8_t *s, int n)
+ {
+     uint8_t *p = js_json_room8(b, n);
+     if (unlikely(!p))
+@@ -56384,7 +56400,7 @@
+     return len;
+ }
+ 
+-static int js_json_put_int(StringBuffer *b, int32_t v)
++static no_inline int js_json_put_int_slow(StringBuffer *b, int32_t v)
+ {
+     uint8_t *p = js_json_room8(b, 11);
+     int len;
+@@ -56402,6 +56418,33 @@
+     return 0;
+ }
+ 
++/* (0 to 99 inline) */
++static inline __attribute__((always_inline)) int js_json_put_int(StringBuffer *b, int32_t v)
++{
++    uint8_t *p;
++    if ((uint32_t)v < 100 && (p = js_json_room8(b, 2))) {
++        if (v < 10) {
++            p[0] = '0' + v;
++            b->len++;
++        } else {
++            memcpy(p, js_json_digits2 + 2 * v, 2);
++            b->len += 2;
++        }
++        return 0;
++    }
++    return js_json_put_int_slow(b, v);
++}
++
++static inline __attribute__((always_inline)) int js_json_putc(StringBuffer *b, uint8_t c)
++{
++    uint8_t *p = js_json_room8(b, 1);
++    if (unlikely(!p))
++        return string_buffer_putc8(b, c);
++    *p = c;
++    b->len++;
++    return 0;
++}
++
+ /* (8 bytes at a time: whether any is below 0x20, '"', '\\' or above 0x7f) */
+ static inline bool js_json_word_plain(uint64_t w)
+ {
+@@ -56411,21 +56454,59 @@
+     return (bad & high) == 0;
+ }
+ 
++/* The characters JSON writes as they are, without escapes (printable
++   ASCII but '"' and '\\'). */
++static const uint8_t js_json_plain8[256] = {
++    [0x20 ... 0x21] = 1, [0x23 ... 0x5b] = 1, [0x5d ... 0x7e] = 1, /* (not '"', '\\') */
++};
++
++/* How many of the first `len` characters at src are plain, 8 at a time
++   (up to the last 7 or fewer). */
++static no_inline uint32_t js_json_plain_words(const uint8_t *src, uint32_t len)
++{
++    uint32_t i = 0;
++    uint64_t w;
++    for (; i + 8 <= len; i += 8) {
++        memcpy(&w, src + i, 8);
++        if (!js_json_word_plain(w))
++            break;
++    }
++    return i;
++}
++
++/* Whether the n (1 to 16) characters at s are plain: two overlapping
++   loads tested 8 at a time (shorter strings padded with a plain 'A'). */
++static inline bool js_json_plain16(const uint8_t *s, uint32_t n)
++{
++    uint64_t a, b;
++    if (n >= 8) {
++        memcpy(&a, s, 8);
++        memcpy(&b, s + n - 8, 8);
++        return js_json_word_plain(a) & js_json_word_plain(b);
++    }
++    if (n >= 4) {
++        uint32_t x, y;
++        memcpy(&x, s, 4);
++        memcpy(&y, s + n - 4, 4);
++        a = x | (uint64_t)y << 32;
++    } else {
++        a = 0x4141414141000000ULL | s[0] | (uint32_t)s[n / 2] << 8 | (uint32_t)s[n - 1] << 16;
++    }
++    return js_json_word_plain(a);
++}
++
+ static int js_json_fast_string(StringBuffer *b, JSString *str)
+ {
+     if (!str->is_wide_char && str->kind == JS_STRING_KIND_NORMAL) {
+-        const uint8_t *src = str8(str);
+-        uint32_t len = str->len, i = 0;
+-        uint64_t w;
+-        for (; i + 8 <= len; i += 8) {
+-            memcpy(&w, src + i, 8);
+-            if (!js_json_word_plain(w))
+-                break;
+-        }
+-        for (; i < len; i++) {
+-            uint8_t c = src[i];
+-            if (c < 0x20 || c == '"' || c == '\\' || c >= 0x80)
+-                break;
++        const uint8_t *src = (const uint8_t *)&str[1];
++        uint32_t len = str->len, i = len;
++        if (len <= 16) {
++            if (len && !js_json_plain16(src, len))
++                i = 0;
++        } else {
++            i = js_json_plain_words(src, len);
++            while (i < len && js_json_plain8[src[i]])
++                i++;
+         }
+         if (i == len) {
+             uint8_t *p = js_json_room8(b, len + 2);
+@@ -56466,9 +56547,11 @@
+ static int js_dtoa_short(char *buf, double d)
+ {
+     static const double pow10[] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8 };
++    static const uint32_t pow10i[] = { 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000 };
+     double a = fabs(d), m;
+-    char digits[24], *q = buf;
+-    int k, len;
++    char *q = buf;
++    uint64_t mi, ip, fp;
++    int k, j;
+     if (a < 0x1p53 && a == trunc(a)) {
+         if (d < 0)
+             *q++ = '-';
+@@ -56480,36 +56563,32 @@
+         m = a * pow10[k];
+         if (m >= 0x1p50)
+             return -1;
+-        m = floor(m + 0.5);
++        m = (double)(int64_t)(m + 0.5); /* (floor: m is positive) */
+         if (m / pow10[k] == a)
+             break;
+     }
+     if (k > 8)
+         return -1;
+-    len = js_json_u64((uint8_t *)digits, (uint64_t)m);
++    /* (The least k: the last fraction digit is not 0.) */
++    mi = (uint64_t)m;
++    ip = mi / pow10i[k];
++    fp = mi - ip * pow10i[k];
+     if (d < 0)
+         *q++ = '-';
+-    if (len > k) {
+-        memcpy(q, digits, len - k);
+-        q += len - k;
+-        *q++ = '.';
+-    } else {
+-        *q++ = '0';
+-        *q++ = '.';
+-        memset(q, '0', k - len);
+-        q += k - len;
++    q += js_json_u64((uint8_t *)q, ip);
++    *q++ = '.';
++    for (j = k - 1; j >= 0; j--) {
++        q[j] = '0' + fp % 10;
++        fp /= 10;
+     }
+-    memcpy(q, digits + len - min_int(len, k), min_int(len, k));
+-    return q + min_int(len, k) - buf;
++    return q + k - buf;
+ }
+ 
+-static int js_json_fast_number(JSContext *ctx, StringBuffer *b, double d)
++static no_inline int js_json_number_slow(StringBuffer *b, double d)
+ {
+     char buf[64];
+     int len;
+     JSDTOATempMem dtoa_mem;
+-    if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d) /* (-0 too: "0") */
+-        return js_json_put_int(b, (int32_t)d);
+     if (!isfinite(d))
+         return js_json_put8(b, (const uint8_t *)"null", 4);
+     len = js_dtoa_short(buf, d);
+@@ -56518,6 +56597,129 @@
+     return js_json_put8(b, (uint8_t *)buf, len);
+ }
+ 
++static int js_json_fast_number(JSContext *ctx, StringBuffer *b, double d)
++{
++    uint8_t *p;
++    int len;
++    if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d) /* (-0 too: "0") */
++        return js_json_put_int(b, (int32_t)d);
++    /* (a short decimal written in place: at most 26 characters) */
++    if (isfinite(d) && (p = js_json_room8(b, 32)) && (len = js_dtoa_short((char *)p, d)) >= 0) {
++        b->len += len;
++        return 0;
++    }
++    return js_json_number_slow(b, d);
++}
++
++static int js_date_iso(uint8_t *p, double t);
++
++/* v's digits at p: where they end. */
++static inline __attribute__((always_inline)) uint8_t *js_json_int_at(uint8_t *p, int32_t v)
++{
++    if ((uint32_t)v < 10) {
++        *p = '0' + v;
++        return p + 1;
++    }
++    if ((uint32_t)v < 100) {
++        memcpy(p, js_json_digits2 + 2 * v, 2);
++        return p + 2;
++    }
++    if (v < 0) {
++        *p = '-';
++        return p + 1 + js_json_u64(p + 1, -(int64_t)v);
++    }
++    return p + js_json_u64(p, v);
++}
++
++/* luminous: what JSON.stringify writes of the properties of the objects
++   of a hashed shape (JSShape.json_keys): `,"key":` for each enumerable
++   string-keyed data property, in order (the text after the entries). */
++#define JS_JSON_KEYS_OK   0
++#define JS_JSON_KEYS_SLOW 1 /* a key needs escapes or 16-bit characters: written one by one */
++#define JS_JSON_KEYS_NO   2 /* not plain data: an index key, `toJSON`, an accessor */
++typedef struct JSJSONKeys {
++    uint32_t count;
++    uint8_t state;
++    struct {
++        uint32_t prop, off, len;
++    } e[];
++} JSJSONKeys;
++
++static JSJSONKeys *js_json_keys(JSContext *ctx, JSShape *sh)
++{
++    JSRuntime *rt = ctx->rt;
++    JSShapeProperty *prs = get_shape_prop(sh);
++    uint32_t i, j, n = 0, text = 0, idx;
++    uint8_t state = JS_JSON_KEYS_OK;
++    JSJSONKeys *k;
++    char *t;
++
++    for (i = 0; i < sh->prop_count; i++) {
++        JSAtom atom = prs[i].atom;
++        JSAtomStruct *as;
++        if (atom == JS_ATOM_NULL)
++            continue;
++        if (__JS_AtomIsTaggedInt(atom)) {
++            state = JS_JSON_KEYS_NO;
++            break;
++        }
++        as = rt->atom_array[atom];
++        if (as->atom_type != JS_ATOM_TYPE_STRING) {
++            if (as->atom_type == JS_ATOM_TYPE_SYMBOL)
++                continue;
++            state = JS_JSON_KEYS_NO;
++            break;
++        }
++        if (atom == JS_ATOM_toJSON || is_num_string(&idx, as) ||
++            (prs[i].flags & JS_PROP_TMASK) != JS_PROP_NORMAL) {
++            state = JS_JSON_KEYS_NO;
++            break;
++        }
++        if (!(prs[i].flags & JS_PROP_ENUMERABLE))
++            continue;
++        if (as->is_wide_char) {
++            state = JS_JSON_KEYS_SLOW;
++        } else {
++            for (j = 0; j < as->len; j++) {
++                uint8_t c = str8(as)[j];
++                if (c < 0x20 || c == '"' || c == '\\' || c >= 0x7f)
++                    state = JS_JSON_KEYS_SLOW;
++            }
++        }
++        n++;
++        text += as->len + 4;
++    }
++    if (state != JS_JSON_KEYS_OK)
++        n = text = 0;
++    /* (the text padded: a key is copied as 16 characters) */
++    k = js_malloc_rt(rt, sizeof(JSJSONKeys) + n * sizeof(k->e[0]) + text + 16);
++    if (!k)
++        return NULL;
++    k->count = n;
++    k->state = state;
++    t = (char *)&k->e[n];
++    for (i = 0, j = 0, text = 0; j < n; i++) {
++        JSAtomStruct *as;
++        if (prs[i].atom == JS_ATOM_NULL || !(prs[i].flags & JS_PROP_ENUMERABLE))
++            continue;
++        as = rt->atom_array[prs[i].atom];
++        if (as->atom_type != JS_ATOM_TYPE_STRING)
++            continue;
++        k->e[j].prop = i;
++        k->e[j].off = text;
++        k->e[j].len = as->len + 4;
++        t[text] = ',';
++        t[text + 1] = '"';
++        memcpy(t + text + 2, str8(as), as->len);
++        t[text + as->len + 2] = '"';
++        t[text + as->len + 3] = ':';
++        text += as->len + 4;
++        j++;
++    }
++    sh->json_keys = k;
++    return k;
++}
++
+ static int js_json_fast(JSContext *ctx, StringBuffer *b, JSValueConst val, int depth)
+ {
+     switch (JS_VALUE_GET_NORM_TAG(val)) {
+@@ -56543,7 +56745,8 @@
+         return 0;
+     JSObject *p = JS_VALUE_GET_OBJ(val);
+     JSObject *object_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
+-    if (find_own_property1(object_proto, JS_ATOM_toJSON))
++    int pristine = js_pristine(ctx);
++    if (!(pristine & JS_PRISTINE_NO_TOJSON) && find_own_property1(object_proto, JS_ATOM_toJSON))
+         return 0;
+     if (unlikely(p->class_id >= JS_CLASS_INIT_COUNT)) {
+         /* An object its class writes: only what the class's exotic methods
+@@ -56566,7 +56769,8 @@
+     }
+     if (p->class_id == JS_CLASS_ARRAY && p->fast_array) {
+         JSObject *array_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
+-        if (p->shape->proto != array_proto || find_own_property1(array_proto, JS_ATOM_toJSON) ||
++        if (p->shape->proto != array_proto ||
++            (!(pristine & JS_PRISTINE_NO_TOJSON) && find_own_property1(array_proto, JS_ATOM_toJSON)) ||
+             find_own_property1(p, JS_ATOM_toJSON))
+             return 0;
+         uint32_t len = p->u.array.count;
+@@ -56575,10 +56779,10 @@
+         if (JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
+             (uint32_t)JS_VALUE_GET_INT(p->prop[0].u.value) != len)
+             return 0;
+-        string_buffer_putc8(b, '[');
++        js_json_putc(b, '[');
+         for (uint32_t i = 0; i < len; i++) {
+             if (i > 0)
+-                string_buffer_putc8(b, ',');
++                js_json_putc(b, ',');
+             /* (Re-read: the array may not change, as no code runs.) */
+             JSValueConst v = p->u.array.u.values[i];
+             int tag = JS_VALUE_GET_NORM_TAG(v);
+@@ -56594,15 +56798,128 @@
+             if (r <= 0)
+                 return r;
+         }
+-        return string_buffer_putc8(b, ']') < 0 ? -1 : 1;
++        return js_json_putc(b, ']') < 0 ? -1 : 1;
++    }
++    if (p->class_id == JS_CLASS_DATE) {
++        /* As toJSON writes it: toISOString's string, or null for an
++           invalid date. */
++        JSValueConst tv = p->u.object_data;
++        double t;
++        uint8_t *q;
++        int n;
++        if (p->shape->prop_count != 0 ||
++            p->shape->proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_DATE]) ||
++            !(pristine & JS_PRISTINE_DATE_JSON) || !JS_IsNumber(tv))
++            return 0;
++        t = JS_VALUE_GET_TAG(tv) == JS_TAG_INT ? JS_VALUE_GET_INT(tv) : JS_VALUE_GET_FLOAT64(tv);
++        if (!isfinite(t))
++            return js_json_put8(b, (const uint8_t *)"null", 4) < 0 ? -1 : 1;
++        q = js_json_room8(b, 32);
++        if (unlikely(!q)) {
++            uint8_t buf[32];
++            n = js_date_iso(buf + 1, t);
++            buf[0] = buf[n + 1] = '"';
++            return string_buffer_write8(b, buf, n + 2) < 0 ? -1 : 1;
++        }
++        n = js_date_iso(q + 1, t);
++        q[0] = q[n + 1] = '"';
++        b->len += n + 2;
++        return 1;
+     }
+     if (p->class_id != JS_CLASS_OBJECT || p->is_exotic ||
+         (p->shape->proto != object_proto && p->shape->proto != NULL))
+         return 0;
+     JSShape *sh = p->shape;
++    JSJSONKeys *keys = NULL;
++    if (sh->is_hashed) {
++        keys = sh->json_keys;
++        if (!keys)
++            keys = js_json_keys(ctx, sh); /* (NULL: written one by one) */
++    }
++    if (keys && keys->state == JS_JSON_KEYS_NO)
++        return 0;
++    if (keys && keys->state == JS_JSON_KEYS_OK) {
++        /* Each property: its key and a number, string of up to 16
++           characters, boolean or null in room reserved once (a key of up
++           to 16 characters copied as 16); others the general way. */
++        const uint8_t *text = (const uint8_t *)&keys->e[keys->count];
++        int skip = 1;
++        js_json_putc(b, '{');
++        for (uint32_t i = 0; i < keys->count; i++) {
++            JSValueConst v = p->prop[keys->e[i].prop].u.value;
++            int tag = JS_VALUE_GET_NORM_TAG(v);
++            const uint8_t *key = text + keys->e[i].off + skip;
++            uint32_t key_len = keys->e[i].len - skip;
++            uint8_t *q;
++            int r;
++            if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL ||
++                (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
++                continue;
++            skip = 0;
++            if (unlikely(b->is_wide_char || key_len > 16 || b->len + 16 + 32 > b->size)) {
++                js_json_put8(b, key, key_len);
++                r = js_json_fast(ctx, b, v, depth + 1);
++                if (r <= 0)
++                    return r;
++                continue;
++            }
++            q = (uint8_t *)&b->str[1] + b->len;
++            memcpy(q, key, 16);
++            q += key_len;
++            switch (tag) {
++            case JS_TAG_INT:
++                q = js_json_int_at(q, JS_VALUE_GET_INT(v));
++                break;
++            case JS_TAG_FLOAT64: {
++                double d = JS_VALUE_GET_FLOAT64(v);
++                int len;
++                if (d >= INT32_MIN && d <= INT32_MAX && d == (int32_t)d) {
++                    q = js_json_int_at(q, (int32_t)d);
++                } else if (isfinite(d) && (len = js_dtoa_short((char *)q, d)) >= 0) {
++                    q += len;
++                } else {
++                    b->len = q - (uint8_t *)&b->str[1];
++                    if (js_json_number_slow(b, d) < 0)
++                        return -1;
++                    continue;
++                }
++                break;
++            }
++            case JS_TAG_BOOL:
++                if (JS_VALUE_GET_BOOL(v)) {
++                    memcpy(q, "true", 4);
++                    q += 4;
++                } else {
++                    memcpy(q, "false", 5);
++                    q += 5;
++                }
++                break;
++            case JS_TAG_NULL:
++                memcpy(q, "null", 4);
++                q += 4;
++                break;
++            case JS_TAG_STRING: {
++                uint8_t *e = JS_JSONPutShortString(q, v);
++                if (e) {
++                    q = e;
++                    break;
++                }
++            }
++                /* fall through */
++            default:
++                b->len = q - (uint8_t *)&b->str[1];
++                r = js_json_fast(ctx, b, v, depth + 1);
++                if (r <= 0)
++                    return r;
++                continue;
++            }
++            b->len = q - (uint8_t *)&b->str[1];
++        }
++        return js_json_putc(b, '}') < 0 ? -1 : 1;
++    }
+     JSShapeProperty *prs = get_shape_prop(sh);
+     bool first = true;
+-    string_buffer_putc8(b, '{');
++    js_json_putc(b, '{');
+     for (uint32_t i = 0; i < sh->prop_count; i++, prs++) {
+         JSAtom atom = prs->atom;
+         if (atom == JS_ATOM_NULL)
+@@ -56630,16 +56947,16 @@
+             (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
+             continue;
+         if (!first)
+-            string_buffer_putc8(b, ',');
++            js_json_putc(b, ',');
+         first = false;
+         if (js_json_fast_string(b, as) < 0)
+             return -1;
+-        string_buffer_putc8(b, ':');
++        js_json_putc(b, ':');
+         int r = js_json_fast(ctx, b, v, depth + 1);
+         if (r <= 0)
+             return r;
+     }
+-    return string_buffer_putc8(b, '}') < 0 ? -1 : 1;
++    return js_json_putc(b, '}') < 0 ? -1 : 1;
+ }
+ 
+ int JS_SetJSONWriter(JSClassID class_id, JSJSONWriteFunc *fn)
+@@ -56678,18 +56995,91 @@
+     return js_json_fast(ctx, (StringBuffer *)w, v, depth);
+ }
+ 
++uint8_t *JS_JSONRoomSlow(JSJSONWriter *w, int n)
++{
++    return js_json_room8_slow((StringBuffer *)w, n);
++}
++
++uint8_t *JS_JSONPutIntSlow(uint8_t *p, int32_t v)
++{
++    if (v < 0) {
++        *p = '-';
++        return p + 1 + js_json_u64(p + 1, -(int64_t)v);
++    }
++    return p + js_json_u64(p, v);
++}
++
++uint8_t *JS_JSONPutDoubleSlow(uint8_t *p, double d)
++{
++    char buf[64];
++    int len;
++    JSDTOATempMem dtoa_mem;
++    if (!isfinite(d)) {
++        memcpy(p, "null", 4);
++        return p + 4;
++    }
++    len = js_dtoa_short((char *)p, d);
++    if (len >= 0)
++        return p + len;
++    len = js_dtoa(buf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
++    memcpy(p, buf, len);
++    return p + len;
++}
++
++#if INTPTR_MAX == INT64_MAX
++static_assert(sizeof(JSString) == JS_LAYOUT_STRING_CHARS, "");
++static_assert(offsetof(StringBuffer, str) == offsetof(JSJSONWriterView, str) &&
++              offsetof(StringBuffer, len) == offsetof(JSJSONWriterView, len) &&
++              offsetof(StringBuffer, size) == offsetof(JSJSONWriterView, size) &&
++              offsetof(StringBuffer, is_wide_char) == offsetof(JSJSONWriterView, is_wide_char), "");
++#endif
++
+ /* luminous: the fast path writes into a buffer the runtime keeps (not
+    into a string, which would be reallocated as it grows, several times
+    for a small result), and the result is one string of its length. 1 with
+    the result, 0 when the value is not such data, -1 on an exception. */
+ #define JS_JSON_BUF_KEEP (64 * 1024)
+ 
++static int js_json_buf_begin(JSContext *ctx, StringBuffer *b);
++static int js_json_buf_end(JSContext *ctx, StringBuffer *b, int r, JSValue *pres);
++
+ static int js_json_fast_run(JSContext *ctx, JSValueConst obj, JSValue *pres)
+ {
+-    JSRuntime *rt = ctx->rt;
+     StringBuffer b;
+-    JSString *str;
++    if (js_json_buf_begin(ctx, &b) < 0)
++        return -1;
++    return js_json_buf_end(ctx, &b, js_json_fast(ctx, &b, obj, 0), pres);
++}
++
++/* JSON.stringify(obj) without a replacer or indentation, for an object
++   of a class with a JSON writer (JS_SetJSONWriter), written by fn(rec):
++   JS_UNINITIALIZED when the fast path would not run (own properties, a
++   prototype other than Object.prototype, null or Array.prototype, a
++   toJSON), or fn finds a value that is not data. */
++JSValue JS_JSONStringifyWith(JSContext *ctx, JSValueConst obj, JSJSONRecordFunc *fn, const void *rec)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSObject *object_proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
++    JSObject *proto = p->shape->proto;
++    StringBuffer b;
++    JSValue res = JS_UNINITIALIZED;
+     int r;
++    if (p->shape->prop_count != 0 || !(js_pristine(ctx) & JS_PRISTINE_NO_TOJSON) ||
++        (proto != object_proto && proto != NULL &&
++         proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY])))
++        return JS_UNINITIALIZED;
++    if (js_json_buf_begin(ctx, &b) < 0)
++        return JS_EXCEPTION;
++    r = js_json_buf_end(ctx, &b, fn(ctx, (JSJSONWriter *)&b, rec, 0), &res);
++    if (r < 0)
++        return JS_EXCEPTION;
++    return r > 0 ? res : JS_UNINITIALIZED;
++}
++
++static int js_json_buf_begin(JSContext *ctx, StringBuffer *pb)
++{
++    JSRuntime *rt = ctx->rt;
++    StringBuffer b;
+     b.ctx = ctx;
+     b.len = 0;
+     b.is_wide_char = 0;
+@@ -56702,8 +57092,21 @@
+         b.str = js_malloc(ctx, sizeof(JSString) + b.size);
+         if (!b.str)
+             return -1;
++        /* (an 8-bit string of the normal kind, for the string buffer
++           functions, which read its characters by its kind) */
++        memset(b.str, 0, sizeof(JSString));
+     }
+-    r = js_json_fast(ctx, &b, obj, 0);
++    *pb = b;
++    return 0;
++}
++
++/* After writing into b (r: as js_json_fast returns): the string written
++   (*pres) when r is 1; b's buffer kept for the next run. */
++static int js_json_buf_end(JSContext *ctx, StringBuffer *pb, int r, JSValue *pres)
++{
++    JSRuntime *rt = ctx->rt;
++    StringBuffer b = *pb;
++    JSString *str;
+     if (r > 0) {
+         str = js_alloc_string(ctx, b.len, b.is_wide_char);
+         if (str) {
+@@ -56727,6 +57130,15 @@
+     return r;
+ }
+ 
++JSValue JS_JSONStringifyData(JSContext *ctx, JSValueConst v)
++{
++    JSValue r = JS_UNINITIALIZED;
++    int k = js_json_fast_run(ctx, v, &r);
++    if (k < 0)
++        return JS_EXCEPTION;
++    return k > 0 ? r : JS_UNINITIALIZED;
++}
++
+ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+                          JSValueConst replacer, JSValueConst space0)
+ {
+@@ -61485,12 +61897,15 @@
+     return js_own_builtin_getter(p, JS_ATOM_flags, (void *)js_regexp_get_flags, 0);
+ }
+ 
++static bool js_date_proto_pristine(JSContext *ctx, JSObject *p);
++
+ static no_inline int js_pristine_update(JSContext *ctx)
+ {
+-    JSValueConst watched[7] = {
++    JSValueConst watched[8] = {
+         ctx->class_proto[JS_CLASS_PROMISE], ctx->promise_ctor,
+         ctx->class_proto[JS_CLASS_ARRAY], ctx->class_proto[JS_CLASS_ARRAY_ITERATOR],
+         ctx->class_proto[JS_CLASS_REGEXP], ctx->array_ctor, ctx->class_proto[JS_CLASS_OBJECT],
++        ctx->class_proto[JS_CLASS_DATE],
+     };
+     JSObject *proto = JS_VALUE_GET_OBJ(watched[0]), *ctor = JS_VALUE_GET_OBJ(watched[1]);
+     JSShapeProperty *prs;
+@@ -61535,6 +61950,11 @@
+             r |= JS_PRISTINE_ARRAY_SPECIES;
+         if (!find_own_property(&pr, JS_VALUE_GET_OBJ(watched[6]), JS_ATOM_then))
+             r |= JS_PRISTINE_NO_THEN;
++        if (!find_own_property(&pr, JS_VALUE_GET_OBJ(watched[6]), JS_ATOM_toJSON) &&
++            !find_own_property(&pr, JS_VALUE_GET_OBJ(watched[2]), JS_ATOM_toJSON))
++            r |= JS_PRISTINE_NO_TOJSON;
++        if (js_date_proto_pristine(ctx, JS_VALUE_GET_OBJ(watched[7])))
++            r |= JS_PRISTINE_DATE_JSON;
+     }
+     if (all_watched) {
+         ctx->pristine_epoch = js_proto_epoch;
+@@ -62098,6 +62518,15 @@
+     memset(&f, 0, sizeof(f));
+     f.p.inline_props = true;
+     union { JSMallocBlockHeader b; uint8_t c[sizeof(JSMallocBlockHeader)]; } m, r;
++    union { JSString s; uint32_t w[2]; } str;
++    memset(&str, 0, sizeof(str));
++    str.s.len = 5;
++    str.s.is_wide_char = 1;
++    str.s.kind = JS_STRING_KIND_SLICE;
++    if (str.w[0] != (5 | 0x80000000u) ||
++        str.w[JS_LAYOUT_STRING_KIND_WORD / 4] != (uint32_t)JS_STRING_KIND_SLICE << JS_LAYOUT_STRING_KIND_SHIFT ||
++        JS_STRING_KIND_NORMAL != 0)
++        return false;
+     memset(&h, 0xff, sizeof(h));
+     h.b.gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+     h.b.gc_remembered = 0;
+@@ -64125,6 +64554,15 @@
+     fmt = (magic >> 4) & 0x0F;
+     part = magic & 0x0F;
+ 
++    if (magic == 0x23) {
++        /* luminous: toISOString without printf */
++        double tv;
++        if (JS_ThisTimeValue(ctx, &tv, this_val))
++            return JS_EXCEPTION;
++        if (isnan(tv))
++            return JS_ThrowRangeError(ctx, "Date value is NaN");
++        return js_new_string8_len(ctx, buf, js_date_iso((uint8_t *)buf, tv));
++    }
+     res = get_date_fields(ctx, this_val, fields, fmt & 1, 0);
+     if (res < 0)
+         return JS_EXCEPTION;
+@@ -64223,6 +64661,92 @@
+     return js_new_string8_len(ctx, buf, pos);
+ }
+ 
++/* luminous: time value t (finite and in range) as toISOString writes it,
++   at p (up to 27 characters): their count. The civil date of a day count
++   from 1970-01-01 (proleptic Gregorian), as in H. Hinnant's
++   days_from_civil inverse. */
++static int js_date_iso(uint8_t *p, double t)
++{
++    static const char digits2[201] =
++        "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
++        "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
++        "8081828384858687888990919293949596979899";
++    int64_t ms = (int64_t)t, days, in_day, z, era, doe, yoe, y, doy, mp, d, m;
++    int64_t h, mi, sec, msec;
++    uint8_t *q = p;
++
++    days = ms >= 0 ? ms / 86400000 : -((-ms + 86400000 - 1) / 86400000);
++    in_day = ms - days * 86400000;
++    z = days + 719468;
++    era = (z >= 0 ? z : z - 146096) / 146097;
++    doe = z - era * 146097;
++    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++    y = yoe + era * 400;
++    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    mp = (5 * doy + 2) / 153;
++    d = doy - (153 * mp + 2) / 5 + 1;
++    m = mp < 10 ? mp + 3 : mp - 9;
++    y += m <= 2;
++    if (y >= 0 && y <= 9999) {
++        memcpy(q, digits2 + 2 * (y / 100), 2);
++        memcpy(q + 2, digits2 + 2 * (y % 100), 2);
++        q += 4;
++    } else {
++        int64_t a = y < 0 ? -y : y;
++        *q++ = y < 0 ? '-' : '+';
++        memcpy(q, digits2 + 2 * (a / 10000), 2);
++        memcpy(q + 2, digits2 + 2 * (a / 100 % 100), 2);
++        memcpy(q + 4, digits2 + 2 * (a % 100), 2);
++        q += 6;
++    }
++    msec = in_day % 1000;
++    sec = in_day / 1000 % 60;
++    mi = in_day / 60000 % 60;
++    h = in_day / 3600000;
++    q[0] = '-';
++    memcpy(q + 1, digits2 + 2 * m, 2);
++    q[3] = '-';
++    memcpy(q + 4, digits2 + 2 * d, 2);
++    q[6] = 'T';
++    memcpy(q + 7, digits2 + 2 * h, 2);
++    q[9] = ':';
++    memcpy(q + 10, digits2 + 2 * mi, 2);
++    q[12] = ':';
++    memcpy(q + 13, digits2 + 2 * sec, 2);
++    q[15] = '.';
++    q[16] = '0' + msec / 100;
++    memcpy(q + 17, digits2 + 2 * (msec % 100), 2);
++    q[19] = 'Z';
++    return q + 20 - p;
++}
++
++static JSValue js_date_toJSON(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue js_date_getTime(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
++static JSValue js_date_Symbol_toPrimitive(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
++
++/* What JS_PRISTINE_DATE_JSON needs of %Date.prototype% (`p`): toJSON
++   reads the time value with ToPrimitive (@@toPrimitive, then valueOf) and
++   calls toISOString. */
++static bool js_date_proto_pristine(JSContext *ctx, JSObject *p)
++{
++    JSAtom atom;
++    bool ok;
++
++    if (!js_is_builtin(js_own_data(p, JS_ATOM_toJSON), (void *)js_date_toJSON, 0) ||
++        !js_is_builtin(js_own_data(p, JS_ATOM_valueOf), (void *)js_date_getTime, 0) ||
++        !js_is_builtin(js_own_data(p, JS_ATOM_Symbol_toPrimitive), (void *)js_date_Symbol_toPrimitive, 0))
++        return false;
++    /* (a name that is no predefined atom: see js_regexp_proto_pristine) */
++    atom = JS_NewAtom(ctx, "toISOString");
++    if (atom == JS_ATOM_NULL) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return false;
++    }
++    ok = js_is_builtin(js_own_data(p, atom), (void *)get_date_string, 0x23);
++    JS_FreeAtom(ctx, atom);
++    return ok;
++}
++
+ /* OS dependent: return the UTC time in ms since 1970. */
+ static int64_t date_now(void) {
+     return js__gettimeofday_us() / 1000;

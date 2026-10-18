@@ -807,7 +807,7 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.String.prototype.slice, g.String.prototype.substring, g.String.prototype.indexOf,\n"
         "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
-        "             g.Set.prototype.has);\n"
+        "             g.Set.prototype.has, g.JSON.stringify);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -2915,26 +2915,20 @@ static int lum_json_key(JSContext *ctx, JSJSONWriter *w, uint32_t k, bool first)
     return JS_JSONWrite8(w, ":", 1);
 }
 
-static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, int depth)
+int lum_struct_json_from(JSContext *ctx, JSJSONWriter *w, const LumStruct *s, int depth, uint32_t from, int first)
 {
-    LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
     const LumLayoutDesc *l = &lum_layouts[s->layout];
     uint32_t base = lum_struct_atom_base[s->layout], i;
-    bool first = true;
     int r;
-    if (JS_JSONWrite8(w, "{", 1) < 0)
+    if (from == 0 && JS_JSONWrite8(w, "{", 1) < 0)
         return -1;
-    for (i = 0; i < l->nfields; i++) {
+    for (i = from; i < l->nfields; i++) {
         const LumFieldDesc *f = &l->fields[i];
-        void *at = lum_field_at(s, f);
+        void *at = lum_field_at((LumStruct *)s, f);
         if (!(s->mask & (1u << i)))
             continue;
-        if (f->storage == LUM_ST_VALUE) {
-            JSValueConst v = *(JSValue *)at;
-            int tag = JS_VALUE_GET_NORM_TAG(v);
-            if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_SYMBOL || (tag == JS_TAG_OBJECT && JS_IsFunction(ctx, v)))
-                continue;
-        }
+        if (f->storage == LUM_ST_VALUE && !lum_json_present(ctx, *(JSValue *)at))
+            continue;
         if (lum_json_key(ctx, w, base + i, first) < 0)
             return -1;
         first = false;
@@ -2958,6 +2952,28 @@ static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, in
             return -1;
     }
     return JS_JSONWrite8(w, "}", 1) < 0 ? -1 : 1;
+}
+
+/* The layout's generated writer, else the general way. */
+static int lum_struct_json(JSContext *ctx, JSJSONWriter *w, JSValueConst obj, int depth)
+{
+    LumStruct *s = JS_GetOpaque(obj, lum_struct_class);
+    JSJSONRecordFunc *fn = lum_layout_json ? lum_layout_json[s->layout] : NULL;
+    if (fn)
+        return fn(ctx, w, s, depth);
+    return lum_struct_json_from(ctx, w, s, depth, 0, true);
+}
+
+/* JSON.stringify(v) by the original builtin, where v is statically an
+ * object of an `aot type` (or undefined): written from its fields
+ * directly, else as JS_JSONStringifyData. */
+JSValue lum_struct_stringify(JSContext *ctx, JSValueConst v)
+{
+    LumStruct *s = JS_GetOpaque(v, lum_struct_class);
+    JSJSONRecordFunc *fn = s && lum_layout_json ? lum_layout_json[s->layout] : NULL;
+    if (fn)
+        return JS_JSONStringifyWith(ctx, v, fn, s);
+    return JS_JSONStringifyData(ctx, v);
 }
 
 /* The JSON keys of the layouts' fields. */

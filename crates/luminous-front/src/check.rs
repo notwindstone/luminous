@@ -5062,7 +5062,18 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     }
 
     /// `obj.atom = v` (evaluates to the value stored).
-    fn set_prop(&self, obj: Expr, atom: ir::AtomId, v: Expr) -> Expr {
+    fn set_prop(&mut self, obj: Expr, atom: ir::AtomId, v: Expr) -> Expr {
+        // An element of an array of an `aot type`: the value first, then an
+        // object, else what JS throws setting a property of `undefined`.
+        if let Ty::StructOrUndef(k) = obj.ty
+            && self.struct_field(Ty::Struct(k), atom).is_some()
+        {
+            let t = self.temp(v.ty);
+            let first = set(t, v);
+            let obj = Expr::new(Ty::Struct(k), ExprKind::NonNullSet(atom, Box::new(obj)));
+            let store = self.set_prop(obj, atom, self.local(t));
+            return seq(vec![first, store]);
+        }
         if let Some((k, i)) = self.struct_field(obj.ty, atom) {
             let v = self.struct_value(k, i, v);
             return Expr::new(v.ty, ExprKind::StructSet(k, Box::new(obj), i, Box::new(v)));
@@ -5382,6 +5393,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     Ty::StructOrUndef(k) if reads_first && self.struct_field(Ty::Struct(k), atom).is_some() => {
                         Expr::new(Ty::Struct(k), ExprKind::NonNull(Some(atom), Box::new(obj)))
                     }
+                    // Only written: checked when stored (see `set_prop`).
+                    Ty::StructOrUndef(k) if self.struct_field(Ty::Struct(k), atom).is_some() => obj,
                     _ => any(obj),
                 };
                 let t = self.temp(obj.ty);
