@@ -37,6 +37,8 @@ use oxc::str::Ident;
 
 use crate::marker;
 
+mod shake;
+
 /// One module's part of a bundle.
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
@@ -136,7 +138,7 @@ struct Import {
 
 /// What a module's file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Kind {
+pub enum Kind {
     Script,
     Json,
     Text,
@@ -266,9 +268,43 @@ enum Anon {
     Class,
 }
 
-enum Resolved {
+/// What a specifier resolves to.
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    /// A module of the bundle (a file, or a path an embedder's `Host` knows).
     File(PathBuf),
+    /// A module the bundle imports as it is (the engine's, a runtime's).
     External(String),
+}
+
+/// Where a bundle's modules come from: the file system, as Luminous
+/// resolves them (`bundle_with`), or an embedder (a bundler's plugins,
+/// `Beyond.build`).
+pub trait Host {
+    /// What `spec`, imported by module `from` (`dynamic`: by `import()`;
+    /// `attr`: its `with { type }`), is.
+    fn resolve(&mut self, from: &Path, spec: &str, dynamic: bool, attr: Option<&str>) -> Result<Resolved, String>;
+    /// The source of module `path` imported as `kind` (a module of JSON,
+    /// text or bytes as `synthesize` makes it).
+    fn load(&mut self, path: &Path, kind: Kind) -> Result<String, String>;
+}
+
+/// Luminous's own `Host`: files, resolved as TypeScript and Node do.
+struct FsHost<'a> {
+    emb: &'a Embedding,
+}
+
+impl Host for FsHost<'_> {
+    fn resolve(&mut self, from: &Path, spec: &str, _dynamic: bool, _attr: Option<&str>) -> Result<Resolved, String> {
+        resolve(from, spec, self.emb)
+    }
+
+    fn load(&mut self, path: &Path, kind: Kind) -> Result<String, String> {
+        match kind {
+            Kind::Script => std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display())),
+            _ => synthesize(path, kind),
+        }
+    }
 }
 
 /// Whether the `package.json` nearest to module `path` says that it has no
@@ -342,6 +378,18 @@ pub struct Embedding {
     /// it), which native code then knows (`new Response()` a class's native
     /// constructor). Not where the module assigns the global.
     pub globals: Vec<(String, String)>,
+    /// Specifiers that are others' (`fs` is `node:fs`).
+    pub aliases: Vec<(String, String)>,
+    /// Directories whose modules a program registers by path, for the
+    /// embedder's loader to give modules it loads at run time (the
+    /// embedder's own; a program that imports at run time registers all
+    /// its modules).
+    pub shared: Vec<PathBuf>,
+    /// A bundle other programs run (`Beyond.build`), not a program Luminous
+    /// compiles: the entry's exports stay the bundle's, an `import()` of a
+    /// computed specifier stays one, and one that does not resolve is an
+    /// error.
+    pub library: bool,
 }
 
 /// The imports that make the embedder's globals that `program` refers to
@@ -374,21 +422,61 @@ fn global_imports(sem: &Semantic, emb: &Embedding) -> Option<String> {
 
 /// Resolve a module specifier imported by `from`.
 fn resolve(from: &Path, spec: &str, emb: &Embedding) -> Result<Resolved, String> {
+    if let Some((_, to)) = emb.aliases.iter().find(|(a, _)| a == spec) {
+        return resolve(from, to, emb);
+    }
     if spec.starts_with("qjs:") || spec.starts_with("luminous:") || emb.externals.iter().any(|e| e == spec) {
         return Ok(Resolved::External(spec.to_string()));
     }
     let not_found = || format!("cannot find module `{spec}`");
+    let opts = ResolveOptions::luminous();
     for (prefix, dir) in &emb.module_dirs {
         if let Some(name) = spec.strip_prefix(prefix.as_str()) {
-            return resolve_path(&dir.join(name)).map(Resolved::File).ok_or_else(not_found);
+            return resolve_path(&dir.join(name), &opts).map(Resolved::File).ok_or_else(not_found);
         }
     }
     let dir = from.parent().unwrap_or(Path::new("."));
-    if spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/') || spec == "." || spec == ".." {
-        return resolve_path(&dir.join(spec)).map(Resolved::File).ok_or_else(not_found);
+    resolve_module(dir, spec, &opts).map(Resolved::File).ok_or_else(not_found)
+}
+
+/// How specifiers resolve to files (`resolve_module`): Luminous's own, or a
+/// bundler's for its target.
+#[derive(Debug, Clone)]
+pub struct ResolveOptions {
+    /// The conditions of `package.json` `exports` and `imports` that apply
+    /// (in no order: the map's decides).
+    pub conditions: Vec<String>,
+    /// What is tried, in order, after a path without one (and in a
+    /// directory after `index`).
+    pub extensions: Vec<String>,
+    /// The fields of a `package.json` without `exports` that name its
+    /// entry, in order.
+    pub main_fields: Vec<String>,
+}
+
+impl ResolveOptions {
+    /// Luminous's: ES modules in TypeScript or JavaScript.
+    pub fn luminous() -> Self {
+        let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        ResolveOptions {
+            conditions: owned(&["import", "module", "default"]),
+            extensions: owned(&[".ts", ".mts", ".js", ".mjs"]),
+            main_fields: owned(&["module", "main"]),
+        }
     }
-    // A package: `name[/sub]` or `@scope/name[/sub]`, from the nearest
-    // `node_modules` that has it.
+}
+
+/// The file specifier `spec` names for a module in directory `dir`: a
+/// relative or absolute path, a `#` import of the package there, or a
+/// package (`name[/sub]`, `@scope/name[/sub]`) from the nearest
+/// `node_modules` that has it.
+pub fn resolve_module(dir: &Path, spec: &str, opts: &ResolveOptions) -> Option<PathBuf> {
+    if spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/') || spec == "." || spec == ".." {
+        return resolve_path(&dir.join(spec), opts);
+    }
+    if spec.starts_with('#') {
+        return resolve_imports(dir, spec, opts);
+    }
     let mut parts = spec.splitn(if spec.starts_with('@') { 3 } else { 2 }, '/');
     let pkg: Vec<&str> = parts.by_ref().take(if spec.starts_with('@') { 2 } else { 1 }).collect();
     let pkg = pkg.join("/");
@@ -396,36 +484,55 @@ fn resolve(from: &Path, spec: &str, emb: &Embedding) -> Result<Resolved, String>
     for d in dir.ancestors() {
         let root = d.join("node_modules").join(&pkg);
         if root.is_dir() {
-            return resolve_package(&root, sub).map(Resolved::File).ok_or_else(not_found);
+            return resolve_package(&root, sub, opts);
         }
     }
-    Err(not_found())
+    None
+}
+
+/// A `#name` specifier through the `imports` of the nearest `package.json`
+/// to `dir`.
+fn resolve_imports(dir: &Path, spec: &str, opts: &ResolveOptions) -> Option<PathBuf> {
+    for d in dir.ancestors() {
+        let Ok(text) = std::fs::read_to_string(d.join("package.json")) else { continue };
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let target = exports_target(json.get("imports")?, spec, opts)?;
+        return if target.starts_with("./") || target.starts_with("../") {
+            resolve_path(&d.join(target), opts)
+        } else {
+            resolve_module(d, &target, opts)
+        };
+    }
+    None
 }
 
 /// A file for a path, as TypeScript resolves it: as is, a `.js` path's
 /// `.ts` source, with an extension added, or a directory's index.
-fn resolve_path(base: &Path) -> Option<PathBuf> {
+fn resolve_path(base: &Path, opts: &ResolveOptions) -> Option<PathBuf> {
     if base.is_file() {
         return Some(base.to_path_buf());
     }
     let s = base.to_string_lossy();
-    for (js, ts) in [(".js", ".ts"), (".mjs", ".mts")] {
-        if let Some(stem) = s.strip_suffix(js) {
+    let has = |e: &str| opts.extensions.iter().any(|x| x == e);
+    for (js, ts) in [(".js", ".ts"), (".mjs", ".mts"), (".cjs", ".cts"), (".jsx", ".tsx"), (".js", ".tsx")] {
+        if let Some(stem) = s.strip_suffix(js)
+            && has(ts)
+        {
             let p = PathBuf::from(format!("{stem}{ts}"));
             if p.is_file() {
                 return Some(p);
             }
         }
     }
-    for ext in [".ts", ".mts", ".js", ".mjs"] {
+    for ext in &opts.extensions {
         let p = PathBuf::from(format!("{s}{ext}"));
         if p.is_file() {
             return Some(p);
         }
     }
     if base.is_dir() {
-        for index in ["index.ts", "index.mts", "index.js", "index.mjs"] {
-            let p = base.join(index);
+        for ext in &opts.extensions {
+            let p = base.join(format!("index{ext}"));
             if p.is_file() {
                 return Some(p);
             }
@@ -434,44 +541,41 @@ fn resolve_path(base: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The conditions of `package.json` `exports` that apply, in no order (the
-/// map's order decides).
-const CONDITIONS: [&str; 3] = ["import", "module", "default"];
-
 /// A file of the package at `root` for subpath `sub` (empty: the package):
-/// through its `exports` if it has them, else its `module` or `main` field,
-/// or the path itself.
-fn resolve_package(root: &Path, sub: &str) -> Option<PathBuf> {
+/// through its `exports` if it has them, else its main fields, or the path
+/// itself.
+fn resolve_package(root: &Path, sub: &str, opts: &ResolveOptions) -> Option<PathBuf> {
     let json: Option<serde_json::Value> =
         std::fs::read_to_string(root.join("package.json")).ok().and_then(|s| serde_json::from_str(&s).ok());
     if let Some(exports) = json.as_ref().and_then(|j| j.get("exports")) {
         let key = if sub.is_empty() { ".".to_string() } else { format!("./{sub}") };
-        let target = exports_target(exports, &key)?;
-        return resolve_path(&root.join(target.trim_start_matches("./")));
+        let target = exports_target(exports, &key, opts)?;
+        return resolve_path(&root.join(target.trim_start_matches("./")), opts);
     }
     if !sub.is_empty() {
-        return resolve_path(&root.join(sub));
+        return resolve_path(&root.join(sub), opts);
     }
-    for field in ["module", "main"] {
+    for field in &opts.main_fields {
         if let Some(f) = json.as_ref().and_then(|j| j.get(field)).and_then(|f| f.as_str())
-            && let Some(p) = resolve_path(&root.join(f))
+            && let Some(p) = resolve_path(&root.join(f), opts)
         {
             return Some(p);
         }
     }
-    resolve_path(&root.join("index"))
+    resolve_path(&root.join("index"), opts)
 }
 
-/// `exports` (a target, conditions, or subpaths) for subpath `key`.
-fn exports_target(exports: &serde_json::Value, key: &str) -> Option<String> {
+/// `exports` or `imports` (a target, conditions, or subpaths) for subpath
+/// `key`.
+fn exports_target(exports: &serde_json::Value, key: &str, opts: &ResolveOptions) -> Option<String> {
     use serde_json::Value;
-    let subpaths = matches!(exports, Value::Object(m) if m.keys().all(|k| k.starts_with('.')));
+    let subpaths = matches!(exports, Value::Object(m) if m.keys().all(|k| k.starts_with('.') || k.starts_with('#')));
     if !subpaths {
-        return if key == "." { conditional(exports, None) } else { None };
+        return if key == "." { conditional(exports, None, opts) } else { None };
     }
     let Value::Object(map) = exports else { return None };
     if let Some(v) = map.get(key) {
-        return conditional(v, None);
+        return conditional(v, None, opts);
     }
     // Patterns (`./*`, `./lib/*.js`): the longest prefix that matches.
     let mut best: Option<(&str, &Value, String)> = None;
@@ -486,20 +590,22 @@ fn exports_target(exports: &serde_json::Value, key: &str) -> Option<String> {
         }
     }
     let (_, v, star) = best?;
-    conditional(v, Some(&star))
+    conditional(v, Some(&star), opts)
 }
 
 /// A target of `exports`: a path, conditions (the first that applies, in
 /// the map's order), or alternatives (the first that resolves).
-fn conditional(v: &serde_json::Value, star: Option<&str>) -> Option<String> {
+fn conditional(v: &serde_json::Value, star: Option<&str>, opts: &ResolveOptions) -> Option<String> {
     use serde_json::Value;
     match v {
         Value::String(s) => Some(match star {
             Some(m) => s.replace('*', m),
             None => s.clone(),
         }),
-        Value::Object(m) => m.iter().filter(|(k, _)| CONDITIONS.contains(&k.as_str())).find_map(|(_, v)| conditional(v, star)),
-        Value::Array(a) => a.iter().find_map(|v| conditional(v, star)),
+        Value::Object(m) => {
+            m.iter().filter(|(k, _)| opts.conditions.iter().any(|c| c == *k)).find_map(|(_, v)| conditional(v, star, opts))
+        }
+        Value::Array(a) => a.iter().find_map(|v| conditional(v, star, opts)),
         _ => None,
     }
 }
@@ -537,7 +643,8 @@ fn attr_type(w: &Option<oxc::allocator::Box<WithClause>>) -> Option<String> {
 fn records(
     unit: &mut Unit,
     program: &Program,
-    resolve_target: &mut dyn FnMut(&str, Option<String>) -> Result<Target, String>,
+    resolve_target: &mut dyn FnMut(&str, Option<String>, bool) -> Result<Target, String>,
+    library: bool,
 ) -> Result<(), String> {
     let scoping = unit.sem.scoping();
     let root = scoping.root_scope_id();
@@ -553,7 +660,7 @@ fn records(
     let mut default_expr = None;
     let mut reexports = Vec::new();
     let mut target_of = |src: &StringLiteral, attr: Option<String>| {
-        resolve_target(src.value.as_str(), attr).map_err(|e| format!("{}: {e}", at(src.span)))
+        resolve_target(src.value.as_str(), attr, false).map_err(|e| format!("{}: {e}", at(src.span)))
     };
     for stmt in &program.body {
         match stmt {
@@ -685,6 +792,7 @@ fn records(
     let nodes = unit.sem.nodes();
     let mut warnings = Vec::new();
     let mut dyn_externals = Vec::new();
+    let mut failed = None;
     let dynamic_imports: Vec<DynImport> = dynamic
         .imports
         .into_iter()
@@ -693,10 +801,16 @@ fn records(
                 DynTo::Leave
             } else {
                 match &d.spec {
-                    Some((s, ty)) => match resolve_target(s, ty.clone()) {
+                    Some((s, ty)) => match resolve_target(s, ty.clone(), true) {
                         Ok(Target::Module(k)) => DynTo::Module(k),
                         Ok(Target::External(e)) => {
-                            dyn_externals.push(e);
+                            if !library {
+                                dyn_externals.push(e);
+                            }
+                            DynTo::Leave
+                        }
+                        Err(e) if library => {
+                            failed.get_or_insert(format!("{}: {e}", at(d.span)));
                             DynTo::Leave
                         }
                         Err(e) => {
@@ -704,6 +818,8 @@ fn records(
                             DynTo::Fallback
                         }
                     },
+                    // (A bundle's: what runs it resolves it.)
+                    None if library => DynTo::Leave,
                     None => {
                         warnings.push(format!(
                             "{}: `import()` of a computed specifier: the module is loaded and interpreted at run time",
@@ -722,6 +838,9 @@ fn records(
             }
         })
         .collect();
+    if let Some(e) = failed {
+        return Err(e);
+    }
     let metas: Vec<(Span, ScopeId)> =
         dynamic.metas.into_iter().map(|(span, node)| (span, nodes.get_node(node).scope_id())).collect();
     // An export name declared twice is an early error.
@@ -745,7 +864,8 @@ fn records(
     unit.default_expr = default_expr;
     unit.reexports = reexports;
     unit.dynamic = dynamic_imports;
-    unit.metas = metas;
+    // (A bundle's `import.meta` is that of the bundle where it runs.)
+    unit.metas = if library { Vec::new() } else { metas };
     unit.tla = program.body.iter().any(has_tla);
     unit.warnings = warnings;
     unit.dyn_externals = dyn_externals;
@@ -877,21 +997,24 @@ fn has_tla(stmt: &Statement) -> bool {
 /// The source of a module of JSON, text or bytes: its content as a default
 /// export.
 fn synthesize(path: &Path, kind: Kind) -> Result<String, String> {
-    let read_err = |e: std::io::Error| format!("reading {}: {e}", path.display());
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    synthesize_content(path, kind, bytes)
+}
+
+/// The source of module `path` of JSON, text or bytes whose content is
+/// `bytes`: its content as a default export.
+pub fn synthesize_content(path: &Path, kind: Kind, bytes: Vec<u8>) -> Result<String, String> {
+    let text = |bytes: Vec<u8>| String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8 text", path.display()));
     Ok(match kind {
-        Kind::Script => unreachable!(),
+        Kind::Script => text(bytes)?,
         Kind::Json => {
-            let text = std::fs::read_to_string(path).map_err(read_err)?;
+            let text = text(bytes)?;
             serde_json::from_str::<serde_json::Value>(&text)
                 .map_err(|e| format!("{}: invalid JSON: {e}", path.display()))?;
             format!("export default JSON.parse({});\n", serde_json::to_string(&text).unwrap())
         }
-        Kind::Text => {
-            let text = std::fs::read_to_string(path).map_err(read_err)?;
-            format!("export default {};\n", serde_json::to_string(&text).unwrap())
-        }
+        Kind::Text => format!("export default {};\n", serde_json::to_string(&text(bytes)?).unwrap()),
         Kind::Bytes => {
-            let bytes = std::fs::read(path).map_err(read_err)?;
             let list: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
             format!("export default new Uint8Array([{}]);\n", list.join(","))
         }
@@ -906,6 +1029,12 @@ pub fn bundle(entry: &Path) -> Result<Bundle, String> {
 /// Build the bundle of the program whose entry module is `entry`, with what
 /// an embedder adds (`Embedding`).
 pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
+    bundle_host(entry, emb, &mut FsHost { emb })
+}
+
+/// Build the bundle of the program whose entry module is `entry`, its
+/// modules resolved and loaded by `host`.
+pub fn bundle_host(entry: &Path, emb: &Embedding, host: &mut dyn Host) -> Result<Bundle, String> {
     let allocator = Allocator::default();
     let mut units: Vec<Unit> = Vec::new();
     let mut index: HashMap<(PathBuf, Kind), usize> = HashMap::new();
@@ -930,10 +1059,7 @@ pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
     let mut i = 0;
     while i < queue.len() {
         let (path, kind) = queue[i].clone();
-        let mut original = match kind {
-            Kind::Script => std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?,
-            _ => synthesize(&path, kind)?,
-        };
+        let mut original = host.load(&path, kind)?;
         // The program's own modules (not the embedder's): its globals are
         // its bindings.
         let own = kind == Kind::Script
@@ -980,8 +1106,8 @@ pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
             warnings: Vec::new(),
             dyn_externals: Vec::new(),
         };
-        let mut resolve_target = |spec: &str, attr: Option<String>| -> Result<Target, String> {
-            Ok(match resolve(&path, spec, emb)? {
+        let mut resolve_target = |spec: &str, attr: Option<String>, dynamic: bool| -> Result<Target, String> {
+            Ok(match host.resolve(&path, spec, dynamic, attr.as_deref())? {
                 Resolved::External(s) => Target::External(s),
                 Resolved::File(p) => {
                     let kind = match attr.as_deref() {
@@ -1003,7 +1129,7 @@ pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
             })
         };
         if unit.errors.is_empty() {
-            records(&mut unit, program, &mut resolve_target)?;
+            records(&mut unit, program, &mut resolve_target, emb.library)?;
         }
         units.push(unit);
         i += 1;
@@ -1021,7 +1147,8 @@ pub fn bundle_with(entry: &Path, emb: &Embedding) -> Result<Bundle, String> {
         let u = units.pop().unwrap();
         return Ok(single(&u.path, u.original));
     }
-    let mut b = link(&units)?;
+    let shared: Vec<PathBuf> = emb.shared.iter().map(|d| d.canonicalize().unwrap_or_else(|_| d.clone())).collect();
+    let mut b = link(&units, emb.library, &shared)?;
     if std::env::var_os("LUMINOUS_DEBUG_BUNDLE").is_some() {
         eprintln!("{}", b.source);
     }
@@ -1110,7 +1237,7 @@ type Hoist = (&'static str, String, Option<Span>);
 const GLOBALS_USED: [&str; 7] = ["Object", "Proxy", "Reflect", "Symbol", "TypeError", "JSON", "Uint8Array"];
 
 /// Order, name and merge the modules.
-fn link(units: &[Unit]) -> Result<Bundle, String> {
+fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, String> {
     // Evaluation order: dependencies first (run-time ones), depth first.
     fn visit(m: usize, units: &[Unit], state: &mut [u8], order: &mut Vec<usize>) {
         state[m] = 1;
@@ -1269,7 +1396,28 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     // program uses what they declare (a binding, or the namespace object
     // that holds it): as bundlers do, a package's `index` that re-exports
     // all of its modules brings only those the program uses.
-    let keep = used_modules(units, &order, &lazy_order, &resolved);
+    // A library's exports: those of its entry that are values.
+    let mut entry_exports: Vec<(String, Binding)> = Vec::new();
+    if library {
+        for n in export_names(units, 0) {
+            let Some(b) = resolve_export(units, 0, &n, &mut Vec::new()) else {
+                return Err(format!("{}: export `{n}` does not resolve", units[0].path.display()));
+            };
+            if let Binding::Symbol(k, sym) = b
+                && !units[k].sem.scoping().symbol_flags(sym).is_value()
+            {
+                continue;
+            }
+            entry_exports.push((n, b));
+        }
+    }
+    // (A library is shaken statement by statement.)
+    let (keep, removed) = if library {
+        let s = shake::shake(units, &order, &lazy_order, &resolved, &entry_exports);
+        (s.keep, s.removed)
+    } else {
+        (used_modules(units, &order, &lazy_order, &resolved, &entry_exports), vec![Vec::new(); units.len()])
+    };
     order.retain(|&m| keep[m]);
     lazy_order.retain(|&m| keep[m]);
     for (m, l) in lazy.iter_mut().enumerate() {
@@ -1356,6 +1504,32 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     }
     writes.sort();
     let mut needed: Vec<usize> = ns_sites.keys().copied().collect();
+    // A program that imports modules at run time: its modules, by path, for
+    // the embedder's loader to give them (one instance of each module).
+    let registry: Vec<usize> = if fallback_sites.is_empty() {
+        order
+            .iter()
+            .copied()
+            .filter(|&t| {
+                let p = units[t].path.canonicalize().unwrap_or_else(|_| units[t].path.clone());
+                shared.iter().any(|d| p.starts_with(d))
+            })
+            .collect()
+    } else {
+        order.clone()
+    };
+    for &t in &registry {
+        if !needed.contains(&t) {
+            needed.push(t);
+        }
+    }
+    for (_, b) in &entry_exports {
+        if let Binding::Namespace(t) = *b
+            && !needed.contains(&t)
+        {
+            needed.push(t);
+        }
+    }
     for &t in &loads {
         if !needed.contains(&t) && !broken.contains_key(&t) {
             needed.push(t);
@@ -1392,7 +1566,10 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         taken.insert("SyntaxError".into());
     }
     if !fallback_sites.is_empty() {
-        taken.extend(["console", "Set", "JSON"].map(String::from));
+        taken.extend(["console", "Set", "JSON", "Map", "globalThis"].map(String::from));
+    }
+    if units.iter().any(|u| !u.metas.is_empty()) {
+        taken.extend(["globalThis", "URL"].map(String::from));
     }
     for u in units {
         let scoping = u.sem.scoping();
@@ -1550,8 +1727,14 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
     for &m in &all {
         let u = &units[m];
         let typed = typed_only.contains(&m);
+        // (Not if tree shaking left the function out.)
+        let shaken = u.default_expr.is_some_and(|d| {
+            let i = u.program.body.partition_point(|s| s.span().end <= d.prefix.start);
+            removed[m].get(i) == Some(&true)
+        });
         if let Some(d) = u.default_expr
             && !typed
+            && !shaken
             && d.anonymous == Anon::Function
             && d.name_at.is_some()
         {
@@ -1561,10 +1744,20 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
             ));
         }
     }
+    if !registry.is_empty() {
+        let entries: Vec<String> = registry
+            .iter()
+            .map(|&t| {
+                let path = units[t].path.canonicalize().unwrap_or_else(|_| units[t].path.clone());
+                format!("[{}, {}]", serde_json::to_string(&path.display().to_string()).unwrap(), names.of[&Binding::Namespace(t)])
+            })
+            .collect();
+        prelude.push_str(&format!("globalThis[Symbol.for(\"luminous.modules\")] = new Map([{}]); ", entries.join(", ")));
+    }
     source.push_str(&prelude);
     for &m in &all {
         let u = &units[m];
-        let mut edits = edits(units, m, &resolved, &names, typed_only.contains(&m), &int_aliases, plans.get(&m))?;
+        let mut edits = edits(units, m, &resolved, &names, typed_only.contains(&m), &int_aliases, plans.get(&m), &removed[m])?;
         // (An edit inside a removed span is dropped: the longer first, an
         // insertion before what starts where it is.)
         edits.sort_by_key(|e| (e.0.start, e.0.end != e.0.start, std::cmp::Reverse(e.0.end)));
@@ -1690,13 +1883,18 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         let path = units[m].path.canonicalize().unwrap_or_else(|_| units[m].path.clone());
         let dir = path.parent().unwrap_or(Path::new("/"));
         let json = |s: String| serde_json::to_string(&s).unwrap();
+        let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        // (`resolve` through the embedder's resolver if it has one.)
         source.push_str(&format!(
             "var {name}$; function {name}() {{ return {name}$ || ({name}$ = Object.assign(Object.create(null), \
-             {{ url: {}, filename: {}, dirname: {}, main: {} }})); }}\n",
-            json(file_url(&path)),
-            json(path.display().to_string()),
-            json(dir.display().to_string()),
-            m == 0
+             {{ url: {url}, filename: {filename}, dirname: {dirname}, dir: {dirname}, file: {file}, path: {filename}, main: {main}, \
+             resolve(specifier) {{ const r = globalThis[Symbol.for(\"luminous.resolve\")]; \
+             return r ? r(`${{specifier}}`, {filename}) : new URL(`${{specifier}}`, {url}).href; }} }})); }}\n",
+            url = json(file_url(&path)),
+            filename = json(path.display().to_string()),
+            dirname = json(dir.display().to_string()),
+            file = json(file),
+            main = m == 0
         ));
     }
     // `import()` left to run time: the engine loads (and interprets) the
@@ -1706,6 +1904,7 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
         source.push_str(&format!(
             "var {f}$w; function {f}(base, specifier, options) {{ \
              let key; try {{ key = `${{specifier}}`; }} catch (e) {{ return (async () => {{ throw e; }})(); }} \
+             const hook = globalThis[Symbol.for(\"luminous.import\")]; if (hook) return hook(key, base, options); \
              if (!({f}$w || ({f}$w = new Set())).has(key)) {{ {f}$w.add(key); \
              console.warn(\"Luminous: import(\" + JSON.stringify(key) + \") is not part of the compiled program: \
              the module is loaded and interpreted at run time\"); }} \
@@ -1713,7 +1912,32 @@ fn link(units: &[Unit]) -> Result<Bundle, String> {
              return import(key, options); }}\n"
         ));
     }
+    if !entry_exports.is_empty() {
+        let mut specs = Vec::new();
+        for (n, b) in &entry_exports {
+            let local = match b {
+                Binding::Namespace(t) => {
+                    // (A namespace object made once, as a binding.)
+                    let f = &names.of[&Binding::Namespace(*t)];
+                    let v = format!("{f}$export");
+                    source.push_str(&format!("var {v} = {f}();\n"));
+                    v
+                }
+                b => names.of[b].clone(),
+            };
+            let exported = if is_identifier_name(n) { n.clone() } else { serde_json::to_string(n).unwrap() };
+            specs.push(if &local == n { local } else { format!("{local} as {exported}") });
+        }
+        source.push_str(&format!("export {{ {} }};\n", specs.join(", ")));
+    }
     Ok(Bundle { source, modules, warnings })
+}
+
+/// Whether `s` can be an export name as is (else it is a string).
+fn is_identifier_name(s: &str) -> bool {
+    let mut cs = s.chars();
+    cs.next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+        && cs.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// The `file:` URL of an absolute path.
@@ -1737,6 +1961,7 @@ fn used_modules(
     order: &[usize],
     lazy_order: &[usize],
     resolved: &HashMap<(usize, SymbolId), Binding>,
+    exported: &[(String, Binding)],
 ) -> Vec<bool> {
     let mut keep = vec![false; units.len()];
     let mut work = Vec::new();
@@ -1764,6 +1989,13 @@ fn used_modules(
                 Some(Binding::Namespace(k)) => materialize(k, units, keep, work, done),
                 None => {}
             }
+        }
+    }
+    // (What a library exports is used.)
+    for (_, b) in exported {
+        match *b {
+            Binding::Symbol(k, _) | Binding::Default(k) => mark(k, &mut keep, &mut work),
+            Binding::Namespace(t) => materialize(t, units, &mut keep, &mut work, &mut materialized),
         }
     }
     while let Some(m) = work.pop() {
@@ -2071,6 +2303,7 @@ fn edits(
     typed_only: bool,
     int_aliases: &[(usize, SymbolId)],
     plan: Option<&LazyPlan>,
+    removed: &[bool],
 ) -> Result<Vec<(Span, String)>, String> {
     let u = &units[m];
     let scoping = u.sem.scoping();
@@ -2166,6 +2399,16 @@ fn edits(
             out.push((Span::new(d.end, d.end), after));
         }
     }
+    // Declarations tree shaking left out (a library's).
+    for (i, stmt) in program.body.iter().enumerate() {
+        if removed.get(i) == Some(&true) {
+            out.push(blank(stmt.span()));
+        }
+    }
+    let removed_at = |pos: u32| -> bool {
+        let i = program.body.partition_point(|s| s.span().end <= pos);
+        removed.get(i) == Some(&true) && program.body[i].span().start <= pos
+    };
     // A module imported for its types only: its type declarations.
     if typed_only {
         for stmt in &program.body {
@@ -2261,8 +2504,11 @@ fn edits(
             rename_at(&mut out, nodes.get_node(node).kind().span(), old, new, shorthand_ref(node));
         }
         // A class's or function's `name` comes from its binding: kept as
-        // written (`class Event$1` is still named "Event").
+        // written (`class Event$1` is still named "Event"). (Not in a module
+        // imported for its types: its declarations are gone.)
         if plan.is_none()
+            && !typed_only
+            && !removed_at(scoping.symbol_span(sym).start)
             && let Some(end) = named_by_binding(nodes, scoping.symbol_declaration(sym))
         {
             out.push((

@@ -84,6 +84,18 @@ pub struct EmbedOpts {
     /// (`--global Response=beyond:fetch`).
     #[arg(long = "global", value_name = "NAME=SPECIFIER", value_parser = parse_global)]
     pub globals: Vec<(String, String)>,
+    /// A specifier that is another's (`--alias fs=node:fs`).
+    #[arg(long = "alias", value_name = "SPECIFIER=TARGET", value_parser = parse_alias)]
+    pub aliases: Vec<(String, String)>,
+    /// A directory whose modules the program registers by path, for
+    /// modules loaded at run time to import them (repeatable).
+    #[arg(long = "shared", value_name = "DIR")]
+    pub shared: Vec<PathBuf>,
+}
+
+fn parse_alias(s: &str) -> Result<(String, String), String> {
+    let (from, to) = s.split_once('=').ok_or("expected SPECIFIER=TARGET")?;
+    Ok((from.to_string(), to.to_string()))
 }
 
 fn parse_global(s: &str) -> Result<(String, String), String> {
@@ -114,6 +126,9 @@ impl EmbedOpts {
             module_dirs: self.module_dirs.clone(),
             externals: self.c_modules.iter().map(|(s, _)| s.clone()).collect(),
             globals: self.globals.clone(),
+            aliases: self.aliases.clone(),
+            shared: self.shared.clone(),
+            library: false,
         }
     }
 }
@@ -373,8 +388,36 @@ fn closure_sources(analysis: &luminous_front::Analysis) -> Vec<Option<String>> {
         .collect()
 }
 
+/// The program's bytecode as C (`lum_program`, `lum_program_size`): one
+/// string literal, which compilers read many times faster than a list of
+/// numbers.
+fn bytecode_c(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut c = String::with_capacity(bytes.len() * 2 + 256);
+    let _ = write!(
+        c,
+        "#include <inttypes.h>\n\nconst uint32_t lum_program_size = {n};\n\nconst uint8_t lum_program[{n}] =\n\"",
+        n = bytes.len()
+    );
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && i % 100 == 0 {
+            c.push_str("\"\n\"");
+        }
+        // (Octal escapes have at most three digits: a digit after one is
+        // its own character. `?` could start a trigraph.)
+        if (0x20..0x7f).contains(&b) && !matches!(b, b'"' | b'\\' | b'?') {
+            c.push(b as char);
+        } else {
+            let _ = write!(c, "\\{b:03o}");
+        }
+    }
+    c.push_str("\";\n");
+    c
+}
+
 pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
+    let fopts = &luminous_front::Options { native: fopts.native && !opts.no_native, ..*fopts };
     let (bundle, mut analysis) = analyze_with(input, fopts, &opts.embed)?;
     if opts.no_native {
         disable_native(&mut analysis);
@@ -400,12 +443,13 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         // The luminous:native module is always linked: its initialization locks
         // the Math and Number builtins, in native and --no-native builds alike.
         let mut qjsc = Command::new(q.build.join("qjsc"));
-        qjsc.arg("-m").arg("-n").arg(&script_name).arg("-N").arg("lum_program").arg("-o").arg(tmp.join("program.c"));
+        qjsc.arg("-b").arg("-m").arg("-n").arg(&script_name).arg("-o").arg(tmp.join("program.bin"));
         qjsc.arg("-M").arg(format!("{NATIVE_MODULE},{}", glue::MODULE_CNAME));
         for (spec, _) in &opts.embed.c_modules {
             qjsc.arg("-M").arg(spec);
         }
         run(qjsc.arg(&js_path))?;
+        std::fs::write(tmp.join("program.c"), bytecode_c(&std::fs::read(tmp.join("program.bin"))?))?;
         std::fs::write(tmp.join("main.c"), main_c(&opts.embed))?;
 
         std::fs::write(

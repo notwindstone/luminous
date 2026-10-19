@@ -23,6 +23,11 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
     let mut flags = settings::builder();
     flags.set("opt_level", opt_level)?;
     flags.set("is_pic", "true")?;
+    // The IR is checked in debug builds and with LUMINOUS_VERIFY (as the
+    // differential tests build), not on every build: it takes a fifth of
+    // the time of a large program's compile (Elysia's build script).
+    let verify = cfg!(debug_assertions) || std::env::var_os("LUMINOUS_VERIFY").is_some();
+    flags.set("enable_verifier", if verify { "true" } else { "false" })?;
     // Hot functions start on a cache line: their speed then does not
     // depend on where the code before them happens to end.
     flags.set("log2_min_function_alignment", "6")?;

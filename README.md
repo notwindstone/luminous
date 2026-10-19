@@ -1304,8 +1304,9 @@ instructions.
   with `.ts`, `.mts`, `.js` or `.mjs` added, or a directory's `index`.
   Other specifiers are packages, from the nearest `node_modules` up: a
   package's `exports` (subpaths and `*` patterns; the `import`, `module`
-  and `default` conditions), else its `module` or `main` field, else its
-  `index`. Their JavaScript is compiled like TypeScript without types
+  and `default` conditions, the first the package lists that applies),
+  else its `module` or `main` field, else its `index`; `#name` specifiers
+  are the importing package's `imports`. Their JavaScript is compiled like TypeScript without types
   (types come from the package's `.d.ts` files, which the build does not
   read: an imported name or `ns.Name` that only they declare is a type,
   erased). The engine's modules (`qjs:os`, `qjs:std`) stay imports.
@@ -1354,8 +1355,17 @@ instructions.
   or that does not resolve when the program is built, is left to run time:
   the build warns, and the engine loads the module (relative to the
   importing module's file) and interprets it, which `console.warn` reports
-  the first time. `import.meta` has `url`, `filename`, `dirname` and
-  `main`.
+  the first time; an embedder may load it instead (a function at
+  `globalThis[Symbol.for("luminous.import")]`, given the specifier, the
+  importing module's directory and the options). Such a program
+  registers its modules (`globalThis[Symbol.for("luminous.modules")]`, a
+  map from each module's path to a function that returns its namespace),
+  so that a module loaded at run time that imports one of them gets the
+  program's instance, not a second one. `import.meta` has `url`,
+  `filename`, `dirname`, `dir`, `file`, `path`, `main` and `resolve()`
+  (the embedder's resolution at
+  `globalThis[Symbol.for("luminous.resolve")]`, else a URL relative to the
+  module's).
 - **Conformance.** test262's module tests (`language/module-code`,
   `language/import`, `language/export`): 622 of 722 pass, against 611 with
   the engine's own module loader (QuickJS-NG); JSON and text imports pass
@@ -1400,12 +1410,30 @@ event loop. `luminous build` (and the `luminous_cli` library: `build` with
   that refer to it without declaring or assigning it get an import of it
   (at the end of their text), so that native code knows it (`new
   Response()` calls a class's native constructor);
-- `--link ARG`: an object file, static library or linker argument.
+- `--link ARG`: an object file, static library or linker argument;
+- `--alias SPECIFIER=TARGET`: the specifier `SPECIFIER` (exactly) is
+  `TARGET` (`--alias fs=node:fs`), resolved before anything else;
+- `--shared DIR`: the modules of `DIR` are registered (see `import()`
+  above) even when no import is left to run time, so that what the
+  embedder loads at run time shares them.
 
 A `declare const x` (any ambient declaration) names the global `x`: its
 references stay global reads, whatever other module has a binding `x`.
 
 `tests/embed` is an example, built by `crates/luminous-cli/tests/embed.rs`.
+
+The bundler itself is a library (`luminous_front::bundle`): `bundle_host`
+takes a `Host` that resolves each specifier (to a file or an external
+module) and loads each module's text (script, JSON, text or bytes), so a
+runtime can put a bundler's plugins in between (Beyond's `Beyond.build`,
+Bun's `Bun.build`). With `Embedding::library`, the bundle is an ES module
+for other programs rather than a program: the entry's exports stay
+exports, an `import()` that does not resolve is an error, and it is tree
+shaken as Bun and esbuild shake one: a module runs only if a module that
+runs imports it or something it declares is used (or, with
+`"sideEffects": false`, only the latter), and of each module only its
+statements that run code and the declarations that what is kept uses
+are kept.
 
 ## The `int` type
 

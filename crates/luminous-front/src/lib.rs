@@ -111,11 +111,14 @@ pub struct Options {
     /// `x = (x + 1) | 0`, in native and interpreted code alike. Without it,
     /// they must provably stay int32s.
     pub int_wrapping: bool,
+    /// Whether functions are compiled natively. Without it, the program is
+    /// only checked and erased (what `--no-native` builds).
+    pub native: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { int_wrapping: true }
+        Options { int_wrapping: true, native: true }
     }
 }
 
@@ -216,10 +219,24 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
     // The `int` type, over the whole module.
     let mut ints = ints::check(program, &scoping, opts.int_wrapping);
     errors.append(&mut ints.errors);
-    let mut out = check::check(program, &scoping, &ints.vars, &stripped.interpreted, &structs);
+    let mut out = if opts.native {
+        check::check(program, &scoping, &ints.vars, &stripped.interpreted, &structs)
+    } else {
+        check::Outcome {
+            native: Vec::new(),
+            module: ir::Module { layouts: structs.layouts.clone(), ..Default::default() },
+            cells: Vec::new(),
+            closure_spans: Vec::new(),
+            rejected: Vec::new(),
+            classes: Vec::new(),
+            class_uses: Vec::new(),
+        }
+    };
     out.module.int_wrapping = opts.int_wrapping;
 
-    let line = |pos: u32| source[..pos as usize].matches('\n').count() as u32 + 1;
+    let line_starts: Vec<u32> =
+        std::iter::once(0).chain(source.match_indices('\n').map(|(i, _)| i as u32 + 1)).collect();
+    let line = |pos: u32| line_starts.partition_point(|&s| s <= pos) as u32;
     let natives: Vec<NativeDecl> = out
         .native
         .iter()
@@ -248,7 +265,9 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
 
     // Functions marked `aot` must have been compiled natively.
     let mut marks = MarkedFunctions { marked: &stripped.marked, found: Vec::new() };
-    marks.visit_program(program);
+    if opts.native {
+        marks.visit_program(program);
+    }
     let inside = |outer: Span, inner: Span| outer.start <= inner.start && inner.end <= outer.end;
     // Functions in a constructor or field initializer run interpreted when
     // the class is constructed by interpreted code, even if native `new`

@@ -356,7 +356,7 @@ pub(crate) fn render_in(
 }
 
 /// Render diagnostics with source snippets (colored when stderr is a terminal).
-pub(crate) fn render(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
+pub fn render(diags: impl IntoIterator<Item = OxcDiagnostic>, source: &str, path: &Path) -> String {
     use std::io::IsTerminal;
     let theme =
         if std::io::stderr().is_terminal() { GraphicalTheme::unicode() } else { GraphicalTheme::unicode_nocolor() };

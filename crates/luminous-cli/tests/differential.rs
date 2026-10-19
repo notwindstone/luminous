@@ -13,6 +13,8 @@ use std::process::Command;
 
 fn luminous() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_luminous"));
+    // Cranelift checks the IR it is given.
+    cmd.env("LUMINOUS_VERIFY", "1");
     // Link against the engine built with assertions, so that leaked objects
     // abort the program at exit (see scripts/build-quickjs.sh).
     let check = repo().join("build/quickjs-check");

@@ -62,7 +62,7 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let fopts = luminous_front::Options { int_wrapping: !cli.no_int_wrapping };
+    let fopts = luminous_front::Options { int_wrapping: !cli.no_int_wrapping, ..Default::default() };
     match cli.cmd {
         Cmd::Build { input, output, opts } => {
             let output = output.unwrap_or_else(|| input.with_extension(""));
