@@ -946,6 +946,15 @@ pub enum ExprKind {
     /// is the builtin, an object of prototype x made with the empty shape
     /// the site caches (`lum_object_create`), else a call.
     ObjectCreate(Box<Expr>, AtomId, Box<Expr>),
+    /// Whether `o.k = v`, on an object made by an object literal (whose
+    /// prototype is Object.prototype) that does not have `k`, adds it as an
+    /// own data property: Object.prototype has no setter nor read-only `k`
+    /// (`lum_plain_add_ok`). `Bool`. (See `virtualize_objects`.)
+    PlainAddOk(AtomId),
+    /// Whether a value is the builtin `Object.create`. `Bool`.
+    IsObjectCreate(Box<Expr>),
+    /// A new object without a prototype (as `Object.create(null)`). `Any`.
+    NullObject,
     /// A value converted for field `field` of layout `layout` as a store
     /// would convert it (an `int` wraps; TypeError if not of its type): of
     /// the field's type (see `scalar_replace_structs`).
@@ -1234,6 +1243,8 @@ macro_rules! visitor {
                 | SuperGetAtom(..)
                 | ProtoMethodIs { .. }
                 | ProtoIs { .. }
+                | PlainAddOk(_)
+                | NullObject
                 | SpecGuard { .. }
                 | ElemGuard { .. }
                 | ArrLen { .. }
@@ -1286,7 +1297,8 @@ macro_rules! visitor {
                 | NonNull(_, a)
                 | NonNullSet(_, a)
                 | StructConvert(_, a)
-                | JsonMethodAs(_, a) => {
+                | JsonMethodAs(_, a)
+                | IsObjectCreate(a) => {
                     $name(a, f)
                 }
                 StructArrGet(_, a, b) | StructArrPush(_, a, b) | KeysLength(a, _, b) | ObjectCreate(a, _, b) => {
@@ -1989,6 +2001,362 @@ pub fn scalar_replace(f: &mut Func) {
         };
         e.kind = new;
     });
+}
+
+/// Whether statement `s` is `InitLocal(l, _)`.
+fn is_init_of(s: &Stmt, l: LocalId) -> bool {
+    matches!(s, Stmt::Expr(Expr { kind: ExprKind::InitLocal(m, _), .. }) if *m == l)
+}
+
+/// The statement list (`stmts`, or the body of one of their statements)
+/// that has statement `InitLocal(l, _)` itself.
+fn init_list(stmts: &mut Vec<Stmt>, l: LocalId) -> Option<&mut Vec<Stmt>> {
+    if stmts.iter().any(|s| is_init_of(s, l)) {
+        return Some(stmts);
+    }
+    for s in stmts.iter_mut() {
+        let found = match s {
+            Stmt::If(_, a, b) => init_list(a, l).or_else(|| init_list(b, l)),
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => init_list(body, l),
+            Stmt::Switch { cases, .. } => cases.iter_mut().find_map(|(_, b)| init_list(b, l)),
+            Stmt::Try { body, catch, finally, .. } => init_list(body, l)
+                .or_else(|| catch.as_mut().and_then(|(_, c)| init_list(c, l)))
+                .or_else(|| finally.as_mut().and_then(|c| init_list(c, l))),
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Put the statements of the block of the declaration of `l` (`let` or
+/// `const`: expressions) in the list that has the block, with the
+/// statements after it that use `l`.
+fn splice_declaration(stmts: &mut Vec<Stmt>, l: LocalId) -> bool {
+    let decl = |s: &Stmt| match s {
+        Stmt::Block(b) => b.iter().any(|s| is_init_of(s, l)) && b.iter().all(|s| matches!(s, Stmt::Expr(_))),
+        _ => false,
+    };
+    if let Some(i) = stmts.iter().position(decl) {
+        let Stmt::Block(b) = stmts.remove(i) else { unreachable!() };
+        stmts.splice(i..i, b);
+        return true;
+    }
+    stmts.iter_mut().any(|s| match s {
+        Stmt::If(_, a, b) => splice_declaration(a, l) || splice_declaration(b, l),
+        Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => splice_declaration(body, l),
+        Stmt::Switch { cases, .. } => cases.iter_mut().any(|(_, b)| splice_declaration(b, l)),
+        Stmt::Try { body, catch, finally, .. } => {
+            splice_declaration(body, l)
+                || catch.as_mut().is_some_and(|(_, c)| splice_declaration(c, l))
+                || finally.as_mut().is_some_and(|c| splice_declaration(c, l))
+        }
+        _ => false,
+    })
+}
+
+/// `x == null`, `x !== undefined` and the like (`Bool`), where `x` is a
+/// local: the local, and whether it is the right operand.
+fn nullish_compare(e: &Expr) -> Option<(LocalId, bool)> {
+    let ExprKind::AnyCompare(AnyCmpOp::Eq | AnyCmpOp::Ne | AnyCmpOp::StrictEq | AnyCmpOp::StrictNe, a, b) = &e.kind
+    else {
+        return None;
+    };
+    let nullish = |x: &Expr| matches!(x.kind, ExprKind::Null | ExprKind::Undefined);
+    match (&a.kind, &b.kind) {
+        _ if e.ty != Ty::Bool => None,
+        (ExprKind::Local(l), _) if nullish(b) => Some((*l, false)),
+        (_, ExprKind::Local(l)) if nullish(a) => Some((*l, true)),
+        _ => None,
+    }
+}
+
+/// A value that can be evaluated twice, in either branch of a check.
+fn plain_value(x: &Expr) -> bool {
+    match &x.kind {
+        ExprKind::Local(_) | ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Null | ExprKind::Undefined => true,
+        ExprKind::Box(y) => matches!(y.kind, ExprKind::Local(_) | ExprKind::Num(_) | ExprKind::Bool(_)),
+        _ => false,
+    }
+}
+
+/// Scalar replacement of plain objects that get their properties after
+/// they are made (`const o: any = {}; o.a = x; ...`), have no prototype
+/// (`Object.create(null)`), or are needed as objects somewhere: what
+/// `scalar_replace` leaves. A local initialized with an object literal or
+/// `Object.create(null)`, named only by the statements after its
+/// declaration in the same block, keeps its properties in locals of their
+/// own while it is virtual (a flag local). A key is added by a statement
+/// `o.k = v` of that block (the first one with it); the statements after
+/// it read and write it. An addition to an object of Object.prototype goes
+/// through it: while it has no setter nor read-only property of the key
+/// (`PlainAddOk`), the key is the object's own. Anywhere else the object is
+/// needed (passed, returned, a key it does not have, an addition in a
+/// branch), and where Object.prototype does not allow an addition, it is
+/// made from the properties it has ("materialized", once) and that use
+/// and every later one work on it. `Object.create(null)` is virtual while
+/// the method is the builtin (else its result is used); a key not added
+/// reads `undefined`.
+pub fn virtualize_objects(f: &mut Func) {
+    let n = f.locals.len();
+    let mut ok: Vec<bool> =
+        (0..n).map(|l| l >= f.params.len() && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)).collect();
+    stmt_locals(&f.body, &mut |l| ok[l] = false);
+    let mut named = vec![0usize; n];
+    each_local(&f.body, &mut |l| named[l] += 1);
+    // Per local: how it is made (`Some(true)`: without a prototype), and
+    // its namings as a value or a declaration (what can be replaced).
+    let mut made: Vec<Option<bool>> = vec![None; n];
+    let mut values = vec![0usize; n];
+    visit_stmts(&f.body, &mut |e| match &e.kind {
+        ExprKind::InitLocal(l, x) => {
+            let how = match &x.kind {
+                ExprKind::Object(_) => Some(false),
+                ExprKind::ObjectCreate(_, _, a) if matches!(a.kind, ExprKind::Null) => Some(true),
+                _ => None,
+            };
+            if how.is_none() || made[*l].is_some() {
+                ok[*l] = false;
+            }
+            made[*l] = how;
+            values[*l] += 1;
+        }
+        ExprKind::Local(l) => values[*l] += 1,
+        _ => {}
+    });
+    let debug = std::env::var_os("LUMINOUS_DEBUG_VIRT").is_some();
+    for l in 0..n {
+        if let Some(no_proto) = made[l]
+            && ok[l]
+            && named[l] == values[l]
+        {
+            let done = virtualize_object(f, l, no_proto);
+            if debug {
+                eprintln!("virtualize object {} local {l}: {}", f.name, if done { "yes" } else { "no" });
+            }
+        }
+    }
+}
+
+/// How many places may materialize an object (each a copy of the code
+/// making it).
+const MATERIALIZE_SITES: usize = 3;
+
+/// `virtualize_objects` for local `l` (made by `Object.create(null)` if
+/// `no_proto`), if its uses are where it allows them and some are virtual.
+fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
+    let mut named = 0;
+    each_local(&f.body, &mut |m| named += (m == l) as usize);
+    let base = f.locals.len();
+    splice_declaration(&mut f.body, l);
+    let Some(list) = init_list(&mut f.body, l) else { return false };
+    let i0 = list.iter().position(|s| is_init_of(s, l)).unwrap();
+    // Every use after the declaration, in the same block.
+    let mut later = 0;
+    each_local(&list[i0 + 1..], &mut |m| later += (m == l) as usize);
+    if later + 1 != named {
+        return false;
+    }
+    let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
+    // The keys: the literal's, then those added, in order.
+    let mut keys: Vec<AtomId> = Vec::new();
+    if let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, x), .. }) = &list[i0]
+        && let ExprKind::Object(props) = &x.kind
+    {
+        for (k, _) in props {
+            if !keys.contains(k) {
+                keys.push(*k);
+            }
+        }
+    }
+    // An addition: statement `l.k = v` of a key it does not have yet.
+    let addition = |s: &Stmt, keys: &[AtomId]| match s {
+        Stmt::Expr(Expr { kind: ExprKind::SetProp(o, k, _), .. }) if is_l(o) && !keys.contains(k) => Some(*k),
+        _ => None,
+    };
+    let k0 = keys.len();
+    // Per statement after the declaration: the key it adds, if any. Uses
+    // that keep the object virtual, and the others (where it is made).
+    let mut adds: Vec<Option<AtomId>> = Vec::new();
+    let (mut virtual_uses, mut others) = (0, 0);
+    for s in &list[i0 + 1..] {
+        let add = addition(s, &keys);
+        let mut uses = 0;
+        each_local(std::slice::from_ref(s), &mut |m| uses += (m == l) as usize);
+        let mut kept = add.is_some() as usize;
+        // (The statement's own expression comes first.)
+        let mut top = add.is_some();
+        visit_stmts(std::slice::from_ref(s), &mut |e| {
+            if nullish_compare(e).is_some_and(|(m, _)| m == l) {
+                kept += 1;
+                return;
+            }
+            let (ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _)) = &e.kind else { return };
+            if !is_l(o) || std::mem::take(&mut top) {
+                return;
+            }
+            // A key it has; or, without a prototype, one it does not (read).
+            if keys.contains(k) || (no_proto && matches!(e.kind, ExprKind::GetProp(..))) {
+                kept += 1;
+            }
+        });
+        virtual_uses += kept;
+        others += uses - kept;
+        keys.extend(add);
+        adds.push(add);
+    }
+    if virtual_uses == 0 || others > MATERIALIZE_SITES {
+        return false;
+    }
+    // The flag, the properties, the object itself while being rewritten
+    // (renamed `l` at the end); then temporaries.
+    let flag = base;
+    let slots: Vec<LocalId> = (base + 1..base + 1 + keys.len()).collect();
+    let ph = base + 1 + keys.len();
+    let slot = |k: AtomId| slots[keys.iter().position(|&x| x == k).unwrap()];
+    let local = |x: LocalId| Expr::new(Ty::Any, ExprKind::Local(x));
+    let flag_e = || Expr::new(Ty::Bool, ExprKind::Local(flag));
+    let bool_ = |b: bool| Expr::new(Ty::Bool, ExprKind::Bool(b));
+    let any = |kind: ExprKind| Expr::new(Ty::Any, kind);
+    let cond = |ty: Ty, c: Expr, a: Expr, b: Expr| Expr::new(ty, ExprKind::Cond(Box::new(c), Box::new(a), Box::new(b)));
+    let temps = std::cell::Cell::new(0);
+    let temp = || {
+        temps.set(temps.get() + 1);
+        ph + temps.get()
+    };
+    // `v` once, as a value usable in both branches of a check: itself, or
+    // a temporary it is stored in first (`Seq[init, ...]`; evaluated before
+    // the check, also if it makes the object).
+    let once = |v: Expr| -> (Option<Expr>, Expr) {
+        let mut names = false;
+        visit(&v, &mut |x| names |= is_l(x));
+        if plain_value(&v) && !names {
+            return (None, v);
+        }
+        let t = temp();
+        (Some(any(ExprKind::InitLocal(t, Box::new(v)))), local(t))
+    };
+    let seq = |first: Option<Expr>, then: Expr| match first {
+        Some(x) => Expr::new(then.ty, ExprKind::Seq(vec![x, then])),
+        None => then,
+    };
+    // The declaration.
+    let Stmt::Expr(init) = &mut list[i0] else { unreachable!() };
+    let ExprKind::InitLocal(_, x) = std::mem::replace(&mut init.kind, ExprKind::Undefined) else { unreachable!() };
+    let mut parts = Vec::new();
+    match x.kind {
+        ExprKind::ObjectCreate(o, create, arg) => {
+            // The method read (from `Object`, once), then called unless it is
+            // the builtin.
+            let (to, tf) = (temp(), temp());
+            parts.push(any(ExprKind::InitLocal(to, o)));
+            parts.push(any(ExprKind::InitLocal(tf, Box::new(any(ExprKind::GetProp(Box::new(local(to)), create))))));
+            let is = Expr::new(Ty::Bool, ExprKind::IsObjectCreate(Box::new(local(tf))));
+            parts.push(Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(is))));
+            let call = any(ExprKind::CallThis(Box::new(local(tf)), Box::new(local(to)), vec![*arg]));
+            parts.push(any(ExprKind::InitLocal(ph, Box::new(cond(Ty::Any, flag_e(), any(ExprKind::Undefined), call)))));
+        }
+        ExprKind::Object(props) => {
+            parts.push(Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(bool_(true)))));
+            for (k, v) in props {
+                parts.push(any(ExprKind::InitLocal(slot(k), Box::new(v))));
+            }
+            parts.push(any(ExprKind::InitLocal(ph, Box::new(any(ExprKind::Undefined)))));
+        }
+        _ => unreachable!(),
+    }
+    // (Assigned before they are read, by their additions.)
+    for &s in &slots[k0..] {
+        parts.push(any(ExprKind::InitLocal(s, Box::new(any(ExprKind::Undefined)))));
+    }
+    parts.push(any(ExprKind::Undefined));
+    *init = any(ExprKind::Seq(parts));
+    // The object, made from the properties it has while it is virtual (an
+    // object literal's: defined; one without a prototype: set, as no
+    // setter can run).
+    let materialize = |have: &[AtomId]| {
+        let mut make = Vec::new();
+        if no_proto {
+            make.push(any(ExprKind::SetLocal(ph, Box::new(any(ExprKind::NullObject)))));
+            for &k in have {
+                make.push(any(ExprKind::SetProp(Box::new(local(ph)), k, Box::new(local(slot(k))))));
+            }
+        } else {
+            let lit = any(ExprKind::Object(have.iter().map(|&k| (k, local(slot(k)))).collect()));
+            make.push(any(ExprKind::SetLocal(ph, Box::new(lit))));
+        }
+        make.push(Expr::new(Ty::Bool, ExprKind::SetLocal(flag, Box::new(bool_(false)))));
+        make.push(local(ph));
+        cond(Ty::Any, flag_e(), any(ExprKind::Seq(make)), local(ph))
+    };
+    let mut have: Vec<AtomId> = keys[..k0].to_vec();
+    for (s, add) in list[i0 + 1..].iter_mut().zip(adds) {
+        // An addition: the value, then the key (while Object.prototype lets
+        // it be the object's own), else the object made and the key added.
+        if let Some(k) = add {
+            let Stmt::Expr(e) = s else { unreachable!() };
+            let ExprKind::SetProp(_, _, v) = std::mem::replace(&mut e.kind, ExprKind::Undefined) else {
+                unreachable!()
+            };
+            let (first, v) = once(*v);
+            let ok = if no_proto {
+                flag_e()
+            } else {
+                cond(Ty::Bool, flag_e(), Expr::new(Ty::Bool, ExprKind::PlainAddOk(k)), bool_(false))
+            };
+            let real = any(ExprKind::SetProp(Box::new(materialize(&have)), k, Box::new(v.clone())));
+            let set = cond(Ty::Any, ok, any(ExprKind::SetLocal(slot(k), Box::new(v))), real);
+            *e = seq(first, set);
+        }
+        visit_stmts_mut(std::slice::from_mut(s), &mut |e| {
+            if let Some((_, right)) = nullish_compare(e) {
+                let ExprKind::AnyCompare(op, a, b) = &mut e.kind else { unreachable!() };
+                let ne = matches!(op, AnyCmpOp::Ne | AnyCmpOp::StrictNe);
+                let x = if right { b } else { a };
+                if is_l(x) {
+                    **x = local(ph);
+                    let real = std::mem::replace(e, bool_(false));
+                    *e = cond(Ty::Bool, flag_e(), bool_(ne), real);
+                }
+                return;
+            }
+            let ty = e.ty;
+            match &mut e.kind {
+                ExprKind::GetProp(o, k) if is_l(o) && (have.contains(k) || no_proto) => {
+                    let fast = if have.contains(k) { local(slot(*k)) } else { any(ExprKind::Undefined) };
+                    **o = local(ph);
+                    let real = std::mem::replace(e, any(ExprKind::Undefined));
+                    *e = cond(ty, flag_e(), fast, real);
+                }
+                ExprKind::SetProp(o, k, v) if is_l(o) && have.contains(k) => {
+                    let k = *k;
+                    let v = std::mem::replace(&mut **v, any(ExprKind::Undefined));
+                    let (first, v) = once(v);
+                    let real = any(ExprKind::SetProp(Box::new(local(ph)), k, Box::new(v.clone())));
+                    let set = cond(ty, flag_e(), any(ExprKind::SetLocal(slot(k), Box::new(v))), real);
+                    *e = seq(first, set);
+                }
+                // The object itself.
+                ExprKind::Local(m) if *m == l => *e = materialize(&have),
+                _ => {}
+            }
+        });
+        have.extend(add);
+    }
+    // The object local is `l` again.
+    visit_stmts_mut(&mut list[i0..], &mut |e| match &mut e.kind {
+        ExprKind::Local(m) | ExprKind::SetLocal(m, _) | ExprKind::InitLocal(m, _) if *m == ph => *m = l,
+        _ => {}
+    });
+    let added = keys.len() + 2 + temps.get();
+    f.locals.push(Ty::Bool);
+    f.locals.extend(std::iter::repeat_n(Ty::Any, added - 1));
+    f.boxed.extend(std::iter::repeat_n(false, added));
+    f.local_names.extend(std::iter::repeat_n(None, added));
+    true
 }
 
 /// A number written to an `Any` local `l` that `retype_numbers` can turn

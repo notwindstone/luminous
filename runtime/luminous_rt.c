@@ -1079,21 +1079,33 @@ static bool lum_ic_fill_add(JSContext *ctx, JSValue obj, JSAtom prop, void *befo
 }
 
 /* Cache that objects of obj's shape do not have `prop`, nor their
-   prototypes (in a polymorphic entry of `ic`, as lum_ic_fill_add's).
-   Returns whether it could. */
-static bool lum_ic_fill_absent(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
+   prototypes (in a polymorphic entry of `ic`, as lum_ic_fill_add's; at a
+   site whose native code reads the primary one's kinds, there if it is
+   free). Returns whether it could. */
+static bool lum_ic_fill_absent(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic, bool primary)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     uint32_t refreshes;
     LumIC *e;
-    void *shape;
+    void *shape, *before;
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return false;
-    e = lum_ic_epoch_entry(rt, ic, *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE),
-                           LUM_IC_ABSENT, &refreshes);
+    before = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    /* (Native code reads `undefined` from the primary entry: its value,
+       while the epoch holds.) */
+    if (primary && !ic->shape && (!ic->alt_shape || (ic->alt_shape == before && ic->kind == LUM_IC_ABSENT))) {
+        refreshes = ic->alt_shape ? ic->refreshes + 1 : 0;
+        e = refreshes > LUM_IC_REFRESHES ? NULL : ic;
+    } else {
+        e = lum_ic_epoch_entry(rt, ic, before, LUM_IC_ABSENT, &refreshes);
+    }
     if (!e || JS_CacheAbsentProperty(ctx, obj, prop, &shape) < 0)
         return false;
     lum_ic_epoch_store(rt, ic, e, shape, NULL, 0, LUM_IC_ABSENT, refreshes);
+    if (e == ic) {
+        ic->value = JS_UNDEFINED;
+        ic->entry = NULL;
+    }
     return true;
 }
 
@@ -1258,6 +1270,12 @@ static void lum_ic_keep_value(LumIC *ic, char *p)
    many times, no epoch: native code then checks the shapes. */
 void lum_ic_refresh(LumIC *ic, void *p)
 {
+    /* (An absent property's entry is made again where the property is
+       looked up: lum_ic_get_proto.) */
+    if (ic->kind == LUM_IC_ABSENT) {
+        ic->epoch = 0;
+        return;
+    }
     if (++ic->refreshes > LUM_IC_REFRESHES) {
         ic->epoch = 0;
         return;
@@ -1440,7 +1458,7 @@ JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
         return JS_DupValue(ctx, *at);
     v = JS_GetProperty(ctx, obj, prop);
     if (!JS_IsException(v) && !lum_ic_full(ic) && !lum_ic_fill(ctx, obj, prop, 0, ic) && JS_IsUndefined(v))
-        lum_ic_fill_absent(ctx, obj, prop, ic);
+        lum_ic_fill_absent(ctx, obj, prop, ic, false);
     return v;
 }
 
@@ -2335,7 +2353,7 @@ JSValue lum_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
         !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_DATA, ic) &&
         !lum_ic_fill_proto(ctx, obj, prop, LUM_IC_PROTO_GETTER, ic) &&
         !lum_ic_fill_deep(ctx, obj, prop, ic) &&
-        !(JS_IsUndefined(v) && lum_ic_fill_absent(ctx, obj, prop, ic)))
+        !(JS_IsUndefined(v) && lum_ic_fill_absent(ctx, obj, prop, ic, true)))
         lum_ic_count_miss(ic);
     return v;
 }
@@ -4508,9 +4526,6 @@ JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc)
     return JS_Invoke(ctx, recv, lum_atom_json, 0, NULL);
 }
 
-/* `f.call(this_obj, v).length` with f read as `Object.keys`: counted
- * without the array while f is the builtin (an object of an `aot type`:
- * its fields; an ordinary object or a dense array: JS_CountOwnKeys). */
 /* Object.create(proto) at a site (f: the method read from this_obj): while
  * f is the builtin, a new object of prototype proto (null or an object),
  * whose empty shape the site caches in `ic` for native code to make the
@@ -4537,6 +4552,51 @@ JSValue lum_object_create(JSContext *ctx, LumIC *ic, JSValueConst f, JSValueCons
     return obj;
 }
 
+/* Whether `o.prop = v` on an ordinary extensible object whose prototype
+ * is Object.prototype, without `prop`, adds it as an own data property:
+ * Object.prototype has no setter nor read-only property `prop` (see
+ * ir::virtualize_objects). Object.prototype is watched: the answer is kept
+ * in `ic->epoch` while js_proto_epoch is unchanged. */
+int lum_plain_add_ok(JSContext *ctx, LumIC *ic, JSAtom prop)
+{
+    JSValue obj = JS_NewObject(ctx), proto;
+    JSPropertyDescriptor d;
+    int watched, r;
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    proto = JS_GetPrototype(ctx, obj);
+    JS_FreeValue(ctx, obj);
+    watched = JS_WatchPrototype(ctx, proto) == 0;
+    r = JS_GetOwnProperty(ctx, &d, proto, prop);
+    JS_FreeValue(ctx, proto);
+    if (r < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    if (r) {
+        int ok = !(d.flags & JS_PROP_GETSET) && (d.flags & JS_PROP_WRITABLE);
+        JS_FreeValue(ctx, d.value);
+        JS_FreeValue(ctx, d.getter);
+        JS_FreeValue(ctx, d.setter);
+        if (!ok)
+            return 0;
+    }
+    if (watched)
+        ic->epoch = js_proto_epoch;
+    return 1;
+}
+
+/* A new object without a prototype (see ir::virtualize_objects). */
+JSValue lum_null_object(JSContext *ctx)
+{
+    return JS_NewObjectProto(ctx, JS_NULL);
+}
+
+/* `f.call(this_obj, v).length` with f read as `Object.keys`: counted
+ * without the array while f is the builtin (an object of an `aot type`:
+ * its fields; an ordinary object or a dense array: JS_CountOwnKeys). */
 JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, JSValueConst v)
 {
     JSValue arr, len;

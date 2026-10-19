@@ -179,14 +179,16 @@ void lum_ic_refresh(LumIC *ic, void *p);
 /* `instanceof`'s right operand: `alt_shape` is its shape, `kind` holds its
  * class in bits 16-31, `slot` is its "prototype" (see lum_instanceof). */
 #define LUM_IC_INSTANCEOF 9
-/* An addition of the property at a write site, in a polymorphic entry:
- * `alt_shape` the object's shape before, `proto_shape` after (both
- * referenced), valid while js_proto_epoch is `epoch` (see
- * JS_CacheAddProperty). */
+/* An addition of the property at a write site (the primary entry if it
+ * was free, else a polymorphic one): `alt_shape` the object's shape before,
+ * `proto_shape` after (both referenced), valid while js_proto_epoch is
+ * `epoch` (see JS_CacheAddProperty). */
 #define LUM_IC_ADD 10
-/* A property objects of a shape do not have, nor their prototypes, in a
- * polymorphic entry: `alt_shape` (referenced), valid while js_proto_epoch is
- * `epoch` (see JS_CacheAbsentProperty). */
+/* A property objects of a shape do not have, nor their prototypes (the
+ * primary entry of a read site that checks prototypes, if it was free; else
+ * a polymorphic one): `alt_shape` (referenced), valid while js_proto_epoch
+ * is `epoch` (see JS_CacheAbsentProperty). In the primary entry `value` is
+ * `undefined`: native code reads it as a prototype's data property. */
 #define LUM_IC_ABSENT 11
 extern LumIC lum_ics[] __attribute__((weak));
 extern const int32_t lum_nics __attribute__((weak));
@@ -376,3 +378,5 @@ JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc);
 void lum_set_json_hook(JSContext *ctx, JSValueConst fn);
 JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, JSValueConst v);
 JSValue lum_object_create(JSContext *ctx, LumIC *ic, JSValueConst f, JSValueConst this_obj, JSValueConst proto);
+int lum_plain_add_ok(JSContext *ctx, LumIC *ic, JSAtom prop);
+JSValue lum_null_object(JSContext *ctx);

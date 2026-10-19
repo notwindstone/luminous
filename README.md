@@ -753,7 +753,10 @@ The differential tests run every case with both.
     instructions each, now about 100), and a property that objects of a
     shape and their prototypes lack (`init.statusText` of a plain
     `{ status, headers }`: undefined, without trying every kind of entry
-    again);
+    again). A read site's first such entry takes the site's own fields
+    when they are free and is checked inline as a prototype's property is,
+    its value `undefined` (a loop reading 2 properties and a missing one:
+    156 instructions an iteration, now 123, without a runtime call);
   - `instanceof` through a per-site cache of the right operand: its shape
     and class, and the slot of its `prototype`, valid while its prototypes
     (watched, up to `Function.prototype`) are unchanged; the left
@@ -777,7 +780,8 @@ The differential tests run every case with both.
     gives (else the engine, which grows the properties in the object's
     cell while there is room). `{}` and 3 properties added, then 2 read:
     about 600 instructions, now 342; from `Object.create(null)`, about
-    870, now 381;
+    870, now 381 (53 and 83 where the object does not escape: see
+    "Plain objects that do not escape" below);
   - `typeof`, `in`, `new`;
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them; a small
@@ -941,6 +945,27 @@ The differential tests run every case with both.
   changed, a prediction that fails, a call that is not inlined) it is made
   then ("materialized", as deoptimization does), and later uses work on
   it, so identity and mutations stay right.
+- **Plain objects that do not escape**: a local holding an object
+  literal or `Object.create(null)` whose properties are added after it
+  is made (`const o: any = {}; o.a = i; o.b = 2;`), used by the
+  statements after its declaration in the same block, keeps its
+  properties in locals while a flag says it is virtual: an addition is a
+  statement `o.k = v` of that block, and the statements after it read and
+  write `k` there; a key `Object.create(null)` was not given reads
+  `undefined`, and a comparison with `null` or `undefined` is known. An
+  addition goes through the prototype in JS, so for an object of
+  `Object.prototype` it is checked (`PlainAddOk`, kept with the prototype
+  epoch: one comparison) that the prototype has no setter or read-only
+  property of the key; `Object.create(null)` is virtual while it is the
+  builtin, else its result is used. Anywhere else (the object passed or
+  returned, a key it lacks, an addition in a branch, `delete`, a setter
+  that appeared) it is made from the properties it has, once, and that
+  use and the later ones work on it: a setter then sees the object as it
+  is. A new object, 3 keys added and 2 read: 342 instructions an
+  iteration, now 53 (`Object.create(null)`: 381, now 83); a new `{}`
+  compared with `null`: 40, now 8; a function that adds 3 keys to `{}`
+  and returns it: 322, now 116 (the object made once with its final
+  shape).
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those

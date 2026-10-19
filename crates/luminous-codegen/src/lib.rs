@@ -548,6 +548,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_Throw", &[P, W], &[W]),
         ("lum_set_elem", &[P, P], &[Int]),
         ("lum_ic_get", &[P, W, Int, P], &[W]),
+        ("lum_plain_add_ok", &[P, P, Int], &[Int]),
+        ("lum_null_object", &[P], &[W]),
         ("JS_GetIteratorObject", &[P, W, Int], &[W]),
         ("JS_ForInStart", &[P, W, P], &[W]),
         ("JS_ForInHas", &[P, W, W, Int], &[Int]),

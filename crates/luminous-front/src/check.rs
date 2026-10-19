@@ -2583,6 +2583,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         };
         func.frameless = func.is_async && !func.is_generator && !ir::has_await(&func.body);
         ir::scalar_replace(&mut func);
+        ir::virtualize_objects(&mut func);
         ir::scalar_replace_structs(&mut func, self.m.layouts);
         ir::promote_struct_fields(&mut func, self.m.layouts);
         ir::number_locals(&mut func);

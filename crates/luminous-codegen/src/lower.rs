@@ -261,6 +261,11 @@ const OBJ_ADD_FLAGS: i64 = 0x02;
 const OBJECT_ROOM: i64 = 4;
 /// `LUM_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
+/// `LUM_IC_PROTO_GETTER`: a getter of a prototype.
+const IC_PROTO_GETTER: i64 = 2;
+/// `LUM_IC_ABSENT`: a property no object of `alt_shape` has (nor its
+/// prototypes); read as `undefined` while the epoch holds.
+const IC_ABSENT: i64 = 11;
 
 pub(crate) struct Env {
     pub helpers: HashMap<&'static str, FuncRef>,
@@ -2518,6 +2523,45 @@ impl Lower {
             }
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
             ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
+            ExprKind::PlainAddOk(a) => {
+                // Known while no watched prototype changed (Object.prototype
+                // is), else asked again.
+                let ic = self.new_ic();
+                let join = self.b.create_block();
+                let r = self.b.append_block_param(join, I8);
+                let ask = self.b.create_block();
+                self.b.set_cold_block(ask);
+                let base = self.b.ins().symbol_value(self.ptr, self.env.proto_epoch);
+                let now = self.b.ins().load(I64, M_TABLE, base, 0);
+                let then = self.b.ins().load(I64, M_IC, ic, IC_EPOCH);
+                let fresh = self.b.ins().icmp(IntCC::Equal, now, then);
+                let yes = self.b.ins().iconst(I8, 1);
+                self.b.ins().brif(fresh, join, &[BlockArg::Value(yes)], ask, &[]);
+                self.b.switch_to_block(ask);
+                let ctx = self.ctx;
+                let atom = self.atom(*a);
+                let ok = self.helper("lum_plain_add_ok", &[ctx, ic, atom])[0];
+                let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+                self.b.ins().jump(join, &[BlockArg::Value(ok)]);
+                self.b.switch_to_block(join);
+                V::Bool(r)
+            }
+            ExprKind::NullObject => {
+                let ctx = self.ctx;
+                let r = self.helper("lum_null_object", &[ctx])[0];
+                self.check_value(r);
+                V::Any(r)
+            }
+            ExprKind::IsObjectCreate(x) => {
+                let (v, owned) = self.operand(x, &[]);
+                let w = self.boxed(v);
+                let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+                let orig = self.b.ins().load(I64, M_CONST, table, PIN_OBJECT_CREATE * 8);
+                let orig = self.mk_ref(TAG_OBJECT, orig);
+                let is = self.b.ins().icmp(IntCC::Equal, w, orig);
+                self.drop_operand(v, owned);
+                V::Bool(is)
+            }
             ExprKind::ProtoIs { class, parent } => {
                 let cw = self.table_value(self.env.homes, 2 * class + 1);
                 let pw = self.table_value(self.env.homes, 2 * parent + 1);
@@ -8036,8 +8080,11 @@ impl Lower {
         let fw = self.b.ins().load(I64, M_IC, ic, IC_VALUE);
         let fe = self.b.ins().load(I64, M_IC, ic, IC_ENTRY);
         let data_fresh = self.b.create_block();
-        let is_data = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 1);
-        self.b.ins().brif(is_data, data_fresh, &[], call, &[BlockArg::Value(fw), BlockArg::Value(fe)]);
+        // (A read site's entries with an epoch: a prototype's data property,
+        // its getter, or a property no object of the shape has, whose value
+        // is `undefined`.)
+        let is_getter = self.b.ins().icmp_imm_s(IntCC::Equal, kind, IC_PROTO_GETTER);
+        self.b.ins().brif(is_getter, call, &[BlockArg::Value(fw), BlockArg::Value(fe)], data_fresh, &[]);
         self.b.switch_to_block(data_fresh);
         if !borrow {
             self.dup(fw);
@@ -8091,6 +8138,12 @@ impl Lower {
         let ja = args(self, vw, false);
         self.b.ins().jump(join, &ja);
         self.b.switch_to_block(getter);
+        // (An absent property's entry, once its epoch is stale: the
+        // runtime's to make again.)
+        let absent = self.b.ins().icmp_imm_s(IntCC::Equal, kind, IC_ABSENT);
+        let accessor = self.b.create_block();
+        self.b.ins().brif(absent, slow, &[], accessor, &[]);
+        self.b.switch_to_block(accessor);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
         let (_, gv) = self.accessor(pat, false);
         let unknown = self.b.ins().iconst(I64, 0);
