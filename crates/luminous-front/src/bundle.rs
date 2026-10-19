@@ -195,6 +195,9 @@ struct DynImport {
     /// The scope it is in.
     scope: ScopeId,
     to: DynTo,
+    /// `import.meta.require("...")` (Bun's): the module evaluated now if it
+    /// has not been, and its namespace object rather than a promise.
+    sync: bool,
 }
 
 /// What an `import(...)` imports.
@@ -665,7 +668,13 @@ fn records(
     for stmt in &program.body {
         match stmt {
             Statement::ImportDeclaration(d) => {
-                let target = target_of(&d.source, attr_type(&d.with_clause))?;
+                let target = match target_of(&d.source, attr_type(&d.with_clause)) {
+                    Ok(t) => t,
+                    // (An `import type` of what does not resolve, such as a
+                    // runtime's own `bun`: its types are not the program's.)
+                    Err(_) if d.import_kind.is_type() => continue,
+                    Err(e) => return Err(e),
+                };
                 let mut bindings = Vec::new();
                 // (Whether each is a type only: `type`, or only used so.)
                 let mut types = Vec::new();
@@ -835,6 +844,7 @@ fn records(
                 head: Span::new(d.span.start, d.span.start + paren as u32 + 1),
                 scope: nodes.get_node(d.node).scope_id(),
                 to,
+                sync: d.sync,
             }
         })
         .collect();
@@ -888,6 +898,8 @@ struct DynSite {
     spec: Option<(String, Option<String>)>,
     /// `import.source(...)` or `import.defer(...)`.
     phase: bool,
+    /// `import.meta.require(...)`.
+    sync: bool,
 }
 
 impl<'a> Visit<'a> for Dynamic {
@@ -927,8 +939,37 @@ impl<'a> Visit<'a> for Dynamic {
             source_start: it.source.span().start,
             spec: spec.zip(ty),
             phase: it.phase.is_some(),
+            sync: false,
         });
         walk::walk_import_expression(self, it);
+    }
+
+    /// `import.meta.require("x")` of a string: a synchronous import (as a
+    /// CommonJS `require` in Bun's ES modules).
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        if let Expression::StaticMemberExpression(m) = &it.callee
+            && matches!(m.object, Expression::ImportMeta(_))
+            && m.property.name == "require"
+            && let [arg] = it.arguments.as_slice()
+            && let Some(spec) = match arg {
+                Argument::StringLiteral(s) => Some(s.value.to_string()),
+                Argument::TemplateLiteral(t) if t.expressions.is_empty() => {
+                    t.quasis.first().and_then(|q| q.value.cooked.map(|c| c.to_string()))
+                }
+                _ => None,
+            }
+        {
+            self.imports.push(DynSite {
+                span: it.span,
+                node: it.node_id.get(),
+                source_start: arg.span().start,
+                spec: Some((spec, None)),
+                phase: false,
+                sync: true,
+            });
+            return;
+        }
+        walk::walk_call_expression(self, it);
     }
 
     fn visit_import_meta(&mut self, it: &ImportMeta) {
@@ -1201,6 +1242,9 @@ struct Names {
     /// Modules `import()` imports: the function that evaluates the module
     /// (if it is lazy) and returns a promise of its namespace object.
     loads: HashMap<usize, String>,
+    /// Modules `import.meta.require` imports: the function that evaluates
+    /// the module (if it is lazy) and returns its namespace object.
+    requires: HashMap<usize, String>,
     /// Lazily evaluated modules: the function that evaluates one, and the
     /// functions of its runs (see `LazyPlan`).
     inits: HashMap<usize, String>,
@@ -1461,10 +1505,18 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
     // those left to run time.
     let mut loads: Vec<usize> = Vec::new();
     let mut load_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
+    let mut requires: Vec<usize> = Vec::new();
+    let mut require_sites: HashMap<usize, Vec<(usize, ScopeId)>> = HashMap::new();
     let mut fallback_sites: Vec<(usize, ScopeId)> = Vec::new();
     for &m in &running {
         for d in &units[m].dynamic {
             match d.to {
+                DynTo::Module(t) if d.sync => {
+                    if !requires.contains(&t) {
+                        requires.push(t);
+                    }
+                    require_sites.entry(t).or_default().push((m, d.scope));
+                }
                 DynTo::Module(t) => {
                     if !loads.contains(&t) {
                         loads.push(t);
@@ -1530,7 +1582,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
             needed.push(t);
         }
     }
-    for &t in &loads {
+    for &t in loads.iter().chain(&requires) {
         if !needed.contains(&t) && !broken.contains_key(&t) {
             needed.push(t);
         }
@@ -1562,7 +1614,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
     // added) use, and not that of a binding in a scope where a reference to
     // it is.
     let mut taken: HashSet<String> = GLOBALS_USED.iter().map(|s| s.to_string()).collect();
-    if loads.iter().any(|t| broken.contains_key(t)) {
+    if loads.iter().chain(&requires).any(|t| broken.contains_key(t)) {
         taken.insert("SyntaxError".into());
     }
     if !fallback_sites.is_empty() {
@@ -1578,7 +1630,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
         }
         // (`declare const x`: the global `x`.)
         for (name, &sym) in scoping.get_bindings(u.root()).iter() {
-            if scoping.symbol_flags(sym).is_ambient() {
+            if crate::only_ambient(scoping, sym) {
                 taken.insert(name.to_string());
             }
         }
@@ -1611,6 +1663,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
         of: HashMap::new(),
         writes: HashMap::new(),
         loads: HashMap::new(),
+        requires: HashMap::new(),
         inits: HashMap::new(),
         runs: HashMap::new(),
         metas: HashMap::new(),
@@ -1631,7 +1684,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
             let name = scoping.symbol_name(sym);
             let b = Binding::Symbol(m, sym);
             // An ambient declaration names a global: its references stay.
-            if scoping.symbol_flags(sym).is_ambient() {
+            if crate::only_ambient(scoping, sym) {
                 names.of.insert(b, name.to_string());
                 continue;
             }
@@ -1693,6 +1746,11 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
         let n = pick(&format!("{}_load", stem(&units[t].path)), &load_sites[&t], &taken);
         taken.insert(n.clone());
         names.loads.insert(t, n);
+    }
+    for &t in &requires {
+        let n = pick(&format!("{}_require", stem(&units[t].path)), &require_sites[&t], &taken);
+        taken.insert(n.clone());
+        names.requires.insert(t, n);
     }
     for &m in &running {
         let u = &units[m];
@@ -1841,6 +1899,16 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
             (None, None) => format!("await null; return {}();", names.of[&Binding::Namespace(t)]),
         };
         source.push_str(&format!("function {}() {{ return (async () => {{ {body} }})(); }}\n", names.loads[&t]));
+    }
+    // What `import.meta.require` of a module returns: its namespace object,
+    // the module evaluated first if it is lazy.
+    for &t in &requires {
+        let body = match (broken.get(&t), names.inits.get(&t)) {
+            (Some(e), _) => format!("throw new SyntaxError({});", serde_json::to_string(e).unwrap()),
+            (None, Some(init)) => format!("{init}(); return {}();", names.of[&Binding::Namespace(t)]),
+            (None, None) => format!("return {}();", names.of[&Binding::Namespace(t)]),
+        };
+        source.push_str(&format!("function {}() {{ {body} }}\n", names.requires[&t]));
     }
     // The evaluation of a lazy module: its lazy dependencies', then its
     // runs, once (an error is that of every later evaluation; one in a cycle
@@ -2331,6 +2399,7 @@ fn edits(
     if !typed_only {
         for d in &u.dynamic {
             match d.to {
+                DynTo::Module(t) if d.sync => out.push((d.span, format!("{}()", names.requires[&t]))),
                 DynTo::Module(t) => out.push((d.span, format!("{}()", names.loads[&t]))),
                 DynTo::Fallback => {
                     let path = u.path.canonicalize().unwrap_or_else(|_| u.path.clone());

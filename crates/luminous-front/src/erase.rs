@@ -230,6 +230,11 @@ pub fn rewrite(source: &str, a: &Analysis) -> String {
     // where it starts: after the statement before it).
     edits.retain(|&(s, e, _)| !segments.iter().any(|&(ss, se, _)| ss <= s && e <= se && !(s == e && s == ss)));
     edits.extend(segments);
+    // Declarations that are only types go (with any edit inside them; what
+    // is inserted where one starts or ends stays).
+    let blanks: Vec<(usize, usize)> = a.signatures.iter().map(|&(s, e)| (s as usize, e as usize)).collect();
+    edits.retain(|&(s, e, _)| !blanks.iter().any(|&(bs, be)| bs <= s && e <= be && !(s == e && (s == bs || s == be))));
+    edits.extend(blanks.into_iter().map(|(s, e)| (s, e, String::new())));
     // Back to front; at equal starts, the replacement before the insertion.
     edits.sort_by_key(|e| std::cmp::Reverse((e.0, e.1)));
     let mut out = source.to_string();

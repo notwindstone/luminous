@@ -5364,7 +5364,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         id.reference_id
             .get()
             .and_then(|r| scoping.get_reference(r).symbol_id())
-            .filter(|&s| !scoping.symbol_flags(s).is_ambient())
+            .filter(|&s| !crate::only_ambient(scoping, s))
             .map(|s| self.m.aliases.get(&s).copied().unwrap_or(s))
     }
 

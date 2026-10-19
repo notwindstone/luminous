@@ -1365,7 +1365,10 @@ instructions.
   `filename`, `dirname`, `dir`, `file`, `path`, `main` and `resolve()`
   (the embedder's resolution at
   `globalThis[Symbol.for("luminous.resolve")]`, else a URL relative to the
-  module's).
+  module's). `import.meta.require("x")` (Bun's synchronous import, with a
+  string) is an `import()` that returns the namespace object itself: a
+  module only it imports is evaluated when the first call runs (its errors
+  thrown by every call).
 - **Conformance.** test262's module tests (`language/module-code`,
   `language/import`, `language/export`): 622 of 722 pass, against 611 with
   the engine's own module loader (QuickJS-NG); JSON and text imports pass

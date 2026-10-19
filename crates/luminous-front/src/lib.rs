@@ -167,6 +167,11 @@ pub struct Analysis {
     /// `JSON.parse(text)` and `await r.json()` whose result is converted to
     /// an `aot type` (see `structs::Structs::parse_sites`): span and desc.
     pub as_sites: Vec<((u32, u32), i32)>,
+    /// Top-level declarations that are only types (TypeScript's overload
+    /// signatures, `declare function`, `declare class`, `declare const`):
+    /// blanked, since a native function's binding takes the name they
+    /// declare.
+    pub signatures: Vec<(u32, u32)>,
 }
 
 pub fn analyze(original: &str, path: &Path, opts: &Options) -> Result<Analysis, String> {
@@ -374,7 +379,25 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
     let mut as_sites: Vec<((u32, u32), i32)> =
         structs.parse_sites.iter().chain(&structs.json_sites).map(|(&s, &(e, d))| ((s, e), d)).collect();
     as_sites.sort();
+    let signatures = program
+        .body
+        .iter()
+        .filter(|s| {
+            let d = match s {
+                oxc::ast::ast::Statement::ExportDeclaration(e) => Some(&e.declaration),
+                s => s.as_declaration(),
+            };
+            match d {
+                Some(oxc::ast::ast::Declaration::FunctionDeclaration(f)) => f.body.is_none(),
+                Some(oxc::ast::ast::Declaration::ClassDeclaration(c)) => c.declare,
+                Some(oxc::ast::ast::Declaration::VariableDeclaration(v)) => v.declare,
+                _ => false,
+            }
+        })
+        .map(|s| (oxc::span::GetSpan::span(s).start, oxc::span::GetSpan::span(s).end))
+        .collect();
     Ok(Analysis {
+        signatures,
         source: source.clone(),
         module: out.module,
         natives,
@@ -547,6 +570,14 @@ impl<'a> Visit<'a> for MarkedFunctions<'_> {
         }
         walk::walk_arrow_function_expression(self, it);
     }
+}
+
+/// Whether `sym` is only declared ambiently (`declare const x`, `declare
+/// class X`): it names a global. One also declared as a value (TypeScript
+/// merges `declare class X` with `function X`) is that value.
+pub(crate) fn only_ambient(scoping: &oxc::semantic::Scoping, sym: oxc::semantic::SymbolId) -> bool {
+    scoping.symbol_flags(sym).is_ambient()
+        && scoping.symbol_redeclarations(sym).iter().all(|r| r.flags.is_ambient())
 }
 
 /// Full front-end pipeline for the interpreted half: rewrite + type erasure.
