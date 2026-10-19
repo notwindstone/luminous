@@ -822,7 +822,7 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
         "             g.Set.prototype.has, g.JSON.stringify, g.JSON.parse,\n"
-        "             g.Object.keys);\n"
+        "             g.Object.keys, g.Object.create);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -996,9 +996,15 @@ static int lum_ic_add(JSContext *ctx, LumIC *ic, JSValueConst obj, JSValue val)
 {
     void *shape;
     int k;
-    if (!ic->poly || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return 0;
     shape = *(void **)((char *)JS_VALUE_GET_PTR(obj) + JS_LAYOUT_OBJ_SHAPE);
+    /* (The primary entry: where native code found the properties do not
+       fit, or the epoch moved.) */
+    if (ic->alt_shape == shape && ic->kind == LUM_IC_ADD)
+        return ic->epoch == js_proto_epoch ? JS_AddCachedProperty(ctx, obj, ic->proto_shape, val) : 0;
+    if (!ic->poly)
+        return 0;
     for (k = 0; k < LUM_POLY; k++) {
         LumIC *e = &ic->poly[k];
         if (e->alt_shape == shape && e->kind == LUM_IC_ADD)
@@ -1055,9 +1061,17 @@ static bool lum_ic_fill_add(JSContext *ctx, JSValue obj, JSAtom prop, void *befo
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     uint32_t refreshes;
-    LumIC *e = lum_ic_epoch_entry(rt, ic, before, LUM_IC_ADD, &refreshes);
+    LumIC *e;
     void *after;
     int slot;
+    /* The first one in the primary entry, which native code checks inline
+       (or the one there, made again). */
+    if (!ic->shape && (!ic->alt_shape || (ic->alt_shape == before && ic->kind == LUM_IC_ADD))) {
+        refreshes = ic->alt_shape ? ic->refreshes + 1 : 0;
+        e = refreshes > LUM_IC_REFRESHES ? NULL : ic;
+    } else {
+        e = lum_ic_epoch_entry(rt, ic, before, LUM_IC_ADD, &refreshes);
+    }
     if (!e || (slot = JS_CacheAddProperty(ctx, obj, prop, before, &after)) < 0)
         return false;
     lum_ic_epoch_store(rt, ic, e, JS_DupSharedShape(before), after, slot, LUM_IC_ADD, refreshes);
@@ -2476,8 +2490,9 @@ static JSValue lum_new_object_proto(JSContext *ctx, LumIC *ic, JSValue obj, int 
     }
     if (JS_CachePlainShape(ctx, obj, n, &shape) == 0) {
         lum_ic_store(ctx, ic, shape, NULL, NULL, 0, LUM_IC_OWN);
-        /* How native code allocates the next ones inline. */
-        ic->slot = JS_ShapeAllocInfo(JS_GetRuntime(ctx), shape);
+        /* How native code allocates the next ones inline (an empty one
+           with room for the properties added next). */
+        ic->slot = JS_ShapeAllocInfoRoom(JS_GetRuntime(ctx), shape, n ? 0 : LUM_OBJECT_ROOM);
     }
     return obj;
 }
@@ -4496,6 +4511,32 @@ JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc)
 /* `f.call(this_obj, v).length` with f read as `Object.keys`: counted
  * without the array while f is the builtin (an object of an `aot type`:
  * its fields; an ordinary object or a dense array: JS_CountOwnKeys). */
+/* Object.create(proto) at a site (f: the method read from this_obj): while
+ * f is the builtin, a new object of prototype proto (null or an object),
+ * whose empty shape the site caches in `ic` for native code to make the
+ * next ones inline with (and room for properties: LUM_OBJECT_ROOM); else
+ * the call. */
+JSValue lum_object_create(JSContext *ctx, LumIC *ic, JSValueConst f, JSValueConst this_obj, JSValueConst proto)
+{
+    JSValue obj;
+    void *shape;
+    if (JS_VALUE_GET_TAG(f) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_PTR(f) == JS_VALUE_GET_PTR(lum_pins[LUM_PIN_OBJECT_CREATE]) &&
+        (JS_IsNull(proto) || JS_IsObject(proto))) {
+        obj = JS_NewObjectProto(ctx, proto);
+        if (!JS_IsException(obj) && JS_CachePlainShape(ctx, obj, 0, &shape) == 0) {
+            lum_ic_store(ctx, ic, shape, NULL, NULL, 0, LUM_IC_OWN);
+            ic->slot = JS_ShapeAllocInfoRoom(JS_GetRuntime(ctx), shape, LUM_OBJECT_ROOM);
+        }
+        return obj;
+    }
+    /* (Held while it runs: it may replace itself.) */
+    f = JS_DupValue(ctx, f);
+    obj = JS_Call(ctx, f, this_obj, 1, &proto);
+    JS_FreeValue(ctx, f);
+    return obj;
+}
+
 JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, JSValueConst v)
 {
     JSValue arr, len;

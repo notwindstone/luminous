@@ -1,0 +1,362 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -623,6 +623,7 @@
+     uint32_t job_size;
+     /* luminous: see JS_SetFunctionSourceHook */
+     JSFunctionSourceHook *function_source_hook;
++    uint64_t shape_ids; /* luminous: the last JSShape.id given */
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -969,6 +970,9 @@
+     uint32_t kind : 2;
+     uint32_t atom_type : 2; /* != 0 if atom, JS_ATOM_TYPE_x */
+     uint32_t hash_next; /* atom_index for JS_ATOM_TYPE_SYMBOL */
++    /* luminous: an atom's index (in what was padding): found without
++       walking its hash chain */
++    uint32_t atom_index;
+     JSWeakRefRecord *first_weak_ref;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head link; /* string list */
+@@ -1447,6 +1451,15 @@
+     /* luminous: while hashed, the number of its enumerable string-keyed
+        properties (JS_CountOwnKeys), -1 until counted */
+     int32_t keys_count;
++    /* luminous: a number of its own each time it is put in the shape hash
++       table (its properties may have changed since: see
++       js_shape_hash_link); and while it is hashed, the shape (not
++       referenced: only compared) whose properties it has, then one more,
++       with that shape's number then, or NULL: find_hashed_shape_prop then
++       need not compare its properties one by one */
++    uint64_t id;
++    struct JSShape *parent;
++    uint64_t parent_id;
+     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
+ };
+ 
+@@ -1575,6 +1588,7 @@
+ static_assert(offsetof(JSContext, global_obj) == JS_LAYOUT_CTX_GLOBAL_OBJ, "");
+ static_assert(offsetof(JSContext, global_var_obj) == JS_LAYOUT_CTX_GLOBAL_VAR_OBJ, "");
+ static_assert(offsetof(JSShape, prop_count) == JS_LAYOUT_SHAPE_PROP_COUNT, "");
++static_assert(offsetof(JSShape, prop_size) == JS_LAYOUT_SHAPE_PROP_SIZE, "");
+ static_assert(JS_CLASS_MAP == JS_LAYOUT_CLASS_MAP && JS_CLASS_SET == JS_LAYOUT_CLASS_SET, "");
+ static_assert(offsetof(JSRuntime, gc_heap.runs) == JS_LAYOUT_RT_GC_RUNS, "");
+ static_assert(sizeof(JSGCRun) == JS_LAYOUT_GC_RUN_SIZE, "");
+@@ -5035,6 +5049,9 @@
+ static JSAtom js_get_atom_index(JSRuntime *rt, JSAtomStruct *p)
+ {
+     uint32_t i = p->hash_next;  /* atom_index */
++    /* luminous: kept (JSString.atom_index) */
++    if (likely(p->atom_type != JS_ATOM_TYPE_SYMBOL))
++        return p->atom_index;
+     if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
+         JSAtomStruct *p1;
+ 
+@@ -5185,6 +5202,7 @@
+ 
+     p->hash = h;
+     p->hash_next = i;   /* atom_index */
++    p->atom_index = i;
+     p->atom_type = atom_type;
+     p->first_weak_ref = NULL;
+ 
+@@ -7594,6 +7612,7 @@
+ static void js_shape_hash_link(JSRuntime *rt, JSShape *sh)
+ {
+     uint32_t h;
++    sh->id = ++rt->shape_ids;
+     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
+     sh->shape_hash_next = rt->shape_hash[h];
+     rt->shape_hash[h] = sh;
+@@ -7610,6 +7629,8 @@
+         sh->json_keys = NULL;
+     }
+     sh->keys_count = -1;
++    /* (it changes, or dies: no longer one more than its parent) */
++    sh->parent = NULL;
+     h = get_shape_hash(sh->hash, rt->shape_hash_bits);
+     psh = &rt->shape_hash[h];
+     while (*psh != sh)
+@@ -7650,6 +7671,8 @@
+     sh->watched = false;
+     sh->json_keys = NULL;
+     sh->keys_count = -1;
++    sh->id = 0;
++    sh->parent = NULL;
+     return sh;
+ }
+ 
+@@ -7742,6 +7765,8 @@
+     sh->watched = false;
+     sh->json_keys = NULL;
+     sh->keys_count = -1;
++    sh->id = 0;
++    sh->parent = NULL;
+     if (sh->proto) {
+         js_dup(JS_MKPTR(JS_TAG_OBJECT, sh->proto));
+     }
+@@ -7814,6 +7839,12 @@
+     bool in_cell = js_inline_props(p), own_cell = !in_cell && js_props_cell(p);
+     if ((in_cell || own_cell) && new_count <= old_count)
+         return p->prop;
++    /* luminous: room in a plain object's cell (made with more: see
++       JS_ShapeAllocInfoRoom), where nothing follows its properties (other
++       classes' data does) */
++    if (p->class_id == JS_CLASS_OBJECT && p->prop == (JSProperty *)&p->u &&
++        (uint8_t *)(p->prop + new_count) <= (uint8_t *)p + js_gc_usable_size(p))
++        return p->prop;
+     if (sizeof(JSProperty) * new_count + sizeof(JSMallocBlockHeader) <= JS_ARENA_MAX_SMALL_SIZE) {
+         /* luminous: a cell of its own (a small one), which the object
+            marks: nothing to free. (No collection: as js_malloc.) */
+@@ -8069,11 +8100,18 @@
+         if (sh1->hash == h &&
+             sh1->proto == sh->proto &&
+             sh1->prop_count == ((n = sh->prop_count) + 1) && !sh1->watched) {
++            /* luminous: sh's properties then one, found before (or made
++               from sh), while neither changed (see JSShape.parent) */
++            if (sh1->parent == sh && sh1->parent_id == sh->id)
++                goto last;
+             for(i = 0; i < n; i++) {
+                 if (unlikely(get_shape_prop(sh1)[i].atom != get_shape_prop(sh)[i].atom) ||
+                     unlikely(get_shape_prop(sh1)[i].flags != get_shape_prop(sh)[i].flags))
+                     goto next;
+             }
++            sh1->parent = sh;
++            sh1->parent_id = sh->id;
++        last:
+             if (unlikely(get_shape_prop(sh1)[n].atom != atom) ||
+                 unlikely(get_shape_prop(sh1)[n].flags != prop_flags))
+                 goto next;
+@@ -8172,10 +8210,11 @@
+    reference taken), its properties zeroed (the caller sets them). All
+    inline, as js_new_object_data: JS_NewObjectFromShape's work for the
+    classes it does not handle is not done. */
+-static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh)
++static inline __attribute__((always_inline)) JSValue js_new_plain_object_room(JSContext *ctx, JSShape *sh,
++                                                                             uint32_t room)
+ {
+     JSRuntime *rt = ctx->rt;
+-    size_t size = JS_PLAIN_OBJECT_SIZE + sizeof(JSProperty) * sh->prop_size;
++    size_t size = JS_PLAIN_OBJECT_SIZE + sizeof(JSProperty) * max_int(sh->prop_size, room);
+     JSObject *p;
+ 
+     js_trigger_gc(rt, size);
+@@ -8195,6 +8234,11 @@
+     return JS_MKPTR(JS_TAG_OBJECT, p);
+ }
+ 
++static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh)
++{
++    return js_new_plain_object_room(ctx, sh, 0);
++}
++
+ /* luminous: the most elements a new array has room for in its own cell */
+ #define JS_ARRAY_INLINE_MAX 32
+ 
+@@ -13302,6 +13346,75 @@
+     }
+ }
+ 
++/* luminous: whether `prop` is an atom's own string (a literal, or a key
++   used before), whose atom is then JSString.atom_index */
++static inline bool js_atom_string(JSValueConst prop)
++{
++    return JS_VALUE_GET_TAG(prop) == JS_TAG_STRING &&
++        JS_VALUE_GET_STRING(prop)->atom_type == JS_ATOM_TYPE_STRING;
++}
++
++/* luminous: p[atom] when p and its prototypes are ordinary objects and it
++   is a data property of one of them, or of none (undefined): *pval; false
++   if the general lookup must run. */
++static inline bool js_get_data_fast(JSObject *p, JSAtom atom, JSValue *pval)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    for (;;) {
++        if (unlikely(p->is_exotic))
++            return false;
++        prs = find_own_property(&pr, p, atom);
++        if (prs) {
++            if (unlikely((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL))
++                return false;
++            *pval = js_dup(pr->u.value);
++            return true;
++        }
++        p = p->shape->proto;
++        if (!p) {
++            *pval = JS_UNDEFINED;
++            return true;
++        }
++    }
++}
++
++/* luminous: p[atom] = val (taken) when p is an ordinary object with it as
++   a writable data property, or without it, extensible, and its prototypes
++   ordinary objects without it (it is added): 1; 0 (val not taken) if the
++   general path must run; -1 (an exception). */
++static int js_set_data_fast(JSContext *ctx, JSObject *p, JSAtom atom, JSValue val)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    JSObject *q;
++    /* (a watched object's writes move js_proto_epoch: the general path) */
++    if (unlikely(p->is_exotic || p->is_watched))
++        return 0;
++    prs = find_own_property(&pr, p, atom);
++    if (prs) {
++        if (unlikely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) != JS_PROP_WRITABLE))
++            return 0;
++        set_value(ctx, &pr->u.value, val);
++        JS_GC_WBV(ctx->rt, p, val);
++        return 1;
++    }
++    if (unlikely(!p->extensible))
++        return 0;
++    for (q = p->shape->proto; q; q = q->shape->proto) {
++        if (q->is_exotic || find_own_property1(q, atom))
++            return 0;
++    }
++    pr = add_property(ctx, p, atom, JS_PROP_C_W_E);
++    if (unlikely(!pr)) {
++        JS_FreeValue(ctx, val);
++        return -1;
++    }
++    pr->u.value = val;
++    JS_GC_WBV(ctx->rt, p, val);
++    return 1;
++}
++
+ JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                             JSValue prop)
+ {
+@@ -13318,6 +13431,12 @@
+             /* fast path for array and typed array access */
+             if (js_get_fast_array_element(ctx, p, idx, &val))
+                 return val;
++        } else if (js_atom_string(prop)) {
++            JSValue val;
++            if (js_get_data_fast(JS_VALUE_GET_OBJ(this_obj), JS_VALUE_GET_STRING(prop)->atom_index, &val)) {
++                JS_FreeValue(ctx, prop);
++                return val;
++            }
+         }
+     } else if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
+         // per spec: not allowed to call ToPropertyKey before ToObject
+@@ -13469,6 +13588,15 @@
+             js_free_shape(ctx->rt, p->shape);
+             p->shape = new_sh;
+             js_gc_wb(ctx->rt, p);
++            assert(JS_REF_COUNT(p->shape) == 1);
++            if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
++                return NULL;
++            /* luminous: sh's properties, then prop (see JSShape.parent) */
++            if (p->shape->is_hashed) {
++                p->shape->parent = sh;
++                p->shape->parent_id = sh->id;
++            }
++            return &p->prop[p->shape->prop_count - 1];
+         }
+     }
+     assert(JS_REF_COUNT(p->shape) == 1);
+@@ -14207,6 +14335,14 @@
+ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                         JSValue prop, JSValue val, int flags)
+ {
++    /* luminous: a key that is an atom's own string, on an ordinary object */
++    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT && js_atom_string(prop)) {
++        int r = js_set_data_fast(ctx, JS_VALUE_GET_OBJ(this_obj), JS_VALUE_GET_STRING(prop)->atom_index, val);
++        if (r) {
++            JS_FreeValue(ctx, prop);
++            return r < 0 ? -1 : true;
++        }
++    }
+     if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT &&
+                JS_VALUE_GET_TAG(prop) == JS_TAG_INT)) {
+         JSObject *p;
+@@ -63284,9 +63420,14 @@
+ 
+ uint32_t JS_ShapeAllocInfo(JSRuntime *rt, void *shape)
+ {
++    return JS_ShapeAllocInfoRoom(rt, shape, 0);
++}
++
++uint32_t JS_ShapeAllocInfoRoom(JSRuntime *rt, void *shape, uint32_t room)
++{
+     JSShape *sh = shape;
+     size_t total = sizeof(JSMallocBlockHeader) + JS_PLAIN_OBJECT_SIZE +
+-        sizeof(JSProperty) * sh->prop_size;
++        sizeof(JSProperty) * max_int(sh->prop_size, room);
+     unsigned idx;
+     if (total > JS_ARENA_MAX_SMALL_SIZE)
+         return 0;
+@@ -63338,11 +63479,16 @@
+ 
+ JSValue JS_NewObjectWithCachedShape(JSContext *ctx, void *shape, JSValue *values)
+ {
++    return JS_NewObjectWithCachedShapeRoom(ctx, shape, values, 0);
++}
++
++JSValue JS_NewObjectWithCachedShapeRoom(JSContext *ctx, void *shape, JSValue *values, uint32_t room)
++{
+     static_assert(sizeof(JSProperty) == sizeof(JSValue), "");
+     JSRuntime *rt = ctx->rt;
+     JSShape *sh = shape;
+     size_t total = sizeof(JSMallocBlockHeader) + JS_PLAIN_OBJECT_SIZE +
+-        sizeof(JSProperty) * sh->prop_size;
++        sizeof(JSProperty) * max_int(sh->prop_size, room);
+     /* Fast: a cell of its class, freed before or from its run (as
+        JS_NewObjectFromShape would make it, with the values taken). */
+     if (likely(total <= JS_ARENA_MAX_SMALL_SIZE)) {
+@@ -63380,6 +63526,20 @@
+             return JS_MKPTR(JS_TAG_OBJECT, p);
+         }
+     }
++    if (room > (uint32_t)sh->prop_size) {
++        /* luminous: with room (a class no other allocation may use: the
++           allocator starts its run, which native code then takes from) */
++        JSValue obj = js_new_plain_object_room(ctx, js_dup_shape(sh), room);
++        int i;
++        if (JS_IsException(obj)) {
++            for (i = 0; i < sh->prop_count; i++)
++                JS_FreeValue(ctx, values[i]);
++            return obj;
++        }
++        for (i = 0; i < sh->prop_count; i++)
++            JS_VALUE_GET_OBJ(obj)->prop[i].u.value = values[i];
++        return obj;
++    }
+     return JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, (JSProperty *)values);
+ }
+ 
+@@ -63427,6 +63587,9 @@
+             break;
+         }
+     }
++    /* (Pinned: compiled code gives objects the shape without counting
++       them, as an allocation site's: see JSShape.pinned.) */
++    new_sh->pinned = true;
+     *pafter = js_dup_shape(new_sh);
+     return new_sh->prop_count - 1;
+ }
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1242,6 +1242,11 @@
+    (JS_CachePlainShape) inline: their size class in the low 8 bits and the
+    bytes the allocator accounts for each above, or 0 if they are too big. */
+ JS_EXTERN uint32_t JS_ShapeAllocInfo(JSRuntime *rt, void *shape);
++/* luminous: JS_ShapeAllocInfo of objects with room for `room` properties
++   in their cell (more are added without moving them), which
++   JS_NewObjectWithCachedShapeRoom makes. */
++JS_EXTERN JSValue JS_NewObjectWithCachedShapeRoom(JSContext *ctx, void *shape, JSValue *values, uint32_t room);
++JS_EXTERN uint32_t JS_ShapeAllocInfoRoom(JSRuntime *rt, void *shape, uint32_t room);
+ /* luminous: whether the bit fields JS_LAYOUT_* describe (JS_LAYOUT_OBJ_GC_BYTE,
+    JS_LAYOUT_OBJ_PLAIN_FLAGS) are laid out as it says. */
+ JS_EXTERN bool JS_LayoutCheck(void);
+@@ -1439,6 +1444,7 @@
+ #define JS_LAYOUT_CTX_GLOBAL_VAR_OBJ 504 /* JSValue: the global let/const definitions */
+ #endif
+ #define JS_LAYOUT_SHAPE_PROP_COUNT  16   /* uint32_t */
++#define JS_LAYOUT_SHAPE_PROP_SIZE   12   /* uint32_t: room for properties (of objects of the shape) */
+ #define JS_LAYOUT_CLASS_MAP         36
+ #define JS_LAYOUT_CLASS_SET         37
+ /* Allocating GC cells inline (js_gc_take): a run { ptr, end } of free

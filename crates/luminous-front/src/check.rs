@@ -5955,6 +5955,17 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         if c.optional {
             return reject(c.span, "optional calls are not supported yet");
         }
+        // `Object.create(p)`: made inline while the method is the builtin.
+        if let Expression::StaticMemberExpression(cm) = c.callee.without_parentheses()
+            && global_member(cm, self.m.scoping) == Some(("Object", "create"))
+            && let [arg] = &c.arguments[..]
+            && let Some(arg) = arg.as_expression()
+        {
+            let obj = Expr::new(Ty::Any, ExprKind::Global(self.m.atom("Object")));
+            let create = self.m.atom("create");
+            let arg = any(self.expr(arg)?);
+            return Ok(Expr::new(Ty::Any, ExprKind::ObjectCreate(Box::new(obj), create, Box::new(arg))));
+        }
         match c.callee.without_parentheses() {
             callee @ (Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_))
                 if let Some((home, key)) = self.super_key(callee.as_member_expression().unwrap())? =>

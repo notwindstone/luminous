@@ -102,9 +102,13 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 /* JSON.stringify, JSON.parse. */
 #define LUM_PIN_JSON_STRINGIFY 46
 #define LUM_PIN_JSON_PARSE 47
-/* Object.keys. */
+/* Object.keys, Object.create. */
 #define LUM_PIN_OBJECT_KEYS 48
-#define LUM_PINS 49
+#define LUM_PIN_OBJECT_CREATE 49
+#define LUM_PINS 50
+/* The properties a new empty object (`{}`, Object.create) has room for in
+ * its cell: up to as many are added without moving them. */
+#define LUM_OBJECT_ROOM 4
 JSValue lum_struct_stringify(JSContext *ctx, JSValueConst v);
 int lum_is_promise_resolve(JSValue promise, JSValue resolve);
 int lum_gen_iter_ok(JSContext *ctx, JSValue iter, JSValue next);
@@ -371,3 +375,4 @@ JSValue lum_json_parse_utf8_as(JSContext *ctx, const uint8_t *buf, size_t len, i
 JSValue lum_json_method_as(JSContext *ctx, JSValueConst recv, int32_t desc);
 void lum_set_json_hook(JSContext *ctx, JSValueConst fn);
 JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, JSValueConst v);
+JSValue lum_object_create(JSContext *ctx, LumIC *ic, JSValueConst f, JSValueConst this_obj, JSValueConst proto);

@@ -247,6 +247,18 @@ const OBJ_EXTENSIBLE: i64 = 0x02;
 /// `JSON.stringify`, `JSON.parse`.
 const PIN_JSON_STRINGIFY: i32 = 46;
 const PIN_JSON_PARSE: i32 = 47;
+/// `Object.create`.
+const PIN_OBJECT_CREATE: i32 = 49;
+/// `LUM_IC_ADD`: an addition of the property, from `alt_shape` to
+/// `proto_shape`.
+const IC_ADD: i64 = 10;
+/// The `extensible`, `is_exotic` and `is_watched` bits of an object's flags
+/// word (see `JSObject`), and those of an object an addition is cached for.
+const OBJ_ADD_MASK: i64 = 0x40a;
+const OBJ_ADD_FLAGS: i64 = 0x02;
+/// `LUM_OBJECT_ROOM`: the properties an empty object (`{}`,
+/// `Object.create`) has room for in its cell.
+const OBJECT_ROOM: i64 = 4;
 /// `LUM_IC_STRING`: a method of String.prototype read from a string.
 const IC_STRING: i64 = 8;
 
@@ -921,6 +933,24 @@ impl Lower {
         self.b.set_cold_block(call);
         self.b.ins().brif(rc, check, &[], join, &[]);
         self.b.switch_to_block(check);
+        let flags = self.b.ins().uload8(I32, M_RC, owner, layout::GC_FLAGS);
+        let bits = self.b.ins().band_imm_u(flags, 0xc0);
+        let old = self.b.ins().icmp_imm_s(IntCC::Equal, bits, 0x80);
+        self.b.ins().brif(old, call, &[], join, &[]);
+        self.b.switch_to_block(call);
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        self.helper("JS_GCWriteBarrier", &[rt, owner]);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+    }
+
+    /// `write_barrier` after a reference to a cell (a shape) is stored in
+    /// GC cell `owner`.
+    fn cell_barrier(&mut self, owner: Value) {
+        let call = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.set_cold_block(call);
         let flags = self.b.ins().uload8(I32, M_RC, owner, layout::GC_FLAGS);
         let bits = self.b.ins().band_imm_u(flags, 0xc0);
         let old = self.b.ins().icmp_imm_s(IntCC::Equal, bits, 0x80);
@@ -2290,6 +2320,74 @@ impl Lower {
                 self.drop_method(f, f_owned);
                 self.drop_operand(obj, owned);
                 V::Any(r[0])
+            }
+            ExprKind::ObjectCreate(o, a, arg) => {
+                // (`o.create` is read before the argument is evaluated.)
+                let (obj, owned) = self.operand(o, &[arg]);
+                let ow = obj.any();
+                let (f, f_owned) = if self.pure_arg(arg) {
+                    let (mw, f_owned) = self.prop_get_inner(ow, None, *a, Vec::new(), true, true);
+                    (V::Any(mw), f_owned)
+                } else {
+                    let mw = self.method_get(ow, *a);
+                    self.check_value(mw);
+                    let f = V::Any(mw);
+                    self.hold(f);
+                    (f, None)
+                };
+                let held = self.expr(arg);
+                self.hold(held);
+                let vw = self.boxed(held);
+                let ctx = self.ctx;
+                let ic = self.new_ic();
+                let join = self.b.create_block();
+                let rw = self.b.append_block_param(join, I64);
+                let slow = self.b.create_block();
+                self.b.set_cold_block(slow);
+                // The builtin, and a prototype (null or an object) of the
+                // empty shape the site cached: made inline, as `{}` is.
+                let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+                let orig = self.b.ins().load(I64, M_CONST, table, PIN_OBJECT_CREATE * 8);
+                let orig = self.mk_ref(TAG_OBJECT, orig);
+                let builtin = self.b.ins().icmp(IntCC::Equal, f.any(), orig);
+                let shape = self.b.ins().load(I64, M_IC, ic, 0);
+                let cached = self.b.ins().icmp_imm_s(IntCC::NotEqual, shape, 0);
+                let go = self.b.ins().band(builtin, cached);
+                let check = self.b.create_block();
+                self.b.ins().brif(go, check, &[], slow, &[]);
+                self.b.switch_to_block(check);
+                let proto = self.b.ins().load(I64, M_HEADER, shape, layout::SHAPE_PROTO);
+                let is_null = self.b.ins().icmp_imm_s(IntCC::Equal, vw, val_const(TAG_NULL, 0));
+                let is_obj = self.val_is(vw, TAG_OBJECT);
+                let vp = self.val_ptr(vw);
+                let zero = self.b.ins().iconst(I64, 0);
+                let want = self.b.ins().select(is_null, zero, vp);
+                let same = self.b.ins().icmp(IntCC::Equal, proto, want);
+                let valid = self.b.ins().bor(is_null, is_obj);
+                let ok = self.b.ins().band(valid, same);
+                let fast = self.b.create_block();
+                self.b.ins().brif(ok, fast, &[], slow, &[]);
+                self.b.switch_to_block(fast);
+                let call = self.b.create_block();
+                self.b.set_cold_block(call);
+                let p = self.alloc_object(ic, shape, call);
+                let w = self.mk_ref(TAG_OBJECT, p);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
+                self.b.switch_to_block(call);
+                let none = self.b.ins().iconst(self.ptr, 0);
+                let room = self.b.ins().iconst(I32, OBJECT_ROOM);
+                let r = self.helper("JS_NewObjectWithCachedShapeRoom", &[ctx, shape, none, room]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+                self.b.switch_to_block(slow);
+                let r = self.helper("lum_object_create", &[ctx, ic, f.any(), ow, vw]);
+                self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+                self.b.switch_to_block(join);
+                self.check_value_method(rw, f, f_owned);
+                self.release(held);
+                self.free_v(held);
+                self.drop_method(f, f_owned);
+                self.drop_operand(obj, owned);
+                V::Any(rw)
             }
             ExprKind::JsonMethodAs(desc, x) => {
                 let v = self.expr(x);
@@ -4448,7 +4546,10 @@ impl Lower {
         self.b.ins().jump(join, &[BlockArg::Value(w)]);
         self.b.switch_to_block(call);
         let values = self.values_slot(&vals);
-        let r = self.helper("JS_NewObjectWithCachedShape", &[ctx, shape, values]);
+        // (An empty literal: with room, as the site's allocation info.)
+        let room = if props.is_empty() && class.is_none() { OBJECT_ROOM } else { 0 };
+        let room = self.b.ins().iconst(I32, room);
+        let r = self.helper("JS_NewObjectWithCachedShapeRoom", &[ctx, shape, values, room]);
         self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
         let values = self.values_slot(&vals);
@@ -4966,8 +5067,42 @@ impl Lower {
         let p = self.val_ptr(w);
         let own = self.b.create_block();
         let proto = self.b.create_block();
+        let not_own = self.b.create_block();
+        let add = self.b.create_block();
         let is_own = self.b.ins().icmp_imm_s(IntCC::Equal, kind, 0);
-        self.b.ins().brif(is_own, own, &[], proto, &[]);
+        self.b.ins().brif(is_own, own, &[], not_own, &[]);
+        self.b.switch_to_block(not_own);
+        let is_add = self.b.ins().icmp_imm_s(IntCC::Equal, kind, IC_ADD);
+        self.b.ins().brif(is_add, add, &[], proto, &[]);
+        // An addition the site cached: the object of the shape before
+        // takes the shape after (pinned: not counted, see
+        // JS_CacheAddProperty) and the value, while no watched prototype
+        // changed (no setter appeared), it is an extensible ordinary
+        // object, and the property fits in the room it has (else the
+        // engine, which moves its properties).
+        self.b.switch_to_block(add);
+        let base = self.b.ins().symbol_value(self.ptr, self.env.proto_epoch);
+        let now = self.b.ins().load(I64, M_TABLE, base, 0);
+        let then = self.b.ins().load(I64, M_IC, ic, IC_EPOCH);
+        let fresh = self.b.ins().icmp(IntCC::Equal, now, then);
+        let flags = self.b.ins().uload32(M_HEADER, p, layout::OBJ_FLAGS);
+        let bits = self.b.ins().band_imm_u(flags, OBJ_ADD_MASK);
+        let plain = self.b.ins().icmp_imm_s(IntCC::Equal, bits, OBJ_ADD_FLAGS);
+        let after = self.b.ins().load(I64, M_IC, ic, 16);
+        let room = self.b.ins().uload32(M_HEADER, shape, layout::SHAPE_PROP_SIZE);
+        let need = self.b.ins().uload32(M_HEADER, after, layout::SHAPE_PROP_SIZE);
+        let fits = self.b.ins().icmp(IntCC::Equal, room, need);
+        let ok = self.b.ins().band(fresh, plain);
+        let ok = self.b.ins().band(ok, fits);
+        let added = self.b.create_block();
+        self.b.ins().brif(ok, added, &[], slow, &[]);
+        self.b.switch_to_block(added);
+        self.b.ins().store(M_HEADER, after, p, layout::OBJ_SHAPE);
+        let at = self.ic_slot_addr(p, ic);
+        self.b.ins().store(M_SLOT, vw, at, 0);
+        // (The shape is a cell too.)
+        self.cell_barrier(p);
+        self.b.ins().jump(join, &[]);
         self.b.switch_to_block(proto);
         let pat = self.ic_accessor_slot(p, shape, kind, ic, slow);
         let (setter, sw) = self.accessor(pat, true);

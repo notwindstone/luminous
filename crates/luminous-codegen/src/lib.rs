@@ -258,6 +258,7 @@ pub mod layout {
     pub const CTX_GLOBAL_OBJ: i32 = 288;
     pub const CTX_GLOBAL_VAR_OBJ: i32 = 296;
     pub const SHAPE_PROP_COUNT: i32 = 16;
+    pub const SHAPE_PROP_SIZE: i32 = 12;
     pub const CLASS_MAP: i64 = 36;
     pub const CLASS_SET: i64 = 37;
     // Allocating GC cells inline.
@@ -307,6 +308,7 @@ pub mod layout {
         ("CTX_STD_ARRAY_PROTO", CTX_STD_ARRAY_PROTO as i64),
         ("CTX_GLOBAL_OBJ", CTX_GLOBAL_OBJ as i64),
         ("CTX_GLOBAL_VAR_OBJ", CTX_GLOBAL_VAR_OBJ as i64),
+        ("SHAPE_PROP_SIZE", SHAPE_PROP_SIZE as i64),
         ("SHAPE_PROP_COUNT", SHAPE_PROP_COUNT as i64),
         ("CLASS_MAP", CLASS_MAP),
         ("CLASS_SET", CLASS_SET),
@@ -616,6 +618,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_json_parse_as", &[P, W, Int], &[W]),
         ("lum_json_method_as", &[P, W, Int], &[W]),
         ("lum_keys_length", &[P, W, W, W], &[W]),
+        ("lum_object_create", &[P, P, W, W, W], &[W]),
+        ("JS_NewObjectWithCachedShapeRoom", &[P, P, P, Int], &[W]),
         ("lum_sarr_from", &[P, Int, W], &[W]),
         ("lum_sarr_push", &[P, W, W], &[W]),
         ("lum_super_get_ic", &[P, W, W, Int, P], &[W]),

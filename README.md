@@ -141,7 +141,8 @@ regular call path's generated code alone.
 `0018-await-or-value.patch`, `0019-json-fast-paths.patch`,
 `0020-exotic-define-own.patch`, `0021-latin1-strings.patch`,
 `0022-count-own-keys.patch`, `0023-frozen-fast-arrays.patch` and
-`0024-json-parse-and-for-in.patch`, each made
+`0024-json-parse-and-for-in.patch` and
+`0025-objects-and-dictionaries.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -330,6 +331,22 @@ engine's semantics:
   and native code steps a shape's shared one itself (`JS_ForInStart`):
   `for (const k in o) n++` over 5 keys, 1,512 instructions, now 293
   (144–152 ns, now 25–30 ns; bun 11–22 ns);
+- objects and dictionaries (`0025`): a shape transition found in the
+  shape table was checked property by property (an object made of 64
+  keys compared about 2,000 pairs); a shape now remembers the one it is
+  one property more than, with that one's number (each shape gets a new
+  number whenever it enters the table, and forgets when it leaves it), so
+  a known transition is one comparison. `obj[key]` with a key that is an
+  atom's own string (a literal, or any key used before: its atom index is
+  kept in the string, where there was padding) reads and writes an
+  ordinary object's data properties without the general lookup. A 64-key
+  dictionary built and read with dynamic keys: about 515 instructions a
+  key, now about 225 (bun's takes two thirds of the time). The shape an addition
+  cached at a write site leads to is pinned, so that compiled code gives
+  it to objects without counting them; an empty object made by compiled
+  code (`{}`, `Object.create`) has room in its cell for 4 properties,
+  which an object's properties grow into before moving out
+  (`JS_ShapeAllocInfoRoom`, `JS_NewObjectWithCachedShapeRoom`);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -746,7 +763,21 @@ The differential tests run every case with both.
     later objects are made with it directly (as JSC's allocation profiles
     do), allocated inline: a block popped from the allocator's cache for
     the shape's size class and the object's fields stored in place
-    (`JS_ShapeAllocInfo`; the engine call otherwise);
+    (`JS_ShapeAllocInfo`; the engine call otherwise). `Object.create(p)`
+    likewise, while it is the builtin: the site caches the empty shape of
+    its prototype (null, or an object), and an argument with that
+    prototype gets an object made inline (a loop making them: about 290
+    instructions an iteration, now 81; `{}`, 40). An empty one has room
+    for 4 properties (patch `0025`);
+  - property additions: a write site that added the property caches the
+    transition (the shape before, the one after), and native code makes
+    it inline: the shape after and the value stored, while no watched
+    prototype changed (no setter appeared), the object is an extensible
+    ordinary one, and the property fits in the room the shape before
+    gives (else the engine, which grows the properties in the object's
+    cell while there is room). `{}` and 3 properties added, then 2 read:
+    about 600 instructions, now 342; from `Object.create(null)`, about
+    870, now 381;
   - `typeof`, `in`, `new`;
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them; a small

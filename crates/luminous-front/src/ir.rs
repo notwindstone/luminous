@@ -942,6 +942,10 @@ pub enum ExprKind {
     /// `o.keys(x).length` (`Object.keys`): counted without the array while
     /// the method is the builtin (`lum_keys_length`).
     KeysLength(Box<Expr>, AtomId, Box<Expr>),
+    /// `o.create(x)` (`Object.create` with one argument): while the method
+    /// is the builtin, an object of prototype x made with the empty shape
+    /// the site caches (`lum_object_create`), else a call.
+    ObjectCreate(Box<Expr>, AtomId, Box<Expr>),
     /// A value converted for field `field` of layout `layout` as a store
     /// would convert it (an `int` wraps; TypeError if not of its type): of
     /// the field's type (see `scalar_replace_structs`).
@@ -1285,7 +1289,7 @@ macro_rules! visitor {
                 | JsonMethodAs(_, a) => {
                     $name(a, f)
                 }
-                StructArrGet(_, a, b) | StructArrPush(_, a, b) | KeysLength(a, _, b) => {
+                StructArrGet(_, a, b) | StructArrPush(_, a, b) | KeysLength(a, _, b) | ObjectCreate(a, _, b) => {
                     $name(a, f);
                     $name(b, f);
                 }
