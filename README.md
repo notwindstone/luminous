@@ -141,8 +141,9 @@ regular call path's generated code alone.
 `0018-await-or-value.patch`, `0019-json-fast-paths.patch`,
 `0020-exotic-define-own.patch`, `0021-latin1-strings.patch`,
 `0022-count-own-keys.patch`, `0023-frozen-fast-arrays.patch` and
-`0024-json-parse-and-for-in.patch` and
-`0025-objects-and-dictionaries.patch`, each made
+`0024-json-parse-and-for-in.patch`,
+`0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`
+and `0027-for-await-close.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -355,6 +356,15 @@ engine's semantics:
   `JS_AddValuesN`, which concatenates them at once when they are strings
   and primitives (else adds them in turn, as `+` does): 56 ns, now 38 ns
   (bun 26–31 ns);
+- `for await` closing its iterator on an exception (`0027`): the body's
+  exception closed the iterator from the interpreter's unwinding, which
+  called `return` without awaiting its result, so the exception went on
+  (to a `catch` after the loop, say) before the iterator was closed (a
+  directory of `fs.opendir` was still open there). The body now has a
+  handler of its own, as a `using` scope has, which calls `return`,
+  awaits its result and ignores what either throws (the spec's
+  AsyncIteratorClose of a throw completion), then rethrows; natively
+  compiled `for await` loops do the same;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly

@@ -4530,17 +4530,37 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             body.extend(cx.body(&f.body)?);
             Ok(Stmt::Loop { id, test: None, post_test: false, body, update: None, per_iteration: vec![] })
         })?;
-        // An exception: close quietly, then rethrow.
+        // An exception: `return` (if any) called and its result awaited,
+        // what either throws ignored, then the exception rethrown (the
+        // spec's AsyncIteratorClose of a throw completion).
         let exc = self.temp(Ty::Any);
+        let return_atom = self.m.atom("return");
+        let quiet_method = self.temp(Ty::Any);
+        let quiet_r = self.temp(Ty::Any);
+        let quiet_nullish = Expr::new(
+            Ty::Bool,
+            ExprKind::AnyCompare(
+                AnyCmpOp::Eq,
+                Box::new(self.local(quiet_method)),
+                Box::new(Expr::new(Ty::Any, ExprKind::Null)),
+            ),
+        );
+        let quiet_call = Expr::new(
+            Ty::Any,
+            ExprKind::CallThis(Box::new(self.local(quiet_method)), Box::new(self.local(iter)), Vec::new()),
+        );
+        let quiet_close = vec![
+            Stmt::Expr(set(quiet_method, Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(iter)), return_atom)))),
+            Stmt::If(quiet_nullish, vec![], vec![Stmt::Await { value: quiet_call, target: ir::AwaitTarget::Set(quiet_r) }]),
+        ];
         let on_throw = vec![
-            Stmt::Expr(Expr::new(Ty::Any, ExprKind::IterCloseQuiet(iter))),
+            Stmt::Try { body: quiet_close, catch: Some((None, vec![])), finally: None, exc: None },
             Stmt::Expr(set(iter, undefined())),
             Stmt::Throw(self.local(exc)),
         ];
         // Leaving early: `return` (if any), awaited, must give an object.
         let method = self.temp(Ty::Any);
         let r = self.temp(Ty::Any);
-        let return_atom = self.m.atom("return");
         let get_return = Expr::new(Ty::Any, ExprKind::GetProp(Box::new(self.local(iter)), return_atom));
         let nullish = Expr::new(
             Ty::Bool,

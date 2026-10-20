@@ -1,0 +1,126 @@
+--- a/quickjs.c	2026-10-20 22:52:35.293685856 +0000
++++ b/quickjs.c	2026-10-20 22:52:56.238962630 +0000
+@@ -26514,6 +26514,9 @@
+     uint8_t is_async_iterator : 1;
+     uint8_t is_regular_stmt : 1; // i.e. not a loop statement
+     uint8_t has_using : 1; /* scope has using declarations needing disposal */
++    /* luminous: the catch offset of a `for await` body (whose exception
++       handler closes the iterator, awaiting `return`) */
++    uint8_t is_async_close : 1;
+     int using_scope_level; /* scope level for OP_dispose_scope (-1 if none) */
+ } BlockEnv;
+ 
+@@ -32855,6 +32858,7 @@
+     be->is_async_iterator = false;
+     be->is_regular_stmt = false;
+     be->has_using = false;
++    be->is_async_close = false;
+     be->using_scope_level = -1;
+ }
+ 
+@@ -32979,7 +32983,7 @@
+     top = s->cur_func->top_break;
+     while (top != NULL) {
+         if (top->has_iterator || top->label_finally != -1 ||
+-            top->has_using) {
++            top->has_using || top->is_async_close) {
+             if (!hasval) {
+                 emit_op(s, OP_undefined);
+                 hasval = true;
+@@ -32990,7 +32994,9 @@
+                instruction instead. */
+             emit_op(s, OP_nip_catch);
+             /* stack: iter_obj next ret_val */
+-            if (top->has_iterator) {
++            if (top->is_async_close) {
++                /* (only the body's catch offset) */
++            } else if (top->has_iterator) {
+                 if (top->is_async_iterator) {
+                     emit_iterator_close(s, true, true);
+                 } else {
+@@ -33351,6 +33357,9 @@
+     int label_next, label_expr, label_cont, label_body, label_break;
+     int pos_next, pos_expr;
+     BlockEnv break_entry;
++    /* luminous: a `for await` body's exception handler */
++    BlockEnv close_entry;
++    int label_async_close = -1;
+ 
+     has_initializer = false;
+     has_destructuring = false;
+@@ -33578,6 +33587,17 @@
+     }
+ 
+     emit_label(s, label_body);
++    /* luminous: an exception thrown by a `for await` body closes the
++       iterator as AsyncIteratorClose closes it on a throw completion: its
++       `return` called and awaited (what they throw ignored), then the
++       exception rethrown. (The generic unwinding, at the iterator's catch
++       offset, closes without awaiting.) */
++    if (is_for_of && is_async) {
++        label_async_close = new_label(s);
++        emit_goto(s, OP_catch, label_async_close);
++        push_break_entry(fd, &close_entry, JS_ATOM_NULL, -1, -1, 1);
++        close_entry.is_async_close = true;
++    }
+     {
+         bool scope_has_using = fd->scopes[fd->scope_level].has_using;
+         int using_scope_level = fd->scope_level;
+@@ -33619,6 +33639,12 @@
+         }
+     }
+ 
++    if (label_async_close >= 0) {
++        pop_break_entry(fd);
++        /* drop the body's catch offset */
++        emit_op(s, OP_drop);
++    }
++
+     close_scopes(s, s->cur_func->scope_level, block_scope_level);
+ 
+     emit_label(s, label_cont);
+@@ -33656,6 +33682,44 @@
+     }
+     pop_break_entry(s->cur_func);
+     pop_scope(s);
++    if (label_async_close >= 0) {
++        int label_end = emit_goto(s, OP_goto, -1);
++        int label_ignore = new_label(s);
++        int label_no_return = new_label(s);
++        emit_label(s, label_async_close);
++        /* stack: iter_obj next catch_offset exception */
++        emit_op(s, OP_swap);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_swap);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_swap);
++        /* exception iter_obj */
++        emit_goto(s, OP_catch, label_ignore);
++        emit_op(s, OP_swap);
++        /* exception catch_offset iter_obj */
++        emit_op(s, OP_get_field2);
++        emit_atom(s, JS_ATOM_return);
++        emit_op(s, OP_dup);
++        emit_op(s, OP_is_undefined_or_null);
++        emit_goto(s, OP_if_true, label_no_return);
++        emit_op(s, OP_call_method);
++        emit_u16(s, 0);
++        emit_op(s, OP_await);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_throw);
++        emit_label(s, label_no_return);
++        /* exception catch_offset iter_obj return_func */
++        emit_op(s, OP_drop);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_drop);
++        emit_op(s, OP_throw);
++        emit_label(s, label_ignore);
++        /* exception exception2 */
++        emit_op(s, OP_drop);
++        emit_op(s, OP_throw);
++        emit_label(s, label_end);
++    }
+     return 0;
+ }
+ 
