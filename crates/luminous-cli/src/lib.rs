@@ -418,7 +418,9 @@ fn bytecode_c(bytes: &[u8]) -> String {
 pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_front::Options) -> Result<()> {
     let q = quickjs(opts)?;
     let fopts = &luminous_front::Options { native: fopts.native && !opts.no_native, ..*fopts };
+    let t0 = std::time::Instant::now();
     let (bundle, mut analysis) = analyze_with(input, fopts, &opts.embed)?;
+    luminous_codegen::time("analysis", t0);
     if opts.no_native {
         disable_native(&mut analysis);
     }
@@ -474,10 +476,12 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         if has_native {
             let cg = opts.codegen()?;
             match luminous_codegen::compile(&analysis.module, &cg)? {
-                Output::Object(bytes) => {
-                    let obj = tmp.join("native.o");
-                    std::fs::write(&obj, bytes)?;
-                    link.arg(&obj);
+                Output::Objects(objects) => {
+                    for (i, bytes) in objects.iter().enumerate() {
+                        let obj = tmp.join(if objects.len() == 1 { "native.o".into() } else { format!("native{i}.o") });
+                        std::fs::write(&obj, bytes)?;
+                        link.arg(&obj);
+                    }
                 }
                 Output::LlvmIr(parts) => {
                     let (mut lls, mut objs) = (Vec::new(), Vec::new());
@@ -488,7 +492,9 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
                         lls.push(ll);
                         objs.push(tmp.join(format!("{name}.o")));
                     }
+                    let t0 = std::time::Instant::now();
                     luminous_codegen::llvm::compile_parts(&lls, &objs, &cg.llvm)?;
+                    luminous_codegen::time("clang", t0);
                     link.args(&objs);
                 }
             }
@@ -497,7 +503,10 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         link.args(&opts.embed.link);
         link.arg(q.build.join("libqjs-libc.a")).arg(q.build.join("libqjs.a"));
         link.args(["-lm", "-lpthread", "-ldl", "-o"]).arg(output);
-        run(&mut link)
+        let t0 = std::time::Instant::now();
+        run(&mut link)?;
+        luminous_codegen::time("link", t0);
+        Ok(())
     })();
     if opts.keep.is_none() {
         let _ = std::fs::remove_dir_all(&tmp);

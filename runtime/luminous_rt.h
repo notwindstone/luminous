@@ -105,7 +105,9 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 /* Object.keys, Object.create. */
 #define LUM_PIN_OBJECT_KEYS 48
 #define LUM_PIN_OBJECT_CREATE 49
-#define LUM_PINS 50
+/* String.prototype.lastIndexOf (JS_CallStringFn). */
+#define LUM_PIN_STRING_LAST_INDEX_OF 50
+#define LUM_PINS 51
 /* The properties a new empty object (`{}`, Object.create) has room for in
  * its cell: up to as many are added without moving them. */
 #define LUM_OBJECT_ROOM 4

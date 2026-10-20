@@ -168,7 +168,8 @@ pub struct Analysis {
     /// an `aot type` (see `structs::Structs::parse_sites`): span and desc.
     pub as_sites: Vec<((u32, u32), i32)>,
     /// Top-level declarations that are only types (TypeScript's overload
-    /// signatures, `declare function`, `declare class`, `declare const`):
+    /// signatures, `declare function`, `declare class`, `declare const`,
+    /// `declare namespace`, `declare enum`):
     /// blanked, since a native function's binding takes the name they
     /// declare.
     pub signatures: Vec<(u32, u32)>,
@@ -391,6 +392,10 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
                 Some(oxc::ast::ast::Declaration::FunctionDeclaration(f)) => f.body.is_none(),
                 Some(oxc::ast::ast::Declaration::ClassDeclaration(c)) => c.declare,
                 Some(oxc::ast::ast::Declaration::VariableDeclaration(v)) => v.declare,
+                Some(oxc::ast::ast::Declaration::TSNamespaceDeclaration(m)) => m.declare,
+                Some(oxc::ast::ast::Declaration::TSExternalModuleDeclaration(m)) => m.declare,
+                Some(oxc::ast::ast::Declaration::TSGlobalDeclaration(_)) => true,
+                Some(oxc::ast::ast::Declaration::TSEnumDeclaration(e)) => e.declare,
                 _ => false,
             }
         })

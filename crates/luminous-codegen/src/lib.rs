@@ -358,8 +358,8 @@ impl Default for Options {
 
 /// What a backend produced for the native functions.
 pub enum Output {
-    /// A relocatable object file.
-    Object(Vec<u8>),
+    /// Relocatable object files, linked together.
+    Objects(Vec<Vec<u8>>),
     /// LLVM modules (textual IR), compiled by `llvm::compile_parts` and
     /// linked together.
     LlvmIr(Vec<String>),
@@ -385,11 +385,23 @@ pub fn lower_module(m: &ir::Module) -> Result<mir::Module> {
 
 /// Compile `m` for the host with the backend `opts` selects.
 pub fn compile(m: &ir::Module, opts: &Options) -> Result<Output> {
+    let t0 = std::time::Instant::now();
     let module = lower_module(m)?;
-    Ok(match opts.backend {
-        Backend::Cranelift => Output::Object(clif::emit(&module, &opts.opt_level)?),
+    time("lowering", t0);
+    let t0 = std::time::Instant::now();
+    let out = match opts.backend {
+        Backend::Cranelift => Output::Objects(clif::emit_parts(&module, &opts.opt_level, opts.llvm.jobs)?),
         Backend::Llvm => Output::LlvmIr(llvm::emit_parts(&module, &opts.llvm, opts.llvm.jobs)?),
-    })
+    };
+    time("backend", t0);
+    Ok(out)
+}
+
+/// With $LUMINOUS_TIMES, prints how long a phase of a build took.
+pub fn time(phase: &str, since: std::time::Instant) {
+    if std::env::var_os("LUMINOUS_TIMES").is_some() {
+        eprintln!("luminous: {phase}: {:.2}s", since.elapsed().as_secs_f64());
+    }
 }
 
 /// `lum_sort_<i>`'s signature: (ctx, values, room for half of them and
@@ -647,6 +659,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_CallStringFn", &[P, W, Int, Int, P], &[W]),
         ("JS_CallMapFn", &[P, W, Int, Int, P], &[W]),
         ("JS_ConcatStrings", &[P, P, Int], &[W]),
+        ("JS_AddValuesN", &[P, P, Int], &[W]),
         ("lum_new_instance", &[P, P, W, Int, P, P], &[W]),
         ("lum_new_instance_full", &[P, P, W, Int, P, P, P, Int], &[W]),
         ("lum_global_or_undefined", &[P, Int], &[W]),

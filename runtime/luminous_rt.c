@@ -822,7 +822,7 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
         "             g.Set.prototype.has, g.JSON.stringify, g.JSON.parse,\n"
-        "             g.Object.keys, g.Object.create);\n"
+        "             g.Object.keys, g.Object.create, g.String.prototype.lastIndexOf);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";

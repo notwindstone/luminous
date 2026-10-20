@@ -14,7 +14,7 @@
 //!   propagate NaN and order -0 below +0: Cranelift's semantics, which the
 //!   LLVM translation keeps.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// The type of a value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -538,7 +538,7 @@ pub struct Decls {
 /// Builds a `Function`, block by block.
 pub struct FunctionBuilder {
     pub func: Function,
-    decls: Rc<Decls>,
+    decls: Arc<Decls>,
     current: Option<Block>,
     entry: Option<Block>,
     /// The `f64const`s made, by value.
@@ -546,7 +546,7 @@ pub struct FunctionBuilder {
 }
 
 impl FunctionBuilder {
-    pub fn new(sig: Signature, decls: Rc<Decls>) -> Self {
+    pub fn new(sig: Signature, decls: Arc<Decls>) -> Self {
         FunctionBuilder {
             func: Function {
                 sig,
@@ -1089,7 +1089,7 @@ pub struct Module {
     pub funcs: Vec<FuncDecl>,
     pub data: Vec<DataDecl>,
     pub sigs: Vec<Signature>,
-    decls: Option<Rc<Decls>>,
+    decls: Option<Arc<Decls>>,
 }
 
 impl Module {
@@ -1129,7 +1129,7 @@ impl Module {
         let decls = self
             .decls
             .get_or_insert_with(|| {
-                Rc::new(Decls { funcs: self.funcs.iter().map(|f| f.sig.clone()).collect(), sigs: self.sigs.clone() })
+                Arc::new(Decls { funcs: self.funcs.iter().map(|f| f.sig.clone()).collect(), sigs: self.sigs.clone() })
             })
             .clone();
         FunctionBuilder::new(sig, decls)

@@ -17,9 +17,46 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::mir::{self, ArgExt, BinOp, ConvOp, InstData, Type, UnOp};
 
-/// Compile `m` to an object file for the host. `opt_level` is Cranelift's:
-/// "none", "speed" or "speed_and_size".
-pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
+/// Below this many instructions, a program's code stays one object (the
+/// cost of splitting outweighs the parallelism).
+const SPLIT_MIN_INSTS: usize = 200_000;
+
+/// Compile `m` to object files for the host (`opt_level` is Cranelift's:
+/// "none", "speed" or "speed_and_size"), as `parts` objects (fewer if
+/// it is small) compiled in parallel that together define its functions:
+/// each defines a run of them (an entry and its body are neighbors) and
+/// refers to the others, which are then hidden instead of local. The first
+/// defines the data.
+pub fn emit_parts(m: &mir::Module, opt_level: &str, parts: usize) -> Result<Vec<Vec<u8>>> {
+    let size = |f: &mir::FuncDecl| f.body.as_ref().map_or(0, |b| b.insts.len() + 1);
+    let total: usize = m.funcs.iter().map(size).sum();
+    let parts = if total < SPLIT_MIN_INSTS { 1 } else { parts.max(1) };
+    // (Each part's first function: runs of about the same size.)
+    let mut starts = vec![0];
+    let mut acc = 0;
+    for (i, f) in m.funcs.iter().enumerate() {
+        if acc >= total * starts.len() / parts && starts.len() < parts && i > 0 {
+            starts.push(i);
+        }
+        acc += size(f);
+    }
+    starts.push(m.funcs.len());
+    let split = starts.len() > 2;
+    let ranges: Vec<_> = starts.windows(2).map(|w| w[0]..w[1]).collect();
+    std::thread::scope(|s| {
+        let jobs: Vec<_> = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(p, r)| s.spawn(move || emit_part(m, opt_level, r, p == 0, split)))
+            .collect();
+        jobs.into_iter().map(|j| j.join().expect("codegen thread")).collect()
+    })
+}
+
+/// The object file of the functions of `m` in `defs` (and its data if
+/// `data`); with `split`, local functions and data are hidden, to be
+/// referred to from the other parts.
+fn emit_part(m: &mir::Module, opt_level: &str, defs: std::ops::Range<usize>, data: bool, split: bool) -> Result<Vec<u8>> {
     let mut flags = settings::builder();
     flags.set("opt_level", opt_level)?;
     flags.set("is_pic", "true")?;
@@ -37,19 +74,33 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
     let builder = ObjectBuilder::new(isa, "luminous", cranelift_module::default_libcall_names())?;
     let mut module = ObjectModule::new(builder);
 
+    // (What another part defines is imported, but colocated: in the same
+    // executable.)
+    let link = |l: mir::Linkage, here: bool| match l {
+        mir::Linkage::Local if split && here => cranelift_module::Linkage::Hidden,
+        _ if !here => cranelift_module::Linkage::Import,
+        l => linkage(l),
+    };
     let mut funcs = Vec::new();
-    for f in &m.funcs {
+    let mut elsewhere = Vec::new();
+    for (i, f) in m.funcs.iter().enumerate() {
         let s = signature(&module, &f.sig);
-        funcs.push(module.declare_function(&f.name, linkage(f.linkage), &s)?);
+        let here = f.body.is_none() || defs.contains(&i);
+        funcs.push(module.declare_function(&f.name, link(f.linkage, here), &s)?);
+        elsewhere.push(!here);
     }
-    let mut data = Vec::new();
+    let mut data_ids = Vec::new();
     for d in &m.data {
-        data.push(module.declare_data(&d.name, linkage(d.linkage), d.writable, false)?);
+        let here = d.init.is_none() || data;
+        data_ids.push(module.declare_data(&d.name, link(d.linkage, here), d.writable, false)?);
+        elsewhere.push(!here);
     }
+    let (func_elsewhere, data_elsewhere) = elsewhere.split_at(m.funcs.len());
 
     let mut fctx = FunctionBuilderContext::new();
     let mut ctx = module.make_context();
-    for (i, f) in m.funcs.iter().enumerate() {
+    for i in defs {
+        let f = &m.funcs[i];
         let Some(body) = &f.body else { continue };
         ctx.func.signature = signature(&module, &f.sig);
         let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -59,7 +110,9 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
             m,
             f: body,
             funcs: &funcs,
-            data: &data,
+            data: &data_ids,
+            func_elsewhere,
+            data_elsewhere,
             vals: vec![None; body.value_types.len()],
             blocks: Vec::new(),
             vars: Vec::new(),
@@ -80,15 +133,17 @@ pub fn emit(m: &mir::Module, opt_level: &str) -> Result<Vec<u8>> {
         module.define_function(funcs[i], &mut ctx).map_err(|e| anyhow!("{}: {e:?}", f.name))?;
         module.clear_context(&mut ctx);
     }
-    for (i, d) in m.data.iter().enumerate() {
-        let Some(init) = &d.init else { continue };
-        let mut desc = DataDescription::new();
-        match init {
-            mir::DataInit::Zeroed { size } => desc.define_zeroinit(*size),
-            mir::DataInit::Bytes(bytes) => desc.define(bytes.clone().into_boxed_slice()),
+    if data {
+        for (i, d) in m.data.iter().enumerate() {
+            let Some(init) = &d.init else { continue };
+            let mut desc = DataDescription::new();
+            match init {
+                mir::DataInit::Zeroed { size } => desc.define_zeroinit(*size),
+                mir::DataInit::Bytes(bytes) => desc.define(bytes.clone().into_boxed_slice()),
+            }
+            desc.set_align(d.align as u64);
+            module.define_data(data_ids[i], &desc)?;
         }
-        desc.set_align(d.align as u64);
-        module.define_data(data[i], &desc)?;
     }
     Ok(module.finish().emit()?)
 }
@@ -245,6 +300,9 @@ struct Translator<'a, 'b> {
     f: &'a mir::Function,
     funcs: &'a [cranelift_module::FuncId],
     data: &'a [cranelift_module::DataId],
+    /// The functions and data another part defines (see `emit_parts`).
+    func_elsewhere: &'a [bool],
+    data_elsewhere: &'a [bool],
     vals: Vec<Option<cl::Value>>,
     blocks: Vec<cl::Block>,
     vars: Vec<Variable>,
@@ -275,7 +333,11 @@ impl Translator<'_, '_> {
         if let Some(&r) = self.frefs.get(&f) {
             return r;
         }
-        let r = self.module.declare_func_in_func(self.funcs[f.index()], self.b.func);
+        let id = self.funcs[f.index()];
+        let r = self.module.declare_func_in_func(id, self.b.func);
+        if self.func_elsewhere[f.index()] {
+            self.b.func.dfg.ext_funcs[r].colocated = true;
+        }
         self.frefs.insert(f, r);
         r
     }
@@ -285,6 +347,11 @@ impl Translator<'_, '_> {
             return g;
         }
         let g = self.module.declare_data_in_func(self.data[d.index()], self.b.func);
+        if self.data_elsewhere[d.index()]
+            && let cl::GlobalValueData::Symbol { colocated, .. } = &mut self.b.func.global_values[g]
+        {
+            *colocated = true;
+        }
         self.gvs.insert(d, g);
         g
     }

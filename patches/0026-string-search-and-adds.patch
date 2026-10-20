@@ -1,0 +1,134 @@
+--- a/quickjs.h	2026-10-19 18:04:18.358850537 +0000
++++ b/quickjs.h	2026-10-19 18:06:54.655048921 +0000
+@@ -1216,6 +1216,7 @@
+ #define JS_STRING_FN_INCLUDES 3
+ #define JS_STRING_FN_STARTS_WITH 4
+ #define JS_STRING_FN_ENDS_WITH 5
++#define JS_STRING_FN_LAST_INDEX_OF 6
+ JS_EXTERN JSValue JS_CallStringFn(JSContext *ctx, JSValueConst str, int which, int argc, JSValueConst *argv);
+ /* luminous: Map.prototype.get, set, has, Set.prototype.add, has (in this
+    order) with a direct entry, for a Map or Set `this` (argv: 2 values). */
+@@ -1223,6 +1224,8 @@
+ /* luminous: the concatenation of parts[0..n) (all taken), each converted with
+    ToString: strings, ropes and primitives. */
+ JS_EXTERN JSValue JS_ConcatStrings(JSContext *ctx, JSValue *parts, int n);
++/* luminous: parts[0] + ... + parts[n - 1] (all taken), as `+` adds them. */
++JS_EXTERN JSValue JS_AddValuesN(JSContext *ctx, JSValue *parts, int n);
+ /* luminous: a regular expression literal's object (a new one each time):
+    pattern and flags borrowed, their bytecode in *bc, compiled into it the
+    first time (while it is not a string; the caller keeps it alive). */
+--- a/quickjs.c	2026-10-19 18:04:18.356935101 +0000
++++ b/quickjs.c	2026-10-19 18:06:54.652944392 +0000
+@@ -7481,6 +7481,37 @@
+     return JS_BinaryOperator(ctx, JS_BINOP_ADD, op1, op2);
+ }
+ 
++/* luminous: parts[0] + parts[1] + ... + parts[n - 1] (all taken), as `+`
++   adds them, left to right: concatenated at once when the first or second
++   is a string and none is an object (whose ToPrimitive could differ from
++   ToString), else pair by pair. */
++JSValue JS_AddValuesN(JSContext *ctx, JSValue *parts, int n)
++{
++    JSValue r, s;
++    int i, str = 0, obj = 0;
++
++    for (i = 0; i < n; i++) {
++        int t = JS_VALUE_GET_TAG(parts[i]);
++        obj |= t == JS_TAG_OBJECT;
++        str |= i < 2 && tag_is_string(t);
++    }
++    if (str && !obj)
++        return JS_ConcatStrings(ctx, parts, n);
++    r = parts[0];
++    for (i = 1; i < n; i++) {
++        s = JS_AddValues(ctx, r, parts[i]);
++        JS_FreeValue(ctx, r);
++        JS_FreeValue(ctx, parts[i]);
++        r = s;
++        if (JS_IsException(r)) {
++            for (i++; i < n; i++)
++                JS_FreeValue(ctx, parts[i]);
++            break;
++        }
++    }
++    return r;
++}
++
+ /* Shape support */
+ 
+ static inline size_t get_shape_size(size_t hash_size, size_t prop_size)
+@@ -51989,6 +52020,38 @@
+     return -1;
+ }
+ 
++/* luminous: the last position at or before `from` where p2 is in p1, or -1
++   (assuming 0 <= from <= p1->len - p2->len). */
++static int string_lastindexof(JSString *p1, JSString *p2, int from)
++{
++    int i, len2 = p2->len;
++    if (len2 == 0)
++        return from;
++    if (!p1->is_wide_char && !p2->is_wide_char) {
++        /* The first character, backward (memrchr), then the rest. */
++        const uint8_t *s = str8(p1), *t = str8(p2);
++        for (i = from; i >= 0; i--) {
++#if defined(__GLIBC__)
++            const uint8_t *q = memrchr(s, t[0], i + 1);
++            if (!q)
++                break;
++            i = q - s;
++#else
++            if (s[i] != t[0])
++                continue;
++#endif
++            if (len2 == 1 || bytes_eq(s + i + 1, t + 1, len2 - 1))
++                return i;
++        }
++        return -1;
++    }
++    for (i = from; i >= 0; i--) {
++        if (string_eq_at(p1, p2, i, 0, len2))
++            return i;
++    }
++    return -1;
++}
++
+ static int64_t string_advance_index(JSString *p, int64_t index, bool unicode)
+ {
+     if (!unicode || index >= p->len || !p->is_wide_char) {
+@@ -52125,15 +52188,9 @@
+         /* luminous: forward, by the first character (string_indexof). */
+         if (len >= v_len && start <= stop)
+             ret = string_indexof(p, p1, start);
+-    } else if (len >= v_len && inc * (stop - start) >= 0) {
+-        for (i = start;; i += inc) {
+-            if (!string_cmp(p, p1, i, 0, v_len)) {
+-                ret = i;
+-                break;
+-            }
+-            if (i == stop)
+-                break;
+-        }
++    } else if (len >= v_len && start >= 0) {
++        /* luminous: backward, by the first character (string_lastindexof). */
++        ret = string_lastindexof(p, p1, start);
+     }
+     JS_FreeValue(ctx, str);
+     JS_FreeValue(ctx, v);
+@@ -52746,6 +52803,16 @@
+             return js_bool((int)p1->len <= len && string_indexof(p, p1, 0) >= 0);
+         }
+         return js_string_includes(ctx, str, argc, argv, 0);
++    case JS_STRING_FN_LAST_INDEX_OF:
++        /* A string, from the end or an int32 position (clamped). */
++        if (ta == JS_TAG_STRING && (tb == JS_TAG_INT || tb == JS_TAG_UNDEFINED)) {
++            JSString *p1 = JS_VALUE_GET_STRING(argv[0]);
++            a = len - (int)p1->len;
++            if (tb == JS_TAG_INT)
++                a = min_int(max_int(JS_VALUE_GET_INT(argv[1]), 0), a);
++            return js_int32(a >= 0 ? string_lastindexof(p, p1, a) : -1);
++        }
++        return js_string_indexOf(ctx, str, argc, argv, 1);
+     case JS_STRING_FN_STARTS_WITH:
+         if (ta == JS_TAG_STRING && tb == JS_TAG_UNDEFINED) {
+             JSString *p1 = JS_VALUE_GET_STRING(argv[0]);

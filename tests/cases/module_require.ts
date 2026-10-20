@@ -2,7 +2,8 @@
 // `require` in ES modules). A module only it imports is evaluated when the
 // first call runs, once; the call returns the namespace object. Also what
 // TypeScript only declares: overload signatures, `declare class X` merged
-// with `function X`, and `import type` of what does not resolve.
+// with `function X`, `declare namespace X` merged with `function X`, and
+// `import type` of what does not resolve. Abstract classes in a lazy module.
 import type { Nothing } from "no-such-package";
 import { eager } from "./module_require/eager.ts";
 
@@ -53,3 +54,9 @@ console.log(p.double(), (Point as any).label);
 
 const n: Nothing | undefined = undefined;
 console.log("type-only import:", n);
+
+function shapes() {
+  return import.meta.require("./module_require/shapes.ts");
+}
+const sq = new (shapes().Square)(3);
+console.log(sq.describe(), sq instanceof shapes().Shape, shapes().warn("loud"), shapes().warn("again"));

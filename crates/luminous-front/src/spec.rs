@@ -634,6 +634,23 @@ fn bx(e: Expr) -> Box<Expr> {
     Box::new(e)
 }
 
+/// The bitwise operator of numbers an `AnyBinOp` is.
+fn bitwise(op: AnyBinOp) -> Option<BinOp> {
+    Some(match op {
+        AnyBinOp::BitAnd => BinOp::BitAnd,
+        AnyBinOp::BitOr => BinOp::BitOr,
+        AnyBinOp::BitXor => BinOp::BitXor,
+        AnyBinOp::Shl => BinOp::Shl,
+        AnyBinOp::Sar => BinOp::Sar,
+        AnyBinOp::Shr => BinOp::Shr,
+        _ => return None,
+    })
+}
+
+fn is_bitwise(op: BinOp) -> bool {
+    matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Sar | BinOp::Shr)
+}
+
 /// The arithmetic `BinOp` of an `AnyBinOp` on two numbers.
 fn arith(op: AnyBinOp) -> Option<BinOp> {
     Some(match op {
@@ -2010,6 +2027,28 @@ impl Region {
                 let b = self.num(b, cx)?;
                 self.work += 1;
                 f64(Binary(*op, bx(a), bx(b)))
+            }
+            // A bitwise operator of numbers: an int32 (`>>>`: a uint32).
+            AnyBinary(op, a, b) if bitwise(*op).is_some() => {
+                let op = bitwise(*op).expect("bitwise");
+                let a = self.num(a, cx)?;
+                let b = self.num(b, cx)?;
+                self.work += 1;
+                let ty = if op == BinOp::Shr { Ty::F64 } else { Ty::I32 };
+                Expr::new(ty, Binary(op, bx(a), bx(b)))
+            }
+            Binary(op, a, b) if is_bitwise(*op) => {
+                let a = self.num(a, cx)?;
+                let b = self.num(b, cx)?;
+                Expr::new(e.ty, Binary(*op, bx(a), bx(b)))
+            }
+            // (Of a bitwise operator: already an int32.)
+            IntOf(x) => {
+                let v = self.num(x, cx)?;
+                if v.ty != Ty::I32 {
+                    return None;
+                }
+                v
             }
             AnyBinary(op, a, b) => {
                 let op = arith(*op)?;

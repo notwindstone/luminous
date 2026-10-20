@@ -194,8 +194,8 @@ pub(crate) enum Method {
     /// `Array.prototype.push` (one argument).
     ArrayPush,
     /// `String.prototype.slice`, `substring`, `indexOf`, `includes`,
-    /// `startsWith`, `endsWith` (in this order; `JS_CallStringFn`), with
-    /// at most two arguments.
+    /// `startsWith`, `endsWith`, `lastIndexOf` (in this order;
+    /// `JS_CallStringFn`), with at most two arguments.
     StringFn(i32),
     /// `Map.prototype.get`, `set`, `has` (or `Set.prototype.has`),
     /// `Set.prototype.add` (`JS_CallMapFn`), with at most two arguments.
@@ -215,6 +215,7 @@ impl Method {
             "includes" => Some(Method::StringFn(3)),
             "startsWith" => Some(Method::StringFn(4)),
             "endsWith" => Some(Method::StringFn(5)),
+            "lastIndexOf" => Some(Method::StringFn(6)),
             "get" => Some(Method::MapFn(0)),
             "set" => Some(Method::MapFn(1)),
             "has" => Some(Method::MapFn(2)),
@@ -237,8 +238,10 @@ const PIN_ARRAY_PUSH: i32 = 26;
 const PIN_ARRAY_LOOPS: i32 = 27;
 /// `Array.prototype.sort`.
 const PIN_ARRAY_SORT: i32 = 34;
-/// The methods of `Method::StringFn`.
+/// The methods of `Method::StringFn` (but the last).
 const PIN_STRING_FNS: i32 = 35;
+/// `String.prototype.lastIndexOf` (`Method::StringFn(6)`).
+const PIN_STRING_LAST_INDEX_OF: i32 = 50;
 /// `Map.prototype.get`, `set`, `has`, `Set.prototype.add`, `has`.
 const PIN_MAP_FNS: i32 = 41;
 /// The `extensible` bit of an object's flags byte (`layout::OBJ_FLAGS`; see
@@ -480,6 +483,9 @@ struct RemInt {
     nan: bool,
     /// Below 2^53 in magnitude, so comparable with rounded products.
     small: bool,
+    /// Where `ok`, below 2^bits in magnitude, if known: sums of these and
+    /// exact integers are then exact too (see `binary`).
+    bits: Option<u32>,
     /// Where not `ok`, the integer this holds (a `charCodeAt` past the end:
     /// -1), if a fixed one: a comparison with a constant that gives the
     /// same at it as at NaN then needs no flag.
@@ -784,7 +790,7 @@ impl Lower {
                 let d = self.b.use_var(v);
                 let int = self.b.use_var(iv);
                 let ok = self.b.use_var(okv);
-                self.rem_of.insert(d, RemInt { int, ok, nan: true, small: true, none: Some(-1) });
+                self.rem_of.insert(d, RemInt { int, ok, nan: true, small: true, bits: Some(32), none: Some(-1) });
                 V::Num(d)
             }
             (LVar::One(v), Ty::F64 | Ty::MaybeF64) => V::Num(self.b.use_var(v)),
@@ -1856,7 +1862,7 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, none: None });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, bits: Some(32), none: None });
         res
     }
 
@@ -1877,7 +1883,7 @@ impl Lower {
         let rf = self.b.ins().fcvt_from_sint(F64, r);
         let rf = self.b.ins().fcopysign(rf, a);
         let ok = self.b.ins().iconst(I8, 1);
-        self.rem_of.insert(rf, RemInt { int: r, ok, nan: true, small: bits <= 53, none: None });
+        self.rem_of.insert(rf, RemInt { int: r, ok, nan: true, small: bits <= 53, bits: Some(bits), none: None });
         rf
     }
 
@@ -2976,6 +2982,31 @@ impl Lower {
                 let n = self.b.ins().iconst(I32, anys.len() as i64);
                 let ctx = self.ctx;
                 let r = self.helper("JS_ConcatStrings", &[ctx, slot, n]);
+                self.check_value(r[0]);
+                V::Any(r[0])
+            }
+            ExprKind::AnyBinary(AnyBinOp::Add, ..) if self.add_chain(e).is_some() => {
+                // `a + "/" + b` of values not known to be strings: added by
+                // one call, which concatenates them at once if they are
+                // strings and primitives (their reads have no effects, so
+                // that adding them in turn after reading all is the same).
+                let parts = self.add_chain(e).unwrap();
+                let vals: Vec<V> = parts
+                    .iter()
+                    .map(|x| {
+                        let v = self.expr(concat_operand(x));
+                        self.hold(v);
+                        v
+                    })
+                    .collect();
+                for &v in vals.iter().rev() {
+                    self.release(v);
+                }
+                let anys: Vec<Value> = vals.iter().map(|v| v.any()).collect();
+                let slot = self.values_slot(&anys);
+                let n = self.b.ins().iconst(I32, anys.len() as i64);
+                let ctx = self.ctx;
+                let r = self.helper("JS_AddValuesN", &[ctx, slot, n]);
                 self.check_value(r[0]);
                 V::Any(r[0])
             }
@@ -5695,7 +5726,7 @@ impl Lower {
         self.b.switch_to_block(join);
         // (Its code as an integer where the index is inside, else NaN (-1
         // as the integer): compared with integers as integers.)
-        self.rem_of.insert(r, RemInt { int: ri, ok: inside, nan: true, small: true, none: Some(-1) });
+        self.rem_of.insert(r, RemInt { int: ri, ok: inside, nan: true, small: true, bits: Some(16), none: Some(-1) });
         r
     }
 
@@ -5989,7 +6020,8 @@ impl Lower {
         let is_str = self.val_is(sw, TAG_STRING);
         let is_obj = self.val_is(fw, TAG_OBJECT);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
-        let orig = self.b.ins().load(I64, M_CONST, table, (PIN_STRING_FNS + k) * 8);
+        let pin = if k == 6 { PIN_STRING_LAST_INDEX_OF } else { PIN_STRING_FNS + k };
+        let orig = self.b.ins().load(I64, M_CONST, table, pin * 8);
         let orig = self.mk_ref(TAG_OBJECT, orig);
         let same = self.b.ins().icmp(IntCC::Equal, fw, orig);
         let ok = self.b.ins().band(is_str, is_obj);
@@ -7158,6 +7190,40 @@ impl Lower {
         self.int_bits.get(&v).copied().or(self.i32s.contains(&v).then_some(32))
     }
 
+    /// The integer form of `v` with its bound, and the flag under which it
+    /// is valid (else `v` is NaN), if any: an exact integer, or a character
+    /// code or `%` result (`rem_of`).
+    fn flagged_int(&self, v: Value) -> Option<(Value, u32, Option<Value>)> {
+        if let Some(bits) = self.bits_of(v) {
+            return Some((self.int_of[&v], bits, None));
+        }
+        let r = self.rem_of.get(&v).filter(|r| r.nan)?;
+        Some((r.int, r.bits?, Some(r.ok)))
+    }
+
+    /// `a + c` or `a - c` where one is a character code or `%` result (NaN
+    /// unless its flag is set) whose result is below 2^53 in magnitude: the
+    /// double, exact (or NaN), and its integer under both flags, which
+    /// `toint32` and comparisons use instead (as `rem_of`).
+    fn flagged_sum(&mut self, op: BinOp, a: Value, c: Value) -> Option<Value> {
+        let (x, ba, fa) = self.flagged_int(a)?;
+        let (y, bc, fc) = self.flagged_int(c)?;
+        let bits = ba.max(bc) + 1;
+        if (fa.is_none() && fc.is_none()) || bits > 53 {
+            return None;
+        }
+        let (d, r) = match op {
+            BinOp::Add => (self.b.ins().fadd(a, c), self.b.ins().iadd(x, y)),
+            _ => (self.b.ins().fsub(a, c), self.b.ins().isub(x, y)),
+        };
+        let ok = match (fa, fc) {
+            (Some(p), Some(q)) => self.b.ins().band(p, q),
+            (p, q) => p.or(q).expect("one flag"),
+        };
+        self.rem_of.insert(d, RemInt { int: r, ok, nan: true, small: true, bits: Some(bits), none: None });
+        Some(d)
+    }
+
     fn binary(&mut self, op: BinOp, a: Value, c: Value) -> Value {
         // Exact in integers below 2^53 (where the `f64` operation is exact
         // too); a product with a positive constant is never -0.
@@ -7182,6 +7248,11 @@ impl Lower {
                 }
                 return d;
             }
+        }
+        if matches!(op, BinOp::Add | BinOp::Sub)
+            && let Some(d) = self.flagged_sum(op, a, c)
+        {
+            return d;
         }
         let ints = (self.i32s.contains(&a) && self.i32s.contains(&c)).then(|| (self.int_of[&a], self.int_of[&c]));
         match (op, ints) {
@@ -7293,7 +7364,7 @@ impl Lower {
         let zero = self.b.ins().iconst(I64, 0);
         self.b.ins().jump(join, &[BlockArg::Value(nan), BlockArg::Value(zero)]);
         self.b.switch_to_block(join);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, none: None });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: nonzero, nan: true, small: true, bits: Some(bits), none: None });
         res
     }
 
@@ -7355,7 +7426,7 @@ impl Lower {
         self.b.switch_to_block(join);
         // On the fast path, the exact remainder (|r| < |c|).
         let small = self.bits_of(c).is_some_and(|b| b <= 53);
-        self.rem_of.insert(res, RemInt { int: r_param, ok: is_int, nan: false, small, none: None });
+        self.rem_of.insert(res, RemInt { int: r_param, ok: is_int, nan: false, small, bits: None, none: None });
         res
     }
 
@@ -8802,6 +8873,13 @@ impl Lower {
         if let Some(&i) = self.int_of.get(&x) {
             return self.b.ins().ireduce(I32, i);
         }
+        // An integer under a flag, else NaN (0).
+        if let Some(r) = self.rem_of.get(&x).filter(|r| r.nan && r.bits.is_some()) {
+            let (int, ok) = (r.int, r.ok);
+            let i = self.b.ins().ireduce(I32, int);
+            let zero = self.b.ins().iconst(I32, 0);
+            return self.b.ins().select(ok, i, zero);
+        }
         let ax = self.b.ins().fabs(x);
         let lim = self.b.ins().f64const(9_223_372_036_854_775_808.0);
         let small = self.b.ins().fcmp(FloatCC::LessThan, ax, lim);
@@ -9892,6 +9970,42 @@ fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
         string(x) || matches!(&x.kind, ExprKind::Box(i) if matches!(i.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool))
     };
     (parts.len() >= 2 && parts[..2].iter().any(string) && parts.iter().all(primitive)).then_some(parts)
+}
+
+impl Lower {
+    /// The operands of a chain of three or more `+` (left to right) where
+    /// the first or second is a string and each but the first is read
+    /// without effects (a string, a local nothing else can assign, a
+    /// number): `JS_AddValuesN` adds them.
+    fn add_chain<'e>(&self, e: &'e Expr) -> Option<Vec<&'e Expr>> {
+        let mut parts = Vec::new();
+        let mut e = e;
+        while let ExprKind::AnyBinary(AnyBinOp::Add, l, r) = &e.kind {
+            parts.push(&**r);
+            e = l;
+        }
+        parts.push(e);
+        parts.reverse();
+        let string = |x: &&Expr| matches!(x.kind, ExprKind::Str(_) | ExprKind::AnyUnary(AnyUnOp::ToStr, _));
+        let pure = |x: &Expr| match &x.kind {
+            ExprKind::Str(_) => true,
+            ExprKind::Local(l) => !matches!(self.vars[*l], LVar::Boxed { .. }),
+            ExprKind::AnyUnary(AnyUnOp::ToStr, inner) | ExprKind::Box(inner) => {
+                let inner = match &inner.kind {
+                    ExprKind::Box(i) => i,
+                    _ => inner,
+                };
+                matches!(inner.ty, Ty::F64 | Ty::I32 | Ty::MaybeF64 | Ty::Bool)
+                    && match &inner.kind {
+                        ExprKind::Local(l) => !matches!(self.vars[*l], LVar::Boxed { .. }),
+                        ExprKind::Num(_) => true,
+                        _ => false,
+                    }
+            }
+            _ => false,
+        };
+        (parts.len() >= 3 && parts[..2].iter().any(string) && parts[1..].iter().all(|x| pure(x))).then_some(parts)
+    }
 }
 
 /// A part of a concatenation as `JS_ConcatStrings` takes it: a number's

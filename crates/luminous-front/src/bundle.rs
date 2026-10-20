@@ -1558,9 +1558,11 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
     let mut needed: Vec<usize> = ns_sites.keys().copied().collect();
     // A program that imports modules at run time: its modules, by path, for
     // the embedder's loader to give them (one instance of each module).
+    // (Lazy ones too: evaluated when first given.)
     let registry: Vec<usize> = if fallback_sites.is_empty() {
         order
             .iter()
+            .chain(&lazy_order)
             .copied()
             .filter(|&t| {
                 let p = units[t].path.canonicalize().unwrap_or_else(|_| units[t].path.clone());
@@ -1568,7 +1570,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
             })
             .collect()
     } else {
-        order.clone()
+        order.iter().chain(&lazy_order).copied().collect()
     };
     for &t in &registry {
         if !needed.contains(&t) {
@@ -1807,7 +1809,13 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
             .iter()
             .map(|&t| {
                 let path = units[t].path.canonicalize().unwrap_or_else(|_| units[t].path.clone());
-                format!("[{}, {}]", serde_json::to_string(&path.display().to_string()).unwrap(), names.of[&Binding::Namespace(t)])
+                let ns = &names.of[&Binding::Namespace(t)];
+                // (A lazy module is evaluated first.)
+                let get = match names.inits.get(&t) {
+                    Some(init) if !is_async[t] => format!("() => ({init}(), {ns}())"),
+                    _ => ns.clone(),
+                };
+                format!("[{}, {get}]", serde_json::to_string(&path.display().to_string()).unwrap())
             })
             .collect();
         prelude.push_str(&format!("globalThis[Symbol.for(\"luminous.modules\")] = new Map([{}]); ", entries.join(", ")));
@@ -2712,7 +2720,25 @@ fn lazy_edits(
             && !c.declare
         {
             let name = name_of(id.symbol_id());
-            out.push((Span::new(c.span.start, c.span.start), format!(";{name} = ")));
+            if c.r#abstract {
+                // (A class expression cannot be abstract: the modifier and
+                // the abstract members, only types, go.)
+                let kw = c.span.start + text[c.span.start as usize..].find("class").unwrap_or(0) as u32;
+                out.push((Span::new(c.span.start, kw), format!(";{name} = ")));
+                for e in &c.body.body {
+                    let abstract_member = match e {
+                        ClassElement::MethodDefinition(m) => m.r#type.is_abstract(),
+                        ClassElement::PropertyDefinition(p) => p.r#type.is_abstract(),
+                        ClassElement::AccessorProperty(p) => p.r#type.is_abstract(),
+                        _ => false,
+                    };
+                    if abstract_member {
+                        out.push((e.span(), String::new()));
+                    }
+                }
+            } else {
+                out.push((Span::new(c.span.start, c.span.start), format!(";{name} = ")));
+            }
             out.push((Span::new(c.span.end, c.span.end), ";".into()));
             hoists[r].push(("let", name, None));
         }

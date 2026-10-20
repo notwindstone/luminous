@@ -347,6 +347,14 @@ engine's semantics:
   code (`{}`, `Object.create`) has room in its cell for 4 properties,
   which an object's properties grow into before moving out
   (`JS_ShapeAllocInfoRoom`, `JS_NewObjectWithCachedShapeRoom`);
+- string searches and sums (`0026`): `lastIndexOf` searched by comparing
+  the needle at every position; it now finds its first character with
+  `memrchr` (and has a direct entry, `JS_CallStringFn`), as `indexOf`
+  does with `memchr`: on a path of 29 characters, 36 ns, now 16 ns (bun
+  6–10 ns). `a + "/" + b` of values not known to be strings is one call,
+  `JS_AddValuesN`, which concatenates them at once when they are strings
+  and primitives (else adds them in turn, as `+` does): 56 ns, now 38 ns
+  (bun 26–31 ns);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -646,9 +654,15 @@ picks the code generator of `luminous build` / `luminous run`. Both translate th
 same backend-neutral IR (`mir.rs`), which the lowering builds, with the same
 semantics: wrapping integer arithmetic, shift amounts modulo the width,
 saturating float-to-integer conversions, NaN-propagating `fmin` / `fmax`.
-The differential tests run every case with both.
+The differential tests run every case with both. With `LUMINOUS_TIMES`,
+a build prints how long its phases took (analysis, lowering, the backend,
+clang, linking).
 
-- **Cranelift** compiles in process, in milliseconds. It optimizes little
+- **Cranelift** compiles in process, in milliseconds, a large program's
+  functions in parts on as many threads as the host has (8 at most; one
+  object file each, with the functions local to the program hidden,
+  rather than local, to the others): the Node.js modules of Beyond's
+  tests compile in 8 s instead of 24 s on 4 cores. It optimizes little
   beyond what the lowering does itself (which, for instance, lowers the
   tests of `if` and loops through `&&`, `||`, `!` and `?:` as jumps, so
   `a || b || c` is a compare and a branch each, no boolean made).
@@ -1368,7 +1382,8 @@ instructions.
   module's). `import.meta.require("x")` (Bun's synchronous import, with a
   string) is an `import()` that returns the namespace object itself: a
   module only it imports is evaluated when the first call runs (its errors
-  thrown by every call).
+  thrown by every call). The modules the embedder's loader is given
+  (`luminous.modules`) include lazy ones, evaluated when first given.
 - **Conformance.** test262's module tests (`language/module-code`,
   `language/import`, `language/export`): 622 of 722 pass, against 611 with
   the engine's own module loader (QuickJS-NG); JSON and text imports pass

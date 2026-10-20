@@ -39,7 +39,7 @@ pub struct Options {
     /// The CPU to compile for, as clang's `-march` (default: the host's).
     pub march: String,
     /// How many modules a large program's code is split into, compiled in
-    /// parallel (default: the host's threads, up to 8).
+    /// parallel (default: the host's threads, up to 8). (Cranelift's too.)
     pub jobs: usize,
 }
 
