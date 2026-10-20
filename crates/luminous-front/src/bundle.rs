@@ -1280,6 +1280,102 @@ type Hoist = (&'static str, String, Option<Span>);
 /// top-level binding may take their names.
 const GLOBALS_USED: [&str; 7] = ["Object", "Proxy", "Reflect", "Symbol", "TypeError", "JSON", "Uint8Array"];
 
+/// The program's evaluation order (`order`, dependencies first) with, before
+/// each module, the program's modules that one it requires lazily
+/// (`import.meta.require`) imports, through other lazy ones: a require in its
+/// top-level code (or in what that calls) evaluates the lazy module then, and
+/// what it imports must have been evaluated. (Not those that import the
+/// module themselves: a cycle stays one.)
+fn order_for_requires(units: &[Unit], order: &[usize], lazy: &[bool]) -> Vec<usize> {
+    let n = units.len();
+    let eager_deps = |m: usize| {
+        units[m].deps.iter().filter_map(move |(t, runtime)| match (t, runtime) {
+            (Target::Module(d), true) if !lazy[*d] => Some(*d),
+            _ => None,
+        })
+    };
+    // Whether `from` imports `to`, through the program's modules.
+    let reaches = |from: usize, to: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![from];
+        while let Some(m) = stack.pop() {
+            if m == to {
+                return true;
+            }
+            if std::mem::replace(&mut seen[m], true) {
+                continue;
+            }
+            stack.extend(eager_deps(m));
+        }
+        false
+    };
+    let mut before: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut any = false;
+    for &m in order {
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = units[m]
+            .dynamic
+            .iter()
+            .filter_map(|d| match d.to {
+                DynTo::Module(t) if d.sync && lazy[t] => Some(t),
+                _ => None,
+            })
+            .collect();
+        while let Some(t) = stack.pop() {
+            if std::mem::replace(&mut seen[t], true) {
+                continue;
+            }
+            for (dt, runtime) in &units[t].deps {
+                let (Target::Module(d), true) = (dt, runtime) else { continue };
+                if lazy[*d] {
+                    stack.push(*d);
+                } else if !seen[*d] && *d != m && !reaches(*d, m) {
+                    seen[*d] = true;
+                    before[m].push(*d);
+                    any = true;
+                }
+            }
+            for d in &units[t].dynamic {
+                if let DynTo::Module(x) = d.to
+                    && d.sync
+                    && lazy[x]
+                {
+                    stack.push(x);
+                }
+            }
+        }
+    }
+    if !any {
+        return order.to_vec();
+    }
+    fn visit(m: usize, deps: &dyn Fn(usize) -> Vec<usize>, before: &[Vec<usize>], state: &mut [u8], out: &mut Vec<usize>) {
+        state[m] = 1;
+        for d in deps(m) {
+            if state[d] == 0 {
+                visit(d, deps, before, state, out);
+            }
+        }
+        for &d in &before[m] {
+            if state[d] == 0 {
+                visit(d, deps, before, state, out);
+            }
+        }
+        state[m] = 2;
+        out.push(m);
+    }
+    let deps = |m: usize| eager_deps(m).collect::<Vec<_>>();
+    let mut state = vec![0u8; n];
+    let mut out = Vec::with_capacity(order.len());
+    // (From the entry, as the first order: the same modules.)
+    visit(order[order.len() - 1], &deps, &before, &mut state, &mut out);
+    for &m in order {
+        if state[m] == 0 {
+            visit(m, &deps, &before, &mut state, &mut out);
+        }
+    }
+    out
+}
+
 /// Order, name and merge the modules.
 fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, String> {
     // Evaluation order: dependencies first (run-time ones), depth first.
@@ -1318,6 +1414,7 @@ fn link(units: &[Unit], library: bool, shared: &[PathBuf]) -> Result<Bundle, Str
     for &m in &lazy_order {
         lazy[m] = true;
     }
+    let mut order = order_for_requires(units, &order, &lazy);
 
     // A module's errors (early errors, and imports or re-exports that do not
     // resolve, below) are the program's; but those of a lazy module (and of

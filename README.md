@@ -1384,6 +1384,10 @@ instructions.
   module only it imports is evaluated when the first call runs (its errors
   thrown by every call). The modules the embedder's loader is given
   (`luminous.modules`) include lazy ones, evaluated when first given.
+  Before an eager module runs, the eager modules its synchronously
+  required lazy ones import (directly or through other lazy ones) run
+  first, unless they import it themselves, so a lazy module required while
+  the program starts finds its imports initialized.
 - **Conformance.** test262's module tests (`language/module-code`,
   `language/import`, `language/export`): 622 of 722 pass, against 611 with
   the engine's own module loader (QuickJS-NG); JSON and text imports pass
