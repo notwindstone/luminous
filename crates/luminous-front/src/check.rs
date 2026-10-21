@@ -662,7 +662,15 @@ fn collect_toplevel<'a>(
                         }
                         continue;
                     }
-                    if kind != BindingKind::Const {
+                    // (A `var` or `let` bound to a function and never assigned
+                    // again or declared again is as a `const` would be: the
+                    // functions of `var a = function a() {...}, b = ...`.)
+                    let function_init = matches!(
+                        init.without_parentheses(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    ) && !written(symbol)
+                        && scoping.symbol_redeclarations(symbol).is_empty();
+                    if kind != BindingKind::Const && !function_init {
                         if !pure_init(init) {
                             run(&mut reached, module_refs(scoping, |vis| vis.visit_expression(init)));
                         }

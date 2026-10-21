@@ -40,7 +40,10 @@ elapsed: 905 ms         # 4.4x faster than the same program interpreted
 
 1. **Selection.** The candidates are:
    - top-level `function` declarations;
-   - top-level `const` bindings of arrow functions and function expressions;
+   - top-level `const` bindings of arrow functions and function expressions,
+     and `let` and `var` ones never assigned or declared again (the
+     functions of `var a = function a() {...}, b = ...`, as Bun's modules
+     declare theirs);
    - class methods;
    - module code: each run of top-level statements (loops, `if`s, expression
      statements, `let` / `const` / `var` declarations) becomes a native
