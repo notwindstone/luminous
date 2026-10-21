@@ -1,0 +1,155 @@
+--- a/quickjs.h	2026-10-20 22:59:46.649185698 +0000
++++ b/quickjs.h	2026-10-20 23:05:01.066438187 +0000
+@@ -981,6 +981,11 @@
+ JS_EXTERN const uint8_t *JS_GetStringLatin1(JSValueConst val, size_t *plen);
+ /* A string of these Latin-1 characters. */
+ JS_EXTERN JSValue JS_NewStringLatin1(JSContext *ctx, const uint8_t *buf, size_t len);
++/* luminous: a new string of `len` characters (8-bit, or 16-bit if
++   `is_wide`) that the caller writes at *pbuf before anything else runs;
++   JS_ShrinkNewString shortens it, before other code has seen it. */
++JS_EXTERN JSValue JS_NewStringUninit(JSContext *ctx, size_t len, int is_wide, void **pbuf);
++JS_EXTERN void JS_ShrinkNewString(JSContext *ctx, JSValueConst val, size_t len);
+ static inline JSValue JS_NewString(JSContext *ctx, const char *str) {
+     return JS_NewStringLen(ctx, str, strlen(str));
+ }
+--- a/quickjs.c	2026-10-20 22:59:46.666987027 +0000
++++ b/quickjs.c	2026-10-20 23:05:01.063005715 +0000
+@@ -446,6 +446,11 @@
+     /* Empty chunks kept for any class (linked through link), how many. */
+     struct list_head spare;
+     uint32_t spare_count;
++    /* luminous: the chunks of large cells freed lately, kept (their pages
++       mapped and populated) for the next large cells of about their size,
++       and their bytes (JS_GC_LARGE_SPARE_MAX at most) */
++    struct list_head large_spare;
++    size_t large_spare_bytes;
+     uint32_t collections;
+     uint32_t n_chunks, peak_chunks; /* (QJS_GC_STATS) */
+     uint64_t minor_ns, major_ns; /* (QJS_GC_STATS) time collecting */
+@@ -2913,7 +2918,28 @@
+         list_add_tail(&ch->avail_link, &h->avail[cls]);
+         return ch;
+     }
+-    ch = cls == JS_GC_LARGE ? js_gc_map(size) : js_gc_map_chunk(h);
++    ch = NULL;
++    if (cls == JS_GC_LARGE) {
++        /* luminous: a large chunk freed lately, of this size or at most a
++           quarter more (its pages faulted in already, which a new mapping
++           costs again for each), its bitmaps cleared */
++        struct list_head *el;
++        list_for_each(el, &h->large_spare) {
++            JSGCChunk *c = list_entry(el, JSGCChunk, link);
++            if (c->size >= size && c->size - size <= size / 4) {
++                list_del(&c->link);
++                h->large_spare_bytes -= c->size;
++                size = c->size;
++                memset(c->bits, 0, JS_GC_BITMAPS * 8 * words);
++                ch = c;
++                break;
++            }
++        }
++        if (!ch)
++            ch = js_gc_map(size);
++    } else {
++        ch = js_gc_map_chunk(h);
++    }
+     if (!ch)
+         return NULL;
+     if (++h->n_chunks > h->peak_chunks)
+@@ -2953,6 +2979,11 @@
+     return ch;
+ }
+ 
++/* luminous: the bytes of freed large chunks kept for reuse, at most (the
++   chunks of the largest cells, over JS_GC_LARGE_SPARE_CELL, are not) */
++#define JS_GC_LARGE_SPARE_MAX (64 * 1024 * 1024)
++#define JS_GC_LARGE_SPARE_CELL (16 * 1024 * 1024)
++
+ static void js_gc_free_chunk(JSRuntime *rt, JSGCChunk *ch)
+ {
+     JSGCHeap *h = &rt->gc_heap;
+@@ -2963,6 +2994,19 @@
+     for (off = 0; off < ch->size; off += JS_GC_CHUNK_SIZE)
+         js_gc_table_del(h, (uintptr_t)ch + off);
+     h->n_chunks--;
++    if (ch->cls == JS_GC_LARGE && ch->size <= JS_GC_LARGE_SPARE_CELL) {
++        /* (kept, the oldest unmapped first while they are too many) */
++        while (h->large_spare_bytes + ch->size > JS_GC_LARGE_SPARE_MAX &&
++               !list_empty(&h->large_spare)) {
++            JSGCChunk *old = list_entry(h->large_spare.next, JSGCChunk, link);
++            list_del(&old->link);
++            h->large_spare_bytes -= old->size;
++            js_gc_unmap(old, old->size);
++        }
++        list_add_tail(&ch->link, &h->large_spare);
++        h->large_spare_bytes += ch->size;
++        return;
++    }
+     js_gc_unmap(ch, ch->size);
+ }
+ 
+@@ -2995,6 +3039,7 @@
+     }
+     init_list_head(&h->large);
+     init_list_head(&h->spare);
++    init_list_head(&h->large_spare);
+     init_list_head(&h->dead_contexts);
+ }
+ 
+@@ -3011,6 +3056,8 @@
+         js_gc_unmap(list_entry(el, JSGCChunk, link), list_entry(el, JSGCChunk, link)->size);
+     list_for_each_safe(el, el1, &h->spare)
+         js_gc_unmap(list_entry(el, JSGCChunk, link), list_entry(el, JSGCChunk, link)->size);
++    list_for_each_safe(el, el1, &h->large_spare)
++        js_gc_unmap(list_entry(el, JSGCChunk, link), list_entry(el, JSGCChunk, link)->size);
+ #if defined(JS_COMPRESSED_POINTERS)
+     /* (The region's chunks never handed out, back to the cage.) */
+     if (h->region < h->region_end)
+@@ -6426,6 +6473,47 @@
+     return js_new_string8_len(ctx, (const char *)buf, len);
+ }
+ 
++/* luminous: a new string of `len` characters (8-bit, or 16-bit if
++   `is_wide`) that the caller writes at *pbuf, all of them, before
++   anything else runs; or JS_EXCEPTION. (What a file holds read straight
++   into its string.) */
++JSValue JS_NewStringUninit(JSContext *ctx, size_t len, int is_wide, void **pbuf)
++{
++    JSString *str;
++    if (len == 0) {
++        *pbuf = NULL;
++        return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    }
++    if (len > JS_STRING_LEN_MAX)
++        return JS_ThrowRangeError(ctx, "invalid string length");
++    str = js_alloc_string(ctx, len, is_wide);
++    if (!str)
++        return JS_EXCEPTION;
++    if (is_wide) {
++        *pbuf = str16(str);
++    } else {
++        str8(str)[len] = '\0';
++        *pbuf = str8(str);
++    }
++    return JS_MKPTR(JS_TAG_STRING, str);
++}
++
++/* luminous: shortens a string JS_NewStringUninit made, while no other code
++   has seen it, to `len` characters (no more than it has). */
++void JS_ShrinkNewString(JSContext *ctx, JSValueConst val, size_t len)
++{
++    JSString *str;
++    (void)ctx;
++    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
++        return;
++    str = JS_VALUE_GET_STRING(val);
++    if (len >= str->len)
++        return;
++    str->len = len;
++    if (!str->is_wide_char)
++        str8(str)[len] = '\0';
++}
++
+ /* create a string from a UTF-8 buffer */
+ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+ {

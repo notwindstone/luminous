@@ -1,0 +1,41 @@
+--- a/quickjs.h	2026-10-20 23:19:03.901592025 +0000
++++ b/quickjs.h	2026-10-20 23:20:37.702018989 +0000
+@@ -586,6 +586,9 @@
+ JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
+ /* use 0 to disable maximum stack size check */
+ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
++/* luminous: the message of a stack overflow's RangeError (kept by the
++   embedder), or NULL for the engine's ("Maximum call stack size exceeded"). */
++JS_EXTERN void JS_SetStackOverflowMessage(JSRuntime *rt, const char *message);
+ /* should be called when changing thread to update the stack top value
+    used to check stack overflow. */
+ JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
+--- a/quickjs.c	2026-10-20 23:19:03.911055817 +0000
++++ b/quickjs.c	2026-10-20 23:20:37.699061392 +0000
+@@ -629,6 +629,9 @@
+     /* luminous: see JS_SetFunctionSourceHook */
+     JSFunctionSourceHook *function_source_hook;
+     uint64_t shape_ids; /* luminous: the last JSShape.id given */
++    /* luminous: the message of a stack overflow's RangeError, the
++       embedder's (JS_SetStackOverflowMessage), or NULL */
++    const char *stack_overflow_message;
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -11978,7 +11981,15 @@
+ 
+ static JSValue JS_ThrowStackOverflow(JSContext *ctx)
+ {
+-    return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
++    const char *m = ctx->rt->stack_overflow_message;
++    return JS_ThrowRangeError(ctx, "%s", m ? m : "Maximum call stack size exceeded");
++}
++
++/* luminous: the message of a stack overflow's RangeError (a string the
++   embedder keeps), or NULL for the engine's. */
++void JS_SetStackOverflowMessage(JSRuntime *rt, const char *message)
++{
++    rt->stack_overflow_message = message;
+ }
+ 
+ static JSValue JS_ThrowTypeErrorNotAConstructor(JSContext *ctx,

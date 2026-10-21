@@ -142,8 +142,9 @@ regular call path's generated code alone.
 `0020-exotic-define-own.patch`, `0021-latin1-strings.patch`,
 `0022-count-own-keys.patch`, `0023-frozen-fast-arrays.patch` and
 `0024-json-parse-and-for-in.patch`,
-`0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`
-and `0027-for-await-close.patch`, each made
+`0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`,
+`0027-for-await-close.patch`, `0028-large-cells-and-strings.patch` and
+`0029-stack-overflow-message.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -365,6 +366,18 @@ engine's semantics:
   awaits its result and ignores what either throws (the spec's
   AsyncIteratorClose of a throw completion), then rethrows; natively
   compiled `for await` loops do the same;
+- large cells and strings made in place (`0028`): a cell larger than
+  16 KB has a chunk of its own, mapped when it is made and unmapped when
+  it dies, so a loop reading a 1 MB file into a buffer or a string paid
+  for an `mmap`, page faults over the whole megabyte and a `munmap` each
+  time. Up to 64 MB of such chunks (each at most 16 MB) are now kept when
+  they die, and a cell of the same size, or up to a quarter smaller,
+  takes one back. `JS_NewStringUninit` makes a string whose characters
+  the caller writes (a file read straight into it) and
+  `JS_ShrinkNewString` gives back what it did not use;
+- the message of a stack overflow (`0029`): `JS_SetStackOverflowMessage`
+  sets what the `RangeError` says (an embedder copying another engine's
+  wording; the default is `Maximum call stack size exceeded`);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
