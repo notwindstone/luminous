@@ -1,5 +1,4 @@
-// @native mathOfValues order remainders signs counters fieldUpdates loopRems
-// @interpreted bigints
+// @native mathOfValues order remainders signs counters fieldUpdates loopRems bigints
 // `Math` functions on JS values convert them with ToNumber once all the
 // arguments are evaluated; integer `%` with exact operands; integer locals
 // derived from others; compound assignments to fields of `aot type` array

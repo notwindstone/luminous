@@ -501,6 +501,8 @@ pub enum ExprKind {
     /// A regular expression literal (its pattern and flags): a new RegExp
     /// object each time, of a pattern compiled once.
     RegExp(StrId, StrId),
+    /// A BigInt literal below 2^64.
+    BigInt(u64),
     /// `F64` or `Bool` as a JS value.
     Box(Box<Expr>),
     AnyUnary(AnyUnOp, Box<Expr>),
@@ -1232,6 +1234,7 @@ macro_rules! visitor {
                 | Null
                 | Str(_)
                 | RegExp(..)
+                | BigInt(_)
                 | Cell(_)
                 | Global(_)
                 | GlobalOrUndefined(_)

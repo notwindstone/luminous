@@ -3004,6 +3004,13 @@ impl Lower {
                 self.check_value(r[0]);
                 V::Any(r[0])
             }
+            ExprKind::BigInt(v) => {
+                let ctx = self.ctx;
+                let x = self.b.ins().iconst(I64, *v as i64);
+                let r = self.helper("JS_NewBigUint64", &[ctx, x]);
+                self.check_value(r[0]);
+                V::Any(r[0])
+            }
             ExprKind::Box(x) => match self.expr(x) {
                 V::Num(d) if x.ty == Ty::MaybeF64 => V::Any(self.box_maybe(d)),
                 V::Num(d) => V::Any(self.box_number(d)),

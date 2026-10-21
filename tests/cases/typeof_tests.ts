@@ -1,5 +1,4 @@
-// @native compare names undeclared main
-// @interpreted kinds
+// @native compare names undeclared main kinds
 // `typeof v === "name"` tests v's tag (and an object's class) without making
 // the string; `typeof v` alone gives the name's constant. Every kind of
 // value, compared both ways round, strictly, loosely and negated.

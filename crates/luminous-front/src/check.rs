@@ -4919,6 +4919,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             }
             // Type-level wrappers have no runtime effect; their types are
             // not trusted.
+            // (Up to 2^64 - 1; a larger one stays interpreted.)
+            Expression::BigIntLiteral(b) => match b.value.as_str().parse::<u64>() {
+                Ok(v) => Expr::new(Ty::Any, ExprKind::BigInt(v)),
+                Err(_) => return reject(span, "BigInt literals of 2^64 and more are not supported"),
+            },
             Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
             Expression::TSAsExpression(a) => self.expr(&a.expression)?,
             Expression::TSSatisfiesExpression(a) => self.expr(&a.expression)?,

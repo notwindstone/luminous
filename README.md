@@ -829,6 +829,9 @@ clang, linking).
     making the string: 7 ns, now under 1 ns (bun 0.9 ns). Alone, the
     name's string constant, from the same tests (7 ns, now 4.5);
   - `in`, `new`;
+  - BigInt literals below 2^64 (`JS_NewBigUint64`); a function with a
+    larger one stays interpreted (Bun's `readSync` was, for its
+    `9223372036854775807n`, and Buffer's `checkInt`);
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them; a small
     one that calls itself has its own body inlined once, so that each call
