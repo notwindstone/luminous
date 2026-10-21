@@ -600,6 +600,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_array_iter_close", &[P, W, Int, Int], &[Int]),
         ("lum_array_iter_ok", &[P], &[Int]),
         ("lum_regexp", &[P, Int, Int], &[W]),
+        ("lum_literal_proto", &[P, W, W], &[Int]),
+        ("lum_define_computed_method", &[P, P, W, Int], &[Int]),
         ("JS_NewBigUint64", &[P, W], &[W]),
         ("lum_gen_iter_ok", &[P, W, W], &[Int]),
         ("JS_NativeGeneratorNext", &[P, W, P], &[W]),

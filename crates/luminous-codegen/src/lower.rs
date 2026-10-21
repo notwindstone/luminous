@@ -4096,6 +4096,27 @@ impl Lower {
                             let r = self.helper("lum_define_accessor", &[ctx, slot, atom, w, s]);
                             self.check_int(r[0]);
                         }
+                        ir::ObjPart::ComputedMethod(k, x, kind) => {
+                            // (The key is already a property key: ToPropKey.)
+                            let key = self.expr(k);
+                            self.hold(key);
+                            let w = self.expr(x).any();
+                            let slot = self.values_slot(&[o[0], key.any()]);
+                            let kd = self.b.ins().iconst(I32, *kind as i64);
+                            let r = self.helper("lum_define_computed_method", &[ctx, slot, w, kd]);
+                            self.check_int(r[0]);
+                            self.release(key);
+                            self.free_v(key);
+                        }
+                        ir::ObjPart::Proto(x) => {
+                            let v = self.expr(x);
+                            self.hold(v);
+                            let w = v.any();
+                            let r = self.helper("lum_literal_proto", &[ctx, o[0], w]);
+                            self.check_int(r[0]);
+                            self.release(v);
+                            self.free_v(v);
+                        }
                         ir::ObjPart::Spread(x) => {
                             let v = self.expr(x);
                             self.hold(v);

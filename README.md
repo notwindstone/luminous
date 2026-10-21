@@ -1237,7 +1237,9 @@ clang, linking).
 - **Destructuring** in declarations, parameters, `catch`, loop heads and
   assignments; **spread** in calls, `new`, and array and object literals;
   **rest** parameters and elements; **optional chaining**; computed keys in
-  object literals.
+  object literals (of values, methods, getters and setters, named after
+  their key); `__proto__: value` in object literals (the prototype, for an
+  object or null).
 - TypeScript **`this` parameters** (`function f(this: T, ...)`): only a
   type.
 - **Object literal methods, getters and setters** (`this` included;
@@ -1246,8 +1248,7 @@ clang, linking).
 
 Not yet: constructors of derived classes that run code before
 `super(...)`, and constructors using `arguments` (which stay
-interpreted), private accessors' and static private methods' direct calls,
-computed method and accessor names in object literals, private names,
+interpreted), private accessors' and static private methods' direct calls, private names,
 static fields and blocks, computed field names and `super.x` in classes
 inside functions, `new.target`. A
 function using one of these stays interpreted (and functions that call it

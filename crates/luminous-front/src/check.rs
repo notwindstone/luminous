@@ -5270,6 +5270,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             Field(ir::AtomId),
             Computed,
             Spread,
+            Proto,
+            ComputedMethod(u8),
             /// A getter (false) or setter (true).
             Accessor(ir::AtomId, bool),
         }
@@ -5291,7 +5293,26 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 ObjectPropertyKind::ObjectProperty(p) => p,
             };
             if p.computed && (p.kind != PropertyKind::Init || p.method) {
-                return reject(p.span, "computed methods and accessors in object literals are not supported yet");
+                // A method, getter or setter of a computed key: the key, then
+                // a native closure with `this`, named once the key is known.
+                let Some(k) = p.key.as_expression() else {
+                    return reject(p.span, "unsupported object literal key");
+                };
+                let Expression::FunctionExpression(f) = p.value.without_parentheses() else {
+                    return reject(p.span, "unsupported object literal member");
+                };
+                let mark = self.pre.len();
+                let k = any(self.expr(k)?);
+                push(self, Expr::new(Ty::Any, ExprKind::ToPropKey(Box::new(k))), &mut values, mark);
+                let v = self.closure_with(FnNode::Function(f), String::new(), true, p.span)?;
+                values.push(v);
+                let kind = match p.kind {
+                    PropertyKind::Get => 1,
+                    PropertyKind::Set => 2,
+                    _ => 0,
+                };
+                parts.push(Part::ComputedMethod(kind));
+                continue;
             }
             if p.computed {
                 let Some(k) = p.key.as_expression() else {
@@ -5317,8 +5338,14 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 }
                 _ => return reject(p.span, "unsupported object literal key"),
             };
-            if name == "__proto__" {
-                return reject(p.span, "`__proto__` in object literals is not supported");
+            // (`__proto__: value` sets the prototype; a shorthand or a method
+            // so named is a property.)
+            if name == "__proto__" && !p.shorthand && !p.method && p.kind == PropertyKind::Init {
+                let mark = self.pre.len();
+                let v = any(self.expr(&p.value)?);
+                push(self, v, &mut values, mark);
+                parts.push(Part::Proto);
+                continue;
             }
             let atom = self.m.atom(&name);
             if p.kind != PropertyKind::Init || p.method {
@@ -5362,6 +5389,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                     ir::ObjPart::Computed(k, values.next().unwrap())
                 }
                 Part::Spread => ir::ObjPart::Spread(values.next().unwrap()),
+                Part::Proto => ir::ObjPart::Proto(values.next().unwrap()),
+                Part::ComputedMethod(kind) => {
+                    let k = values.next().unwrap();
+                    ir::ObjPart::ComputedMethod(k, values.next().unwrap(), kind)
+                }
                 Part::Accessor(a, setter) => ir::ObjPart::Accessor(a, values.next().unwrap(), setter),
             })
             .collect();

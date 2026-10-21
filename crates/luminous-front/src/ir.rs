@@ -1011,6 +1011,11 @@ pub enum ObjPart {
     /// `[key]: value` (the key is converted when the property is defined).
     Computed(Expr, Expr),
     Spread(Expr),
+    /// `__proto__: value`: the prototype, if `value` is an object or null.
+    Proto(Expr),
+    /// `[key]() {}` (0), `get [key]() {}` (1) or `set [key](v) {}` (2): the
+    /// key, then the function (named after the key when it is defined).
+    ComputedMethod(Expr, Expr, u8),
 }
 
 #[derive(Debug, Clone)]
@@ -1385,8 +1390,10 @@ macro_rules! visitor {
                 ObjectParts(parts) => {
                     for p in parts {
                         match p {
-                            ObjPart::Field(_, x) | ObjPart::Spread(x) | ObjPart::Accessor(_, x, _) => $name(x, f),
-                            ObjPart::Computed(k, x) => {
+                            ObjPart::Field(_, x) | ObjPart::Spread(x) | ObjPart::Accessor(_, x, _) | ObjPart::Proto(x) => {
+                                $name(x, f)
+                            }
+                            ObjPart::Computed(k, x) | ObjPart::ComputedMethod(k, x, _) => {
                                 $name(k, f);
                                 $name(x, f);
                             }
@@ -3241,7 +3248,7 @@ fn write_of(x: &Expr) -> Write {
                     }
                     // Keys not known: nothing before it (here: after) is
                     // predicted.
-                    ObjPart::Spread(_) | ObjPart::Computed(..) => break,
+                    ObjPart::Spread(_) | ObjPart::Computed(..) | ObjPart::ComputedMethod(..) | ObjPart::Proto(_) => break,
                 }
             }
             Write::Literal(members)

@@ -1699,6 +1699,59 @@ int lum_define_computed(JSContext *ctx, JSValue *v, JSValue val)
     return ret;
 }
 
+/* `[key]() {}` (kind 0), `get [key]() {}` (1) or `set [key](v) {}` (2) in an
+   object literal: v[0] the object, v[1] the key (a property key), `fn` the
+   function (taken), named as the key ("[description]" for a symbol), with
+   "get " or "set " before for an accessor. */
+int lum_define_computed_method(JSContext *ctx, JSValue *v, JSValue fn, int kind)
+{
+    JSAtom atom = JS_ValueToAtom(ctx, v[1]);
+    JSValue parts[3], name;
+    int n = 0, ret;
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, fn);
+        return -1;
+    }
+    if (kind)
+        parts[n++] = JS_NewString(ctx, kind == 1 ? "get " : "set ");
+    if (JS_IsSymbol(v[1])) {
+        JSValue desc = JS_GetPropertyStr(ctx, v[1], "description");
+        if (JS_IsException(desc))
+            goto fail_parts;
+        if (!JS_IsUndefined(desc)) {
+            JSValue b[3] = {JS_NewString(ctx, "["), desc, JS_NewString(ctx, "]")};
+            parts[n++] = JS_ConcatStrings(ctx, b, 3);
+        } else {
+            parts[n++] = JS_NewString(ctx, "");
+        }
+    } else {
+        parts[n++] = JS_AtomToString(ctx, atom);
+    }
+    name = n == 1 ? parts[0] : JS_ConcatStrings(ctx, parts, n);
+    if (JS_IsException(name))
+        goto fail;
+    if (JS_DefinePropertyValueStr(ctx, fn, "name", name, JS_PROP_CONFIGURABLE) < 0)
+        goto fail;
+    if (kind == 0) {
+        ret = JS_DefinePropertyValue(ctx, v[0], atom, fn, JS_PROP_C_W_E | JS_PROP_THROW);
+    } else {
+        int flags = JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE |
+                    JS_PROP_CONFIGURABLE | JS_PROP_THROW | (kind == 2 ? JS_PROP_HAS_SET : JS_PROP_HAS_GET);
+        ret = JS_DefineProperty(ctx, v[0], atom, JS_UNDEFINED, kind == 2 ? JS_UNDEFINED : fn,
+                                kind == 2 ? fn : JS_UNDEFINED, flags);
+        JS_FreeValue(ctx, fn);
+    }
+    JS_FreeAtom(ctx, atom);
+    return ret;
+fail_parts:
+    while (n > 0)
+        JS_FreeValue(ctx, parts[--n]);
+fail:
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, fn);
+    return -1;
+}
+
 /* `...source` in an object literal. Borrows both. */
 int lum_object_spread(JSContext *ctx, JSValue obj, JSValue source)
 {
@@ -2187,6 +2240,15 @@ JSValue lum_for_await_result(JSContext *ctx, JSValue r, int *done)
     *done = JS_ToBool(ctx, d);
     JS_FreeValue(ctx, d);
     return JS_GetPropertyStr(ctx, r, "value");
+}
+
+/* `__proto__: proto` in an object literal (`obj` new, both borrowed): its
+   prototype, if `proto` is an object or null. */
+int lum_literal_proto(JSContext *ctx, JSValue obj, JSValue proto)
+{
+    if (!JS_IsObject(proto) && !JS_IsNull(proto))
+        return 0;
+    return JS_SetPrototype(ctx, obj, proto) < 0 ? -1 : 0;
 }
 
 /* Whether object `v` (borrowed) is callable: typeof's "function" for the
