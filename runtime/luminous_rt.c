@@ -2189,6 +2189,13 @@ JSValue lum_for_await_result(JSContext *ctx, JSValue r, int *done)
     return JS_GetPropertyStr(ctx, r, "value");
 }
 
+/* Whether object `v` (borrowed) is callable: typeof's "function" for the
+   classes native code does not know. */
+int lum_is_function(JSContext *ctx, JSValue v)
+{
+    return JS_IsFunction(ctx, v);
+}
+
 /* TypeError unless `v` (borrowed) is an object. */
 int lum_check_object(JSContext *ctx, JSValue v)
 {

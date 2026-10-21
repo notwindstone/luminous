@@ -143,8 +143,9 @@ regular call path's generated code alone.
 `0022-count-own-keys.patch`, `0023-frozen-fast-arrays.patch` and
 `0024-json-parse-and-for-in.patch`,
 `0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`,
-`0027-for-await-close.patch`, `0028-large-cells-and-strings.patch` and
-`0029-stack-overflow-message.patch`, each made
+`0027-for-await-close.patch`, `0028-large-cells-and-strings.patch`,
+`0029-stack-overflow-message.patch` and `0030-function-classes.patch`,
+each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -378,6 +379,9 @@ engine's semantics:
 - the message of a stack overflow (`0029`): `JS_SetStackOverflowMessage`
   sets what the `RangeError` says (an embedder copying another engine's
   wording; the default is `Maximum call stack size exceeded`);
+- the last function class (`0030`): `JS_LAYOUT_CLASS_GENERATOR_FUNCTION`,
+  for native `typeof` (the classes from `JS_LAYOUT_CLASS_C_FUNCTION` to
+  it are the callable ones below the proxy's);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -819,7 +823,12 @@ clang, linking).
     about 600 instructions, now 342; from `Object.create(null)`, about
     870, now 381 (53 and 83 where the object does not escape: see
     "Plain objects that do not escape" below);
-  - `typeof`, `in`, `new`;
+  - `typeof`: compared with a string (`typeof v === "string"`), a test
+    of the value's tag, and for an object of its class (below the proxy's,
+    the function classes are a range; others ask the engine), without
+    making the string: 7 ns, now under 1 ns (bun 0.9 ns). Alone, the
+    name's string constant, from the same tests (7 ns, now 4.5);
+  - `in`, `new`;
   - calls to any function: native functions directly (small ones without
     loops or closures are inlined, as JIT compilers inline them; a small
     one that calls itself has its own body inlined once, so that each call

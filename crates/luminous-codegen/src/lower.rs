@@ -269,6 +269,9 @@ const IC_PROTO_GETTER: i64 = 2;
 /// `LUM_IC_ABSENT`: a property no object of `alt_shape` has (nor its
 /// prototypes); read as `undefined` while the epoch holds.
 const IC_ABSENT: i64 = 11;
+/// What `typeof` gives, by the index `typeof_is` and `typeof_any` use.
+pub(crate) const TYPEOF_NAMES: [&str; 8] =
+    ["undefined", "number", "string", "boolean", "symbol", "bigint", "object", "function"];
 
 pub(crate) struct Env {
     pub helpers: HashMap<&'static str, FuncRef>,
@@ -327,6 +330,8 @@ pub(crate) struct Env {
     pub int_wrapping: bool,
     /// The string constants' text (`ir::Module::strings`).
     pub texts: std::rc::Rc<Vec<String>>,
+    /// The string constants `TYPEOF_NAMES`, if all are used.
+    pub typeof_names: Option<[ir::StrId; 8]>,
     /// The signature of `JSCFunctionFast` entries.
     pub fast_sig: SigRef,
 }
@@ -1624,6 +1629,106 @@ impl Lower {
         }
         self.scopes.pop();
         self.b.switch_to_block(exit);
+    }
+
+    /// Whether object `w` is callable (`typeof` is "function"): by its
+    /// class below the proxy's, else by the engine.
+    fn is_callable(&mut self, w: Value) -> Value {
+        let p = self.val_ptr(w);
+        let class = self.b.ins().uload16(I32, M_HEADER, p, layout::OBJ_CLASS_ID);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, I8);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        let rel = self.b.ins().iadd_imm_s(class, -layout::CLASS_C_FUNCTION);
+        let func = self.b.ins().icmp_imm_u(
+            IntCC::UnsignedLessThan,
+            rel,
+            layout::CLASS_GENERATOR_FUNCTION - layout::CLASS_C_FUNCTION + 1,
+        );
+        let known = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, class, layout::CLASS_PROXY);
+        self.b.ins().brif(known, join, &[BlockArg::Value(func)], slow, &[]);
+        self.b.switch_to_block(slow);
+        let ctx = self.ctx;
+        let r = self.helper("lum_is_function", &[ctx, w]);
+        let r = self.b.ins().icmp_imm_s(IntCC::NotEqual, r[0], 0);
+        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(join);
+        res
+    }
+
+    /// Whether `typeof w` (`w` borrowed) is `name`. (No object is
+    /// "HTMLDDA", whose `typeof` is "undefined": only a test harness API
+    /// makes one, which this runtime never calls.)
+    fn typeof_is(&mut self, w: Value, name: &str) -> Value {
+        match name {
+            "undefined" => self.val_is(w, TAG_UNDEFINED),
+            "number" => self.is_number(w),
+            "string" => val::tag_in(&mut self.b, w, TAG_STRING, TAG_STRING_ROPE),
+            "boolean" => self.val_is(w, TAG_BOOL),
+            "symbol" => self.val_is(w, TAG_SYMBOL),
+            "bigint" => {
+                let big = self.val_is(w, TAG_BIG_INT);
+                let short = self.val_is(w, TAG_SHORT_BIG_INT);
+                self.b.ins().bor(big, short)
+            }
+            "object" | "function" => {
+                let join = self.b.create_block();
+                let res = self.b.append_block_param(join, I8);
+                let obj = self.b.create_block();
+                let is_obj = self.val_is(w, TAG_OBJECT);
+                let other = if name == "object" { self.val_is(w, TAG_NULL) } else { self.b.ins().iconst(I8, 0) };
+                self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(other)]);
+                self.b.switch_to_block(obj);
+                let f = self.is_callable(w);
+                let r = if name == "object" { self.b.ins().bxor_imm_u(f, 1) } else { f };
+                self.b.ins().jump(join, &[BlockArg::Value(r)]);
+                self.b.switch_to_block(join);
+                res
+            }
+            _ => self.b.ins().iconst(I8, 0),
+        }
+    }
+
+    /// `typeof w` (`w` borrowed): one of the string constants `names`
+    /// (`TYPEOF_NAMES`).
+    fn typeof_any(&mut self, w: Value, names: [ir::StrId; 8]) -> Value {
+        let base = self.b.ins().symbol_value(self.ptr, self.env.strings);
+        let join = self.b.create_block();
+        let res = self.b.append_block_param(join, I64);
+        let name = |l: &mut Self, k: usize| l.b.ins().load(I64, M_CONST, base, (names[k] * SIZE) as i32);
+        // The common ones first; then objects, symbols and bigints.
+        for (k, tag) in [(2, TAG_STRING), (1, TAG_INT), (0, TAG_UNDEFINED), (3, TAG_BOOL), (6, TAG_NULL)] {
+            let t = match k {
+                2 => val::tag_in(&mut self.b, w, TAG_STRING, TAG_STRING_ROPE),
+                1 => self.is_number(w),
+                _ => self.val_is(w, tag),
+            };
+            let yes = self.b.create_block();
+            let next = self.b.create_block();
+            self.b.ins().brif(t, yes, &[], next, &[]);
+            self.b.switch_to_block(yes);
+            let s = name(self, k);
+            self.b.ins().jump(join, &[BlockArg::Value(s)]);
+            self.b.switch_to_block(next);
+        }
+        let obj = self.b.create_block();
+        let rest = self.b.create_block();
+        let is_obj = self.val_is(w, TAG_OBJECT);
+        self.b.ins().brif(is_obj, obj, &[], rest, &[]);
+        self.b.switch_to_block(obj);
+        let f = self.is_callable(w);
+        let (so, sf) = (name(self, 6), name(self, 7));
+        let s = self.b.ins().select(f, sf, so);
+        self.b.ins().jump(join, &[BlockArg::Value(s)]);
+        self.b.switch_to_block(rest);
+        let sym = self.val_is(w, TAG_SYMBOL);
+        let (ss, sb) = (name(self, 4), name(self, 5));
+        let s = self.b.ins().select(sym, ss, sb);
+        self.b.ins().jump(join, &[BlockArg::Value(s)]);
+        self.b.switch_to_block(join);
+        self.dup(res);
+        res
     }
 
     /// Whether `w` (borrowed) is string constant `id`: by reference, then
@@ -3037,6 +3142,22 @@ impl Lower {
                     _ => self.b.ins().iconst(I8, (*op == AnyCmpOp::StrictNe) as i64),
                 };
                 self.drop_operand(v, owned);
+                V::Bool(r)
+            }
+            ExprKind::AnyCompare(
+                op @ (AnyCmpOp::StrictEq | AnyCmpOp::StrictNe | AnyCmpOp::Eq | AnyCmpOp::Ne),
+                x,
+                y,
+            ) if let Some((arg, id)) = typeof_compare(x, y) => {
+                // `typeof v === "name"`: a test of `v`'s tag (and of an
+                // object's class), without making the string.
+                let (v, owned) = self.operand(arg, &[]);
+                let w = self.boxed(v);
+                let name = self.env.texts[id].clone();
+                let res = self.typeof_is(w, &name);
+                self.drop_operand(v, owned);
+                let r =
+                    if matches!(op, AnyCmpOp::StrictNe | AnyCmpOp::Ne) { self.b.ins().bxor_imm_u(res, 1) } else { res };
                 V::Bool(r)
             }
             ExprKind::AnyCompare(op @ (AnyCmpOp::StrictEq | AnyCmpOp::StrictNe), x, y)
@@ -7066,9 +7187,16 @@ impl Lower {
                 self.b.switch_to_block(join);
                 return rw;
             }
-            AnyUnOp::Typeof => {
-                self.b.ins().jump(slow, &[]);
-            }
+            AnyUnOp::Typeof => match self.env.typeof_names {
+                Some(names) => {
+                    let r = self.typeof_any(v, names);
+                    self.free(v);
+                    self.b.ins().jump(join, &[BlockArg::Value(r)]);
+                }
+                None => {
+                    self.b.ins().jump(slow, &[]);
+                }
+            },
             _ => {
                 if matches!(op, AnyUnOp::Inc | AnyUnOp::Dec) {
                     // An int32 that does not overflow stays one.
@@ -10016,5 +10144,15 @@ fn concat_operand(x: &Expr) -> &Expr {
             inner
         }
         _ => x,
+    }
+}
+
+/// `typeof arg` compared with a string constant (either way round): `arg`
+/// and the constant.
+fn typeof_compare<'e>(x: &'e Expr, y: &'e Expr) -> Option<(&'e Expr, ir::StrId)> {
+    match (&x.kind, &y.kind) {
+        (ExprKind::AnyUnary(AnyUnOp::Typeof, arg), ExprKind::Str(id))
+        | (ExprKind::Str(id), ExprKind::AnyUnary(AnyUnOp::Typeof, arg)) => Some((arg, *id)),
+        _ => None,
     }
 }

@@ -5869,6 +5869,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             // `typeof undeclared` is "undefined", not a ReferenceError.
             let atom = self.m.atom(id.name.as_str());
             let g = Expr::new(Ty::Any, ExprKind::GlobalOrUndefined(atom));
+            for name in ["undefined", "number", "string", "boolean", "symbol", "bigint", "object", "function"] {
+                self.m.string(name);
+            }
             return Ok(Expr::new(Ty::Any, ExprKind::AnyUnary(AnyUnOp::Typeof, Box::new(g))));
         }
         if u.operator == UnaryOperator::Delete {
@@ -5912,7 +5915,13 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 let id = self.m.string(name);
                 seq(vec![x, Expr::new(Ty::Any, ExprKind::Str(id))])
             }
-            (UnaryOperator::Typeof, _) => dynamic(AnyUnOp::Typeof, x),
+            (UnaryOperator::Typeof, _) => {
+                // (The names it gives, for native code to give them.)
+                for name in ["undefined", "number", "string", "boolean", "symbol", "bigint", "object", "function"] {
+                    self.m.string(name);
+                }
+                dynamic(AnyUnOp::Typeof, x)
+            }
             (UnaryOperator::Void, _) => Expr::new(Ty::Any, ExprKind::Void(Box::new(x))),
             (op, _) => return reject(u.span, format!("`{}` is not supported", op.as_str())),
         })

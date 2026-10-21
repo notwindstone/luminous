@@ -1,0 +1,20 @@
+--- a/quickjs.h	2026-10-20 23:27:33.944340785 +0000
++++ b/quickjs.h	2026-10-20 23:31:05.024126465 +0000
+@@ -1421,6 +1421,7 @@
+ #define JS_LAYOUT_FORIN_KEYS        40   /* JSValue: its keys and their slots */
+ #define JS_LAYOUT_CLASS_C_FUNCTION  12
+ #define JS_LAYOUT_CLASS_PROXY       51
++#define JS_LAYOUT_CLASS_GENERATOR_FUNCTION 17 /* of the classes below PROXY, C_FUNCTION..this are the callable ones */
+ #define JS_LAYOUT_STRING_KIND       4    /* uint32_t: the kind in bits 28-29 (0: characters follow) */
+ #define JS_LAYOUT_STRING_DATA       24   /* the characters of a string of kind 0 */
+ /* Allocating plain objects inline (JS_ShapeAllocInfo): what
+--- a/quickjs.c	2026-10-20 23:27:33.951086135 +0000
++++ b/quickjs.c	2026-10-20 23:30:58.807098312 +0000
+@@ -1610,6 +1610,7 @@
+ static_assert(offsetof(JSArrayBuffer, immutable) == JS_LAYOUT_ABUF_IMMUTABLE, "");
+ static_assert(JS_CLASS_ARRAY == JS_LAYOUT_CLASS_ARRAY, "");
+ static_assert(JS_CLASS_PROXY == JS_LAYOUT_CLASS_PROXY, "");
++static_assert(JS_CLASS_GENERATOR_FUNCTION == JS_LAYOUT_CLASS_GENERATOR_FUNCTION, "");
+ static_assert(JS_CLASS_UINT8C_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_UINT8C, "");
+ static_assert(JS_CLASS_FLOAT64_ARRAY == JS_LAYOUT_CLASS_TYPED_ARRAY + JS_TYPED_ARRAY_FLOAT64, "");
+ /* JSString.len is the low 31 bits of the first word (JS_LAYOUT_STRING_LEN). */

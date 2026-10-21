@@ -63,6 +63,8 @@ pub mod jsvalue {
     /// The lowest tag (`JS_TAG_FIRST`): the tags of references are
     /// `FIRST_TAG..0`.
     pub const FIRST_TAG: i64 = -9;
+    pub const TAG_BIG_INT: i64 = -9;
+    pub const TAG_SYMBOL: i64 = -8;
     pub const TAG_STRING: i64 = -7;
     pub const TAG_STRING_ROPE: i64 = -6;
     pub const TAG_OBJECT: i64 = -1;
@@ -72,6 +74,7 @@ pub mod jsvalue {
     pub const TAG_UNDEFINED: i64 = 3;
     pub const TAG_UNINITIALIZED: i64 = 4;
     pub const TAG_EXCEPTION: i64 = 6;
+    pub const TAG_SHORT_BIG_INT: i64 = 7;
     pub const TAG_FLOAT64: i64 = 8;
     /// What a tag's high half is above the tag (`JS_TAG_BASE`).
     pub const TAG_BASE: u32 = 0xffff_fff8;
@@ -241,6 +244,10 @@ pub mod layout {
     pub const FTMPL_PROPS: i32 = 16;
     pub const FTMPL_RECORD: i32 = 32;
     pub const CLASS_C_FUNCTION: i64 = 12;
+    // `typeof`: below the proxy's class, the callable classes are
+    // `CLASS_C_FUNCTION..=CLASS_GENERATOR_FUNCTION`.
+    pub const CLASS_GENERATOR_FUNCTION: i64 = 17;
+    pub const CLASS_PROXY: i64 = 51;
     pub const STRING_KIND: i32 = 4;
     pub const STRING_DATA: i32 = 24;
     // Allocating plain objects inline (see `JS_ShapeAllocInfo`).
@@ -295,6 +302,8 @@ pub mod layout {
         ("FTMPL_PROPS", FTMPL_PROPS as i64),
         ("FTMPL_RECORD", FTMPL_RECORD as i64),
         ("CLASS_C_FUNCTION", CLASS_C_FUNCTION),
+        ("CLASS_GENERATOR_FUNCTION", CLASS_GENERATOR_FUNCTION),
+        ("CLASS_PROXY", CLASS_PROXY),
         ("STRING_KIND", STRING_KIND as i64),
         ("STRING_DATA", STRING_DATA as i64),
         ("CTX_RT", CTX_RT as i64),
@@ -611,6 +620,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_throw_iterator_throw", &[P], &[Int]),
         ("lum_for_await_result", &[P, W, P], &[W]),
         ("lum_check_object", &[P, W], &[Int]),
+        ("lum_is_function", &[P, W], &[Int]),
         ("lum_iter_close_quiet", &[P, W], &[]),
         ("lum_yield_star", &[P, P, Int, P], &[W]),
         ("lum_ic_set", &[P, W, Int, W, P], &[Int]),
@@ -725,6 +735,8 @@ struct Codegen {
     int_wrapping: bool,
     /// The string constants' text.
     texts: std::rc::Rc<Vec<String>>,
+    /// The string constants `lower::TYPEOF_NAMES`, if all are used.
+    typeof_names: Option<[ir::StrId; 8]>,
 }
 
 impl Codegen {
@@ -836,6 +848,11 @@ impl Codegen {
             layouts: std::rc::Rc::new(m.layouts.clone()),
             int_wrapping: m.int_wrapping,
             texts: std::rc::Rc::new(m.strings.clone()),
+            typeof_names: lower::TYPEOF_NAMES
+                .iter()
+                .map(|n| m.strings.iter().position(|s| s == n))
+                .collect::<Option<Vec<_>>>()
+                .map(|v| v.try_into().unwrap()),
             promise_resolve: m
                 .atoms
                 .iter()
@@ -907,6 +924,7 @@ impl Codegen {
             layouts: self.layouts.clone(),
             int_wrapping: self.int_wrapping,
             texts: self.texts.clone(),
+            typeof_names: self.typeof_names,
             fast_sig: self.fast_sig,
         }
     }
