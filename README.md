@@ -736,7 +736,10 @@ clang, linking).
   Compiling takes seconds, and the code is optimized much further. A large
   program's IR (4 MB or more) is split into as many modules as the host
   has threads (8 at most), each defining a run of its functions and
-  declaring the others, compiled by that many clangs at once: Beyond's
+  declaring the others, compiled by that many clangs at once (the
+  program's analysis and IR are freed, and their memory returned to the
+  system, before they start: a 6 GB compiler and four 2 GB clangs did not
+  fit in 16 GB): Beyond's
   Hono app (186 MB of IR) builds in a third of the time (1 min 34 s
   against 4 min 19 s on 4 cores: bundling, analysis and linking stay
   serial), its code running the same instructions per request (67,008

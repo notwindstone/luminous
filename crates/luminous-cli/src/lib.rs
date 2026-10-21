@@ -361,6 +361,20 @@ fn quickjs(opts: &BuildOpts) -> Result<QuickJs> {
     Ok(q)
 }
 
+/// Returns the memory the allocator holds free to the system (glibc keeps
+/// it otherwise, for the process's next allocations).
+fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}
+
 fn run(cmd: &mut Command) -> Result<()> {
     let out = cmd.output().with_context(|| format!("running {:?}", cmd.get_program()))?;
     if !out.status.success() {
@@ -436,7 +450,9 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         }
         None => tempdir()?,
     };
-    let result = (|| -> Result<()> {
+    // (Ok: the link command, and the LLVM IR files to compile first to the
+    // object files it links.)
+    let result = (|| -> Result<(Command, Vec<PathBuf>, Vec<PathBuf>)> {
         let script_name = input.file_name().unwrap().to_string_lossy().into_owned();
         let js_path = tmp.join(Path::new(&script_name).with_extension("js"));
         std::fs::write(&js_path, &js)?;
@@ -473,6 +489,7 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         link.args(["-O2", "-w", "-fno-stack-protector", "-fcf-protection=none"]);
         link.arg("-I").arg(&q.src).arg("-I").arg(&tmp);
         link.arg(tmp.join("main.c")).arg(tmp.join("program.c")).arg(tmp.join("glue.c")).arg(tmp.join("luminous_rt.c"));
+        let (mut lls, mut objs) = (Vec::new(), Vec::new());
         if has_native {
             let cg = opts.codegen()?;
             match luminous_codegen::compile(&analysis.module, &cg)? {
@@ -484,7 +501,6 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
                     }
                 }
                 Output::LlvmIr(parts) => {
-                    let (mut lls, mut objs) = (Vec::new(), Vec::new());
                     for (i, ir) in parts.iter().enumerate() {
                         let name = if parts.len() == 1 { "native".to_string() } else { format!("native{i}") };
                         let ll = tmp.join(format!("{name}.ll"));
@@ -492,12 +508,22 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
                         lls.push(ll);
                         objs.push(tmp.join(format!("{name}.o")));
                     }
-                    let t0 = std::time::Instant::now();
-                    luminous_codegen::llvm::compile_parts(&lls, &objs, &cg.llvm)?;
-                    luminous_codegen::time("clang", t0);
-                    link.args(&objs);
                 }
             }
+        }
+        Ok((link, lls, objs))
+    })();
+    // The clangs of a large program take gigabytes each: the program's
+    // analysis and IR (as many) are freed, and their memory returned to the
+    // system, before they start.
+    drop((bundle, analysis, js));
+    release_memory();
+    let result = result.and_then(|(mut link, lls, objs)| {
+        if !lls.is_empty() {
+            let t0 = std::time::Instant::now();
+            luminous_codegen::llvm::compile_parts(&lls, &objs, &opts.codegen()?.llvm)?;
+            luminous_codegen::time("clang", t0);
+            link.args(&objs);
         }
         // (The embedder's libraries use the engine's: before it.)
         link.args(&opts.embed.link);
@@ -507,7 +533,7 @@ pub fn build(input: &Path, output: &Path, opts: &BuildOpts, fopts: &luminous_fro
         run(&mut link)?;
         luminous_codegen::time("link", t0);
         Ok(())
-    })();
+    });
     if opts.keep.is_none() {
         let _ = std::fs::remove_dir_all(&tmp);
     }
