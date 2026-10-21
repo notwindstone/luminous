@@ -161,7 +161,14 @@ typedef struct LumIC {
      * prototype (lum_ic_refresh): past LUM_IC_REFRESHES, it keeps no epoch
      * (a program that keeps changing its prototypes). */
     uint32_t refreshes;
+    /* At a site of computed member reads and writes (`obj[sym]`): the
+     * symbol key its entries are of, as a value's reference bits (its
+     * atom held; native code compares a key's low half with it), or 0:
+     * none yet, or, with LUM_IC_ANY_KEY in `refreshes`, none since it saw
+     * another (it caches nothing then). */
+    uint32_t key;
 } LumIC;
+#define LUM_IC_ANY_KEY 0x80000000u
 #define LUM_IC_REFRESHES 64
 void lum_ic_refresh(LumIC *ic, void *p);
 #define LUM_POLY 4
@@ -226,6 +233,8 @@ JSValue lum_private_get_ic(JSContext *ctx, JSValue obj, JSValue name, LumIC *ic)
 int lum_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, LumIC *ic);
 JSValue lum_ic_get_proto(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 JSValue lum_ic_get_cached(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
+JSValue lum_get_elem_ic(JSContext *ctx, JSValue obj, JSValue key, LumIC *ic);
+int lum_set_elem_ic(JSContext *ctx, JSValue *v, LumIC *ic);
 int lum_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumIC *ic);
 JSValue lum_call_getter(JSContext *ctx, void *getter, JSValue this_obj);
 JSValue lum_super_get_ic(JSContext *ctx, JSValue home, JSValue this_obj, JSAtom prop, LumIC *ic);

@@ -149,8 +149,9 @@ regular call path's generated code alone.
 `0027-for-await-close.patch`, `0028-large-cells-and-strings.patch`,
 `0029-stack-overflow-message.patch`, `0030-function-classes.patch`,
 `0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
-`0033-symbol-key-fast-paths.patch` and
-`0034-typed-array-proto-getters.patch`, each made
+`0033-symbol-key-fast-paths.patch`,
+`0034-typed-array-proto-getters.patch` and `0035-symbol-atom.patch`,
+each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -412,6 +413,8 @@ engine's semantics:
   cached (`JS_TypedArrayGetterValue`); and a prototype watched gets a
   shared shape if it had none (a builtin's, once its lazily made members
   are), which is what the caches can take;
+- a symbol's atom (`0035`, `JS_SymbolAtom`), without a reference: for
+  the caches of computed member sites (`obj[sym]`);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -811,7 +814,11 @@ clang, linking).
     watched prototype, a site whose prototypes' shapes still hold takes
     the new epoch once (a runtime call, out of line), and one that keeps
     seeing changes stops after 64 and checks the shapes on the way, as
-    before. A method site compares the prototype entry's shape
+    before. A computed member read or write whose key is a symbol (Bun's
+    `this[kFd]`, `this[kRefs]++`) has a cache of its own too, of the first
+    symbol it sees: the key's reference compared, then the object's shape,
+    as a named site's (the runtime's misses fill it as a named one's); a
+    site that sees another symbol stops caching. A method site compares the prototype entry's shape
     first, the arguments of a predicted call are spilled only where it
     calls, and the tests of `if` and loops are jumps. A site that sees objects of several shapes
     (a class hierarchy) keeps up to four more own or prototype data

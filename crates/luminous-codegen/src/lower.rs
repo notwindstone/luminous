@@ -2365,9 +2365,7 @@ impl Lower {
                 self.b.switch_to_block(slow);
                 let kv = self.boxed(key);
                 let slot = self.values_slot(&[ow, kv, vw]);
-                let ctx = self.ctx;
-                let r = self.helper("lum_set_elem", &[ctx, slot]);
-                self.check_int(r[0]);
+                self.elem_ic_set(ow, kv, vw, slot);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
                 self.release(v);
@@ -3518,11 +3516,17 @@ impl Lower {
                 self.dup(vw);
                 self.b.ins().jump(join, &[BlockArg::Value(vw)]);
                 // Anything else. The key is passed on (JS_GetPropertyValue
-                // frees it).
+                // frees it); a key not known to be a number (a symbol, as
+                // Bun's `this[kFd]`) through a cache of the site's.
                 self.b.switch_to_block(slow);
+                let numeric = matches!(key, V::Num(_));
                 let kw = self.boxed(key);
                 let ctx = self.ctx;
-                let r = self.helper("JS_GetPropertyValue", &[ctx, ow, kw]);
+                let r = if numeric {
+                    self.helper("JS_GetPropertyValue", &[ctx, ow, kw])
+                } else {
+                    vec![self.elem_ic_get(ow, kw)]
+                };
                 self.check_value(r[0]);
                 self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
                 self.b.switch_to_block(join);
@@ -3584,9 +3588,7 @@ impl Lower {
                 self.release(v);
                 self.release(key);
                 self.hold(v);
-                let ctx = self.ctx;
-                let r = self.helper("lum_set_elem", &[ctx, slot]);
-                self.check_int(r[0]);
+                self.elem_ic_set(ow, kv, vw, slot);
                 self.b.ins().jump(join, &[]);
                 self.b.switch_to_block(join);
                 self.release(v);
@@ -3810,7 +3812,6 @@ impl Lower {
                 }
                 let (obj, owned) = self.operand(o, &later);
                 let ow = obj.any();
-                let ctx = self.ctx;
                 let method = match key {
                     Key::Atom(a) if pred.is_empty() => self.env.methods.get(a).copied(),
                     _ => None,
@@ -3849,7 +3850,7 @@ impl Lower {
                     }
                     Key::Value(k) => {
                         let kw = self.expr(k).any();
-                        self.helper("JS_GetPropertyValue", &[ctx, ow, kw])
+                        vec![self.elem_ic_get(ow, kw)]
                     }
                 };
                 self.check_value(m[0]);
@@ -8768,6 +8769,71 @@ impl Lower {
         self.b.ins().iadd_imm_s(base, (i * IC_SIZE) as i64)
     }
 
+    /// `obj[key]` (the key taken) through a cache of the site's: a symbol key
+    /// it is of and an object of the shape it holds read inline (an own data
+    /// property, as Bun's `this[kFd]`), else the runtime's.
+    fn elem_ic_get(&mut self, ow: Value, kw: Value) -> Value {
+        let ic = self.new_ic();
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let call = self.b.create_block();
+        let probe = self.b.create_block();
+        let is_sym = self.val_is(kw, TAG_SYMBOL);
+        self.b.ins().brif(is_sym, probe, &[], call, &[]);
+        self.b.switch_to_block(probe);
+        let bits = self.b.ins().band_imm_u(kw, 0xffff_ffffi64);
+        let cached = self.b.ins().uload32(M_IC, ic, IC_KEY);
+        let same = self.b.ins().icmp(IntCC::Equal, bits, cached);
+        let shaped = self.b.create_block();
+        self.b.ins().brif(same, shaped, &[], call, &[]);
+        self.b.switch_to_block(shaped);
+        let at = self.ic_hit(ow, ic, call);
+        let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.dup(vw);
+        self.free(kw);
+        self.b.ins().jump(join, &[BlockArg::Value(vw)]);
+        self.b.switch_to_block(call);
+        let ctx = self.ctx;
+        let r = self.helper("lum_get_elem_ic", &[ctx, ow, kw, ic])[0];
+        self.b.ins().jump(join, &[BlockArg::Value(r)]);
+        self.b.switch_to_block(join);
+        rw
+    }
+
+    /// `obj[key] = v` (the key and value taken) through a cache of the site's:
+    /// a symbol key it is of and an object of the shape it holds written
+    /// inline (an own writable data property), else the runtime's (`slot`
+    /// holding the object, key and value).
+    fn elem_ic_set(&mut self, ow: Value, kw: Value, vw: Value, slot: Value) {
+        let ic = self.new_ic();
+        let done = self.b.create_block();
+        let call = self.b.create_block();
+        let probe = self.b.create_block();
+        let is_sym = self.val_is(kw, TAG_SYMBOL);
+        self.b.ins().brif(is_sym, probe, &[], call, &[]);
+        self.b.switch_to_block(probe);
+        let bits = self.b.ins().band_imm_u(kw, 0xffff_ffffi64);
+        let cached = self.b.ins().uload32(M_IC, ic, IC_KEY);
+        let same = self.b.ins().icmp(IntCC::Equal, bits, cached);
+        let shaped = self.b.create_block();
+        self.b.ins().brif(same, shaped, &[], call, &[]);
+        self.b.switch_to_block(shaped);
+        let at = self.ic_hit(ow, ic, call);
+        let old = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.b.ins().store(M_SLOT, vw, at, 0);
+        let p = self.val_ptr(ow);
+        self.write_barrier(p, vw);
+        self.free(old);
+        self.free(kw);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(call);
+        let ctx = self.ctx;
+        let r = self.helper("lum_set_elem_ic", &[ctx, slot, ic]);
+        self.check_int(r[0]);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
     /// Continue if `(p, t)` is an object with the shape cached in `ic`, else
     /// go to `slow`. Returns the address of the cached property's value.
     fn ic_hit(&mut self, w: Value, ic: Value, slow: Block) -> Value {
@@ -9172,6 +9238,8 @@ const RECORD_TRIES: i64 = 64;
 pub(crate) const RECORD_STRIDE: usize = (RECORD_SHAPES + 1) * 8;
 /// Size of a `LumIC` (an inline cache entry).
 pub(crate) const IC_SIZE: usize = 80;
+/// `LumIC.key`: a computed member site's symbol key, as reference bits.
+const IC_KEY: i32 = 76;
 /// `LumFnCache`: its size, its closures' cell class and size (0: not made
 /// inline), and their template (`JSFunctionTemplate`).
 const FN_CACHE_SIZE: i64 = 80;

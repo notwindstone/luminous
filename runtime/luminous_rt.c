@@ -2387,6 +2387,7 @@ int lum_private_set_ic(JSContext *ctx, JSValue *v, JSValue val, LumIC *ic)
 /* ---- inline caches of prototype properties ---- */
 
 /* Codegen reads entries at these offsets (lower::IC_SIZE). */
+_Static_assert(offsetof(LumIC, key) == 76, "LumIC.key (lower::IC_KEY)");
 _Static_assert(sizeof(LumIC) == 80 && offsetof(LumIC, slot) == 8 && offsetof(LumIC, kind) == 12 &&
                    offsetof(LumIC, proto_shape) == 16 && offsetof(LumIC, mid_shape) == 24 &&
                    offsetof(LumIC, alt_shape) == 32 && offsetof(LumIC, poly) == 40 &&
@@ -2522,6 +2523,64 @@ int lum_ic_set_proto(JSContext *ctx, JSValue obj, JSAtom prop, JSValue val, LumI
         lum_ic_count_miss(ic);
     }
     return r;
+}
+
+/* Whether computed member site `ic` caches what symbol key `atom` finds:
+ * the first key it sees (held), and none once it saw another. */
+static bool lum_ic_key(JSContext *ctx, LumIC *ic, JSValueConst key)
+{
+    uint32_t bits = (uint32_t)((uintptr_t)JS_VALUE_GET_PTR(key) >> 3);
+    if (ic->key == bits)
+        return true;
+    if (ic->refreshes & LUM_IC_ANY_KEY)
+        return false;
+    if (ic->key != 0) {
+        JS_FreeAtom(ctx, JS_SymbolAtom(JS_MKPTR(JS_TAG_SYMBOL, (void *)((uintptr_t)ic->key << 3))));
+        ic->key = 0;
+        ic->refreshes |= LUM_IC_ANY_KEY;
+        return false;
+    }
+    JS_DupAtom(ctx, JS_SymbolAtom(key));
+    ic->key = bits;
+    return true;
+}
+
+/* obj[key] (obj borrowed, key taken): with a symbol key (Bun's `this[kFd]`)
+ * through `ic` as a named read of it, else JS_GetPropertyValue. */
+JSValue lum_get_elem_ic(JSContext *ctx, JSValue obj, JSValue key, LumIC *ic)
+{
+    if (JS_VALUE_GET_TAG(key) == JS_TAG_SYMBOL && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && lum_ic_key(ctx, ic, key)) {
+        JSValue v = lum_ic_get_cached(ctx, obj, JS_SymbolAtom(key), ic);
+        JS_FreeValue(ctx, key);
+        return v;
+    }
+    return JS_GetPropertyValue(ctx, obj, key);
+}
+
+/* obj[key] = val (v: obj borrowed, key and val taken): with a symbol key
+ * through `ic` as a named write of it (an own writable data property of
+ * the shape cached written in place), else as lum_set_elem. */
+int lum_set_elem_ic(JSContext *ctx, JSValue *v, LumIC *ic)
+{
+    JSValue obj = v[0], key = v[1], val = v[2];
+    if (JS_VALUE_GET_TAG(key) == JS_TAG_SYMBOL && JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && lum_ic_key(ctx, ic, key)) {
+        char *p = JS_VALUE_GET_PTR(obj);
+        int r;
+        if (ic->shape && *(void **)(p + JS_LAYOUT_OBJ_SHAPE) == ic->shape) {
+            JSValue *at = (JSValue *)*(char **)(p + JS_LAYOUT_OBJ_PROP) + ic->slot;
+            JSValue old = *at;
+            *at = val;
+            JS_FreeValue(ctx, old);
+            if (JS_VALUE_HAS_REF_COUNT(val))
+                JS_GCWriteBarrier(JS_GetRuntime(ctx), p);
+            r = 0;
+        } else {
+            r = lum_ic_set_proto(ctx, obj, JS_SymbolAtom(key), val, ic);
+        }
+        JS_FreeValue(ctx, key);
+        return r;
+    }
+    return JS_SetPropertyValue(ctx, obj, key, val, JS_PROP_THROW);
 }
 
 /* Call a cached getter (a function object) on this_obj (borrowed), as the

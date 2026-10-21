@@ -568,6 +568,8 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("JS_GetException", &[P], &[W]),
         ("JS_Throw", &[P, W], &[W]),
         ("lum_set_elem", &[P, P], &[Int]),
+        ("lum_set_elem_ic", &[P, P, P], &[Int]),
+        ("lum_get_elem_ic", &[P, W, W, P], &[W]),
         ("lum_ic_get", &[P, W, Int, P], &[W]),
         ("lum_plain_add_ok", &[P, P, Int], &[Int]),
         ("lum_null_object", &[P], &[W]),
