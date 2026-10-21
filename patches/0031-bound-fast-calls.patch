@@ -1,0 +1,20 @@
+--- a/quickjs.c	2026-10-20 23:31:05.043891071 +0000
++++ b/quickjs.c	2026-10-21 08:50:55.933600548 +0000
+@@ -22100,6 +22100,17 @@
+ JSValue JS_CallFast(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                     int argc, JSValueConst *argv)
+ {
++    /* A bound function without bound arguments (f.bind(x)) of a natively
++       compiled one: that one, called on the bound this, as
++       js_call_bound_function would. */
++    if (JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(func_obj)->class_id == JS_CLASS_BOUND_FUNCTION) {
++        JSBoundFunction *bf = JS_VALUE_GET_OBJ(func_obj)->u.bound_function;
++        if (bf->argc == 0 && js_is_c_function_data(bf->func_obj)) {
++            this_obj = bf->this_val;
++            func_obj = bf->func_obj;
++        }
++    }
+     if (js_is_c_function_data(func_obj)) {
+         JSValue r;
+         if (js_check_stack_overflow(ctx->rt, 0))

@@ -147,8 +147,8 @@ regular call path's generated code alone.
 `0024-json-parse-and-for-in.patch`,
 `0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`,
 `0027-for-await-close.patch`, `0028-large-cells-and-strings.patch`,
-`0029-stack-overflow-message.patch` and `0030-function-classes.patch`,
-each made
+`0029-stack-overflow-message.patch`, `0030-function-classes.patch` and
+`0031-bound-fast-calls.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -385,6 +385,12 @@ engine's semantics:
 - the last function class (`0030`): `JS_LAYOUT_CLASS_GENERATOR_FUNCTION`,
   for native `typeof` (the classes from `JS_LAYOUT_CLASS_C_FUNCTION` to
   it are the callable ones below the proxy's);
+- bound functions called from native code (`0031`): `JS_CallFast` of a
+  function bound without arguments (`f.bind(x)`, as Bun's `node:fs`
+  exports its binding's functions) whose target is a natively compiled
+  function enters the target on the bound `this`, where it went through
+  `JS_CallInternal` and `js_call_bound_function` (copying the arguments)
+  to `JS_Call` the target;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
@@ -832,6 +838,10 @@ clang, linking).
     making the string: 7 ns, now under 1 ns (bun 0.9 ns). Alone, the
     name's string constant, from the same tests (7 ns, now 4.5);
   - `in`, `new`;
+  - remainders: of two int32s (`i % 4`), an integer remainder, but for a
+    zero divisor or a zero from a negative dividend (-0), a double; `x %
+    1` of a double (`n % 1 === 0`, whether `n` is an integer), `x` less
+    its integer part, with its sign, where both called `fmod`;
   - `arguments.length` in a function that reads its `arguments` only so
     (not written, deleted, or read by its arrow functions): the count,
     which its JS entry passes instead of making the arguments object
@@ -1228,6 +1238,8 @@ clang, linking).
   assignments; **spread** in calls, `new`, and array and object literals;
   **rest** parameters and elements; **optional chaining**; computed keys in
   object literals.
+- TypeScript **`this` parameters** (`function f(this: T, ...)`): only a
+  type.
 - **Object literal methods, getters and setters** (`this` included;
   generator and async methods too; `super` in them
   is not supported yet).
