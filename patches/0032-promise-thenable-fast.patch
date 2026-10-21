@@ -1,0 +1,47 @@
+--- a/quickjs.c	2026-10-21 09:12:24.089715379 +0000
++++ b/quickjs.c	2026-10-21 10:21:29.306328246 +0000
+@@ -62474,6 +62474,22 @@
+     }
+ }
+ 
++static int js_promise_react_native(JSContext *ctx, JSValueConst promise, JSJobFunc *job,
++                                   JSValueConst data, JSValueConst data2);
++static bool js_promise_ctor_is_intrinsic(JSContext *ctx, JSObject *p);
++static bool js_is_builtin(JSValueConst v, void *fn, int magic);
++static void js_promise_resolve_with(JSContext *ctx, JSValueConst promise,
++                                    JSValueConst resolution, bool is_reject);
++
++/* luminous: the reaction of js_promise_resolve_thenable_job's fast path:
++   (promise, the value, whether rejected): what calling the resolving
++   function of `promise` it made would do. */
++static JSValue js_promise_settle_job(JSContext *ctx, int argc, JSValueConst *argv)
++{
++    js_promise_resolve_with(ctx, argv[0], argv[1], JS_ToBool(ctx, argv[2]));
++    return JS_UNDEFINED;
++}
++
+ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
+                                                int argc, JSValueConst *argv)
+ {
+@@ -62487,6 +62503,21 @@
+     promise = argv[0];
+     thenable = argv[1];
+     then = argv[2];
++    /* luminous: `then` the builtin and `thenable` a promise of %Promise%
++       (its constructor %Promise%, whose species is itself): the derived
++       promise `then` would make is not observable, nor are the resolving
++       functions, which only `then` sees; a native reaction settles
++       `promise` where the resolving function would be called. */
++    if (!ctx->rt->promise_hook && JS_VALUE_GET_TAG(thenable) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(thenable)->class_id == JS_CLASS_PROMISE &&
++        js_promise_ctor_is_intrinsic(ctx, JS_VALUE_GET_OBJ(thenable)) &&
++        js_is_builtin(then, (void *)js_promise_then, 0) &&
++        (js_pristine(ctx) & (JS_PRISTINE_CTOR | JS_PRISTINE_SPECIES)) ==
++            (JS_PRISTINE_CTOR | JS_PRISTINE_SPECIES)) {
++        if (js_promise_react_native(ctx, thenable, js_promise_settle_job, promise, JS_UNDEFINED) < 0)
++            return JS_EXCEPTION;
++        return JS_UNDEFINED;
++    }
+     if (js_create_resolving_functions(ctx, args, promise) < 0)
+         return JS_EXCEPTION;
+     rt = ctx->rt;

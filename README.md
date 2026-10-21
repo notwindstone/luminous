@@ -147,8 +147,9 @@ regular call path's generated code alone.
 `0024-json-parse-and-for-in.patch`,
 `0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`,
 `0027-for-await-close.patch`, `0028-large-cells-and-strings.patch`,
-`0029-stack-overflow-message.patch`, `0030-function-classes.patch` and
-`0031-bound-fast-calls.patch`, each made
+`0029-stack-overflow-message.patch`, `0030-function-classes.patch`,
+`0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch` and
+`0033-symbol-key-fast-paths.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -391,6 +392,16 @@ engine's semantics:
   function enters the target on the bound `this`, where it went through
   `JS_CallInternal` and `js_call_bound_function` (copying the arguments)
   to `JS_Call` the target;
+- a promise resolved with a promise (`0032`): an async function returning
+  one, `resolve(p)`. The spec's job then calls `p.then` with new
+  resolving functions, which makes a derived promise; when `then` is the
+  builtin and `p` a promise of `%Promise%` (its constructor and species
+  unchanged), none of that is observable, and a native reaction settles
+  the promise where the resolving function would be called (the same
+  jobs, in the same order);
+- symbol keys (`0033`): `obj[sym]` and `obj[sym] = v` take the fast path
+  of keys that are atoms' strings (an ordinary object's data property)
+  where they took the general lookup (Bun's `this[kFd]`);
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly
