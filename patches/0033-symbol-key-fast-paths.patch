@@ -1,0 +1,58 @@
+--- a/quickjs.c	2026-10-21 10:22:46.345256379 +0000
++++ b/quickjs.c	2026-10-21 12:30:18.494201811 +0000
+@@ -13485,6 +13485,28 @@
+         JS_VALUE_GET_STRING(prop)->atom_type == JS_ATOM_TYPE_STRING;
+ }
+ 
++/* luminous: whether key `prop` is an atom's own string or a symbol (not a
++   private name), and in *patom its atom (not referenced). */
++static inline bool js_key_atom(JSRuntime *rt, JSValueConst prop, JSAtom *patom)
++{
++    JSAtomStruct *p;
++    if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
++        p = JS_VALUE_GET_STRING(prop);
++        if (p->atom_type != JS_ATOM_TYPE_STRING)
++            return false;
++        *patom = p->atom_index;
++        return true;
++    }
++    if (JS_VALUE_GET_TAG(prop) == JS_TAG_SYMBOL) {
++        p = JS_VALUE_GET_PTR(prop);
++        if (p->atom_type != JS_ATOM_TYPE_SYMBOL && p->atom_type != JS_ATOM_TYPE_GLOBAL_SYMBOL)
++            return false;
++        *patom = js_get_atom_index(rt, p);
++        return true;
++    }
++    return false;
++}
++
+ /* luminous: p[atom] when p and its prototypes are ordinary objects and it
+    is a data property of one of them, or of none (undefined): *pval; false
+    if the general lookup must run. */
+@@ -13562,9 +13584,9 @@
+             /* fast path for array and typed array access */
+             if (js_get_fast_array_element(ctx, p, idx, &val))
+                 return val;
+-        } else if (js_atom_string(prop)) {
++        } else if (js_key_atom(ctx->rt, prop, &atom)) {
+             JSValue val;
+-            if (js_get_data_fast(JS_VALUE_GET_OBJ(this_obj), JS_VALUE_GET_STRING(prop)->atom_index, &val)) {
++            if (js_get_data_fast(JS_VALUE_GET_OBJ(this_obj), atom, &val)) {
+                 JS_FreeValue(ctx, prop);
+                 return val;
+             }
+@@ -14466,9 +14488,11 @@
+ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                         JSValue prop, JSValue val, int flags)
+ {
+-    /* luminous: a key that is an atom's own string, on an ordinary object */
+-    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT && js_atom_string(prop)) {
+-        int r = js_set_data_fast(ctx, JS_VALUE_GET_OBJ(this_obj), JS_VALUE_GET_STRING(prop)->atom_index, val);
++    /* luminous: a key that is an atom's own string or a symbol, on an
++       ordinary object */
++    JSAtom key_atom;
++    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT && js_key_atom(ctx->rt, prop, &key_atom)) {
++        int r = js_set_data_fast(ctx, JS_VALUE_GET_OBJ(this_obj), key_atom, val);
+         if (r) {
+             JS_FreeValue(ctx, prop);
+             return r < 0 ? -1 : true;
