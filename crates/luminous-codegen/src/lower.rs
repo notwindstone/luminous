@@ -2232,6 +2232,15 @@ impl Lower {
                     V::Int(_) => unreachable!("an ABI value"),
                 })
             }
+            // `x % 1` (`n % 1 === 0`: whether `n` is an integer): `x` less
+            // its integer part, with `x`'s sign (NaN for an infinity or
+            // NaN), without calling fmod.
+            ExprKind::Binary(BinOp::Rem, x, y) if matches!(y.kind, ExprKind::Num(c) if c == 1.0) => {
+                let a = self.expr(x).num();
+                let t = self.b.ins().trunc(a);
+                let d = self.b.ins().fsub(a, t);
+                V::Num(self.b.ins().fcopysign(d, a))
+            }
             ExprKind::Binary(op, x, y) => {
                 let a = self.expr(x).num();
                 let c = self.expr(y).num();
@@ -6924,6 +6933,19 @@ impl Lower {
                     let minus_zero = b.ins().band(zero, neg);
                     (r, b.ins().bor(out, minus_zero))
                 }
+                // The remainder of two int32s (`n % 1`, `i % 4`), but for a
+                // zero divisor (NaN) and a zero from a negative dividend (-0):
+                // a double.
+                AnyBinOp::Rem => {
+                    let by_zero = b.ins().icmp_imm_s(IntCC::Equal, y, 0);
+                    let one = b.ins().iconst(I32, 1);
+                    let d = b.ins().select(by_zero, one, y);
+                    let r = b.ins().srem(x, d);
+                    let zero = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                    let neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, x, 0);
+                    let minus_zero = b.ins().band(zero, neg);
+                    (r, b.ins().bor(by_zero, minus_zero))
+                }
                 AnyBinOp::BitAnd => (b.ins().band(x, y), no),
                 AnyBinOp::BitOr => (b.ins().bor(x, y), no),
                 AnyBinOp::BitXor => (b.ins().bxor(x, y), no),
@@ -6938,6 +6960,7 @@ impl Lower {
             AnyBinOp::Add
                 | AnyBinOp::Sub
                 | AnyBinOp::Mul
+                | AnyBinOp::Rem
                 | AnyBinOp::BitAnd
                 | AnyBinOp::BitOr
                 | AnyBinOp::BitXor
