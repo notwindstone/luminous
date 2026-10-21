@@ -1540,14 +1540,12 @@ type ParamSpec<'a> = (&'a BindingPattern<'a>, Ty, Option<&'a Expression<'a>>);
 type Header<'a> = (Vec<Param<'a>>, bool, Option<Ty>);
 
 fn header<'a>(node: FnNode<'a>) -> R<Header<'a>> {
-    let (span, this_param, params, return_type) = match node {
+    // (A `this` parameter, `function f(this: T)`, is only a type.)
+    let (params, return_type) = match node {
         FnNode::Segment(..) => return Ok((Vec::new(), false, None)),
-        FnNode::Function(f) => (f.span, f.this_param.is_some(), &f.params, &f.return_type),
-        FnNode::Arrow(a) => (a.span, false, &a.params, &a.return_type),
+        FnNode::Function(f) => (&f.params, &f.return_type),
+        FnNode::Arrow(a) => (&a.params, &a.return_type),
     };
-    if this_param {
-        return reject(span, "`this` parameters are not supported");
-    }
     let mut out = Vec::new();
     for p in &params.items {
         let annotated = p.type_annotation.as_ref().and_then(|a| ts_type(&a.type_annotation));
