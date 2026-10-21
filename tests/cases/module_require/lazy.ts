@@ -7,3 +7,9 @@ export function bump() {
 export default function plusOne(n: number) {
   return n + 1;
 }
+// (Named as the main module's own: renamed, and still named as written.)
+export function fmt(): string {
+  return "lazy fmt";
+}
+export class Point {}
+export const n = (): number => 0;

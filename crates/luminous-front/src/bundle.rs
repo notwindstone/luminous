@@ -2303,7 +2303,8 @@ const target = Object.create(null); \
 for (const n of names) Object.defineProperty(target, n, { value: undefined, writable: true, enumerable: true, configurable: false }); \
 Object.defineProperty(target, Symbol.toStringTag, { value: \"Module\" }); \
 Object.preventExtensions(target); \
-const has = (k) => typeof k === \"string\" && names.includes(k); \
+const keys = new Set(names); \
+const has = (k) => typeof k === \"string\" && keys.has(k); \
 return new Proxy(target, { \
 get(t, k) { return has(k) ? get(k) : Reflect.get(t, k); }, \
 set() { return false; }, \
@@ -2417,20 +2418,40 @@ fn uses_this(units: &[Unit], b: Binding) -> bool {
                 v.visit_function_body(body);
             }
         }
+        // (A variable assigned again might be anything.)
+        AstKind::VariableDeclarator(_) if scoping.symbol_is_mutated(sym) => return true,
         AstKind::VariableDeclarator(d) => match d.init.as_ref().map(|e| e.without_parentheses()) {
             Some(Expression::FunctionExpression(f)) => {
                 if let Some(body) = &f.body {
                     v.visit_function_body(body);
                 }
             }
-            Some(Expression::ArrowFunctionExpression(_)) => {}
-            // (Another value: its methods might.)
-            _ => return true,
+            Some(e) => return !ignores_this(e),
+            None => return true,
         },
         AstKind::Class(_) => {}
         _ => return true,
     }
     v.0
+}
+
+/// Whether value `e`, called, cannot read its `this`: an arrow function, a
+/// function's `bind` (`fs.readSync.bind(fs)`), a primitive, or either of
+/// two such values. (Another value: its methods might.)
+fn ignores_this(e: &Expression) -> bool {
+    match e.without_parentheses() {
+        Expression::ArrowFunctionExpression(_)
+        | Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::StringLiteral(_) => true,
+        Expression::Identifier(id) => id.name == "undefined",
+        Expression::CallExpression(c) => {
+            matches!(c.callee.without_parentheses(), Expression::StaticMemberExpression(m) if m.property.name == "bind")
+        }
+        Expression::ConditionalExpression(c) => ignores_this(&c.consequent) && ignores_this(&c.alternate),
+        _ => false,
+    }
 }
 
 /// For a reference to a namespace import at `node`: `ns.x` (or the type
@@ -2678,10 +2699,11 @@ fn edits(
             rename_at(&mut out, nodes.get_node(node).kind().span(), old, new, shorthand_ref(node));
         }
         // A class's or function's `name` comes from its binding: kept as
-        // written (`class Event$1` is still named "Event"). (Not in a module
-        // imported for its types: its declarations are gone.)
-        if plan.is_none()
-            && !typed_only
+        // written (`class Event$1` is still named "Event"), in a lazily
+        // evaluated module too (after the declaration, in its run if it is
+        // in one). (Not in a module imported for its types: its declarations
+        // are gone.)
+        if !typed_only
             && !removed_at(scoping.symbol_span(sym).start)
             && let Some(end) = named_by_binding(nodes, scoping.symbol_declaration(sym))
         {

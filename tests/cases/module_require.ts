@@ -18,6 +18,7 @@ const ns = lazy();
 console.log("value:", ns.value, ns.default(2), ns.counter);
 ns.bump();
 console.log("live:", ns.counter, "same namespace:", ns === lazy());
+console.log("names:", ns.fmt.name, ns.fmt(), ns.Point.name, ns.n.name);
 console.log("eager:", import.meta.require("./module_require/eager.ts").eager === eager);
 
 // A module that throws: every call throws its error.
