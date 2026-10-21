@@ -150,8 +150,8 @@ regular call path's generated code alone.
 `0029-stack-overflow-message.patch`, `0030-function-classes.patch`,
 `0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
 `0033-symbol-key-fast-paths.patch`,
-`0034-typed-array-proto-getters.patch` and `0035-symbol-atom.patch`,
-each made
+`0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch` and
+`0036-proxy-own-shape.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -415,6 +415,10 @@ engine's semantics:
   are), which is what the caches can take;
 - a symbol's atom (`0035`, `JS_SymbolAtom`), without a reference: for
   the caches of computed member sites (`obj[sym]`);
+- a proxy has a shape of its own, not hashed (`0036`): it had the one
+  `Object.create(null)` gives, and a cache checks an object's shape
+  alone, so a proxy read what a site had cached for such objects (a
+  property they lack: `undefined`) without asking its handler;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly

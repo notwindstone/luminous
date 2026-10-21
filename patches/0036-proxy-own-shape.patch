@@ -1,0 +1,15 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -59592,7 +59592,11 @@
+         JS_VALUE_GET_TAG(handler) != JS_TAG_OBJECT) {
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+     }
+-    obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROXY);
++    /* (luminous: a shape of its own, not hashed. Caches check an object's
++       shape alone, and fill only from objects of hashed shapes that are
++       not exotic: a proxy of Object.create(null)'s shape would read what
++       they cached for such objects, without its handler.) */
++    obj = JS_NewObjectProtoClassAlloc(ctx, JS_NULL, JS_CLASS_PROXY, 0);
+     if (JS_IsException(obj))
+         return obj;
+     s = js_malloc(ctx, sizeof(*s));
