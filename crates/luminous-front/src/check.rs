@@ -1866,6 +1866,9 @@ struct FnCx<'x, 'm, 'a> {
     /// it (in those arrows: the captured box).
     args_local: Option<ir::LocalId>,
     args_box: Option<ir::LocalId>,
+    /// The function reads its `arguments` only as `arguments.length`: its
+    /// parameter is the count (`ir::Func::arguments_count`).
+    args_count: bool,
     /// Functions that suspend: where a return value waits for `finally`s.
     ret_slot: Option<ir::LocalId>,
     locals: Vec<Ty>,
@@ -2141,6 +2144,77 @@ fn uses_arguments(node: FnNode, scoping: &Scoping) -> bool {
     v.found
 }
 
+/// Whether function `node` reads its own `arguments` only as
+/// `arguments.length` (not written, deleted, or used by its arrow functions).
+fn arguments_length_only(node: FnNode, scoping: &Scoping) -> bool {
+    use oxc::ast_visit::{Visit, walk};
+    use oxc::syntax::scope::ScopeFlags;
+    struct V<'s> {
+        scoping: &'s Scoping,
+        other: bool,
+        nested: bool,
+        arrows: usize,
+        writing: usize,
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+            // (Another function's own.)
+            if !self.nested {
+                self.nested = true;
+                walk::walk_function(self, it, flags);
+            }
+        }
+        fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+            self.arrows += 1;
+            walk::walk_arrow_function_expression(self, it);
+            self.arrows -= 1;
+        }
+        fn visit_assignment_target(&mut self, it: &AssignmentTarget<'a>) {
+            self.writing += 1;
+            walk::walk_assignment_target(self, it);
+            self.writing -= 1;
+        }
+        fn visit_simple_assignment_target(&mut self, it: &SimpleAssignmentTarget<'a>) {
+            self.writing += 1;
+            walk::walk_simple_assignment_target(self, it);
+            self.writing -= 1;
+        }
+        fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
+            let delete = it.operator == UnaryOperator::Delete;
+            self.writing += delete as usize;
+            walk::walk_unary_expression(self, it);
+            self.writing -= delete as usize;
+        }
+        fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
+            if let Expression::Identifier(id) = it.object.without_parentheses()
+                && is_arguments(id, self.scoping)
+                && it.property.name == "length"
+                && self.arrows == 0
+                && self.writing == 0
+                && !it.optional
+            {
+                return;
+            }
+            // (The object of a member written is read.)
+            let writing = std::mem::take(&mut self.writing);
+            walk::walk_static_member_expression(self, it);
+            self.writing = writing;
+        }
+        fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+            let writing = std::mem::take(&mut self.writing);
+            walk::walk_computed_member_expression(self, it);
+            self.writing = writing;
+        }
+        fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+            self.other |= is_arguments(it, self.scoping);
+        }
+    }
+    let FnNode::Function(f) = node else { return false };
+    let mut v = V { scoping, other: false, nested: false, arrows: 0, writing: 0 };
+    v.visit_function(f, ScopeFlags::Function);
+    !v.other
+}
+
 /// A class member's key that is a name known statically.
 fn class_key(key: &PropertyKey, computed: bool) -> Option<String> {
     match key {
@@ -2252,6 +2326,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             ret_slot: None,
             rest: false,
             args_local: None,
+            args_count: false,
             args_box: None,
             for_in_keys: Vec::new(),
             class: None,
@@ -2331,6 +2406,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             let l = self.temp(Ty::Any);
             abi.push(Ty::Any);
             self.args_local = Some(l);
+            self.args_count = !self.caps.args_owners.contains(&self.key) && arguments_length_only(node, self.m.scoping);
         }
         if self.suspends() {
             self.ret_slot = Some(self.temp(Ty::Any));
@@ -2575,6 +2651,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             is_generator: self.is_generator,
             rest: self.rest,
             arguments: self.args_local.is_some(),
+            arguments_count: self.args_count,
             ret_slot: self.ret_slot,
             class: if self.has_this && !self.is_closure { self.class } else { None },
             hints: self.sym_local.iter().filter_map(|(sym, &l)| Some((l, *self.sym_hints.get(sym)?))).collect(),
@@ -4734,6 +4811,16 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 None => {
                     if m.optional {
                         return reject(span, "optional chaining is not supported yet");
+                    }
+                    // `arguments.length` of a function that reads only that:
+                    // its parameter is the count.
+                    if self.args_count
+                        && m.property.name == "length"
+                        && let Expression::Identifier(id) = m.object.without_parentheses()
+                        && is_arguments(id, self.m.scoping)
+                        && let Some(l) = self.args_local
+                    {
+                        return Ok(self.local(l));
                     }
                     // `Object.keys(x).length`: counted, without the array.
                     if m.property.name == "length"

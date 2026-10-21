@@ -829,6 +829,10 @@ clang, linking).
     making the string: 7 ns, now under 1 ns (bun 0.9 ns). Alone, the
     name's string constant, from the same tests (7 ns, now 4.5);
   - `in`, `new`;
+  - `arguments.length` in a function that reads its `arguments` only so
+    (not written, deleted, or read by its arrow functions): the count,
+    which its JS entry passes instead of making the arguments object
+    (Bun's `readSync`: `if (arguments.length <= 3 || ...)`);
   - BigInt literals below 2^64 (`JS_NewBigUint64`); a function with a
     larger one stays interpreted (Bun's `readSync` was, for its
     `9223372036854775807n`, and Buffer's `checkInt`);

@@ -1237,8 +1237,9 @@ impl Codegen {
         };
         // The rest array and the arguments object; if they cannot be
         // allocated, drop the frame (the collector frees the rest array).
-        let made: Vec<(usize, &str)> = [(f.rest_param(), "lum_rest"), (f.arguments_param(), "lum_arguments")]
-            .into_iter()
+        let made: Vec<(usize, &str)> =
+            [(f.rest_param(), "lum_rest"), (f.arguments_param().filter(|_| !f.arguments_count), "lum_arguments")]
+                .into_iter()
             .filter_map(|(k, h)| Some((k?, h)))
             .collect();
         for &(k, helper) in &made {
@@ -1258,6 +1259,11 @@ impl Codegen {
             // (As `spill_locals` stores them: JS values, numbers as floats.)
             let w = match (t, params[k]) {
                 (_, V::Any(w)) if made.iter().any(|&(j, _)| j == k) => w,
+                // (Only `arguments.length`: the count.)
+                _ if f.arguments_count && f.arguments_param() == Some(k) => {
+                    let n = b.ins().uextend(I64, argc);
+                    val::mk_int(&mut b, n)
+                }
                 (Ty::Any | Ty::Arr(_) | Ty::Struct(_) | Ty::StructArr(_) | Ty::StructOrUndef(_), _) => {
                     load_arg(&mut b, argc, argv, k)
                 }
@@ -1384,7 +1390,13 @@ impl Codegen {
             params[k] = rest_arg(&mut b, env.helpers["lum_rest"], js_ctx, argc, argv, k, exception);
         }
         if let Some(k) = f.arguments_param() {
-            params[k] = rest_arg(&mut b, env.helpers["lum_arguments"], js_ctx, argc, argv, k, exception);
+            params[k] = if f.arguments_count {
+                // (Only `arguments.length`: the count.)
+                let n = b.ins().uextend(I64, argc);
+                V::Any(val::mk_int(&mut b, n))
+            } else {
+                rest_arg(&mut b, env.helpers["lum_arguments"], js_ctx, argc, argv, k, exception)
+            };
         }
         // Then the JS-valued parameters: new references, `undefined` if absent.
         for (k, &t) in f.params.iter().enumerate() {

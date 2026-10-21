@@ -365,6 +365,9 @@ pub struct Func {
     /// do): its last parameter is the arguments object, which its JS entry
     /// makes (native code calls it only through its JS entry).
     pub arguments: bool,
+    /// The function reads its `arguments` only as `arguments.length`: that
+    /// parameter is the number of arguments (an int), not the object.
+    pub arguments_count: bool,
     /// The constructor of a class inside a function: a closure that `new`
     /// calls with `this` new.target (`has_this`), and that makes and
     /// returns the instance.
