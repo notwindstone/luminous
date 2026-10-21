@@ -1,0 +1,137 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -63453,12 +63453,23 @@
+         return 0;
+     }
+     p->is_watched = true;
++    /* luminous: and a shared shape, for the caches (a builtin's prototype
++       has none once its lazily made members are; but for one with
++       properties deleted) */
++    JS_ShareObjectShape(ctx, obj);
+     return 0;
+ }
+ 
+-static bool js_cacheable_holder(JSObject *p)
++static bool js_cacheable_holder(JSContext *ctx, JSObject *p, JSAtom prop)
+ {
+-    return (!p->is_exotic || p->class_id == JS_CLASS_ARRAY) && p->shape->is_hashed;
++    if (!p->shape->is_hashed)
++        return false;
++    if (!p->is_exotic || p->class_id == JS_CLASS_ARRAY)
++        return true;
++    /* luminous: a typed array is exotic for its numeric keys only (an
++       index, or a canonical numeric string: undefined, its prototypes not
++       looked at) */
++    return is_typed_array(p->class_id) && JS_AtomIsNumericIndex(ctx, prop) == 0;
+ }
+ 
+ /* Watch the prototypes of `obj` from the first up to the one that has
+@@ -63496,16 +63507,16 @@
+         return -1;
+     p = JS_VALUE_GET_OBJ(obj);
+     /* (Arrays are exotic for their indices and length only.) */
+-    if (!js_cacheable_holder(p) || find_own_property(&pr, p, prop))
++    if (!js_cacheable_holder(ctx, p, prop) || find_own_property(&pr, p, prop))
+         return -1;
+     proto = p->shape->proto;
+-    if (!proto || !js_cacheable_holder(proto))
++    if (!proto || !js_cacheable_holder(ctx, proto, prop))
+         return -1;
+     prs = find_own_property(&pr, proto, prop);
+     if (!prs) {
+         mid = proto;
+         proto = mid->shape->proto;
+-        if (!proto || !js_cacheable_holder(proto))
++        if (!proto || !js_cacheable_holder(ctx, proto, prop))
+             return -1;
+         prs = find_own_property(&pr, proto, prop);
+         if (!prs)
+@@ -63534,7 +63545,7 @@
+     for (i = 0; i < 4; i++) {
+         if (i > 0)
+             chain[i] = chain[i - 1]->shape->proto;
+-        if (!chain[i] || !js_cacheable_holder(chain[i]))
++        if (!chain[i] || !js_cacheable_holder(ctx, chain[i], prop))
+             return -1;
+         prs = find_own_property(&pr, chain[i], prop);
+         if (prs ? i < 3 : i == 3)
+@@ -63547,6 +63558,61 @@
+     return pr - chain[3]->prop;
+ }
+ 
++int JS_CacheProtoGetter(JSContext *ctx, JSValueConst obj, JSAtom prop, void **shapes, int *pdepth)
++{
++    JSObject *chain[4];
++    JSShapeProperty *prs = NULL;
++    JSProperty *pr;
++    int i, k;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || __JS_AtomIsTaggedInt(prop))
++        return -1;
++    chain[0] = JS_VALUE_GET_OBJ(obj);
++    if (!js_cacheable_holder(ctx, chain[0], prop) || find_own_property(&pr, chain[0], prop))
++        return -1;
++    for (i = 1; i < 4; i++) {
++        chain[i] = chain[i - 1]->shape->proto;
++        if (!chain[i] || !js_cacheable_holder(ctx, chain[i], prop))
++            return -1;
++        prs = find_own_property(&pr, chain[i], prop);
++        if (prs)
++            break;
++    }
++    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET || !js_ref_obj(pr->u.getset.getter))
++        return -1;
++    for (k = 0; k <= i; k++)
++        shapes[k] = js_dup_shape(chain[k]->shape);
++    *pdepth = i;
++    return pr - chain[i]->prop;
++}
++
++static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val);
++static JSValue js_typed_array_get_byteLength(JSContext *ctx, JSValueConst this_val);
++
++JSValue JS_TypedArrayGetterValue(JSValueConst obj, void *getter)
++{
++    JSValueConst g = JS_MKPTR(JS_TAG_OBJECT, getter);
++    JSObject *p;
++    JSTypedArray *ta;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return JS_UNINITIALIZED;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (!is_typed_array(p->class_id))
++        return JS_UNINITIALIZED;
++    if (js_is_builtin(g, (void *)js_typed_array_get_length, 0))
++        return js_int32(p->u.array.count);
++    if (!js_is_builtin(g, (void *)js_typed_array_get_byteLength, 0))
++        return JS_UNINITIALIZED;
++    /* (as js_typed_array_get_byteLength) */
++    if (typed_array_is_oob(p))
++        return js_int32(0);
++    ta = p->u.typed_array;
++    if (!ta->track_rab)
++        return js_uint32(ta->length);
++    return js_int64((int64_t)p->u.array.count << typed_array_size_log2(p->class_id));
++}
++
+ int JS_CacheOwnProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
+                         int mode, void **pshape)
+ {
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1206,6 +1206,15 @@
+    the way has it): its index, and new references to the shapes of `obj`,
+    its first, second and third prototypes in shapes[0..3]; else -1. */
+ JS_EXTERN int JS_CacheDeepProtoProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, void **shapes);
++/* luminous: a getter of the first, second or third prototype of `obj`
++   (none of the objects on the way has `prop`): its index in that holder,
++   its depth (1 to 3) in *pdepth, and new references to the shapes of `obj`
++   and of its prototypes up to the holder in shapes[0..depth]; else -1. */
++JS_EXTERN int JS_CacheProtoGetter(JSContext *ctx, JSValueConst obj, JSAtom prop, void **shapes, int *pdepth);
++/* luminous: what %TypedArray%.prototype's `length` or `byteLength` getter
++   (the object `getter`) returns for `obj`, a typed array; else (another
++   getter, or another object) JS_UNINITIALIZED. */
++JS_EXTERN JSValue JS_TypedArrayGetterValue(JSValueConst obj, void *getter);
+ /* Watch object `obj`: every later change to it (a property added, deleted,
+    redefined or written, its prototype set) moves js_proto_epoch, so that a
+    cache of what it holds stays valid while the counter is unchanged. It

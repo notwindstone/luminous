@@ -148,8 +148,9 @@ regular call path's generated code alone.
 `0025-objects-and-dictionaries.patch`, `0026-string-search-and-adds.patch`,
 `0027-for-await-close.patch`, `0028-large-cells-and-strings.patch`,
 `0029-stack-overflow-message.patch`, `0030-function-classes.patch`,
-`0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch` and
-`0033-symbol-key-fast-paths.patch`, each made
+`0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
+`0033-symbol-key-fast-paths.patch` and
+`0034-typed-array-proto-getters.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -402,6 +403,15 @@ engine's semantics:
 - symbol keys (`0033`): `obj[sym]` and `obj[sym] = v` take the fast path
   of keys that are atoms' strings (an ordinary object's data property)
   where they took the general lookup (Bun's `this[kFd]`);
+- typed arrays' prototype properties (`0034`): a typed array is exotic
+  for its numeric keys only, so the caches take its other properties
+  (they skipped every exotic object but arrays); a getter up to three
+  prototypes away (`byteLength` of a Buffer, a subclass of Uint8Array)
+  is found for a polymorphic entry; `%TypedArray%.prototype`'s `length`
+  and `byteLength` getters are read directly when they are the ones
+  cached (`JS_TypedArrayGetterValue`); and a prototype watched gets a
+  shared shape if it had none (a builtin's, once its lazily made members
+  are), which is what the caches can take;
 - `instanceof` without calling `Symbol.hasInstance` when the constructor
   cannot have its own (none on its prototype chain up to
   `Function.prototype`, whose is fixed): OrdinaryHasInstance directly

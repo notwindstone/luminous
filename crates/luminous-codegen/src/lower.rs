@@ -7548,6 +7548,13 @@ impl Lower {
     }
 
     fn rem(&mut self, a: Value, c: Value) -> Value {
+        // `x % 1` or `x % -1` (an integer test): `x` less its integer part,
+        // with `x`'s sign (NaN for an infinity or NaN), without fmod.
+        if self.int_consts.get(&c).is_some_and(|&k| k == 1 || k == -1) {
+            let t = self.b.ins().trunc(a);
+            let d = self.b.ins().fsub(a, t);
+            return self.b.ins().fcopysign(d, a);
+        }
         // An operand that is an exact integer needs no test (`int_of` values
         // stay far from the `i64` limits).
         let exact = |l: &Self, v: Value| l.int_of.get(&v).copied();

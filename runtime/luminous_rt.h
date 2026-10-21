@@ -192,6 +192,12 @@ void lum_ic_refresh(LumIC *ic, void *p);
  * is `epoch` (see JS_CacheAbsentProperty). In the primary entry `value` is
  * `undefined`: native code reads it as a prototype's data property. */
 #define LUM_IC_ABSENT 11
+/* A getter of the first to third prototype, in a polymorphic entry (the
+ * site's own could not take it: the third's, or another shape's): as a
+ * prototype's data property's entry (`alt_shape`, `mid_shape`,
+ * `mid2_shape`, `proto_shape`), the getter read from the holder at each
+ * use. Only the runtime's misses find it (lum_ic_get_proto). */
+#define LUM_IC_DEEP_GETTER 12
 extern LumIC lum_ics[] __attribute__((weak));
 extern const int32_t lum_nics __attribute__((weak));
 /* Per native function: the shape of its closures (referenced) and its name
