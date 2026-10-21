@@ -44,7 +44,12 @@ enum Cmd {
         no_native: bool,
     },
     /// Print the typed IR of the natively compiled functions.
-    Ir { input: PathBuf },
+    Ir {
+        input: PathBuf,
+        /// One statement per line, in a JS-like notation.
+        #[arg(long)]
+        compact: bool,
+    },
 }
 
 fn main() {
@@ -91,8 +96,12 @@ fn real_main() -> Result<()> {
             print!("{}", luminous_front::erased_js(&input, &analysis).map_err(anyhow::Error::msg)?);
             Ok(())
         }
-        Cmd::Ir { input } => {
+        Cmd::Ir { input, compact } => {
             let (_, analysis) = analyze(&input, &fopts)?;
+            if compact {
+                print!("{}", luminous_front::pretty::module(&analysis.module));
+                return Ok(());
+            }
             for (i, f) in analysis.module.funcs.iter().enumerate() {
                 println!("// lum_fn_{i}\n{f:#?}\n");
             }

@@ -1067,6 +1067,25 @@ clang, linking).
   compared with `null`: 40, now 8; a function that adds 3 keys to `{}`
   and returns it: 322, now 116 (the object made once with its final
   shape).
+
+  These passes (and those of `aot type` objects) run after inlining
+  (`ir::replace_objects`), on what the inlined calls left: an inlined
+  call reads its arguments' locals itself (a parameter bound to a local
+  the call does not assign is that local), the body of one whose value a
+  statement takes (`const q = make(i)`, `return f(x)`, `await g()`) runs
+  as the caller's own statements, and that of an expression and a
+  `return` is a sequence. So an object passed to a small function is read
+  there through its fields, and one a small function makes and returns is
+  the caller's: `len({ x: i, y: 2 * i })` with `len(p) { return p.x +
+  p.y }` is two locals added, without an object or a boxed number. Along
+  the code after the declaration, the virtual flag is folded where it is
+  known (`escape::fold_flag`): true until something may have made the
+  object, false after something surely did; an object always passed on
+  is then made where it is passed, and read there after, without tests.
+  (An `async` callee is not inlined: to keep the order of promise
+  reactions, the caller would have to settle a promise of its own
+  wherever the callee's would settle, and adopt a returned promise in
+  as many ticks.)
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those

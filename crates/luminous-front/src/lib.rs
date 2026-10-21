@@ -5,9 +5,11 @@ pub mod builtins;
 pub mod bundle;
 pub mod check;
 pub mod erase;
+pub mod escape;
 pub mod ints;
 pub mod ir;
 pub mod marker;
+pub mod pretty;
 pub mod spec;
 pub mod structs;
 

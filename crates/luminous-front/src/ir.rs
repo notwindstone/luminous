@@ -1505,6 +1505,273 @@ visitor!(
     visit_mut visit_stmts_mut mut
 );
 
+/// The direct subexpressions of `x`, in the order they are evaluated (not
+/// the statements of the bodies it holds).
+pub fn children_mut(x: &mut Expr) -> Vec<&mut Expr> {
+    let mut out: Vec<&mut Expr> = Vec::new();
+    macro_rules! push {
+        ($e:expr) => {
+            out.push($e)
+        };
+    }
+    use ExprKind::*;
+    match &mut x.kind {
+        Num(_)
+        | Bool(_)
+        | Local(_)
+        | Update { .. }
+        | Undefined
+        | Null
+        | Str(_)
+        | RegExp(..)
+        | BigInt(_)
+        | Cell(_)
+        | Global(_)
+        | GlobalOrUndefined(_)
+        | This
+        | IterStep(..)
+        | ForInStep(..)
+        | IterClose(..)
+        | IterCloseQuiet(_)
+        | SuperGetAtom(..)
+        | ProtoMethodIs { .. }
+        | ProtoIs { .. }
+        | PlainAddOk(_)
+        | NullObject
+        | SpecGuard { .. }
+        | ElemGuard { .. }
+        | ArrLen { .. }
+        | RegionTypedGet { .. }
+        | RegionLeave(_)
+        | SlotLoad { .. }
+        | StrLen { .. }
+        | HomeValue(_)
+        | CurrentFunction
+        | Closure(..) => {}
+        Inline { .. } => {}
+        Predicted { expr, .. } => push!(expr),
+        ArrayLoop { recv, callback, .. } => {
+            push!(recv);
+            push!(callback);
+        }
+        ArraySort { recv, callback, .. } => {
+            push!(recv);
+            push!(callback);
+        }
+        ShapeGet { obj, .. } => push!(obj),
+        SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => push!(value),
+        RegionTypedSet { idx, value, .. } => {
+            push!(idx);
+            push!(value);
+        }
+        ShapeSet { obj, value, .. } => {
+            push!(obj);
+            push!(value);
+        }
+        CallChecked { callee, args, .. } => {
+            push!(callee);
+            for x in args {
+                push!(x);
+            }
+        }
+        StructNew { fields, .. } => {
+            for (_, x) in fields {
+                push!(x);
+            }
+        }
+        StructGet(_, a, _)
+        | StructCoerce(_, _, a)
+        | StructArrFrom(_, a)
+        | StructArrLen(a)
+        | NonNull(_, a)
+        | NonNullSet(_, a)
+        | StructConvert(_, a)
+        | JsonMethodAs(_, a)
+        | IsObjectCreate(a) => {
+            push!(a)
+        }
+        StructArrGet(_, a, b) | StructArrPush(_, a, b) | KeysLength(a, _, b) | ObjectCreate(a, _, b) => {
+            push!(a);
+            push!(b);
+        }
+        StructArrSet(_, a, b, c) => {
+            push!(a);
+            push!(b);
+            push!(c);
+        }
+        StructSet(_, a, _, b) => {
+            push!(a);
+            push!(b);
+        }
+        SetLocal(_, a)
+        | InitLocal(_, a)
+        | Unary(_, a)
+        | Truthy(a)
+        | Box(a)
+        | AnyUnary(_, a)
+        | SetCell(_, a)
+        | InitCell(_, a)
+        | SetGlobal(_, a)
+        | GetProp(a, _)
+        | Length(a, _)
+        | DeleteProp(a, _)
+        | IterOpen(a, ..)
+        | ForInIterator(a, _)
+        | ToObject(a)
+        | ToPropKey(a)
+        | PrivateField(a, _)
+        | PrivateMethod(a, _)
+        | PrivateGetter(a, _)
+        | PrivateIn(a, _)
+        | AddBrand(a, _)
+        | SuperGet(_, a)
+        | ArrayPush(_, a)
+        | IntOf(a)
+        | AsyncIterator(a)
+        | AsyncIterResult(a, _)
+        | CheckObject(a)
+        | Lazy(a)
+        | NewFromTarget(a)
+        | Void(a) => push!(a),
+        SuperNewSpread { class, target, args } => {
+            push!(class);
+            push!(target);
+            push!(args);
+        }
+        SuperNew { class, target, args } => {
+            push!(class);
+            push!(target);
+            for x in args {
+                push!(x);
+            }
+        }
+        ClassSetup { ctor, parent } => {
+            push!(ctor);
+            if let Some(p) = parent {
+                push!(p);
+            }
+        }
+        DefineMethod { obj, key, func, .. } => {
+            push!(obj);
+            if let Key::Value(k) = key {
+                push!(k);
+            }
+            push!(func);
+        }
+        ArrayParts(parts) => {
+            for p in parts {
+                if let ArrPart::Value(x) | ArrPart::Spread(x) = p {
+                    push!(x);
+                }
+            }
+        }
+        ObjectParts(parts) => {
+            for p in parts {
+                match p {
+                    ObjPart::Field(_, x) | ObjPart::Spread(x) | ObjPart::Accessor(_, x, _) | ObjPart::Proto(x) => {
+                        push!(x)
+                    }
+                    ObjPart::Computed(k, x) | ObjPart::ComputedMethod(k, x, _) => {
+                        push!(k);
+                        push!(x);
+                    }
+                }
+            }
+        }
+        ObjectRest(a, xs) => {
+            push!(a);
+            for x in xs {
+                push!(x);
+            }
+        }
+        ForInGet(_, _, a, b) => {
+            push!(a);
+            push!(b);
+        }
+        PrivateSetField(a, _, b) | PrivateSetter(a, _, b) | SuperSet(_, a, b) | PrivateDefine(a, _, b) => {
+            push!(a);
+            push!(b);
+        }
+        NewSpread(a, b) => {
+            push!(a);
+            push!(b);
+        }
+        CallSpread(a, b, c) => {
+            push!(a);
+            push!(b);
+            push!(c);
+        }
+        TypedGet(_, a, b) => {
+            push!(a);
+            push!(b);
+        }
+        TypedSet(_, a, b, c) => {
+            push!(a);
+            push!(b);
+            push!(c);
+        }
+        Binary(_, a, b)
+        | NumArith(_, a, b)
+        | Compare(_, a, b)
+        | Logical(_, a, b)
+        | AnyBinary(_, a, b)
+        | AnyCompare(_, a, b)
+        | SetProp(a, _, b)
+        | DefineField(a, _, b)
+        | GetElem(a, b)
+        | DeleteElem(a, b) => {
+            push!(a);
+            push!(b);
+        }
+        Cond(a, b, c) | SetElem(a, b, c) => {
+            push!(a);
+            push!(b);
+            push!(c);
+        }
+        Call(_, xs) | Math(_, xs) | Seq(xs) | Array(xs) => {
+            for x in xs {
+                push!(x);
+            }
+        }
+        CallValue(a, xs) | New(a, xs) | CallDirectThis(_, a, xs) => {
+            push!(a);
+            for x in xs {
+                push!(x);
+            }
+        }
+        CallThis(a, b, xs) => {
+            push!(a);
+            push!(b);
+            for x in xs {
+                push!(x);
+            }
+        }
+        CallMethod(a, k, xs) => {
+            push!(a);
+            if let Key::Value(k) = k {
+                push!(k);
+            }
+            for x in xs {
+                push!(x);
+            }
+        }
+        Object(props) | NewInstance { fields: props, .. } => {
+            for (_, x) in props {
+                push!(x);
+            }
+        }
+        NewInstanceFull { fields, privates, .. } => {
+            for (_, x) in fields {
+                push!(x);
+            }
+            for (_, x) in privates {
+                push!(x);
+            }
+        }
+    }
+    out
+}
+
 /// A function that can neither throw nor call: only unboxed numbers and
 /// booleans, arithmetic, comparisons and control flow. Callers skip the
 /// unwinding check after calling it, and it skips the stack check.
@@ -1649,7 +1916,7 @@ stmt_visitor!(
 
 /// Calls `f` on the locals named by statements themselves (not by their
 /// expressions).
-fn stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+pub(crate) fn stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
     let target = |t: &AwaitTarget, f: &mut dyn FnMut(LocalId)| {
         if let AwaitTarget::Set(l) | AwaitTarget::Init(l) = t {
             f(*l);
@@ -1798,7 +2065,7 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
 
 /// Calls `f` on every naming of a local in `stmts` (by statements, or
 /// expressions at any depth).
-fn each_local(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+pub(crate) fn each_local(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
     stmt_locals(stmts, f);
     visit_stmts(stmts, &mut |e| expr_locals(e, f));
 }
@@ -1844,7 +2111,7 @@ pub fn iteration_locals(body: &[Stmt], uses: &[usize], cand: impl Fn(LocalId) ->
 }
 
 /// Calls `f` on the expressions that are statements.
-fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
+pub(crate) fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
     for s in stmts {
         match s {
             Stmt::Expr(e) => f(e),
@@ -1945,7 +2212,10 @@ pub fn scalar_replace(f: &mut Func) {
         }
         ExprKind::AsyncIterResult(_, a) | ExprKind::IterCloseQuiet(a) => ok[*a] = false,
         ExprKind::Closure(_, ls) => ls.iter().for_each(|&l| ok[l] = false),
-        ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _) => {
+        ExprKind::GetProp(o, k)
+        | ExprKind::SetProp(o, k, _)
+        | ExprKind::ShapeGet { obj: o, atom: k, .. }
+        | ExprKind::ShapeSet { obj: o, atom: k, .. } => {
             if let ExprKind::Local(l) = o.kind {
                 as_object[l] += 1;
                 used[l].push(*k);
@@ -1999,11 +2269,11 @@ pub fn scalar_replace(f: &mut Func) {
                 seq.push(Expr::new(Ty::Any, ExprKind::Undefined));
                 ExprKind::Seq(seq)
             }
-            ExprKind::GetProp(o, k) => match o.kind {
+            ExprKind::GetProp(o, k) | ExprKind::ShapeGet { obj: o, atom: k, .. } => match o.kind {
                 ExprKind::Local(l) if fields[l].is_some() => ExprKind::Local(field(l, *k).unwrap()),
                 _ => return,
             },
-            ExprKind::SetProp(o, k, v) => match o.kind {
+            ExprKind::SetProp(o, k, v) | ExprKind::ShapeSet { obj: o, atom: k, value: v, .. } => match o.kind {
                 ExprKind::Local(l) if fields[l].is_some() => {
                     let v = std::mem::replace(&mut **v, Expr::new(Ty::Any, ExprKind::Undefined));
                     ExprKind::SetLocal(field(l, *k).unwrap(), Box::new(v))
@@ -2019,29 +2289,6 @@ pub fn scalar_replace(f: &mut Func) {
 /// Whether statement `s` is `InitLocal(l, _)`.
 fn is_init_of(s: &Stmt, l: LocalId) -> bool {
     matches!(s, Stmt::Expr(Expr { kind: ExprKind::InitLocal(m, _), .. }) if *m == l)
-}
-
-/// The statement list (`stmts`, or the body of one of their statements)
-/// that has statement `InitLocal(l, _)` itself.
-fn init_list(stmts: &mut Vec<Stmt>, l: LocalId) -> Option<&mut Vec<Stmt>> {
-    if stmts.iter().any(|s| is_init_of(s, l)) {
-        return Some(stmts);
-    }
-    for s in stmts.iter_mut() {
-        let found = match s {
-            Stmt::If(_, a, b) => init_list(a, l).or_else(|| init_list(b, l)),
-            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => init_list(body, l),
-            Stmt::Switch { cases, .. } => cases.iter_mut().find_map(|(_, b)| init_list(b, l)),
-            Stmt::Try { body, catch, finally, .. } => init_list(body, l)
-                .or_else(|| catch.as_mut().and_then(|(_, c)| init_list(c, l)))
-                .or_else(|| finally.as_mut().and_then(|c| init_list(c, l))),
-            _ => None,
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
 }
 
 /// Put the statements of the block of the declaration of `l` (`let` or
@@ -2072,7 +2319,7 @@ fn splice_declaration(stmts: &mut Vec<Stmt>, l: LocalId) -> bool {
 
 /// `x == null`, `x !== undefined` and the like (`Bool`), where `x` is a
 /// local: the local, and whether it is the right operand.
-fn nullish_compare(e: &Expr) -> Option<(LocalId, bool)> {
+pub(crate) fn nullish_compare(e: &Expr) -> Option<(LocalId, bool)> {
     let ExprKind::AnyCompare(AnyCmpOp::Eq | AnyCmpOp::Ne | AnyCmpOp::StrictEq | AnyCmpOp::StrictNe, a, b) = &e.kind
     else {
         return None;
@@ -2087,7 +2334,7 @@ fn nullish_compare(e: &Expr) -> Option<(LocalId, bool)> {
 }
 
 /// A value that can be evaluated twice, in either branch of a check.
-fn plain_value(x: &Expr) -> bool {
+pub(crate) fn plain_value(x: &Expr) -> bool {
     match &x.kind {
         ExprKind::Local(_) | ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
         ExprKind::Null | ExprKind::Undefined => true,
@@ -2117,9 +2364,9 @@ pub fn virtualize_objects(f: &mut Func) {
     let n = f.locals.len();
     let mut ok: Vec<bool> =
         (0..n).map(|l| l >= f.params.len() && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)).collect();
-    stmt_locals(&f.body, &mut |l| ok[l] = false);
+    deep_stmt_locals(&f.body, &mut |l| ok[l] = false);
     let mut named = vec![0usize; n];
-    each_local(&f.body, &mut |l| named[l] += 1);
+    each_name(&f.body, &mut |l| named[l] += 1);
     // Per local: how it is made (`Some(true)`: without a prototype), and
     // its namings as a value or a declaration (what can be replaced).
     let mut made: Vec<Option<bool>> = vec![None; n];
@@ -2158,20 +2405,180 @@ pub fn virtualize_objects(f: &mut Func) {
 /// making it).
 const MATERIALIZE_SITES: usize = 3;
 
+/// `stmt_locals` of `stmts` and of the bodies of the inlined, predicted and
+/// callback calls in them.
+pub(crate) fn deep_stmt_locals(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+    stmt_locals(stmts, f);
+    visit_stmts(stmts, &mut |e| {
+        if let ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } | ExprKind::ArrayLoop { body, .. } =
+            &e.kind
+        {
+            stmt_locals(body, f);
+        }
+    });
+}
+
+/// `each_local`, but for the locals lists of inlined, predicted and
+/// callback bodies (which only scope their locals).
+pub(crate) fn each_name(stmts: &[Stmt], f: &mut impl FnMut(LocalId)) {
+    stmt_locals(stmts, f);
+    visit_stmts(stmts, &mut |e| match &e.kind {
+        ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } | ExprKind::ArrayLoop { body, .. } => {
+            stmt_locals(body, f)
+        }
+        _ => expr_locals(e, f),
+    });
+}
+
+/// How many times `each_name` names `l` in `stmts`.
+pub(crate) fn names_of(stmts: &[Stmt], l: LocalId) -> usize {
+    let mut n = 0;
+    each_name(stmts, &mut |m| n += (m == l) as usize);
+    n
+}
+
+/// The bodies of inlined, predicted and callback calls, with their locals.
+pub(crate) fn body_of(e: &mut Expr) -> Option<(&mut Vec<Stmt>, &mut Vec<LocalId>)> {
+    match &mut e.kind {
+        ExprKind::Inline { body, locals } | ExprKind::Predicted { body, locals, .. } => Some((body, locals)),
+        ExprKind::ArrayLoop { body, locals, .. } => Some((body, locals)),
+        _ => None,
+    }
+}
+
+/// Whether `pred` accepts `stmts` or a statement list nested in them (also
+/// in the bodies of inlined, predicted and callback calls).
+fn has_list(stmts: &[Stmt], pred: &dyn Fn(&[Stmt]) -> bool) -> bool {
+    let mut found = false;
+    stmt_lists(stmts, &mut |list| found |= pred(list));
+    if !found {
+        visit_stmts(stmts, &mut |e| {
+            if let ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } | ExprKind::ArrayLoop { body, .. } =
+                &e.kind
+            {
+                found = found || has_list(body, pred);
+            }
+        });
+    }
+    found
+}
+
+/// The expressions of statement `s` itself (not of the statements in it).
+fn own_exprs_mut(s: &mut Stmt) -> Vec<&mut Expr> {
+    match s {
+        Stmt::Expr(x) | Stmt::Throw(x) | Stmt::If(x, ..) => vec![x],
+        Stmt::Await { value, .. } | Stmt::Yield { value, .. } => vec![value],
+        Stmt::Return(x) => x.iter_mut().collect(),
+        Stmt::Loop { test, update, .. } => test.iter_mut().chain(update.iter_mut()).collect(),
+        Stmt::Switch { cases, .. } => cases.iter_mut().filter_map(|(c, _)| c.as_mut()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The statement lists of statement `s` itself.
+fn own_lists_mut(s: &mut Stmt) -> Vec<&mut Vec<Stmt>> {
+    match s {
+        Stmt::If(_, a, b) => vec![a, b],
+        Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => vec![body],
+        Stmt::Switch { cases, .. } => cases.iter_mut().map(|(_, b)| b).collect(),
+        Stmt::Try { body, catch, finally, .. } => {
+            let mut v = vec![body];
+            v.extend(catch.as_mut().map(|(_, c)| c));
+            v.extend(finally.as_mut());
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Calls `k` on the first statement list that `pred` accepts, among
+/// `stmts` and the lists nested in them (also in the bodies of inlined,
+/// predicted and callback calls), with the locals list of the body it is
+/// in (`scope`; `None` at the function's own level).
+pub(crate) fn find_list_mut<R>(
+    stmts: &mut Vec<Stmt>,
+    scope: Option<&mut Vec<LocalId>>,
+    pred: &dyn Fn(&[Stmt]) -> bool,
+    k: &mut dyn FnMut(&mut Vec<Stmt>, Option<&mut Vec<LocalId>>) -> R,
+) -> Option<R> {
+    if pred(stmts) {
+        return Some(k(stmts, scope));
+    }
+    let mut scope = scope;
+    for s in stmts.iter_mut() {
+        if !has_list(std::slice::from_ref(s), pred) {
+            continue;
+        }
+        for list in own_lists_mut(s) {
+            if let Some(r) = find_list_mut(list, scope.as_deref_mut(), pred, k) {
+                return Some(r);
+            }
+        }
+        for e in own_exprs_mut(s) {
+            let mut out = None;
+            visit_mut(e, &mut |x| {
+                if out.is_some() {
+                    return;
+                }
+                if let Some((body, locals)) = body_of(x)
+                    && has_list(body, pred)
+                {
+                    out = find_list_mut(body, Some(locals), pred, k);
+                }
+            });
+            if out.is_some() {
+                return out;
+            }
+        }
+    }
+    None
+}
+
 /// `virtualize_objects` for local `l` (made by `Object.create(null)` if
 /// `no_proto`), if its uses are where it allows them and some are virtual.
+/// (Its declaration may be in an inlined body: what it adds is scoped
+/// there.)
 fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
-    let mut named = 0;
-    each_local(&f.body, &mut |m| named += (m == l) as usize);
+    let named = names_of(&f.body, l);
     let base = f.locals.len();
-    splice_declaration(&mut f.body, l);
-    let Some(list) = init_list(&mut f.body, l) else { return false };
+    // A `let` / `const` block of the declaration is spliced into its list.
+    let decl_block = |list: &[Stmt]| {
+        list.iter().any(|s| match s {
+            Stmt::Block(b) => b.iter().any(|s| is_init_of(s, l)) && b.iter().all(|s| matches!(s, Stmt::Expr(_))),
+            _ => false,
+        })
+    };
+    // (Again while that block is one of expressions itself: an inlined
+    // body's declaration, in the statements a flattened call left.)
+    while find_list_mut(&mut f.body, None, &decl_block, &mut |list, _| splice_declaration(list, l)) == Some(true) {}
+    let has_decl = |list: &[Stmt]| list.iter().any(|s| is_init_of(s, l));
+    let added = find_list_mut(&mut f.body, None, &has_decl, &mut |list, scope| {
+        let added = virtualize_in(list, l, no_proto, named, base)?;
+        if let Some(scope) = scope {
+            scope.extend(base..base + added.len());
+        }
+        Some(added)
+    })
+    .flatten();
+    let Some(added) = added else { return false };
+    f.boxed.extend(std::iter::repeat_n(false, added.len()));
+    f.local_names.extend(std::iter::repeat_n(None, added.len()));
+    f.locals.extend(added);
+    // (The flag is local `base`.)
+    crate::escape::fold_flag(f, base);
+    true
+}
+
+/// `virtualize_object` in `list`, which has the declaration of `l` (named
+/// `named` times in the function); new locals from `base`. Their types, if
+/// it is done.
+fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, base: LocalId) -> Option<Vec<Ty>> {
     let i0 = list.iter().position(|s| is_init_of(s, l)).unwrap();
     // Every use after the declaration, in the same block.
     let mut later = 0;
-    each_local(&list[i0 + 1..], &mut |m| later += (m == l) as usize);
+    each_name(&list[i0 + 1..], &mut |m| later += (m == l) as usize);
     if later + 1 != named {
-        return false;
+        return None;
     }
     let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
     // The keys: the literal's, then those added, in order.
@@ -2198,7 +2605,7 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
     for s in &list[i0 + 1..] {
         let add = addition(s, &keys);
         let mut uses = 0;
-        each_local(std::slice::from_ref(s), &mut |m| uses += (m == l) as usize);
+        each_name(std::slice::from_ref(s), &mut |m| uses += (m == l) as usize);
         let mut kept = add.is_some() as usize;
         // (The statement's own expression comes first.)
         let mut top = add.is_some();
@@ -2207,12 +2614,18 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
                 kept += 1;
                 return;
             }
-            let (ExprKind::GetProp(o, k) | ExprKind::SetProp(o, k, _)) = &e.kind else { return };
+            let (ExprKind::GetProp(o, k)
+            | ExprKind::SetProp(o, k, _)
+            | ExprKind::ShapeGet { obj: o, atom: k, .. }
+            | ExprKind::ShapeSet { obj: o, atom: k, .. }) = &e.kind
+            else {
+                return;
+            };
             if !is_l(o) || std::mem::take(&mut top) {
                 return;
             }
             // A key it has; or, without a prototype, one it does not (read).
-            if keys.contains(k) || (no_proto && matches!(e.kind, ExprKind::GetProp(..))) {
+            if keys.contains(k) || (no_proto && matches!(e.kind, ExprKind::GetProp(..) | ExprKind::ShapeGet { .. })) {
                 kept += 1;
             }
         });
@@ -2222,7 +2635,7 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
         adds.push(add);
     }
     if virtual_uses == 0 || others > MATERIALIZE_SITES {
-        return false;
+        return None;
     }
     // The flag, the properties, the object itself while being rewritten
     // (renamed `l` at the end); then temporaries.
@@ -2338,17 +2751,28 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
             }
             let ty = e.ty;
             match &mut e.kind {
-                ExprKind::GetProp(o, k) if is_l(o) && (have.contains(k) || no_proto) => {
+                ExprKind::GetProp(o, k) | ExprKind::ShapeGet { obj: o, atom: k, .. }
+                    if is_l(o) && (have.contains(k) || no_proto) =>
+                {
                     let fast = if have.contains(k) { local(slot(*k)) } else { any(ExprKind::Undefined) };
                     **o = local(ph);
                     let real = std::mem::replace(e, any(ExprKind::Undefined));
                     *e = cond(ty, flag_e(), fast, real);
                 }
-                ExprKind::SetProp(o, k, v) if is_l(o) && have.contains(k) => {
+                ExprKind::SetProp(o, k, v) | ExprKind::ShapeSet { obj: o, atom: k, value: v, .. }
+                    if is_l(o) && have.contains(k) =>
+                {
                     let k = *k;
                     let v = std::mem::replace(&mut **v, any(ExprKind::Undefined));
                     let (first, v) = once(v);
-                    let real = any(ExprKind::SetProp(Box::new(local(ph)), k, Box::new(v.clone())));
+                    // (The store, on the object.)
+                    let mut real = std::mem::replace(e, any(ExprKind::Undefined));
+                    let (ExprKind::SetProp(o, _, rv) | ExprKind::ShapeSet { obj: o, value: rv, .. }) = &mut real.kind
+                    else {
+                        unreachable!()
+                    };
+                    **o = local(ph);
+                    **rv = v.clone();
                     let set = cond(ty, flag_e(), any(ExprKind::SetLocal(slot(k), Box::new(v))), real);
                     *e = seq(first, set);
                 }
@@ -2365,11 +2789,9 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
         _ => {}
     });
     let added = keys.len() + 2 + temps.get();
-    f.locals.push(Ty::Bool);
-    f.locals.extend(std::iter::repeat_n(Ty::Any, added - 1));
-    f.boxed.extend(std::iter::repeat_n(false, added));
-    f.local_names.extend(std::iter::repeat_n(None, added));
-    true
+    let mut types = vec![Ty::Bool];
+    types.extend(std::iter::repeat_n(Ty::Any, added - 1));
+    Some(types)
 }
 
 /// A number written to an `Any` local `l` that `retype_numbers` can turn
@@ -2467,6 +2889,25 @@ fn simplify_boxed_arith(f: &mut Func) -> bool {
     loop {
         let mut again = false;
         visit_stmts_mut(&mut f.body, &mut |e| {
+            // A number and a boxed number.
+            if let ExprKind::NumArith(op, x, y) = &mut e.kind {
+                for z in [&mut *x, &mut *y] {
+                    if let ExprKind::Box(inner) = &mut z.kind
+                        && inner.ty.is_number()
+                    {
+                        let n = std::mem::replace(&mut **inner, Expr::num(0.0));
+                        **z = n;
+                    }
+                }
+                if x.ty.is_number() && y.ty.is_number() {
+                    let op = *op;
+                    let (a, b) =
+                        (std::mem::replace(&mut **x, Expr::num(0.0)), std::mem::replace(&mut **y, Expr::num(0.0)));
+                    e.kind = ExprKind::Binary(op, Box::new(a), Box::new(b));
+                    again = true;
+                }
+                return;
+            }
             let ExprKind::AnyBinary(op, x, y) = &mut e.kind else { return };
             let (ExprKind::Box(a), ExprKind::Box(b)) = (&x.kind, &y.kind) else { return };
             if !a.ty.is_number() || !b.ty.is_number() {
@@ -2660,7 +3101,7 @@ fn new_boxes(stmts: &[Stmt], l: LocalId) -> usize {
 }
 
 /// Calls `f` on `stmts` and on every statement list nested in them.
-fn stmt_lists<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(&'a [Stmt])) {
+pub(crate) fn stmt_lists<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(&'a [Stmt])) {
     f(stmts);
     for s in stmts {
         match s {
@@ -2681,7 +3122,7 @@ fn stmt_lists<'a>(stmts: &'a [Stmt], f: &mut impl FnMut(&'a [Stmt])) {
 }
 
 /// `stmt_lists` for rewriting.
-fn stmt_lists_mut(stmts: &mut Vec<Stmt>, f: &mut impl FnMut(&mut Vec<Stmt>)) {
+pub(crate) fn stmt_lists_mut(stmts: &mut Vec<Stmt>, f: &mut impl FnMut(&mut Vec<Stmt>)) {
     f(stmts);
     for s in stmts.iter_mut() {
         match s {
@@ -2909,7 +3350,7 @@ fn shift_locals(e: &mut Expr, base: LocalId) {
 }
 
 /// Renumber the locals of `e` (not its subexpressions) by `map`.
-fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
+pub(crate) fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
     let m = |l: &mut LocalId| *l = map(*l);
     match &mut e.kind {
         ExprKind::Local(l)
@@ -2941,6 +3382,283 @@ fn remap_locals(e: &mut Expr, map: &impl Fn(LocalId) -> LocalId) {
         }
         _ => {}
     }
+}
+
+/// Calls `f` on the locals that `e` itself writes (or names otherwise than
+/// by reading them: what `local_refs` counts as other references).
+pub(crate) fn written_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
+    match &e.kind {
+        ExprKind::SetLocal(m, _)
+        | ExprKind::InitLocal(m, _)
+        | ExprKind::Update { local: m, .. }
+        | ExprKind::ArrayPush(m, _)
+        | ExprKind::AsyncIterResult(_, m)
+        | ExprKind::ForInIterator(_, m)
+        | ExprKind::IterCloseQuiet(m) => f(*m),
+        ExprKind::IterOpen(_, m, n, _) | ExprKind::IterClose(m, n) | ExprKind::ForInGet(m, n, ..) => {
+            f(*m);
+            f(*n);
+        }
+        ExprKind::IterStep(m, n) => {
+            f(*m);
+            n.iter().for_each(|&n| f(n));
+        }
+        ExprKind::ForInStep(m, n, _) => {
+            f(*m);
+            f(*n);
+        }
+        _ => {}
+    }
+}
+
+/// An inlined call binds the arguments to the callee's parameters
+/// (`InitLocal(p, x)`, the first statements of its body). Where an argument
+/// is a local `a` of the caller that nothing in the inlined call assigns,
+/// and the parameter is assigned nowhere else, the body reads `a` itself:
+/// an object passed to an inlined function is then only used for its
+/// properties there (`a.key`), which scalar replacement needs.
+pub fn forward_inline_args(f: &mut Func) {
+    let n = f.locals.len();
+    let mut writes = vec![0usize; n];
+    deep_stmt_locals(&f.body, &mut |l| writes[l] += 1);
+    visit_stmts(&f.body, &mut |e| written_locals(e, &mut |l| writes[l] += 1));
+    let boxed = f.boxed.clone();
+    let types = f.locals.clone();
+    // (Only parameters named by reads and their binding.)
+    let mut names = vec![0usize; n];
+    each_name(&f.body, &mut |l| names[l] += 1);
+    let mut plain = vec![0usize; n];
+    visit_stmts(&f.body, &mut |e| match e.kind {
+        ExprKind::Local(l) => plain[l] += 1,
+        _ => written_locals(e, &mut |l| plain[l] += 1),
+    });
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let ExprKind::Inline { body, locals } = &mut e.kind else { return };
+        let mut map: Vec<(LocalId, LocalId)> = Vec::new();
+        for s in body.iter() {
+            let Stmt::Expr(Expr { kind: ExprKind::InitLocal(p, x), .. }) = s else { break };
+            let ExprKind::Local(a) = x.kind else { continue };
+            if locals.contains(p)
+                && writes[*p] == 1
+                && names[*p] == plain[*p]
+                && !boxed[*p]
+                && !boxed[a]
+                && types[*p] == types[a]
+                && x.ty == types[a]
+            {
+                map.push((*p, a));
+            }
+        }
+        if map.is_empty() {
+            return;
+        }
+        let mut assigned = HashSet::new();
+        deep_stmt_locals(body, &mut |l| {
+            assigned.insert(l);
+        });
+        visit_stmts(body, &mut |x| {
+            written_locals(x, &mut |l| {
+                assigned.insert(l);
+            })
+        });
+        map.retain(|(_, a)| !assigned.contains(a));
+        if map.is_empty() {
+            return;
+        }
+        body.retain(|s| !matches!(s, Stmt::Expr(Expr { kind: ExprKind::InitLocal(p, _), .. }) if map.iter().any(|(q, _)| q == p)));
+        visit_stmts_mut(body, &mut |x| {
+            if let ExprKind::Local(q) = &mut x.kind
+                && let Some(&(_, a)) = map.iter().find(|(p, _)| p == q)
+            {
+                *q = a;
+            }
+        });
+    });
+}
+
+/// A local declared as a copy of another (`let q = o`: what a flattened
+/// inlined call that returns a local leaves), where neither is ever
+/// assigned otherwise, is that other local: its uses name it instead.
+pub fn forward_copies(f: &mut Func) {
+    let n = f.locals.len();
+    let mut writes = vec![0usize; n];
+    deep_stmt_locals(&f.body, &mut |l| writes[l] += 1);
+    visit_stmts(&f.body, &mut |e| written_locals(e, &mut |l| writes[l] += 1));
+    // Locals named otherwise than read (`Local`) or written are kept (a
+    // closure capturing one).
+    let mut names = vec![0usize; n];
+    each_name(&f.body, &mut |l| names[l] += 1);
+    let mut plain = vec![0usize; n];
+    visit_stmts(&f.body, &mut |e| match e.kind {
+        ExprKind::Local(l) => plain[l] += 1,
+        _ => written_locals(e, &mut |l| plain[l] += 1),
+    });
+    let mut map: Vec<Option<LocalId>> = vec![None; n];
+    let mut found = false;
+    // The locals a statement declares, itself or in blocks it is (which
+    // run once, in order).
+    fn declares(s: &Stmt, out: &mut Vec<LocalId>) {
+        match s {
+            Stmt::Expr(Expr { kind: ExprKind::InitLocal(l, _), .. }) => out.push(*l),
+            Stmt::Block(b) => b.iter().for_each(|s| declares(s, out)),
+            _ => {}
+        }
+    }
+    lists_deep_mut(&mut f.body, &mut |list| {
+        // (The other local is declared before, in the same list: the copy
+        // runs again only after it does.)
+        let mut before: Vec<LocalId> = Vec::new();
+        list.retain(|s| {
+            declares(s, &mut before);
+            let Stmt::Expr(Expr { kind: ExprKind::InitLocal(q, x), .. }) = s else { return true };
+            let ExprKind::Local(o) = x.kind else { return true };
+            let ok = *q >= f.params.len()
+                && (o < f.params.len() || before.contains(&o))
+                && names[*q] == plain[*q]
+                && names[o] == plain[o]
+                && writes[*q] == 1
+                // (A parameter has no declaration of its own.)
+                && writes[o] == (o >= f.params.len()) as usize
+                && !f.boxed[*q]
+                && !f.boxed[o]
+                && f.locals[*q] == f.locals[o]
+                && x.ty == f.locals[o]
+                && f.ret_slot != Some(*q)
+                && map[o].is_none();
+            if ok {
+                map[*q] = Some(o);
+                found = true;
+            }
+            !ok
+        });
+    });
+    if !found {
+        return;
+    }
+    // (A copy of a copy names the first.)
+    let root = |mut l: LocalId| {
+        while let Some(o) = map[l] {
+            l = o;
+        }
+        l
+    };
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        if let ExprKind::Local(q) = &mut e.kind {
+            *q = root(*q);
+        }
+    });
+}
+
+/// Calls `f` on every statement list of `stmts`, also in the bodies of
+/// inlined, predicted and callback calls (before the lists in them).
+pub(crate) fn lists_deep_mut(stmts: &mut Vec<Stmt>, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
+    stmt_lists_mut(stmts, &mut |l| f(l));
+    visit_stmts_mut(stmts, &mut |e| {
+        if let Some((body, _)) = body_of(e) {
+            stmt_lists_mut(body, &mut |l| f(l));
+        }
+    });
+}
+
+/// `s` without its inlined call: when `s` initializes, assigns, returns,
+/// awaits or discards the value of an inlined call whose body returns only
+/// at its end, the body's statements, then `s` with the value returned.
+fn flatten_stmt(s: &mut Stmt) -> Option<Vec<Stmt>> {
+    let slot: &mut Expr = match s {
+        Stmt::Expr(e) => match &mut e.kind {
+            ExprKind::InitLocal(_, x) | ExprKind::SetLocal(_, x) | ExprKind::Void(x) => x,
+            ExprKind::Inline { .. } => e,
+            _ => return None,
+        },
+        Stmt::Return(Some(x)) | Stmt::Await { value: x, .. } => x,
+        _ => return None,
+    };
+    let ExprKind::Inline { body, .. } = &mut slot.kind else { return None };
+    let Some(Stmt::Return(Some(_))) = body.last() else { return None };
+    let mut early = false;
+    stmt_lists(&body[..body.len() - 1], &mut |l| early |= l.iter().any(|s| matches!(s, Stmt::Return(_))));
+    if early {
+        return None;
+    }
+    let mut stmts = std::mem::take(body);
+    let Some(Stmt::Return(Some(x))) = stmts.pop() else { unreachable!() };
+    *slot = x;
+    let rest = std::mem::replace(s, Stmt::Block(Vec::new()));
+    stmts.push(rest);
+    Some(stmts)
+}
+
+/// Inlined calls whose values statements use directly (see `flatten_stmt`)
+/// become their bodies' statements in the caller: an object an inlined
+/// call returns is then made by a statement of the caller, as scalar
+/// replacement needs. Elsewhere, a body of expressions and a `return`
+/// becomes a sequence of them (whose value number arithmetic can use).
+pub fn flatten_inlines(f: &mut Func) {
+    visit_stmts_mut(&mut f.body, &mut |e| {
+        let ExprKind::Inline { body, .. } = &mut e.kind else { return };
+        let Some((Stmt::Return(Some(_)), rest)) = body.split_last() else { return };
+        if !rest.iter().all(|s| matches!(s, Stmt::Expr(_))) {
+            return;
+        }
+        let Some(Stmt::Return(Some(x))) = body.pop() else { unreachable!() };
+        let mut xs: Vec<Expr> = std::mem::take(body)
+            .into_iter()
+            .map(|s| match s {
+                Stmt::Expr(x) => x,
+                _ => unreachable!(),
+            })
+            .collect();
+        let ty = x.ty;
+        if xs.is_empty() {
+            *e = x;
+        } else {
+            xs.push(x);
+            *e = Expr::new(ty, ExprKind::Seq(xs));
+        }
+    });
+    loop {
+        let mut changed = false;
+        lists_deep_mut(&mut f.body, &mut |list| {
+            let mut i = 0;
+            while i < list.len() {
+                match flatten_stmt(&mut list[i]) {
+                    Some(new) => {
+                        // (The statement with the value is looked at again.)
+                        let n = new.len();
+                        list.splice(i..i + 1, new);
+                        i += n - 1;
+                        changed = true;
+                    }
+                    None => i += 1,
+                }
+            }
+        });
+        if !changed {
+            return;
+        }
+    }
+}
+
+/// The passes that remove objects, again after inlining (`inline_calls`,
+/// `predict_calls`, `inline_callbacks`): an object passed to an inlined
+/// function is used for its properties there (`forward_inline_args`), and
+/// objects made in inlined bodies are the caller's own. Scalar
+/// replacement, allocation sinking (`virtualize_objects`, which runs only
+/// here, so that it sees through calls inlined later) and those of `aot
+/// type` objects, then `number_locals` for the locals they make.
+pub fn replace_objects(m: &mut Module) {
+    let layouts = std::mem::take(&mut m.layouts);
+    for f in m.funcs.iter_mut().chain(m.closures.iter_mut()) {
+        forward_inline_args(f);
+        flatten_inlines(f);
+        forward_copies(f);
+        scalar_replace(f);
+        virtualize_objects(f);
+        scalar_replace_structs(f, &layouts);
+        promote_struct_fields(f, &layouts);
+        number_locals(f);
+    }
+    m.layouts = layouts;
 }
 
 /// Inlining, as JIT compilers inline small functions: a direct call of a
@@ -3972,7 +4690,7 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
 }
 
 /// The type of the local holding a field after `scalar_replace_structs`.
-fn field_local_ty(f: &LayoutField) -> Ty {
+pub(crate) fn field_local_ty(f: &LayoutField) -> Ty {
     match f.storage {
         Storage::Int32 => Ty::I32,
         Storage::F64 => Ty::F64,
@@ -4725,5 +5443,6 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
     let n = fields.len() + 2;
     f.boxed.extend(std::iter::repeat_n(false, n));
     f.local_names.extend(std::iter::repeat_n(None, n));
+    crate::escape::fold_flag(f, flag);
     true
 }

@@ -411,6 +411,7 @@ pub fn check<'a>(
             ir::fold_new_instances(&mut module);
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
+            ir::replace_objects(&mut module);
             ir::virtualize_instances(&mut module);
             crate::spec::speculate_numbers(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
@@ -2665,10 +2666,9 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             body: prologue,
         };
         func.frameless = func.is_async && !func.is_generator && !ir::has_await(&func.body);
+        // (Allocation sinking runs after inlining: see `ir::replace_objects`.)
         ir::scalar_replace(&mut func);
-        ir::virtualize_objects(&mut func);
         ir::scalar_replace_structs(&mut func, self.m.layouts);
-        ir::promote_struct_fields(&mut func, self.m.layouts);
         ir::number_locals(&mut func);
         Ok(func)
     }
