@@ -1,6 +1,17 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22359,6 +22359,7 @@
+@@ -12319,7 +12319,9 @@
+     return 0;
+ }
+ 
+-static inline __exception int js_poll_interrupts(JSContext *ctx)
++/* (luminous: always inline, as it was before js_call_epoch's increments
++   next to its calls made the call paths larger.) */
++static inline __attribute__((always_inline)) __exception int js_poll_interrupts(JSContext *ctx)
+ {
+     if (unlikely(--ctx->interrupt_counter <= 0)) {
+         return __js_poll_interrupts(ctx);
+@@ -22359,6 +22361,7 @@
  JSValue JS_CallFast(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                      int argc, JSValueConst *argv)
  {
@@ -8,7 +19,7 @@
      /* A bound function without bound arguments (f.bind(x)) of a natively
         compiled one: that one, called on the bound this, as
         js_call_bound_function would. */
-@@ -22397,6 +22398,7 @@
+@@ -22397,6 +22400,7 @@
      JSValueConst buf[4];
      JSValue ret;
      int cproto = p->u.cfunc.cproto, n = p->u.cfunc.length;
@@ -16,7 +27,7 @@
  
      /* What JS_CallInternal does for one, before its class's call. */
      if (js_poll_interrupts(ctx))
-@@ -22441,6 +22443,8 @@
+@@ -22441,6 +22445,8 @@
      JSObject *p;
      JSFunctionBytecode *b;
      JSStackFrame sf_s, *sf = &sf_s;
@@ -25,7 +36,7 @@
      uint8_t *pc;
      int opcode, arg_allocated_size, i;
      JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
-@@ -25498,6 +25502,7 @@
+@@ -25498,6 +25504,7 @@
      JSObject *p;
      JSFunctionBytecode *b;
  
@@ -33,7 +44,7 @@
      if (js_poll_interrupts(ctx))
          return JS_EXCEPTION;
      flags |= JS_CALL_FLAG_CONSTRUCTOR;
-@@ -25967,6 +25972,7 @@
+@@ -25967,6 +25974,7 @@
      JSGeneratorData *s = JS_GetOpaque(gen, JS_CLASS_GENERATOR);
      JSValue ret, done;
      int kind = true; /* left as is when the generator completes */
@@ -41,7 +52,7 @@
      ret = js_native_generator_next(ctx, s, JS_UNDEFINED, &kind, GEN_MAGIC_NEXT);
      if (JS_IsException(ret) || kind != 2) {
          *pdone = kind;
-@@ -63662,6 +63668,43 @@
+@@ -63662,6 +63670,43 @@
     every change to an object it watches (JS_WatchPrototype) moves it. */
  uint64_t js_proto_epoch = 1;
  

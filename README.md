@@ -1428,6 +1428,8 @@ clang, linking).
   unchanged knows that only what the summary describes ran. (An await is
   a full barrier: a resumed step runs from a job.) Interpreted code a
   summary leaves out is code the engine runs, so it moves the counter too.
+  It costs one increment per call: `bench/boundary.ts` (5M calls from
+  interpreted code into native code) runs 0.23% more instructions.
   `LUMINOUS_DEBUG_EFFECTS=1` prints the summaries.
 
   What they are used for:
