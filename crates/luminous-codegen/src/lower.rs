@@ -252,6 +252,34 @@ const PIN_JSON_STRINGIFY: i32 = 46;
 const PIN_JSON_PARSE: i32 = 47;
 /// `Object.create`.
 const PIN_OBJECT_CREATE: i32 = 49;
+/// `Object.keys`, `Object.values`, `Object.entries`.
+const PIN_OBJECT_KEYS: i32 = 48;
+const PIN_OBJECT_VALUES: i32 = 51;
+const PIN_OBJECT_ENTRIES: i32 = 52;
+
+/// A frame object's slot (see `JS_GCFramePin`): its word ({ size, live }),
+/// the cell's header, the object and room for `room` properties.
+/// (`luminous_front::frames::slot_bytes`.)
+/// The `lum_shapes` slot of the original of a builtin that frame objects
+/// may be given (as `Object.keys(o)`: see `ir::ExprKind::FrameObject`),
+/// which keeps nothing; `JSON.stringify` (0) may run code (`toJSON`) but
+/// for its fast path.
+/// `offsetof(LumFrame, slots)` (`self` is at 0).
+const LUM_FRAME_SLOTS: i32 = 40;
+
+pub(crate) fn frame_slot_bytes(room: u32) -> i64 {
+    16 + layout::OBJ_SIZE as i64 + room as i64 * SIZE as i64
+}
+
+pub(crate) fn frame_pin(name: &str) -> Option<i32> {
+    match name {
+        "keys" => Some(PIN_OBJECT_KEYS),
+        "values" => Some(PIN_OBJECT_VALUES),
+        "entries" => Some(PIN_OBJECT_ENTRIES),
+        "stringify" => Some(0),
+        _ => None,
+    }
+}
 /// `LUM_IC_ADD`: an addition of the property, from `alt_shape` to
 /// `proto_shape`.
 const IC_ADD: i64 = 10;
@@ -318,6 +346,9 @@ pub(crate) struct Env {
     pub json_parse: Option<ir::AtomId>,
     /// Atoms naming builtin methods with fast paths.
     pub methods: std::rc::Rc<HashMap<ir::AtomId, Method>>,
+    /// Atoms naming the builtins frame objects may be given, and their
+    /// originals' `lum_shapes` slots (see `frame_pin`).
+    pub frame_pins: std::rc::Rc<HashMap<ir::AtomId, i32>>,
     /// Per function: it can neither throw nor call (see `nothrow_leaf`).
     pub nothrow: std::rc::Rc<Vec<bool>>,
     /// JS entries (`lum_fast_<i>`), by `FuncId`.
@@ -471,6 +502,17 @@ pub(crate) struct Lower {
     active_lo: Vec<(ir::LocalId, i64)>,
     /// Exact integers (in `int_of`) known to be at least this.
     int_lo: HashMap<Value, i64>,
+    /// Frame objects (`ir::ExprKind::FrameObject`): each slot's offset from
+    /// its base, the properties it has room for, and whether it is in an
+    /// async function's frame cell; the bytes of the slots in the frame
+    /// region, and their base (0 when the frame region had no room: the
+    /// objects go to the heap); the base of those in the frame cell, and
+    /// the frame object (whose cell it is); the locals that hold them.
+    frame: Vec<(i64, u32, bool)>,
+    frame_bytes: i64,
+    frame_base: Option<Variable>,
+    frame_cell: Option<(Variable, Variable)>,
+    frame_locals: HashSet<ir::LocalId>,
 }
 
 /// Integers to compare two numbers by, and the flags under which they are
@@ -602,7 +644,29 @@ impl Lower {
             loop_lo: loop_bounds(&f.body),
             active_lo: Vec::new(),
             int_lo: HashMap::new(),
+            frame: Vec::new(),
+            frame_bytes: 0,
+            frame_base: None,
+            frame_cell: None,
+            frame_locals: f.frame_locals.iter().copied().collect(),
         };
+        let (mut region, mut cell) = (0i64, 0i64);
+        for &(room, in_cell) in &f.frame {
+            let at = if in_cell { &mut cell } else { &mut region };
+            l.frame.push((*at, room, in_cell));
+            *at += frame_slot_bytes(room);
+        }
+        if region > 0 {
+            l.frame_bytes = region;
+            let var = l.b.declare_var(I64);
+            // (0 until pushed: an exception may leave first)
+            let zero = l.b.ins().iconst(I64, 0);
+            l.b.def_var(var, zero);
+            l.frame_base = Some(var);
+        }
+        if cell > 0 {
+            l.frame_cell = Some((l.b.declare_var(I64), l.b.declare_var(I64)));
+        }
         for (i, &t) in f.locals.iter().enumerate() {
             if let LVar::Boxed { obj, slot, .. } = l.vars[i] {
                 // Boxes are created when their scope is entered (or come
@@ -1060,6 +1124,9 @@ impl Lower {
 
     /// Lower a whole function body, including its exits.
     pub(crate) fn body(mut self, body: &[Stmt]) -> FunctionBuilder {
+        if self.async_cx.is_none() {
+            self.frame_enter();
+        }
         self.stmts(body);
         if !self.is_filled() {
             // Falling off the end (or dead code after a terminator).
@@ -1076,6 +1143,7 @@ impl Lower {
         self.b.switch_to_block(rb);
         let rv: Vec<Value> = self.b.block_params(rb).to_vec();
         self.free_all_locals();
+        self.frame_leave();
         if is_async {
             // The value the promise resolves to.
             let ret = self.ret;
@@ -1103,6 +1171,7 @@ impl Lower {
         let ee = self.exc_exit;
         self.b.switch_to_block(ee);
         self.free_all_locals();
+        self.frame_leave();
         if is_async {
             // The exception is pending; the runtime rejects the promise.
             // (The returned tag says so: a native callee's flag is not left
@@ -3921,6 +3990,11 @@ impl Lower {
                 self.check_value(m[0]);
                 let fv = V::Any(m[0]);
                 self.hold(fv);
+                if let Key::Atom(a) = key
+                    && args.iter().any(|x| self.frame_local(x))
+                {
+                    self.frame_builtin(m[0], *a);
+                }
                 let r = match method {
                     Some(Method::CharCodeAt) => self.char_code_at(fv, None, obj, args),
                     Some(Method::ArrayPush) if args.len() == 1 => self.array_push(fv, None, obj, &args[0]),
@@ -4069,8 +4143,15 @@ impl Lower {
             }
             ExprKind::Object(props) => self.new_object(props, None),
             ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
+            ExprKind::FrameObject { slot, obj } => match &obj.kind {
+                ExprKind::Object(props) => self.new_object_with(props, None, None, Some(*slot)),
+                ExprKind::NewInstance { class, fields } => {
+                    self.new_object_with(fields, Some(*class), None, Some(*slot))
+                }
+                _ => self.expr(obj),
+            },
             ExprKind::NewInstanceFull { class, fields, brand, privates } => {
-                self.new_object_with(fields, Some(*class), Some((*brand, privates)))
+                self.new_object_with(fields, Some(*class), Some((*brand, privates)), None)
             }
             ExprKind::Array(elems) => {
                 let held: Vec<V> = elems
@@ -4782,7 +4863,154 @@ impl Lower {
     /// An object literal (`class`: `None`), or an instance of a class with
     /// a native constructor, with these fields.
     fn new_object(&mut self, props: &[(ir::AtomId, Expr)], class: Option<usize>) -> V {
-        self.new_object_with(props, class, None)
+        self.new_object_with(props, class, None, None)
+    }
+
+    /// A sync function's frame objects' slots, pushed in the frame region
+    /// (each slot's word: its size, not live): the base, else 0 (no room:
+    /// its objects go to the heap).
+    fn frame_enter(&mut self) {
+        let Some(var) = self.frame_base else { return };
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        let top = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_FRAME);
+        let end = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_FRAME + 8);
+        let next = self.b.ins().iadd_imm_s(top, self.frame_bytes);
+        let room = self.b.ins().icmp(IntCC::UnsignedLessThanOrEqual, next, end);
+        let zero = self.b.ins().iconst(I64, 0);
+        let base = self.b.ins().select(room, top, zero);
+        self.b.def_var(var, base);
+        let push = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(room, push, &[], cont, &[]);
+        self.b.switch_to_block(push);
+        self.b.ins().store(M_ALLOC, next, rt, layout::RT_GC_FRAME);
+        for (off, room, in_cell) in self.frame.clone() {
+            if !in_cell {
+                let w = self.b.ins().iconst(I64, frame_slot_bytes(room));
+                self.b.ins().store(M_ALLOC, w, top, off as i32);
+            }
+        }
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+    }
+
+    /// Pops the frame objects' slots in the frame region (if pushed), down
+    /// to its floor at most (see `JS_GCFramePin`): as a function returns,
+    /// or a step of an async function.
+    fn frame_leave(&mut self) {
+        let Some(var) = self.frame_base else { return };
+        let base = self.b.use_var(var);
+        let pop = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.ins().brif(base, pop, &[], cont, &[]);
+        self.b.switch_to_block(pop);
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        let floor = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_FRAME + 16);
+        let below = self.b.ins().icmp(IntCC::UnsignedLessThan, base, floor);
+        let top = self.b.ins().select(below, floor, base);
+        self.b.ins().store(M_ALLOC, top, rt, layout::RT_GC_FRAME);
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+    }
+
+    /// Whether `x` is a local holding frame objects.
+    fn frame_local(&self, x: &Expr) -> bool {
+        matches!(x.kind, ExprKind::Local(l) if self.frame_locals.contains(&l))
+    }
+
+    /// A builtin called with frame objects (see `frames`): unless `f` is
+    /// the original one (that keeps nothing), pins them.
+    fn frame_builtin(&mut self, f: Value, name: ir::AtomId) {
+        let pin = self.env.frame_pins.get(&name).copied().unwrap_or(0);
+        if pin == 0 {
+            self.frame_pin_now();
+            return;
+        }
+        let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
+        let orig = self.b.ins().load(I64, M_CONST, table, pin * 8);
+        let orig = self.mk_ref(TAG_OBJECT, orig);
+        let same = self.b.ins().icmp(IntCC::Equal, f, orig);
+        let pin_it = self.b.create_block();
+        let cont = self.b.create_block();
+        self.b.set_cold_block(pin_it);
+        self.b.ins().brif(same, cont, &[], pin_it, &[]);
+        self.b.switch_to_block(pin_it);
+        self.frame_pin_now();
+        self.b.ins().jump(cont, &[]);
+        self.b.switch_to_block(cont);
+    }
+
+    /// Before code that may keep the frame objects given to it (a builtin
+    /// replaced, `JSON.stringify` beyond its fast path): they stay.
+    fn frame_pin_now(&mut self) {
+        let ctx = self.ctx;
+        let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+        self.helper("JS_GCFramePin", &[rt]);
+    }
+
+    /// The object `new_object_with` makes in frame slot `slot` (shape
+    /// `shape`, cached by the site; property values `vals`), if the slot
+    /// can hold it: jumps to `join` with it; else continues (to the heap).
+    fn frame_object(&mut self, slot: u32, shape: Value, vals: &[Value], join: Block) {
+        let (off, room, in_cell) = self.frame[slot as usize];
+        let (var, owner) = match (in_cell, self.frame_cell, self.frame_base) {
+            (true, Some((base, owner)), _) => (base, Some(owner)),
+            (false, _, Some(base)) => (base, None),
+            _ => return,
+        };
+        let base = self.b.use_var(var);
+        let at = self.b.ins().iadd_imm_s(base, off);
+        let mut ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, base, 0);
+        if owner.is_none() {
+            // (A slot under the floor holds an object kept: not reused.)
+            let ctx = self.ctx;
+            let rt = self.b.ins().load(I64, M_CONST, ctx, layout::CTX_RT);
+            let floor = self.b.ins().load(I64, M_ALLOC, rt, layout::RT_GC_FRAME + 16);
+            let above = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, floor);
+            ok = self.b.ins().band(ok, above);
+        }
+        // (The properties the shape has room for, which the engine may
+        // fill without asking: as many as the slot.)
+        let size = self.b.ins().uload32(M_HEADER, shape, layout::SHAPE_PROP_SIZE);
+        let fits = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, size, room as i64);
+        ok = self.b.ins().band(ok, fits);
+        let framed = self.b.create_block();
+        let heap = self.b.create_block();
+        self.b.ins().brif(ok, framed, &[], heap, &[]);
+        self.b.switch_to_block(framed);
+        let word = self.b.ins().iconst(I64, frame_slot_bytes(room) | (1 << 32));
+        self.b.ins().store(M_ALLOC, word, at, 0);
+        let p = self.b.ins().iadd_imm_s(at, 16);
+        let header = match owner {
+            // A cell of its own (a JS object, young, one reference).
+            None => self.b.ins().iconst(I64, layout::GC_CELL_WORD | (1 << 32)),
+            // In the frame's cell: its GC bits, and the distance back to it.
+            Some(ov) => {
+                let owner = self.b.use_var(ov);
+                let bits = self.b.ins().uload8(I64, M_HEADER, owner, layout::GC_FLAGS);
+                let bits = self.b.ins().band_imm_u(bits, 0xc0);
+                let bits = self.b.ins().ishl_imm_u(bits, 24);
+                let dist = self.b.ins().isub(p, owner);
+                let dist = self.b.ins().ishl_imm_u(dist, 32);
+                let w = self.b.ins().bor_imm_u(bits, layout::GC_EMBEDDED_WORD);
+                self.b.ins().bor(w, dist)
+            }
+        };
+        self.b.ins().store(M_RC, header, p, -8);
+        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
+        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
+        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
+        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
+        for (i, &w) in vals.iter().enumerate() {
+            self.b.ins().store(M_SLOT, w, props, (i * SIZE) as i32);
+        }
+        let w = self.mk_ref(TAG_OBJECT, p);
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
+        self.b.switch_to_block(heap);
     }
 
     /// `new_object`, of an instance with private state too (`private`: the
@@ -4794,6 +5022,7 @@ impl Lower {
         props: &[(ir::AtomId, Expr)],
         class: Option<usize>,
         private: Option<(Option<usize>, &[(usize, Expr)])>,
+        frame: Option<u32>,
     ) -> V {
         // The values first (the object is unobservable until made),
         // then the object: an allocation site caches the literal's
@@ -4834,6 +5063,9 @@ impl Lower {
         let shape = self.b.ins().load(I64, M_IC, ic, 0);
         self.b.ins().brif(shape, fast, &[], slow, &[]);
         self.b.switch_to_block(fast);
+        if let Some(slot) = frame {
+            self.frame_object(slot, shape, &vals, join);
+        }
         let call = self.b.create_block();
         self.b.set_cold_block(call);
         let p = self.alloc_object(ic, shape, call);
@@ -6337,6 +6569,10 @@ impl Lower {
         self.check_value_method(r[0], f, f_owned);
         self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
         self.b.switch_to_block(slow);
+        if self.frame_local(arg) {
+            // (Beyond the fast path, code may run that keeps it: toJSON.)
+            self.frame_pin_now();
+        }
         let vals = vec![fw, sw, vw];
         let slot = self.values_slot(&vals);
         let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
@@ -9709,7 +9945,18 @@ impl Lower {
     /// Start lowering an async step function: move the locals out of the
     /// frame, then dispatch on the state (0: start of the body).
     pub(crate) fn enter_async(&mut self, slots: Value, state: Value, value: Value, is_throw: Value, f: &ir::Func) {
-        let (layout, this_slot, _) = frame_layout(f);
+        let (layout, this_slot, nslots) = frame_layout(f);
+        if let Some((var, ov)) = self.frame_cell {
+            // The frame objects' slots in the frame's cell: after its own
+            // (laid out by the entry); the frame object (`LumFrame.self`)
+            // before them.
+            let base = self.b.ins().iadd_imm_s(slots, (nslots * SIZE) as i64);
+            self.b.def_var(var, base);
+            let owner = self.b.ins().load(I64, M_HEADER, slots, -LUM_FRAME_SLOTS);
+            self.b.def_var(ov, owner);
+        }
+        // Those in the frame region: pushed for each step.
+        self.frame_enter();
         // (A value capture's value is in its first slot, which its address
         // then points at: the closure's data may be gone while the frame is
         // suspended.)
@@ -9804,6 +10051,7 @@ impl Lower {
     /// The step function's result when it suspends (`payload`: the resume
     /// state and what it yields; see the runtime).
     fn suspended(&mut self, payload: i64) {
+        self.frame_leave();
         let r = self.b.ins().iconst(I64, val_const(TAG_UNINITIALIZED, payload));
         self.b.ins().return_(&[r]);
     }

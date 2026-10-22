@@ -976,6 +976,8 @@ impl Spec {
             boxed[n_new + q] = false;
         }
         Some(Func {
+            frame: Vec::new(),
+            frame_locals: Vec::new(),
             name: t.name.clone(),
             js_length: params.len(),
             params,

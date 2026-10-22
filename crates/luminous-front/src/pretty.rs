@@ -265,6 +265,7 @@ impl P<'_> {
             K::New(f, xs) => format!("new {}({})", self.expr(f, d), self.list(xs, d)),
             K::Object(props) => format!("new{{{}}}", self.fields(props, d)),
             K::NewInstance { class, fields } => format!("new C{class}{{{}}}", self.fields(fields, d)),
+            K::FrameObject { slot, obj } => format!("frame{slot} {}", self.expr(obj, d)),
             K::NewInstanceFull { class, fields, .. } => {
                 format!("new C{class}{{{}, ...private}}", self.fields(fields, d))
             }

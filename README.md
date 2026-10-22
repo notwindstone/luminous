@@ -150,8 +150,8 @@ regular call path's generated code alone.
 `0029-stack-overflow-message.patch`, `0030-function-classes.patch`,
 `0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
 `0033-symbol-key-fast-paths.patch`,
-`0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch` and
-`0036-proxy-own-shape.patch`, each made
+`0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch`,
+`0036-proxy-own-shape.patch` and `0037-frame-objects.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -601,6 +601,29 @@ unreachable, and never moves anything.
 - **Weak references.** Strings referenced only as values leave the atom
   table once unreachable, shapes the shape hash; WeakMap entries, WeakRefs
   and FinalizationRegistry callbacks are processed when their targets die.
+- **Frame objects** (patch 0037). Objects that never outlive the call
+  that makes them (see [What compiles natively](#what-compiles-natively))
+  live in a slot of that call's frame. A sync function's slots are in
+  the runtime's frame region, a 256KB chunk of the cage that native code
+  pushes slots onto on entry (when they fit, else its objects go to the
+  heap) and pops on every exit, normal or not. Each slot is a word
+  (its size, whether it holds an object) and an ordinary cell: the
+  object, its properties after it. The region's live objects are roots
+  of every collection, its chunk has the bitmaps of a chunk of 8-byte
+  cells, so a reference to a frame object from a cell (`JSON.stringify`'s
+  and `for`-`in`'s temporaries) marks and traces it as any other, and one
+  to anything else there (a stale word) is ignored; frame objects are
+  never old, so the write barrier leaves them, and they are not in the
+  chunk table, so the conservative scan never reaches them. Where code
+  that might keep a frame object runs anyway (a `toJSON`, a replaced
+  `Object.keys`, a getter that `o[k]` in `for`-`in` reaches), native code
+  or the engine first pins the region (`JS_GCFramePin`): the objects made
+  so far stay as roots, their slots are not reused, and frames pop no
+  lower. An async function's objects that live across awaits are in its
+  frame's own cell, after its slots: their headers carry the cell's GC
+  bits and their distance back to it, so the barrier remembers the cell,
+  marking one marks the cell, and the cell's mark function traces them
+  (`JS_MarkEmbeddedObjects`).
 - **Checking it.** `QJS_GC_STRESS=n` collects every n allocations;
   `QJS_GC_VERIFY=1` poisons dead cells and keeps them for a collection
   (aborting on a reference to one), and after each minor collection checks
@@ -1144,6 +1167,36 @@ clang, linking).
   object made per request and passed down a chain of four functions with
   loops (`bench/context.ts`): 10M objects in 837 ms, now none in 513;
   `bench/vectors.ts`'s points and segments, 25M objects of 30M.
+- **Objects that never outlive their call** (frame objects,
+  `crates/luminous-front/src/frames.rs`). What the passes above leave as
+  objects (written by functions that are not inlined, serialized,
+  enumerated) is made in a slot of the function's frame rather than in
+  the heap when it cannot outlive the call: every value of its local is
+  made by an object literal (or an inlined `new`) whose value a statement
+  takes, the local is not captured, and every other use is one that
+  cannot keep the object: its own properties read or written (every
+  literal of the local has the key, so no prototype getter or setter
+  runs), `typeof`, `===`, a truth or nullish test, an argument of a
+  function whose escape summary reads or writes it without letting it
+  escape or reach an async call that runs later, and, from code that does
+  not suspend, `JSON.stringify(o)`, `Object.keys`, `values` and `entries`,
+  `for`-`in`, `{...o}` and rest destructuring, which keep nothing (and
+  where they might run other code, pin the frame region first, see
+  [Memory](#memory-a-generational-tracing-collector)). A literal run again
+  (a loop) reuses its slot, which by then only its local refers to. In
+  an async function, an object made after an await and done with before
+  the next one is in the frame region for that step (the region is pushed
+  for each step and popped when it suspends), and may be given to those
+  builtins; one that lives across awaits is in the frame's cell, and may
+  be given to an async callee only where the call is awaited at once
+  (the frame waits for it). A deep recursion fills the region (about
+  230KB): the objects of the frames past it go to the heap. They are real
+  objects (identity, key order, `JSON.stringify` and `toJSON`, getters
+  that receive them). `bench/frames.ts` (per-request records written by
+  helpers that are not inlined, serialized and counted; then the same
+  across awaits): 8.97M objects freed by the collector, now 6.50M (the
+  2.5M records), in about the same time, as the young generation already
+  made and freed them cheaply.
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those
@@ -1952,9 +2005,15 @@ what would come next:
   locals: raytracer runs faster than bun, nbody about as fast (its loads follow
   a decoded reference, see [Values](#values-8-bytes)). Objects passed to
   functions that are not inlined and only read them are passed as their
-  fields (escape summaries). Next: objects returned from such calls (a
-  `Vec` returned by a method), and SIMD for the pair loop of nbody-like
-  code.
+  fields (escape summaries), and objects that never outlive their call
+  are made in its frame. Next: objects returned from such calls (a `Vec`
+  returned by a method: a slot the caller passes), frame objects stored
+  in other frame objects of the same call (a reused slot must then not
+  be reachable from an older object), instances whose methods are called
+  without a prediction (a check of the prototype's method, as virtual
+  instances have), async callees reached through an entry that may
+  decline (the function as interpreted then has the object), and SIMD
+  for the pair loop of nbody-like code.
 - **Numeric regions in methods.** Regions cover `this` fields in methods
   and the bodies of inlined methods. Next: regions that span calls to
   small methods of other objects (predicted and guarded), and regions over

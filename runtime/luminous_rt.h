@@ -67,7 +67,7 @@ JSValue lum_make_closure(JSContext *ctx, int fn, int n, JSValue *data);
 /* Step functions of async functions (NULL for others), by function index. */
 typedef JSValue LumStep(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
 extern LumStep *const lum_steps[];
-JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots);
+JSValue lum_async_start(JSContext *ctx, int fn, int nslots, int embed, JSValue *promise, JSValue **slots);
 void lum_async_step(JSContext *ctx, JSValue *slots, int state, JSValue *value, int is_throw);
 JSValue lum_async_settled(JSContext *ctx, JSValue v);
 JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
@@ -107,7 +107,10 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 #define LUM_PIN_OBJECT_CREATE 49
 /* String.prototype.lastIndexOf (JS_CallStringFn). */
 #define LUM_PIN_STRING_LAST_INDEX_OF 50
-#define LUM_PINS 51
+/* Object.values, Object.entries (what frame objects may be given). */
+#define LUM_PIN_OBJECT_VALUES 51
+#define LUM_PIN_OBJECT_ENTRIES 52
+#define LUM_PINS 53
 /* The properties a new empty object (`{}`, Object.create) has room for in
  * its cell: up to as many are added without moving them. */
 #define LUM_OBJECT_ROOM 4

@@ -272,6 +272,9 @@ pub mod layout {
     pub const RT_GC_RUNS: i32 = 2288;
     pub const GC_RUN_SIZE: i32 = 16;
     pub const GC_CELL_WORD: i64 = 0xfe0000;
+    // Frame objects (see `JS_GCFramePin`).
+    pub const RT_GC_FRAME: i32 = 6176;
+    pub const GC_EMBEDDED_WORD: i64 = 0xfd0000;
 
     pub const ALL: &[(&str, i64)] = &[
         ("GC_FLAGS", GC_FLAGS as i64),
@@ -324,6 +327,8 @@ pub mod layout {
         ("RT_GC_RUNS", RT_GC_RUNS as i64),
         ("GC_RUN_SIZE", GC_RUN_SIZE as i64),
         ("GC_CELL_WORD", GC_CELL_WORD),
+        ("RT_GC_FRAME", RT_GC_FRAME as i64),
+        ("GC_EMBEDDED_WORD", GC_EMBEDDED_WORD),
     ];
 }
 
@@ -685,7 +690,9 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_throw_uninitialized_atom", &[P, Int], &[]),
         ("lum_box_new", &[P, P], &[W]),
         ("lum_make_closure", &[P, Int, Int, P], &[W]),
-        ("lum_async_start", &[P, Int, Int, P, P], &[W]),
+        ("lum_async_start", &[P, Int, Int, Int, P, P], &[W]),
+        ("JS_GCFramePin", &[P], &[]),
+        ("JS_GCFrameExpose", &[P, W], &[]),
         ("lum_async_step", &[P, P, Int, P, Int], &[]),
         ("lum_await", &[P, P, W, Int], &[W]),
         ("lum_async_settled", &[P, W], &[W]),
@@ -732,6 +739,7 @@ struct Codegen {
     /// The atom `parse`, if used.
     json_parse: Option<ir::AtomId>,
     methods: std::rc::Rc<HashMap<ir::AtomId, lower::Method>>,
+    frame_pins: std::rc::Rc<HashMap<ir::AtomId, i32>>,
     nothrow: std::rc::Rc<Vec<bool>>,
     /// Return types, by `FuncId`.
     rets: std::rc::Rc<Vec<Ty>>,
@@ -868,6 +876,9 @@ impl Codegen {
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
             ),
+            frame_pins: std::rc::Rc::new(
+                m.atoms.iter().enumerate().filter_map(|(i, a)| lower::frame_pin(a).map(|k| (i, k))).collect(),
+            ),
             module,
             funcs,
             sort_cmps,
@@ -923,6 +934,7 @@ impl Codegen {
             promise_resolve: self.promise_resolve,
             json_parse: self.json_parse,
             methods: self.methods.clone(),
+            frame_pins: self.frame_pins.clone(),
             nothrow: self.nothrow.clone(),
             fast: self.fast_funcs.clone(),
             rets: self.rets.clone(),
@@ -1223,10 +1235,13 @@ impl Codegen {
         let slots_addr = b.ins().stack_addr(ptr, out, 16);
         let fi = b.ins().iconst(I32, index as i64);
         let ns = b.ins().iconst(I32, nslots as i64);
+        // (Its frame objects' slots after its own: see `Lower::frame_object`.)
+        let embed: i64 = f.frame.iter().filter(|s| s.1).map(|s| lower::frame_slot_bytes(s.0)).sum();
         let start = if f.is_generator {
             b.ins().call(env.helpers["lum_gen_start"], &[js_ctx, fi, ns, slots_addr])
         } else {
-            b.ins().call(env.helpers["lum_async_start"], &[js_ctx, fi, ns, promise_addr, slots_addr])
+            let eb = b.ins().iconst(I32, embed);
+            b.ins().call(env.helpers["lum_async_start"], &[js_ctx, fi, ns, eb, promise_addr, slots_addr])
         };
         let frame = b.inst_results(start)[0];
         let failed = b.ins().icmp_imm_s(IntCC::Equal, frame, jsvalue::val_const(jsvalue::TAG_EXCEPTION, 0));
@@ -1239,6 +1254,14 @@ impl Codegen {
         let store = |b: &mut FunctionBuilder, s: usize, w: Value| {
             b.ins().store(M_SLOT, w, slots, (s * jsvalue::SIZE) as i32);
         };
+        // The frame objects' slots laid out (each one's word: its size, not
+        // live) before anything can collect.
+        let mut at = (nslots * jsvalue::SIZE) as i64;
+        for &(room, _) in f.frame.iter().filter(|s| s.1) {
+            let w = b.ins().iconst(I64, lower::frame_slot_bytes(room));
+            b.ins().store(M_SLOT, w, slots, at as i32);
+            at += lower::frame_slot_bytes(room);
+        }
         // The rest array and the arguments object; if they cannot be
         // allocated, drop the frame (the collector frees the rest array).
         let made: Vec<(usize, &str)> =

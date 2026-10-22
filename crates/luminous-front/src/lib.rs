@@ -6,6 +6,7 @@ pub mod bundle;
 pub mod check;
 pub mod erase;
 pub mod escape;
+pub mod frames;
 pub mod ints;
 pub mod ir;
 pub mod marker;

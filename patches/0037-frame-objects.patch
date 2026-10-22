@@ -1,0 +1,383 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -358,12 +358,19 @@
+ #define JS_GC_CELL 0xfe
+ /* gc_obj_type of a cell in a free cell cache */
+ #define JS_GC_FREE_TYPE 0x3f
++/* luminous: block_size_idx of an object embedded in another cell (an
++   async function's frame: see JS_MarkEmbeddedObjects), not a cell itself.
++   Its header's GC bits are the cell's, and its ref_count the distance
++   back to the cell's header. */
++#define JS_GC_EMBEDDED 0xfd
+ /* Cell sizes (with their header): the arena's classes up to 512 bytes,
+    then these, then a chunk per cell. */
+ #define JS_GC_BIG_CLASS_COUNT 20
+ #define JS_GC_CLASS_COUNT (JS_ARENA_BLOCK_SIZE_COUNT + JS_GC_BIG_CLASS_COUNT)
+ #define JS_GC_MAX_CELL 16384
+ #define JS_GC_LARGE 0xff
++/* luminous: the class of the frame region's chunk (see JSGCHeap) */
++#define JS_GC_FRAME 0xfe
+ /* Bytes of cells in a run, at most. */
+ #define JS_GC_RUN_MAX (64 * 1024)
+ /* A major collection when the old cells (and other memory) have grown
+@@ -492,6 +499,17 @@
+     void *verify_parent;
+     uintptr_t *verify_stack;
+     size_t verify_stack_len, verify_stack_size;
++    /* luminous: the frame region, a chunk of class JS_GC_FRAME (in no
++       list): objects that native functions make in slots of their own
++       (the objects that do not outlive the call), pushed below
++       `frame_top` on entry and popped on exit. Each slot is a word
++       { uint32_t size (with the word), live } then a cell (an object).
++       The live ones are roots; their chunk's bits are those of a chunk
++       of 8-byte cells, so that references to them mark as to any cell.
++       The objects below `frame_floor` were given to code that may keep
++       them (JS_GCFramePin) and stay. */
++    uint8_t *frame_top, *frame_end, *frame_floor;
++    JSGCChunk *frame_chunk;
+ } JSGCHeap;
+ 
+ typedef struct JSGCMarkHook {
+@@ -1602,6 +1620,10 @@
+ static_assert(sizeof(JSGCRun) == JS_LAYOUT_GC_RUN_SIZE, "");
+ static_assert(offsetof(JSRuntime, gc_heap.free_cells) == JS_LAYOUT_RT_GC_FREE_CELLS, "");
+ static_assert(JS_GC_CELL << 16 == JS_LAYOUT_GC_CELL_WORD, "");
++static_assert(offsetof(JSRuntime, gc_heap.frame_top) == JS_LAYOUT_RT_GC_FRAME, "");
++static_assert(offsetof(JSRuntime, gc_heap.frame_end) == JS_LAYOUT_RT_GC_FRAME + 8, "");
++static_assert(offsetof(JSRuntime, gc_heap.frame_floor) == JS_LAYOUT_RT_GC_FRAME + 16, "");
++static_assert(JS_GC_EMBEDDED << 16 == JS_LAYOUT_GC_EMBEDDED_WORD, "");
+ #if !defined(__APPLE__)
+ static_assert(MALLOC_OVERHEAD == JS_LAYOUT_MALLOC_OVERHEAD, "");
+ #endif
+@@ -3073,9 +3095,158 @@
+     rt->mf.js_free(rt->malloc_state.opaque, h->others);
+     rt->mf.js_free(rt->malloc_state.opaque, h->remembered);
+     rt->mf.js_free(rt->malloc_state.opaque, h->verify_stack);
++    if (h->frame_chunk)
++        js_gc_unmap(h->frame_chunk, JS_GC_CHUNK_SIZE);
+     js_gc_init(rt);
+ }
+ 
++static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func);
++
++/* luminous: the frame region (see JSGCHeap): a chunk of 8-byte cells, in
++   no list nor the chunk table (the conservative scan does not find its
++   objects: they are roots). Without it, no frame has room: native code
++   makes its objects in the heap. */
++static void js_gc_frame_init(JSRuntime *rt)
++{
++    JSGCHeap *h = &rt->gc_heap;
++    JSGCChunk *ch = js_gc_map(JS_GC_CHUNK_SIZE);
++    uint32_t n, words;
++    size_t hdr;
++    if (!ch)
++        return;
++    n = (JS_GC_CHUNK_SIZE - sizeof(JSGCChunk)) / 8;
++    for (;;) {
++        words = (n + 63) / 64;
++        hdr = (sizeof(JSGCChunk) + JS_GC_BITMAPS * 8 * words + 15) & ~(size_t)15;
++        if (hdr + (size_t)n * 8 <= JS_GC_CHUNK_SIZE)
++            break;
++        n--;
++    }
++    ch->size = JS_GC_CHUNK_SIZE;
++    ch->cell_size = 8;
++    ch->n_cells = n;
++    ch->first = hdr;
++    ch->n_words = words;
++    ch->cls = JS_GC_FRAME;
++    ch->inv = (((uint64_t)1 << 40) + 7) / 8;
++    init_list_head(&ch->link);
++    init_list_head(&ch->avail_link);
++    h->frame_chunk = ch;
++    h->frame_top = h->frame_floor = (uint8_t *)ch + hdr;
++    h->frame_end = (uint8_t *)ch + JS_GC_CHUNK_SIZE;
++}
++
++/* The slot after `s` in the frame region (or an object's), or NULL past
++   `end`. */
++static inline uint8_t *js_gc_frame_next(uint8_t *s, uint8_t *end)
++{
++    uint32_t size = ((uint32_t *)s)[0];
++    s += size;
++    return size && s < end ? s : NULL;
++}
++
++static inline JSObject *js_gc_frame_object(uint8_t *s)
++{
++    return ((uint32_t *)s)[1] ? (JSObject *)(s + 8 + sizeof(JSMallocBlockHeader)) : NULL;
++}
++
++/* (Before a collection traces) the frame region's live objects: their
++   alloc bits set, every other bit clear (none old, none aged: they are
++   traced as roots by every collection, see js_gc_mark_roots). */
++static void js_gc_frame_prepare(JSRuntime *rt)
++{
++    JSGCHeap *h = &rt->gc_heap;
++    JSGCChunk *ch = h->frame_chunk;
++    uint8_t *s, *start;
++    if (!ch)
++        return;
++    memset(ch->bits, 0, 2 * ch->n_words * sizeof(uint64_t));
++    memset(JS_GC_AGE(ch), 0, ch->n_words * sizeof(uint64_t));
++    start = (uint8_t *)ch + ch->first;
++    for (s = h->frame_top > start ? start : NULL; s; s = js_gc_frame_next(s, h->frame_top)) {
++        JSObject *p = js_gc_frame_object(s);
++        if (p) {
++            uint32_t i = js_gc_index(ch, (uintptr_t)js_rc(p));
++            ch->bits[i >> 6] |= (uint64_t)1 << (i & 63);
++        }
++    }
++}
++
++static void js_gc_frame_roots(JSRuntime *rt, JS_MarkFunc *mark_func)
++{
++    JSGCHeap *h = &rt->gc_heap;
++    JSGCChunk *ch = h->frame_chunk;
++    uint8_t *s, *start;
++    if (!ch)
++        return;
++    start = (uint8_t *)ch + ch->first;
++    for (s = h->frame_top > start ? start : NULL; s; s = js_gc_frame_next(s, h->frame_top)) {
++        JSObject *p = js_gc_frame_object(s);
++        if (p)
++            mark_func(rt, &p->header);
++    }
++}
++
++/* (After the trace) the frame objects are not old (the write barrier
++   leaves them: they are roots) nor remembered. */
++static void js_gc_frame_reset(JSRuntime *rt)
++{
++    JSGCHeap *h = &rt->gc_heap;
++    JSGCChunk *ch = h->frame_chunk;
++    uint8_t *s, *start;
++    if (!ch)
++        return;
++    start = (uint8_t *)ch + ch->first;
++    for (s = h->frame_top > start ? start : NULL; s; s = js_gc_frame_next(s, h->frame_top)) {
++        JSObject *p = js_gc_frame_object(s);
++        if (p) {
++            js_rc(p)->mark = 0;
++            js_rc(p)->gc_remembered = 0;
++        }
++    }
++}
++
++/* Whether `b` (in the frame region's chunk) is a live object's header as
++   the collection running found them (js_gc_frame_prepare): a reference to
++   anything else there is stale (from what is dead itself). */
++static inline bool js_gc_frame_live(JSGCChunk *ch, const JSMallocBlockHeader *b)
++{
++    uint32_t i;
++    if ((uintptr_t)b < (uintptr_t)ch + ch->first)
++        return false;
++    i = js_gc_index(ch, (uintptr_t)b);
++    return i < ch->n_cells && (ch->bits[i >> 6] & ((uint64_t)1 << (i & 63)));
++}
++
++void JS_GCFramePin(JSRuntime *rt)
++{
++    JSGCHeap *h = &rt->gc_heap;
++    if (h->frame_top > h->frame_floor)
++        h->frame_floor = h->frame_top;
++}
++
++void JS_GCFrameExpose(JSRuntime *rt, JSValueConst v)
++{
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT &&
++        ((uintptr_t)JS_VALUE_GET_PTR(v) & JS_GC_CHUNK_MASK) == (uintptr_t)rt->gc_heap.frame_chunk)
++        JS_GCFramePin(rt);
++}
++
++void JS_MarkEmbeddedObjects(JSRuntime *rt, void *owner, void *start, void *end, JS_MarkFunc *mark_func)
++{
++    JSMallocBlockHeader *ob = js_rc(owner);
++    uint8_t *s;
++    for (s = start < end ? start : NULL; s; s = js_gc_frame_next(s, end)) {
++        JSObject *p = js_gc_frame_object(s);
++        if (p) {
++            JSMallocBlockHeader *b = js_rc(p);
++            b->mark = ob->mark;
++            b->gc_remembered = ob->gc_remembered;
++            mark_children(rt, &p->header, mark_func);
++        }
++    }
++}
++
+ /* The native stack's end (highest address), whose frames the collector
+    scans; whether to verify the roots, and to collect every n triggers. */
+ static void js_gc_init_stack(JSRuntime *rt)
+@@ -3107,6 +3278,7 @@
+     h->major_threshold = JS_GC_MIN_THRESHOLD;
+     rt->malloc_gc_threshold = rt->malloc_state.malloc_size + h->young_limit;
+     h->stats = getenv("QJS_GC_STATS") != NULL;
++    js_gc_frame_init(rt);
+ }
+ 
+ /* The mask of bits [i, j) of the word holding bit i (j within it or at
+@@ -9821,6 +9993,10 @@
+ {
+     JSGCHeap *h = &rt->gc_heap;
+     JSMallocBlockHeader *b = js_rc(gp);
++    /* (a frame object: see js_gc_frame_live) */
++    if (unlikely(((uintptr_t)b & JS_GC_CHUNK_MASK) == (uintptr_t)h->frame_chunk) &&
++        !js_gc_frame_live(h->frame_chunk, b))
++        return;
+     if (likely(b->block_size_idx == JS_GC_CELL)) {
+         JSGCChunk *ch = js_gc_chunk_of_cell(b);
+         uint32_t i;
+@@ -9887,7 +10063,18 @@
+     JSGCChunk *ch = js_gc_chunk_of_cell(b);
+     uint32_t i;
+     uint64_t m, *w, *a;
+-    i = unlikely(ch->cls == JS_GC_LARGE) ? 0 : js_gc_index(ch, (uintptr_t)b);
++    if (unlikely(ch->cls >= JS_GC_FRAME)) {
++        if (ch->cls == JS_GC_LARGE) {
++            i = 0;
++        } else {
++            /* (a frame object: see js_gc_frame_live) */
++            if (!js_gc_frame_live(ch, b))
++                return;
++            i = js_gc_index(ch, (uintptr_t)b);
++        }
++    } else {
++        i = js_gc_index(ch, (uintptr_t)b);
++    }
+     m = (uint64_t)1 << (i & 63);
+     w = &ch->bits[ch->n_words + (i >> 6)];
+     a = &JS_GC_AGE(ch)[i >> 6];
+@@ -10096,8 +10283,20 @@
+ static no_inline void js_gc_remember(JSRuntime *rt, JSMallocBlockHeader *b)
+ {
+     JSGCHeap *h = &rt->gc_heap;
++    if (b->block_size_idx == JS_GC_EMBEDDED) {
++        /* (an object in another cell: that cell, whose trace marks the
++           object's children and gives it its bits again) */
++        JSMallocBlockHeader *o = (JSMallocBlockHeader *)((uint8_t *)b - b->ref_count);
++        b->gc_remembered = 1;
++        if (o->gc_remembered)
++            return;
++        b = o;
++    }
+     if (b->block_size_idx != JS_GC_CELL)
+         return;
++    /* (a frame object: a root, traced by every collection) */
++    if (unlikely(js_gc_chunk_of_cell(b)->cls == JS_GC_FRAME))
++        return;
+     if (h->remembered_len == h->remembered_size &&
+         !js_gc_grow(rt, &h->remembered, &h->remembered_size)) {
+         /* (out of memory: the next collection traces everything) */
+@@ -10175,6 +10374,7 @@
+     }
+     for (hook = h->hooks; hook; hook = hook->next)
+         hook->func(rt, hook->opaque, mark_func);
++    js_gc_frame_roots(rt, mark_func);
+     js_gc_scan_stack(rt, mark_func);
+ }
+ 
+@@ -10233,6 +10433,12 @@
+                 js_gc_bad_reference(rt, b);
+             continue;
+         }
++        if (unlikely(b->block_size_idx == JS_GC_EMBEDDED)) {
++            /* (an object in another cell, which its mark bit was: that
++               cell, which marks the object's children) */
++            b = (JSMallocBlockHeader *)((uint8_t *)b - b->ref_count);
++            p = b->user_data;
++        }
+         if (!young)
+             b->mark = 1;
+         h->young_child = false;
+@@ -10269,8 +10475,10 @@
+             js_rc(h->remembered[i])->gc_remembered = 0;
+         h->remembered_len = 0;
+     }
++    js_gc_frame_prepare(rt);
+     js_gc_mark_roots(rt, js_gc_trace_mark);
+     js_gc_drain(rt);
++    js_gc_frame_reset(rt);
+     h->tracing = false;
+ }
+ 
+@@ -10284,8 +10492,11 @@
+     JSGCChunk *ch;
+     uint32_t i;
+     uint64_t m, *v;
++    if (unlikely(((uintptr_t)b & JS_GC_CHUNK_MASK) == (uintptr_t)h->frame_chunk) &&
++        !js_gc_frame_live(h->frame_chunk, b))
++        return;
+     if (b->block_size_idx != JS_GC_CELL)
+-        return; /* (a context: one of the roots) */
++        return; /* (a context: one of the roots; an embedded object) */
+     ch = js_gc_chunk_of_cell(b);
+     i = js_gc_cell_index(ch, b);
+     m = (uint64_t)1 << (i & 63);
+@@ -10383,6 +10594,8 @@
+     }
+     list_for_each(el, &h->large)
+         list_entry(el, JSGCChunk, link)->bits[3] = 0;
++    if (h->frame_chunk)
++        memset(h->frame_chunk->bits + 3 * h->frame_chunk->n_words, 0, h->frame_chunk->n_words * sizeof(uint64_t));
+     h->tracing = true;
+     h->verify_parent = NULL;
+     list_for_each(el, &rt->context_list)
+@@ -64198,6 +64411,8 @@
+                 return js_dup(p->prop[slot].u.value);
+         }
+     }
++    /* (luminous: a getter may run, given obj) */
++    JS_GCFrameExpose(ctx->rt, obj);
+     return JS_GetPropertyValue(ctx, obj, js_dup(key));
+ }
+ 
+@@ -64221,6 +64436,7 @@
+                 return js_dup(p->prop[it->slot].u.value);
+         }
+     }
++    JS_GCFrameExpose(ctx->rt, obj);
+     return JS_GetPropertyValue(ctx, obj, js_dup(key));
+ }
+ 
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -617,6 +617,24 @@
+    user data): when the cell has survived a collection, the next minor
+    collection traces it. */
+ JS_EXTERN void JS_GCWriteBarrier(JSRuntime *rt, void *cell);
++/* luminous: frame objects. Native code makes objects that do not outlive
++   a call in slots of its frame in the runtime's frame region (pushed on
++   entry from JS_LAYOUT_RT_GC_FRAME's top, if there is room below its
++   end, and popped on exit), each a word { uint32_t size, live } then the
++   object's cell; an async function's in its frame's cell (each a word
++   then the object, its header JS_LAYOUT_GC_EMBEDDED_WORD's with its
++   frame's GC bits, and the distance back to the frame cell's header as
++   its reference count). JS_GCFramePin: the frame objects made so far may
++   be held past their frames (given to code that may keep them): they
++   stay, and their slots are not reused (native code makes objects only
++   in the slots above the floor, and pops no lower). JS_MarkEmbeddedObjects:
++   for the mark function of the cell `owner` that holds such objects in
++   [start, end): marks their children, and gives them its GC bits. */
++JS_EXTERN void JS_GCFramePin(JSRuntime *rt);
++/* (JS_GCFramePin if `v` is a frame object of the frame region) */
++JS_EXTERN void JS_GCFrameExpose(JSRuntime *rt, JSValueConst v);
++JS_EXTERN void JS_MarkEmbeddedObjects(JSRuntime *rt, void *owner, void *start, void *end,
++                                      JS_MarkFunc *mark_func);
+ JS_EXTERN void JS_RunGC(JSRuntime *rt);
+ JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+ 
+@@ -1485,6 +1503,14 @@
+ #define JS_LAYOUT_RT_GC_FREE_CELLS  3112 /* per class: a free cell's user data, linking the next */
+ #endif
+ #define JS_LAYOUT_GC_CELL_WORD      0xfe0000
++/* Frame objects (see JS_GCFramePin): the frame region's { top, end, floor }
++   (uint8_t *), and the header word of an embedded object. */
++#if defined(JS_COMPRESSED_POINTERS)
++#define JS_LAYOUT_RT_GC_FRAME       6176
++#else
++#define JS_LAYOUT_RT_GC_FRAME       6184
++#endif
++#define JS_LAYOUT_GC_EMBEDDED_WORD  0xfd0000
+ #define JS_LAYOUT_MALLOC_OVERHEAD   8
+ JS_EXTERN int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj);
+ JS_EXTERN int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,

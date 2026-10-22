@@ -386,6 +386,12 @@ pub struct Func {
     pub hints: HashMap<LocalId, Hint>,
     /// What the function returns, by its annotation.
     pub ret_hint: Option<Hint>,
+    /// Frame objects (`ExprKind::FrameObject`): per slot, the properties
+    /// it has room for, and whether it is in the frame's cell (an async
+    /// function's object that may live across an await) rather than in
+    /// the frame region; and the locals that hold them.
+    pub frame: Vec<(u32, bool)>,
+    pub frame_locals: Vec<LocalId>,
     pub body: Vec<Stmt>,
 }
 
@@ -585,6 +591,13 @@ pub enum ExprKind {
     NewFromTarget(Box<Expr>),
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
+    /// `obj` (an `Object` or a `NewInstance`) made in slot `slot` of the
+    /// function's frame (`Func::frame`) while there is room, else in the
+    /// heap: an object that never outlives the call (see `frames`).
+    FrameObject {
+        slot: u32,
+        obj: Box<Expr>,
+    },
     /// A new instance of top-level class `class` (whose prototype is home
     /// object `2 * class`) with these own fields, in order (enumerable,
     /// writable, configurable), as its constructor makes it. `Any`.
@@ -1296,7 +1309,7 @@ macro_rules! visitor {
                     $name(recv, f);
                     $name(callback, f);
                 }
-                ShapeGet { obj, .. } => $name(obj, f),
+                ShapeGet { obj, .. } | FrameObject { obj, .. } => $name(obj, f),
                 SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => $name(value, f),
                 RegionTypedSet { idx, value, .. } => {
                     $name(idx, f);
@@ -1592,7 +1605,7 @@ pub fn children_mut(x: &mut Expr) -> Vec<&mut Expr> {
             push!(recv);
             push!(callback);
         }
-        ShapeGet { obj, .. } => push!(obj),
+        ShapeGet { obj, .. } | FrameObject { obj, .. } => push!(obj),
         SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => push!(value),
         RegionTypedSet { idx, value, .. } => {
             push!(idx);

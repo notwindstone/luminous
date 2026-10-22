@@ -412,7 +412,11 @@ pub fn check<'a>(
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
             ir::replace_objects(&mut module);
+            // (What functions do with the objects passed to them, before
+            // their number fields are speculated on: the same fields.)
+            let uses = crate::escape::summaries(&module);
             crate::spec::speculate_numbers(&mut module);
+            crate::frames::frame_objects(&mut module, &uses);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }
@@ -2639,6 +2643,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
             && (!self.has_this || self.ordinary_this);
         let mut func = ir::Func {
             constructor,
+            frame: Vec::new(),
+            frame_locals: Vec::new(),
             name,
             js_length,
             params: abi,

@@ -187,8 +187,15 @@ typedef struct LumFrame {
        it: the entry runs it only until it first suspends): its awaits
        may continue at once (see lum_await) */
     int in_job;
+    /* async: the bytes after the slots that hold its frame objects (see
+       JS_GCFramePin; zero until the entry lays the slots out) */
+    int embed;
+    int unused;
     JSValue slots[];
 } LumFrame;
+
+/* (The step functions find the frame object before the slots.) */
+_Static_assert(offsetof(LumFrame, self) == 0 && offsetof(LumFrame, slots) == 40, "LumFrame layout");
 
 static JSClassID lum_frame_class;
 /* The shape of frame objects, from the first (referenced). */
@@ -211,10 +218,10 @@ static LumFrame *lum_frame_of(JSValue *slots)
 /* A new frame object for function `fn`, its slots `undefined`: the frame
  * in the object's own cell (one allocation, nothing to finalize, and no
  * zeroing of slots that are then made `undefined`). */
-static JSValue lum_frame_new(JSContext *ctx, int fn, int nslots, LumFrame **pf)
+static JSValue lum_frame_new(JSContext *ctx, int fn, int nslots, int embed, LumFrame **pf)
 {
     void *data;
-    size_t size = sizeof(LumFrame) + nslots * sizeof(JSValue);
+    size_t size = sizeof(LumFrame) + nslots * sizeof(JSValue) + embed;
     JSValue obj;
     LumFrame *f;
     int i;
@@ -234,8 +241,11 @@ static JSValue lum_frame_new(JSContext *ctx, int fn, int nslots, LumFrame **pf)
     f->nslots = nslots;
     f->state = 0;
     f->in_job = 0;
+    f->embed = embed;
     for (i = 0; i < nslots; i++)
         f->slots[i] = JS_UNDEFINED;
+    if (embed)
+        memset(&f->slots[nslots], 0, embed);
     *pf = f;
     return obj;
 }
@@ -251,13 +261,15 @@ static void lum_frame_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
     JS_MarkValue(rt, f->promise, mark_func);
     for (i = 0; i < f->nslots; i++)
         JS_MarkValue(rt, f->slots[i], mark_func);
+    if (f->embed)
+        JS_MarkEmbeddedObjects(rt, f->self, &f->slots[f->nslots], (char *)&f->slots[f->nslots] + f->embed, mark_func);
 }
 
 /* A new frame for async function `fn` (returned), its promise and slots. */
-JSValue lum_async_start(JSContext *ctx, int fn, int nslots, JSValue *promise, JSValue **slots)
+JSValue lum_async_start(JSContext *ctx, int fn, int nslots, int embed, JSValue *promise, JSValue **slots)
 {
     LumFrame *f;
-    JSValue obj = lum_frame_new(ctx, fn, nslots, &f);
+    JSValue obj = lum_frame_new(ctx, fn, nslots, embed, &f);
     if (JS_IsException(obj))
         return obj;
     /* (No resolving functions: only the frame settles it.) */
@@ -822,7 +834,8 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.String.prototype.includes, g.String.prototype.startsWith, g.String.prototype.endsWith,\n"
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
         "             g.Set.prototype.has, g.JSON.stringify, g.JSON.parse,\n"
-        "             g.Object.keys, g.Object.create, g.String.prototype.lastIndexOf);\n"
+        "             g.Object.keys, g.Object.create, g.String.prototype.lastIndexOf,\n"
+        "             g.Object.values, g.Object.entries);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -1856,7 +1869,7 @@ int lum_array_iter_ok(JSContext *ctx)
 JSValue lum_gen_start(JSContext *ctx, int fn, int nslots, JSValue **slots)
 {
     LumFrame *f;
-    JSValue obj = lum_frame_new(ctx, fn, nslots, &f);
+    JSValue obj = lum_frame_new(ctx, fn, nslots, 0, &f);
     if (JS_IsException(obj))
         return obj;
     *slots = f->slots;
@@ -4807,7 +4820,8 @@ JSValue lum_keys_length(JSContext *ctx, JSValueConst f, JSValueConst this_obj, J
         if (n >= 0)
             return JS_NewInt64(ctx, n);
     }
-    /* (Held while it runs: it may replace itself.) */
+    /* (Held while it runs: it may replace itself. It may keep v.) */
+    JS_GCFrameExpose(JS_GetRuntime(ctx), v);
     f = JS_DupValue(ctx, f);
     arr = JS_Call(ctx, f, this_obj, 1, &v);
     JS_FreeValue(ctx, f);
