@@ -14,18 +14,21 @@
 //!
 //! An object goes in a slot when every value of its local is made by an
 //! object literal (or a `new` of a class whose constructor is inlined:
-//! `NewInstance`) at a statement of its own, the local is not captured,
-//! and every other use of it is one that cannot keep it:
+//! `NewInstance`; or an `aot type`'s literal, `StructNew`) at a statement
+//! of its own, the local is not captured, and every other use of it is one
+//! that cannot keep it:
 //!
 //! - reading or writing one of its own properties (every literal of the
-//!   local has the key: no prototype getter or setter runs);
+//!   local has the key: no prototype getter or setter runs), or one of the
+//!   fields of an `aot type`'s object;
 //! - `typeof`, truthiness, `===` / `!==` and nullish comparisons;
 //! - passing it to a function whose escape summary says it only reads or
 //!   writes own properties of it, and does not hand it to an async call
 //!   that may run later (`Use::Reads`, `Use::Writes`, not `outlives`); an
 //!   async callee that may suspend only from an async function that
 //!   awaits it at once (its frame lives until the callee is done);
-//! - for an object in the frame region, builtins that read it without
+//! - for an object in the frame region (not of an `aot type`), builtins
+//!   that read it without
 //!   running code that could keep it: `JSON.stringify(o)`,
 //!   `Object.keys/values/entries(o)`, `for (k in o)`, `{...o}`, rest
 //!   destructuring. Where such a call may reach other code instead (the
@@ -83,7 +86,7 @@ pub fn frame_objects(m: &mut Module, table: &Summaries) {
     let debug = std::env::var_os("LUMINOUS_DEBUG_FRAME").is_some();
     for g in 0..nf + m.closures.len() {
         let f = if g < nf { &mut m.funcs[g] } else { &mut m.closures[g - nf] };
-        place(f, table, &suspends, &builtins, debug);
+        place(f, table, &suspends, &builtins, &m.layouts, debug);
     }
 }
 
@@ -139,24 +142,43 @@ fn value_of_mut(x: &mut Expr) -> &mut Expr {
 }
 
 /// The keys of the literal a site makes (its value, after what a
-/// sequence evaluates first).
+/// sequence evaluates first): none for an `aot type`'s, whose fields are
+/// read by index (`StructGet`), never from a prototype.
 fn literal_keys(x: &Expr) -> Option<Vec<AtomId>> {
     match &value_of(x).kind {
         ExprKind::Object(props) | ExprKind::NewInstance { fields: props, .. } => {
             Some(props.iter().map(|(a, _)| *a).collect())
         }
+        ExprKind::StructNew { .. } => Some(Vec::new()),
         _ => None,
     }
 }
 
-fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins, debug: bool) {
+/// The properties a slot has room for (8 bytes each, after an object of
+/// the Object class): those of the literal at a site, or as many as hold
+/// an `aot type`'s object (the object of another class, its data's
+/// header, its fields).
+fn slot_room(x: &Expr, layouts: &[Layout]) -> Option<u32> {
+    match &value_of(x).kind {
+        ExprKind::StructNew { layout, .. } => Some((32 + layouts[*layout as usize].size).div_ceil(8)),
+        _ => literal_keys(x).map(|ks| room(ks.len())),
+    }
+}
+
+fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins, layouts: &[Layout], debug: bool) {
     if f.is_generator {
         return;
     }
     let n = f.locals.len();
+    // (Locals of `aot type`s: their objects' fields are read by index.)
+    let structs: Vec<bool> = f.locals.iter().map(|t| matches!(t, Ty::Struct(_))).collect();
     let mut ok: Vec<bool> = (0..n)
         .map(|l| {
-            l >= f.params.len() && l != THIS_LOCAL && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)
+            l >= f.params.len()
+                && l != THIS_LOCAL
+                && !f.boxed[l]
+                && (f.locals[l] == Ty::Any || structs[l])
+                && f.ret_slot != Some(l)
         })
         .collect();
     deep_stmt_locals(&f.body, &mut |l| ok[l] = false);
@@ -310,8 +332,9 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
             if let Some(Use::Reads { fields, outlives: false } | Use::Writes { fields, outlives: false }) = u {
                 for fd in fields {
                     match fd {
-                        Field::Prop(a) => need[l].push(*a),
-                        Field::Slot(_) => bad[l] = true,
+                        Field::Prop(a) if !structs[l] => need[l].push(*a),
+                        Field::Slot(_) if structs[l] => {}
+                        _ => bad[l] = true,
                     }
                 }
                 fine[l] += 1;
@@ -330,6 +353,11 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
             | ExprKind::ShapeSet { obj: o, atom: a, .. } => {
                 if let Some(l) = local(o) {
                     need[l].push(*a);
+                    fine[l] += 1;
+                }
+            }
+            ExprKind::StructGet(_, o, _) | ExprKind::StructSet(_, o, _, _) => {
+                if let Some(l) = local(o) {
                     fine[l] += 1;
                 }
             }
@@ -377,6 +405,7 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
                 if builtins.is(recv, *m)
                     && let Some(l) = local(&args[0])
                     && !in_cell[l]
+                    && !structs[l]
                 {
                     fine[l] += 1;
                 }
@@ -385,6 +414,7 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
                 if matches!(recv.kind, ExprKind::Global(g) if Some(g) == builtins.object)
                     && let Some(l) = local(x)
                     && !in_cell[l]
+                    && !structs[l]
                 {
                     fine[l] += 1;
                 }
@@ -392,6 +422,7 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
             ExprKind::ForInGet(_, _, o, _) => {
                 if let Some(l) = local(o)
                     && !in_cell[l]
+                    && !structs[l]
                 {
                     fine[l] += 1;
                 }
@@ -400,19 +431,23 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
                 for p in parts {
                     if let ObjPart::Spread(x) = p
                         && let Some(l) = local(x)
+                        && !structs[l]
                     {
                         fine[l] += 1;
                     }
                 }
             }
             ExprKind::ObjectRest(x, _) => {
-                if let Some(l) = local(x) {
+                if let Some(l) = local(x)
+                    && !structs[l]
+                {
                     fine[l] += 1;
                 }
             }
             ExprKind::SetLocal(q, x) | ExprKind::InitLocal(q, x) if alias[*q].is_some() => {
                 if let Some(l) = local(x)
                     && !in_cell[l]
+                    && !structs[l]
                 {
                     fine[l] += 1;
                 }
@@ -460,9 +495,8 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
         if let ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) = &mut e.kind
             && chosen.contains(l)
             && site_exprs.contains(&(value_of(x) as *const Expr))
-            && let Some(ks) = literal_keys(x)
+            && let Some(r) = slot_room(x, layouts)
         {
-            let r = room(ks.len());
             if frame.len() >= SLOTS || bytes + slot_bytes(r) > FRAME_BYTES {
                 return;
             }
@@ -471,8 +505,9 @@ fn place(f: &mut Func, table: &Summaries, suspends: &[bool], builtins: &Builtins
             frame.push((r, in_cell[*l]));
             placed.insert(*l);
             let lit = value_of_mut(x);
+            let ty = lit.ty;
             let obj = std::mem::replace(lit, Expr::new(Ty::Any, ExprKind::Undefined));
-            *lit = Expr::new(Ty::Any, ExprKind::FrameObject { slot, obj: Box::new(obj) });
+            *lit = Expr::new(ty, ExprKind::FrameObject { slot, obj: Box::new(obj) });
         }
     });
     f.frame = frame;

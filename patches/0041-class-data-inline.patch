@@ -1,0 +1,59 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64123,6 +64123,41 @@
+     return obj;
+ }
+ 
++/* luminous: the shape a new object of class `class_id` without properties
++   has (its class's prototype), as JS_NewObjectClassData gives it, pinned
++   (see JSShape.pinned): compiled code gives it to the objects it makes
++   inline (see JS_ClassDataAllocInfo). NULL if it cannot be made. */
++void *JS_ClassShape(JSContext *ctx, JSClassID class_id)
++{
++    JSObject *proto = object_or_null(ctx->class_proto[class_id]);
++    JSShape *sh = find_hashed_shape_proto(ctx->rt, proto);
++
++    if (sh) {
++        sh = js_dup_shape(sh);
++    } else {
++        sh = js_new_shape(ctx, proto);
++        if (!sh)
++            return NULL;
++    }
++    sh->pinned = true;
++    return sh;
++}
++
++/* luminous: JS_ShapeAllocInfo for an object of another class than Object
++   with `size` bytes of data in its cell, as JS_NewObjectClassData makes it
++   (no property storage: the data follows the object): the GC heap's cell
++   class and the cell size; 0 if it is too big for the arena. */
++uint32_t JS_ClassDataAllocInfo(JSRuntime *rt, size_t size)
++{
++    size_t total = ((sizeof(JSObject) + size + JS_ARENA_ALIGN - 1) & ~(size_t)(JS_ARENA_ALIGN - 1)) +
++        sizeof(JSMallocBlockHeader);
++    unsigned idx;
++    if (total > JS_ARENA_MAX_SMALL_SIZE)
++        return 0;
++    idx = rt->arena_state.size_index[total / 8];
++    return idx | (uint32_t)js_gc_cell_size(idx) << 8;
++}
++
+ /* luminous: an extensible one, of a class without exotic methods or a
+    finalizer, with the shape of a first one (JS_DupObjectShape). */
+ JSValue JS_NewObjectClassDataShaped(JSContext *ctx, void *shape, JSClassID class_id, size_t size,
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1255,6 +1255,12 @@
+ /* luminous: whether ArraySpeciesCreate(obj) makes an Array with no code
+    running (obj an array of the initial shape, %Array%'s species pristine). */
+ JS_EXTERN bool JS_ArraySpeciesPristine(JSContext *ctx, JSValueConst obj);
++/* luminous: objects of a class with data made inline by compiled code: the
++   pinned shape of a new one without properties, and the GC heap's cell
++   class and size (as JS_ShapeAllocInfo) for one with `size` bytes of data,
++   which follow the object (u.opaque points to them). */
++JS_EXTERN void *JS_ClassShape(JSContext *ctx, JSClassID class_id);
++JS_EXTERN uint32_t JS_ClassDataAllocInfo(JSRuntime *rt, size_t size);
+ JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
+ /* luminous: String.prototype methods with a direct entry (JS_CallStringFn). */
+ #define JS_STRING_FN_SLICE 0

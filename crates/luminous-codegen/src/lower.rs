@@ -297,6 +297,10 @@ const IC_PROTO_GETTER: i64 = 2;
 /// `LUM_IC_ABSENT`: a property no object of `alt_shape` has (nor its
 /// prototypes); read as `undefined` while the epoch holds.
 const IC_ABSENT: i64 = 11;
+/// The flags of a new object of an `aot type` (its class id is added):
+/// exotic, not extensible (`JSObject`'s bits).
+const OBJ_EXOTIC_FLAGS: i64 = 0x8;
+
 /// `lum_chain_ok`'s bits for `slice` and `reduce` (after `LoopKind`'s).
 const CHAIN_SLICE: i64 = 7;
 const CHAIN_REDUCE: i64 = 8;
@@ -339,6 +343,10 @@ pub(crate) struct Env {
     pub homes: GlobalValue,
     /// `lum_struct_class`: the class of `aot type` objects.
     pub struct_class: GlobalValue,
+    /// `lum_struct_shape`, `lum_struct_alloc_info`: what native code makes
+    /// those objects with inline.
+    pub struct_shape: GlobalValue,
+    pub struct_alloc: GlobalValue,
     /// `lum_sarr_class`: the class of arrays of `aot type` objects.
     pub sarr_class: GlobalValue,
     /// `lum_record_shapes`: per record type, its shape once learned.
@@ -478,6 +486,8 @@ pub(crate) struct Lower {
     handlers: Vec<Block>,
     /// Where an `ArrayChain`'s loop stops (`Sure`), innermost last.
     chain_bail: Vec<Block>,
+    /// Where a frame object is made in the heap instead (`frame_cell`).
+    frame_heap: Vec<Block>,
     scopes: Vec<Scope>,
     /// Exception edges: (block, temporaries to free, handler).
     pending: Vec<ExceptionEdge>,
@@ -649,6 +659,7 @@ impl Lower {
             temps: Vec::new(),
             handlers: Vec::new(),
             chain_bail: Vec::new(),
+            frame_heap: Vec::new(),
             scopes: Vec::new(),
             pending: Vec::new(),
             exc_exit,
@@ -2350,37 +2361,7 @@ impl Lower {
                 V::Num(self.binary(*op, a, c))
             }
             ExprKind::Inline { body, locals } => self.inline_body(body, locals, e.ty),
-            ExprKind::StructNew { layout, mask, fields } => {
-                // The values first (in order), then the object, which takes them.
-                let held: Vec<V> = fields
-                    .iter()
-                    .map(|(_, x)| {
-                        let v = self.expr(x);
-                        self.hold(v);
-                        v
-                    })
-                    .collect();
-                let ctx = self.ctx;
-                let k = self.b.ins().iconst(I32, *layout as i64);
-                let m = self.b.ins().iconst(I32, *mask as i64);
-                let r = self.helper("lum_struct_new", &[ctx, k, m]);
-                self.check_value(r[0]);
-                let obj = V::Any(r[0]);
-                self.hold(obj);
-                for (&(fi, _), &v) in fields.iter().zip(&held) {
-                    self.release(v);
-                    self.struct_store(*layout, fi, r[0], v, true);
-                }
-                // Which member it matches may depend on the values.
-                let l = &self.env.layouts[*layout as usize];
-                let check = l.members.len() > 1 && fields.iter().any(|&(fi, _)| !l.fields[fi as usize].simple);
-                if check {
-                    let ok = self.helper("lum_struct_validate", &[ctx, r[0]]);
-                    self.check_int(ok[0]);
-                }
-                self.release(obj);
-                obj
-            }
+            ExprKind::StructNew { layout, mask, fields } => self.struct_new(*layout, *mask, fields, None),
             ExprKind::StructArrFrom(k, x) => {
                 let w = self.expr(x).any();
                 let ctx = self.ctx;
@@ -4296,6 +4277,7 @@ impl Lower {
             ExprKind::NewInstance { class, fields } => self.new_object(fields, Some(*class)),
             ExprKind::FrameObject { slot, obj } => match &obj.kind {
                 ExprKind::Object(props) => self.new_object_with(props, None, None, Some(*slot)),
+                ExprKind::StructNew { layout, mask, fields } => self.struct_new(*layout, *mask, fields, Some(*slot)),
                 ExprKind::NewInstance { class, fields } => {
                     self.new_object_with(fields, Some(*class), None, Some(*slot))
                 }
@@ -4757,7 +4739,11 @@ impl Lower {
     /// the field's type go inline into fields that hold them unboxed when
     /// no member can change; everything else is checked by the runtime.
     fn struct_store(&mut self, k: u32, fi: u32, ow: Value, v: V, fresh: bool) {
-        let f = self.env.layouts[k as usize].fields[fi as usize].clone();
+        let l = &self.env.layouts[k as usize];
+        let f = l.fields[fi as usize].clone();
+        // A field every member that has it holds strings in.
+        let string =
+            l.members.iter().all(|m| matches!(m.types[fi as usize], ir::FieldType::String | ir::FieldType::Absent));
         let p = self.val_ptr(ow);
         let join = self.b.create_block();
         let slow = self.b.create_block();
@@ -4813,6 +4799,19 @@ impl Lower {
             (ir::Storage::Bool, V::Bool(x)) if inline => {
                 let x = self.b.ins().uextend(I32, x);
                 self.b.ins().istore8(M_STRUCT, x, at, 0);
+                self.b.ins().jump(join, &[]);
+            }
+            // A string in a new object's string field (its mask has it).
+            // Else (`undefined` in an optional one, a TypeError, a rope)
+            // the runtime's.
+            (ir::Storage::Value, V::Any(vw)) if fresh && string => {
+                let is_str = self.val_is(vw, TAG_STRING);
+                let st = self.b.create_block();
+                self.b.ins().brif(is_str, st, &[], slow, &[]);
+                self.b.switch_to_block(st);
+                self.dup(vw);
+                self.b.ins().store(M_STRUCT, vw, at, 0);
+                self.write_barrier(p, vw);
                 self.b.ins().jump(join, &[]);
             }
             _ => {
@@ -5105,11 +5104,34 @@ impl Lower {
     /// `shape`, cached by the site; property values `vals`), if the slot
     /// can hold it: jumps to `join` with it; else continues (to the heap).
     fn frame_object(&mut self, slot: u32, shape: Value, vals: &[Value], join: Block) {
+        // (The properties the shape has room for, which the engine may
+        // fill without asking: as many as the slot.)
+        let room = self.frame[slot as usize].1;
+        let size = self.b.ins().uload32(M_HEADER, shape, layout::SHAPE_PROP_SIZE);
+        let fits = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, size, room as i64);
+        let Some(p) = self.frame_cell(slot, Some(fits)) else { return };
+        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
+        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
+        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
+        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
+        self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
+        for (i, &w) in vals.iter().enumerate() {
+            self.b.ins().store(M_SLOT, w, props, (i * SIZE) as i32);
+        }
+        self.frame_made(p, join);
+    }
+
+    /// Frame slot `slot`'s cell, if it can be had (and `fits`): its object's
+    /// address, in a block where its header is set (its fields are the
+    /// caller's to set, then `frame_made`); the code after that block
+    /// (`frame_made` switches to it) makes the object in the heap.
+    fn frame_cell(&mut self, slot: u32, fits: Option<Value>) -> Option<Value> {
         let (off, room, in_cell) = self.frame[slot as usize];
         let (var, owner) = match (in_cell, self.frame_cell, self.frame_base) {
             (true, Some((base, owner)), _) => (base, Some(owner)),
             (false, _, Some(base)) => (base, None),
-            _ => return,
+            _ => return None,
         };
         let base = self.b.use_var(var);
         let at = self.b.ins().iadd_imm_s(base, off);
@@ -5122,13 +5144,12 @@ impl Lower {
             let above = self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, at, floor);
             ok = self.b.ins().band(ok, above);
         }
-        // (The properties the shape has room for, which the engine may
-        // fill without asking: as many as the slot.)
-        let size = self.b.ins().uload32(M_HEADER, shape, layout::SHAPE_PROP_SIZE);
-        let fits = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThanOrEqual, size, room as i64);
-        ok = self.b.ins().band(ok, fits);
+        if let Some(fits) = fits {
+            ok = self.b.ins().band(ok, fits);
+        }
         let framed = self.b.create_block();
         let heap = self.b.create_block();
+        self.frame_heap.push(heap);
         self.b.ins().brif(ok, framed, &[], heap, &[]);
         self.b.switch_to_block(framed);
         let word = self.b.ins().iconst(I64, frame_slot_bytes(room) | (1 << 32));
@@ -5150,18 +5171,105 @@ impl Lower {
             }
         };
         self.b.ins().store(M_RC, header, p, -8);
-        const _: () = assert!(layout::OBJ_WEAK_REF == layout::OBJ_FLAGS + 4);
-        let flags = self.b.ins().iconst(I64, layout::OBJ_PLAIN_FLAGS);
-        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
-        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
-        let props = self.b.ins().iadd_imm_s(p, layout::OBJ_SIZE as i64);
-        self.b.ins().store(M_HEADER, props, p, layout::OBJ_PROP);
-        for (i, &w) in vals.iter().enumerate() {
-            self.b.ins().store(M_SLOT, w, props, (i * SIZE) as i32);
-        }
+        Some(p)
+    }
+
+    /// The end of a `frame_cell` block: object `p` made, to `join`; then on
+    /// to make it in the heap.
+    fn frame_made(&mut self, p: Value, join: Block) {
         let w = self.mk_ref(TAG_OBJECT, p);
         self.b.ins().jump(join, &[BlockArg::Value(w)]);
+        let heap = self.frame_heap.pop().expect("a frame_cell block");
         self.b.switch_to_block(heap);
+    }
+
+    /// An object of `aot type` `k` from a literal (`StructNew`), with the
+    /// fields in `mask`: the values first, in order; then the object, made
+    /// inline in frame slot `frame` if given (and free), else in the heap
+    /// (as `JS_NewObjectClassData` makes it: `init_struct`), else by the
+    /// runtime; then its fields, each stored as the value fits.
+    fn struct_new(&mut self, k: u32, mask: u32, fields: &[(u32, Expr)], frame: Option<u32>) -> V {
+        let held: Vec<V> = fields
+            .iter()
+            .map(|(_, x)| {
+                let v = self.expr(x);
+                self.hold(v);
+                v
+            })
+            .collect();
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        if let Some(slot) = frame
+            && let Some(p) = self.frame_cell(slot, None)
+        {
+            self.init_struct(p, k, mask);
+            self.frame_made(p, join);
+        }
+        let call = self.b.create_block();
+        self.b.set_cold_block(call);
+        let table = self.b.ins().symbol_value(self.ptr, self.env.struct_alloc);
+        let infos = self.b.ins().load(I64, M_CONST, table, 0);
+        let info = self.b.ins().uload32(M_CONST, infos, (k * 4) as i32);
+        let p = self.alloc_cell(info, call);
+        self.init_struct(p, k, mask);
+        let w = self.mk_ref(TAG_OBJECT, p);
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
+        self.b.switch_to_block(call);
+        let kv = self.b.ins().iconst(I32, k as i64);
+        let m = self.b.ins().iconst(I32, mask as i64);
+        let r = self.helper("lum_struct_new", &[ctx, kv, m]);
+        self.check_value(r[0]);
+        self.b.ins().jump(join, &[BlockArg::Value(r[0])]);
+        self.b.switch_to_block(join);
+        let obj = V::Any(rw);
+        self.hold(obj);
+        for (&(fi, _), &v) in fields.iter().zip(&held) {
+            self.release(v);
+            self.struct_store(k, fi, rw, v, true);
+        }
+        // Which member it matches may depend on the values.
+        let l = &self.env.layouts[k as usize];
+        let check = l.members.len() > 1 && fields.iter().any(|&(fi, _)| !l.fields[fi as usize].simple);
+        if check {
+            let ok = self.helper("lum_struct_validate", &[ctx, rw]);
+            self.check_int(ok[0]);
+        }
+        self.release(obj);
+        obj
+    }
+
+    /// The fields of a new object of `aot type` `k` at `p` (a cell of the
+    /// size its layout needs) but its data's fields: its class, exotic (its
+    /// fields are its properties) and not extensible, the shape
+    /// `lum_struct_shape`, no property storage, its data after it (the
+    /// opaque); the data's layout and mask, and `undefined` in its JS-valued
+    /// fields (the collector traces them).
+    fn init_struct(&mut self, p: Value, k: u32, mask: u32) {
+        let sc = self.b.ins().symbol_value(self.ptr, self.env.struct_class);
+        let class = self.b.ins().load(I32, M_CONST, sc, 0);
+        let class = self.b.ins().uextend(I64, class);
+        let flags = self.b.ins().ishl_imm_u(class, 16);
+        let flags = self.b.ins().bor_imm_u(flags, OBJ_EXOTIC_FLAGS);
+        self.b.ins().store(M_HEADER, flags, p, layout::OBJ_FLAGS);
+        let ss = self.b.ins().symbol_value(self.ptr, self.env.struct_shape);
+        let shape = self.b.ins().load(I64, M_CONST, ss, 0);
+        self.b.ins().store(M_HEADER, shape, p, layout::OBJ_SHAPE);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().store(M_HEADER, zero, p, layout::OBJ_PROP);
+        let data = self.b.ins().iadd_imm_s(p, layout::OBJ_CLASS_SIZE as i64);
+        self.b.ins().store(M_HEADER, data, p, layout::OBJ_OPAQUE);
+        let kv = self.b.ins().iconst(I32, k as i64);
+        self.b.ins().store(M_STRUCT, kv, data, 0);
+        let m = self.b.ins().iconst(I32, mask as i64);
+        self.b.ins().store(M_STRUCT, m, data, 4);
+        let fields = self.env.layouts[k as usize].fields.clone();
+        for f in &fields {
+            if f.storage == ir::Storage::Value {
+                let undef = self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0));
+                self.b.ins().store(M_STRUCT, undef, data, 8 + f.offset as i32);
+            }
+        }
     }
 
     /// `new_object`, of an instance with private state too (`private`: the

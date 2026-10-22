@@ -369,6 +369,8 @@ static inline int lum_json_present(JSContext *ctx, JSValueConst v)
 extern const char *const lum_struct_lits[] __attribute__((weak));
 extern const int32_t lum_nstruct_lits __attribute__((weak));
 extern uint32_t lum_struct_class;
+extern void *lum_struct_shape;
+extern uint32_t *lum_struct_alloc_info;
 
 JSValue lum_struct_new(JSContext *ctx, int layout, uint32_t mask);
 int lum_struct_put(JSContext *ctx, JSValue obj, int field, JSValue v);

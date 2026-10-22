@@ -627,6 +627,9 @@ static void lum_state_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_fu
         JS_MarkCachedShape(rt, lum_cca_shape, mark_func);
     if (lum_frame_shape)
         JS_MarkCachedShape(rt, lum_frame_shape, mark_func);
+    /* (No object may have it, its objects in frames, or none yet.) */
+    if (lum_struct_shape)
+        JS_MarkCachedShape(rt, lum_struct_shape, mark_func);
     for (i = 0; i < lum_ncells; i++)
         JS_MarkValue(rt, lum_cells[i], mark_func);
     for (i = 0; i < lum_nprivates; i++)
@@ -2842,6 +2845,12 @@ JSValue lum_global_get(JSContext *ctx, JSAtom prop, LumIC *ic)
  * An `int` field wraps other integers to int32, as `int` variables do. */
 
 uint32_t lum_struct_class;
+/* Native code makes an object of a layout inline (see JS_ClassShape): with
+ * this shape (pinned), in a cell of the class and size of the layout's
+ * entry here (as JS_ClassDataAllocInfo gives it; 0: through
+ * lum_struct_new). */
+void *lum_struct_shape;
+uint32_t *lum_struct_alloc_info;
 /* Per layout field (flat, layout by layout): its name as an atom. */
 static JSAtom *lum_struct_atoms;
 static uint32_t *lum_struct_atom_base;
@@ -3243,21 +3252,6 @@ static int lum_struct_define(JSContext *ctx, JSValueConst obj, JSAtom prop, JSVa
     return true;
 }
 
-static void lum_struct_finalizer(JSRuntime *rt, JSValueConst val)
-{
-    LumStruct *s = JS_GetOpaque(val, lum_struct_class);
-    const LumLayoutDesc *l;
-    uint32_t i;
-    if (!s)
-        return;
-    l = &lum_layouts[s->layout];
-    for (i = 0; i < l->nfields; i++) {
-        if (l->fields[i].storage == LUM_ST_VALUE)
-            JS_FreeValueRT(rt, *(JSValue *)lum_field_at(s, &l->fields[i]));
-    }
-    /* The data is part of the object's allocation. */
-}
-
 static void lum_struct_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     LumStruct *s = JS_GetOpaque(val, lum_struct_class);
@@ -3438,8 +3432,9 @@ JSValue lum_struct_from(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 static int lum_structs_init(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    JSClassDef def = { "Object", .finalizer = lum_struct_finalizer, .gc_mark = lum_struct_mark,
-                       .exotic = (JSClassExoticMethods *)&lum_struct_exotic };
+    /* (No finalizer: the data is in the object's cell, and the collector
+       traces what its fields hold.) */
+    JSClassDef def = { "Object", .gc_mark = lum_struct_mark, .exotic = (JSClassExoticMethods *)&lum_struct_exotic };
     int n = lum_layout_count(), i, total = 0;
     uint32_t f;
     JSValue proto;
@@ -3453,6 +3448,13 @@ static int lum_structs_init(JSContext *ctx)
         return -1;
     JS_SetClassProto(ctx, lum_struct_class, JS_GetPrototype(ctx, proto));
     JS_FreeValue(ctx, proto);
+    /* What native code makes objects with inline (see lum_struct_shape). */
+    lum_struct_shape = JS_ClassShape(ctx, lum_struct_class);
+    lum_struct_alloc_info = js_mallocz(ctx, sizeof(uint32_t) * n);
+    if (!lum_struct_alloc_info)
+        return -1;
+    for (i = 0; lum_struct_shape && i < n; i++)
+        lum_struct_alloc_info[i] = JS_ClassDataAllocInfo(rt, sizeof(LumStruct) + lum_layouts[i].size);
     lum_struct_atom_base = js_mallocz(ctx, sizeof(uint32_t) * n);
     for (i = 0; i < n; i++) {
         lum_struct_atom_base[i] = total;
@@ -3497,6 +3499,9 @@ static void lum_structs_free(JSRuntime *rt)
     js_free_rt(rt, lum_struct_atoms);
     js_free_rt(rt, lum_struct_atom_base);
     js_free_rt(rt, lum_struct_lit_values);
+    js_free_rt(rt, lum_struct_alloc_info);
+    lum_struct_alloc_info = NULL;
+    lum_struct_shape = NULL;
     JS_FreeAtomRT(rt, lum_atom_length);
     lum_atom_length = JS_ATOM_NULL;
     lum_struct_atoms = NULL;

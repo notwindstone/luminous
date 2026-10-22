@@ -152,8 +152,8 @@ regular call path's generated code alone.
 `0033-symbol-key-fast-paths.patch`,
 `0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch`,
 `0036-proxy-own-shape.patch`, `0037-frame-objects.patch`,
-`0038-call-epoch-and-peek.patch`, `0039-array-species-pristine.patch` and
-`0040-sort-merge.patch`, each made
+`0038-call-epoch-and-peek.patch`, `0039-array-species-pristine.patch`,
+`0040-sort-merge.patch` and `0041-class-data-inline.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -178,6 +178,10 @@ engine's semantics:
   calls the engine makes (of code native code does not call directly),
   and a property read that is made only if it runs no code, for effect
   summaries (see [What compiles natively](#what-compiles-natively));
+- `JS_ClassShape` and `JS_ClassDataAllocInfo` (patch 0041): the pinned
+  shape and the GC heap's cell class and size of an object of a class with
+  data in its cell, which native code then makes inline (objects of `aot
+  type`s);
 - the interpreter's own iteration (`for`-`of`, `for`-`in`, spread,
   destructuring), CopyDataProperties (object spread and rest), property
   access with a receiver (`super`), private field access and brand checks,
@@ -1206,7 +1210,11 @@ clang, linking).
   helpers that are not inlined, serialized and counted; then the same
   across awaits): 8.97M objects freed by the collector, now 6.50M (the
   2.5M records), in about the same time, as the young generation already
-  made and freed them cheaply.
+  made and freed them cheaply. An object of an `aot type` made by a
+  literal goes in a slot the same way, where its uses are reads and writes
+  of its fields (by index, never from a prototype), comparisons and truth
+  tests, and arguments of functions whose escape summaries keep it (not
+  the builtins, which it is not given in a frame).
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those
@@ -1949,7 +1957,16 @@ const v: User = await (await fetch(url)).json();
   on it stays in integers. Elsewhere (an element
   of a plain array), property caches recognize the object's layout. An
   object that does not escape is not allocated at all: its fields become
-  locals, with the same checks on stores. In a loop that runs no other code
+  locals, with the same checks on stores. One that must exist is made
+  inline, as a plain object is: one cell (the object, its layout and mask,
+  its fields), the struct shape native code keeps (patch 0041), no
+  finalizer, numbers and strings stored after a check of their tag; and
+  where it never outlives the call, in the call's frame (see frame objects
+  in [What compiles natively](#what-compiles-natively)). An async pipeline
+  whose per-job object is an `aot type` (`bench/pipeline.ts` with `aot
+  type Job`): 275 ms, now 251 (as `type Job`, 257); objects written by a
+  helper that is not inlined, in a loop and across awaits: 1.83G
+  instructions, now 1.17G, and 1.3M fewer objects for the collector. In a loop that runs no other code
   (no calls, getters or conversions), the fields it uses live in registers
   and are stored back after the loop. A native function whose `aot
   type` parameter gets another value declines the call (the interpreted

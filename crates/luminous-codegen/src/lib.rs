@@ -727,7 +727,7 @@ struct Codegen {
     sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 15],
+    data: [DataId; 17],
     fast_sig: SigRef,
     /// Inline caches allocated so far (`lum_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
@@ -861,6 +861,9 @@ impl Codegen {
         // Its count of calls of code native code does not call directly
         // (see `luminous_front::effects`).
         data.push(module.declare_data("js_call_epoch", Linkage::Import, true));
+        // What `aot type` objects are made with inline (see `lum_struct_shape`).
+        data.push(module.declare_data("lum_struct_shape", Linkage::Import, true));
+        data.push(module.declare_data("lum_struct_alloc_info", Linkage::Import, true));
         Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
@@ -917,6 +920,8 @@ impl Codegen {
             record_shapes,
             proto_epoch,
             call_epoch,
+            struct_shape,
+            struct_alloc,
         ] = self.data;
         Env {
             helpers: self.helpers.clone(),
@@ -937,6 +942,8 @@ impl Codegen {
             record_shapes,
             proto_epoch,
             call_epoch,
+            struct_shape,
+            struct_alloc,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
             params: self.params.clone(),
