@@ -1147,7 +1147,11 @@ clang, linking).
   on calls a clone of the next function, recursion included), once per
   function and set of parameters replaced, at most 8 per function and 256
   in all; the function itself stays for its other callers. A clone's
-  parameters that every call gives numbers are unboxed numbers.
+  parameters that every call gives numbers are unboxed numbers, and so
+  are then its locals that only hold numbers (a ternary of numbers too),
+  with comparisons and math functions of boxed numbers made number
+  operations: `bench/vectors.ts`'s distance helper, called with the
+  fields of four points, became number code (398 ms to 204, bun 288).
 
   The copies are read when the call is made, so they are exact only if
   nothing writes the fields while the callee may still read them. A

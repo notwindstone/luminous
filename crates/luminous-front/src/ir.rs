@@ -3205,13 +3205,19 @@ fn virtualize_in(
 /// into an `F64` one: a boxed number, `l` plus or minus one, or `+ - * /`
 /// on `l` and boxed numbers.
 fn number_write(l: LocalId, v: &Expr) -> bool {
-    let operand = |x: &Expr| match &x.kind {
-        ExprKind::Local(m) => *m == l,
-        ExprKind::Box(e) => e.ty.is_number(),
-        _ => false,
-    };
+    fn operand(l: LocalId, x: &Expr) -> bool {
+        match &x.kind {
+            ExprKind::Local(m) => *m == l,
+            ExprKind::Box(e) => e.ty.is_number(),
+            // (`c ? 1 : x`)
+            ExprKind::Cond(_, a, b) => operand(l, a) && operand(l, b),
+            _ => false,
+        }
+    }
+    let operand = |x: &Expr| operand(l, x);
     match &v.kind {
         ExprKind::Box(e) => e.ty.is_number(),
+        ExprKind::Cond(..) => operand(v),
         ExprKind::AnyUnary(AnyUnOp::Inc | AnyUnOp::Dec, x) => matches!(x.kind, ExprKind::Local(m) if m == l),
         ExprKind::AnyBinary(AnyBinOp::Add | AnyBinOp::Sub | AnyBinOp::Mul | AnyBinOp::Div, a, b) => {
             operand(a) && operand(b)
@@ -3225,6 +3231,12 @@ fn number_operand(l: LocalId, x: Expr) -> Expr {
     match x.kind {
         ExprKind::Box(e) => *e,
         ExprKind::Local(m) if m == l => Expr::new(Ty::F64, ExprKind::Local(l)),
+        ExprKind::Cond(c, a, b) => {
+            let (a, b) = (number_operand(l, *a), number_operand(l, *b));
+            // (Both as doubles: an int32 arm is widened where it is used.)
+            let ty = if a.ty == b.ty { a.ty } else { Ty::F64 };
+            Expr::new(ty, ExprKind::Cond(c, Box::new(a), Box::new(b)))
+        }
         _ => unreachable!("not a number operand"),
     }
 }
@@ -3313,6 +3325,55 @@ fn simplify_boxed_arith(f: &mut Func) -> bool {
                     e.kind = ExprKind::Binary(op, Box::new(a), Box::new(b));
                     again = true;
                 }
+                return;
+            }
+            // The int32 of a boxed int32: that int32.
+            if let ExprKind::IntOf(x) = &mut e.kind
+                && let ExprKind::Box(inner) = &mut x.kind
+                && inner.ty == Ty::I32
+            {
+                let n = std::mem::replace(&mut **inner, Expr::num(0.0));
+                *e = n;
+                again = true;
+                return;
+            }
+            // A math function of a boxed number: of the number.
+            if let ExprKind::Math(_, args) = &mut e.kind {
+                for a in args.iter_mut() {
+                    if let ExprKind::Box(inner) = &mut a.kind
+                        && inner.ty.is_number()
+                    {
+                        let n = std::mem::replace(&mut **inner, Expr::num(0.0));
+                        *a = n;
+                        again = true;
+                    }
+                }
+                return;
+            }
+            // A comparison of two boxed numbers: a number comparison (the
+            // same result, NaN included; equality of numbers is strict).
+            if let ExprKind::AnyCompare(op, x, y) = &mut e.kind
+                && let (ExprKind::Box(a), ExprKind::Box(b)) = (&x.kind, &y.kind)
+                && a.ty.is_number()
+                && b.ty.is_number()
+                && e.ty == Ty::Bool
+            {
+                let cmp = match op {
+                    AnyCmpOp::Lt => CmpOp::Lt,
+                    AnyCmpOp::Le => CmpOp::Le,
+                    AnyCmpOp::Gt => CmpOp::Gt,
+                    AnyCmpOp::Ge => CmpOp::Ge,
+                    AnyCmpOp::Eq | AnyCmpOp::StrictEq => CmpOp::Eq,
+                    AnyCmpOp::Ne | AnyCmpOp::StrictNe => CmpOp::Ne,
+                    AnyCmpOp::In | AnyCmpOp::InstanceOf => return,
+                };
+                let take = |x: &mut Box<Expr>| match std::mem::replace(&mut x.kind, ExprKind::Undefined) {
+                    ExprKind::Box(inner) => *inner,
+                    _ => unreachable!(),
+                };
+                let (a, b) = (take(x), take(y));
+                e.kind = ExprKind::Compare(cmp, Box::new(a), Box::new(b));
+                again = true;
                 return;
             }
             let ExprKind::AnyBinary(op, x, y) = &mut e.kind else { return };
