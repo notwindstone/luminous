@@ -1469,6 +1469,11 @@ clang, linking).
     and `length` are not peeked. `bench/effects.ts`'s loop over four
     configuration fields around a call: 322 instructions per iteration,
     now 284.
+  - **Array chains as one loop** (see the array callbacks above) need
+    callbacks that run no code; a summary cannot say that of a callback
+    reading its element's properties (any element could have a getter),
+    so the loop checks it as it goes (`Sure`) and gives up for the chain
+    as written at the first doubt, rather than relying on a summary.
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering
@@ -2091,7 +2096,7 @@ at 107MB, taking two to four times as long.
 
 ### Open performance work
 
-Five open-ended lines of work, each left at a finished, tested point, with
+Six open-ended lines of work, each left at a finished, tested point, with
 what would come next:
 
 - **LLVM code quality.** Most of the benchmarks above already run faster
@@ -2132,6 +2137,23 @@ what would come next:
   and the bodies of inlined methods. Next: regions that span calls to
   small methods of other objects (predicted and guarded), and regions over
   loops that call such methods.
+- **Effect summaries.** Every function's reads, writes, allocation,
+  exceptions and unseen code are known, with the engine's call counter
+  for what slow paths run: calls that cannot throw skip their exception
+  test, property reads and pure calls are reused across statements and
+  out of loops, and array chains run as one loop. Next: values a loop
+  reuses stay JS values, so arithmetic on a hoisted `config.scale` is
+  still boxed (a loop version for numbers, with the check made once,
+  belongs with argument types proven across the whole program); method
+  calls through a JS entry (`a.interest(2)` on a predicted receiver) still
+  box their arguments and result (direct calls, same work); chains of
+  `some`, `every`, `find`, `forEach` and `slice(a, b)`, callbacks with
+  statements, and a chain's result only iterated (`for (const x of
+  xs.filter(f))`) are not one loop yet; calls of interpreted fallbacks
+  count as unknown code. LLVM `memory(read)` / `willreturn` on functions
+  the summaries prove read-only changed no benchmark by more than 0.06%
+  (such functions are inlined, or their callers keep nothing in memory
+  across the calls), so it is not done.
 - **Garbage collector.** The engine's reference counting is replaced by a
   tracing, non-moving mark-sweep collector with generations (sticky mark
   bits and a write barrier), conservative stack roots and inline bump
