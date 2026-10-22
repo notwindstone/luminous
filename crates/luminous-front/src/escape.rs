@@ -550,7 +550,7 @@ fn summarize(m: &Module, g: usize, table: &Summaries, methods: &HashSet<usize>) 
 
 /// The strongly connected components of the call graph, callees first
 /// (Tarjan's algorithm).
-fn components(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
+pub(crate) fn components(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
     struct T<'a> {
         succ: &'a [Vec<usize>],
         index: Vec<Option<usize>>,

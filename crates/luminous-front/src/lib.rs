@@ -4,6 +4,7 @@
 pub mod builtins;
 pub mod bundle;
 pub mod check;
+pub mod effects;
 pub mod erase;
 pub mod escape;
 pub mod frames;
