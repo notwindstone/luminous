@@ -1,4 +1,4 @@
-// @native filterMap revenue count doubled logged mutating throwing withArray withIndex fields sorted
+// @native filterMap revenue count doubled logged mutating throwing withArray withIndex fields sorted aliased sliceReplaced speciesMidway
 // Chains of `filter` and `map` (ending with an array, `.length` or
 // `.reduce`) whose callbacks run no code are one loop (see src/chains.rs):
 // what they give, and what runs, is still what the chain as written gives
@@ -62,6 +62,49 @@ function sorted(xs: Item[]): number[] {
     .slice()
     .sort((a, b) => b.price - a.price || a.id - b.id)
     .map((x) => x.price);
+}
+
+// An array a local holds is copied by `slice`; one a callback replaces
+// `slice` or the species for is used as the replacement says.
+function aliased(xs: Item[]): string {
+  const a = xs.filter((x) => x.qty > 3);
+  const b = a.slice();
+  b.push(xs[0]);
+  return [a === b, a.length, b.length].join(",");
+}
+const originalSlice = Array.prototype.slice;
+function sliceReplaced(xs: Item[]): string {
+  const r = xs
+    .filter((x) => {
+      if (x.id === 2) {
+        (Array.prototype as any).slice = function (this: Item[]) {
+          log.push("slice!");
+          return originalSlice.call(this, 1);
+        };
+      }
+      return true;
+    })
+    .slice()
+    .map((x) => x.id);
+  Array.prototype.slice = originalSlice;
+  return r.join(",");
+}
+function speciesMidway(xs: Item[]): string {
+  const r = xs
+    .filter((x) => {
+      if (x.id === 1) {
+        Object.defineProperty(Array, Symbol.species, {
+          get() {
+            log.push("midway");
+            return Array;
+          },
+          configurable: true,
+        });
+      }
+      return true;
+    })
+    .map((x) => x.id * 2);
+  return r.join(",");
 }
 
 const items: Item[] = [];
@@ -131,6 +174,8 @@ try {
 }
 console.log("withArray", withArray(items.slice(0, 5)).join(","), "withIndex", withIndex(items.slice(0, 5)).join(","));
 
+console.log("aliased", aliased(items), "sliceReplaced", sliceReplaced(items.slice(0, 4)), log[log.length - 1]);
+
 // Replaced builtins: map, then reduce, then the species.
 const originalMap = Array.prototype.map;
 (Array.prototype as any).map = function (this: any[], f: any) {
@@ -154,3 +199,4 @@ Object.defineProperty(Array, Symbol.species, {
   configurable: true,
 });
 console.log("species", filterMap(items.slice(0, 3)).join(","), log.filter((s) => s === "species").length);
+console.log("speciesMidway", speciesMidway(items.slice(0, 4)), log.filter((s) => s === "midway").length);

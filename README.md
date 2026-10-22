@@ -1377,7 +1377,15 @@ clang, linking).
   `bench/chains.ts`'s `filter`→`map`, `map`→`reduce` and
   `filter`→`map`→`.length` over 2000 records: 1.28G instructions, now
   0.68G (the engine's `reduce` and its callback calls gone), 67 ms to
-  47.
+  47. A chain that is not one loop still makes fewer arrays: the array
+  a `filter`, `map`, `sort` or `slice()` gives straight to the next call
+  (not through a variable) is held by nothing else when the Array
+  constructor made it, so `slice()` of it is that array itself, and
+  `map` over it (with a callback that does not take the array) writes
+  its results in its place, where `slice` and `map` are the original
+  builtins and making an array of its species runs no code (no one could
+  tell); `sort` sorts in place anyway. `bench/chains.ts`'s
+  `filter`→`slice`→`sort`→`map`: 11% fewer instructions outside the sort.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing is sorted
   by a merge sort compiled per comparator (the engine's stable algorithm:
   insertion sorts of up to 8 elements, halves merged), which runs a copy

@@ -740,6 +740,8 @@ struct Codegen {
     promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     /// The atom `parse`, if used.
     json_parse: Option<ir::AtomId>,
+    /// The atom `slice`, if used.
+    array_slice: Option<ir::AtomId>,
     methods: std::rc::Rc<HashMap<ir::AtomId, lower::Method>>,
     frame_pins: std::rc::Rc<HashMap<ir::AtomId, i32>>,
     nothrow: std::rc::Rc<Vec<bool>>,
@@ -877,6 +879,7 @@ impl Codegen {
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
             json_parse: m.atoms.iter().position(|a| a == "parse"),
+            array_slice: m.atoms.iter().position(|a| a == "slice"),
             nothrow: std::rc::Rc::new(luminous_front::effects::summaries(m).nothrow),
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
@@ -940,6 +943,7 @@ impl Codegen {
             value_captures: self.value_captures.clone(),
             promise_resolve: self.promise_resolve,
             json_parse: self.json_parse,
+            array_slice: self.array_slice,
             methods: self.methods.clone(),
             frame_pins: self.frame_pins.clone(),
             nothrow: self.nothrow.clone(),

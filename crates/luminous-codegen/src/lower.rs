@@ -297,6 +297,22 @@ const IC_PROTO_GETTER: i64 = 2;
 /// `LUM_IC_ABSENT`: a property no object of `alt_shape` has (nor its
 /// prototypes); read as `undefined` while the epoch holds.
 const IC_ABSENT: i64 = 11;
+/// `lum_chain_ok`'s bits for `slice` and `reduce` (after `LoopKind`'s).
+const CHAIN_SLICE: i64 = 7;
+const CHAIN_REDUCE: i64 = 8;
+
+/// Whether `e` gives an array that only the expression it is in holds,
+/// when the Array constructor made it: a `filter`, `map`, `sort` or
+/// `slice()` call (`fresh_of`).
+fn direct_array(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::ArrayLoop { kind, .. } => matches!(kind, LoopKind::Map | LoopKind::Filter),
+        ExprKind::ArraySort { .. } => true,
+        ExprKind::CallMethod(_, Key::Atom(_), args) => args.is_empty(),
+        _ => false,
+    }
+}
+
 /// What `typeof` gives, by the index `typeof_is` and `typeof_any` use.
 pub(crate) const TYPEOF_NAMES: [&str; 8] =
     ["undefined", "number", "string", "boolean", "symbol", "bigint", "object", "function"];
@@ -347,6 +363,8 @@ pub(crate) struct Env {
     pub promise_resolve: Option<(ir::AtomId, ir::AtomId)>,
     /// The atom `parse`, if used (`JSON.parse` converted to an `aot type`).
     pub json_parse: Option<ir::AtomId>,
+    /// The atom `slice`, if used.
+    pub array_slice: Option<ir::AtomId>,
     /// Atoms naming builtin methods with fast paths.
     pub methods: std::rc::Rc<HashMap<ir::AtomId, Method>>,
     /// Atoms naming the builtins frame objects may be given, and their
@@ -416,6 +434,11 @@ pub(crate) struct Lower {
     /// payload, so arithmetic on boxed numbers needs no boxing in between
     /// (the boxing is left unused).
     num_shadow: HashMap<Value, Value>,
+    /// Arrays that `filter`, `map`, `sort` or `slice` gave to an expression
+    /// that is the receiver of another such call (`direct_array`): whether
+    /// the Array constructor made them (an `I8`), so that no other code
+    /// holds them.
+    fresh_of: HashMap<Value, Value>,
     /// For a JS value made where it may or may not be a number (a binary
     /// operation's result: numbers but from its slow path), an `I8` that
     /// says whether it is one (constant on the number paths, so that tests
@@ -612,6 +635,7 @@ impl Lower {
             shadows,
             code_vars,
             num_shadow: HashMap::new(),
+            fresh_of: HashMap::new(),
             num_known: HashMap::new(),
             fn_entries: HashMap::new(),
             spec_src: HashMap::new(),
@@ -4063,6 +4087,16 @@ impl Lower {
                 }
                 let (obj, owned) = self.operand(o, &later);
                 let ow = obj.any();
+                if let Key::Atom(a) = key
+                    && Some(*a) == self.env.array_slice
+                    && args.is_empty()
+                    && direct_array(o)
+                    && let Some(&fresh) = self.fresh_of.get(&ow)
+                {
+                    let r = self.slice_fresh(ow, fresh, *a, obj, pred);
+                    self.drop_operand(obj, owned);
+                    return r;
+                }
                 let method = match key {
                     Key::Atom(a) if pred.is_empty() => self.env.methods.get(a).copied(),
                     _ => None,
@@ -5355,8 +5389,17 @@ impl Lower {
         let ctx = self.ctx;
         let join = self.b.create_block();
         let rw = self.b.append_block_param(join, I64);
+        // (Whether the Array constructor made the result: see `fresh_of`.)
+        let rf = self.b.append_block_param(join, I8);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
+        // A `map` of an array only this expression holds, whose callback
+        // does not take the array: the results go in its place.
+        let in_place = if kind == LoopKind::Map && direct_array(recv) && self.env.params[func].len() <= 2 {
+            self.fresh_of.get(&ow).copied()
+        } else {
+            None
+        };
         // The original builtin, an array, no holes.
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
         let orig = self.b.ins().load(I64, M_CONST, table, (PIN_ARRAY_LOOPS + kind as i32) * 8);
@@ -5372,20 +5415,42 @@ impl Lower {
         // The result array (`map`: with room for every element), and
         // whether the Array constructor made it itself: then no other code
         // holds it, and an element goes where there is room.
-        let (out, fresh) = match kind {
+        let (out, fresh, placed) = match kind {
             LoopKind::Map | LoopKind::Filter => {
+                // (In place where making an array of its species runs no
+                // code: no one could tell.)
+                let made_blk = self.b.create_block();
+                let out = self.b.append_block_param(made_blk, I64);
+                let fresh = self.b.append_block_param(made_blk, I8);
+                let placed = self.b.append_block_param(made_blk, I8);
+                if let Some(rf) = in_place {
+                    let none = self.b.ins().iconst(I32, 0);
+                    let ok = self.helper("lum_chain_ok", &[ctx, ow, none])[0];
+                    let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+                    let go = self.b.ins().band(rf, ok);
+                    let same = self.b.create_block();
+                    let mk = self.b.create_block();
+                    self.b.ins().brif(go, same, &[], mk, &[]);
+                    self.b.switch_to_block(same);
+                    let yes = self.b.ins().iconst(I8, 1);
+                    self.b.ins().jump(made_blk, &[BlockArg::Value(ow), BlockArg::Value(yes), BlockArg::Value(yes)]);
+                    self.b.switch_to_block(mk);
+                }
                 let n = if kind == LoopKind::Map { len } else { self.b.ins().iconst(I64, -1) };
                 let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
                 let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
                 let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, ow, n, addr]);
                 self.check_value(r[0]);
                 let made = self.b.ins().stack_load(self.ptr, I32, slot, 0);
-                let fresh = self.b.ins().icmp_imm_s(IntCC::NotEqual, made, 0);
-                let a = V::Any(r[0]);
+                let made = self.b.ins().icmp_imm_s(IntCC::NotEqual, made, 0);
+                let no = self.b.ins().iconst(I8, 0);
+                self.b.ins().jump(made_blk, &[BlockArg::Value(r[0]), BlockArg::Value(made), BlockArg::Value(no)]);
+                self.b.switch_to_block(made_blk);
+                let a = V::Any(out);
                 self.hold(a);
-                (Some(a), Some(fresh))
+                (Some(a), Some(fresh), in_place.map(|_| placed))
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         let head = self.b.create_block();
         let k = self.b.append_block_param(head, I64);
@@ -5518,6 +5583,18 @@ impl Lower {
                     self.release(v);
                     self.free_v(v);
                 }
+                if let Some(placed) = placed {
+                    // (Element `k` read already.)
+                    let store = self.b.create_block();
+                    let append = self.b.create_block();
+                    self.b.ins().brif(placed, store, &[], append, &[]);
+                    self.b.switch_to_block(store);
+                    let at = self.array_slot(op_, k);
+                    self.b.ins().store(M_SLOT, resw, at, 0);
+                    self.write_barrier(op_, resw);
+                    self.b.ins().jump(next, &[BlockArg::Value(k1), BlockArg::Value(n)]);
+                    self.b.switch_to_block(append);
+                }
                 let define = self.b.create_block();
                 self.b.set_cold_block(define);
                 // (Its `length` is the source's already.)
@@ -5586,7 +5663,11 @@ impl Lower {
             // (The result: the array, now the expression's.)
             self.release(a);
         }
-        self.b.ins().jump(join, &[BlockArg::Value(dw)]);
+        let df = match fresh {
+            Some(f) => f,
+            None => self.b.ins().iconst(I8, 0),
+        };
+        self.b.ins().jump(join, &[BlockArg::Value(dw), BlockArg::Value(df)]);
         // Otherwise a call, with the callback.
         self.b.switch_to_block(slow);
         let cb = self.expr(callback);
@@ -5600,11 +5681,48 @@ impl Lower {
         self.check_value(gw);
         self.release(cb);
         self.free_v(cb);
-        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
+        let no = self.b.ins().iconst(I8, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(gw), BlockArg::Value(no)]);
         self.b.switch_to_block(join);
         self.release(f);
         self.free_v(f);
         self.drop_operand(obj, owned);
+        if matches!(kind, LoopKind::Map | LoopKind::Filter) {
+            self.fresh_of.insert(rw, rf);
+        }
+        V::Any(rw)
+    }
+
+    /// `a.slice()` of an array `a` that only this expression holds
+    /// (`fresh`, see `fresh_of`): `a` itself where `slice` is the original
+    /// builtin and making an array of `a`'s species runs no code (no one
+    /// could tell a copy from it); else the call.
+    fn slice_fresh(&mut self, ow: Value, fresh: Value, a: ir::AtomId, obj: V, pred: Vec<Pred>) -> V {
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let rf = self.b.append_block_param(join, I8);
+        let bits = self.b.ins().iconst(I32, 1 << CHAIN_SLICE);
+        let ok = self.helper("lum_chain_ok", &[ctx, ow, bits])[0];
+        let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+        let go = self.b.ins().band(fresh, ok);
+        let keep = self.b.create_block();
+        let call = self.b.create_block();
+        self.b.ins().brif(go, keep, &[], call, &[]);
+        self.b.switch_to_block(keep);
+        self.dup(ow);
+        let yes = self.b.ins().iconst(I8, 1);
+        self.b.ins().jump(join, &[BlockArg::Value(ow), BlockArg::Value(yes)]);
+        self.b.switch_to_block(call);
+        let mw = self.method_get(ow, a);
+        self.check_value(mw);
+        let fv = V::Any(mw);
+        self.hold(fv);
+        let r = self.call_values(fv, obj, &[], pred).any();
+        let no = self.b.ins().iconst(I8, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(r), BlockArg::Value(no)]);
+        self.b.switch_to_block(join);
+        self.fresh_of.insert(rw, rf);
         V::Any(rw)
     }
 
@@ -5621,10 +5739,10 @@ impl Lower {
         let rw = self.b.append_block_param(join, I64);
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
-        // The methods: by `LoopKind` (bits 0-6), `reduce` (bit 8).
+        // The methods: by `LoopKind`, and `reduce` (see `lum_chain_ok`).
         let mut methods = stages.iter().fold(0i64, |m, s| m | (1 << s.kind as i64));
         if let ir::ChainEnd::Reduce { .. } = end {
-            methods |= 1 << 8;
+            methods |= 1 << CHAIN_REDUCE;
         }
         let methods = self.b.ins().iconst(I32, methods);
         let ok = self.helper("lum_chain_ok", &[ctx, ow, methods])[0];
@@ -5781,6 +5899,12 @@ impl Lower {
         let ctx = self.ctx;
         let join = self.b.create_block();
         let rw = self.b.append_block_param(join, I64);
+        // (`sort` gives the array: as fresh as it was, see `fresh_of`.)
+        let rf = self.b.append_block_param(join, I8);
+        let fresh = match direct_array(recv) {
+            true => self.fresh_of.get(&ow).copied(),
+            false => None,
+        };
         let slow = self.b.create_block();
         self.b.set_cold_block(slow);
         let table = self.b.ins().symbol_value(self.ptr, self.env.shapes);
@@ -5801,7 +5925,11 @@ impl Lower {
         self.b.switch_to_block(sorted);
         // (`sort` returns the array.)
         self.dup(ow);
-        self.b.ins().jump(join, &[BlockArg::Value(ow)]);
+        let f0 = match fresh {
+            Some(f) => f,
+            None => self.b.ins().iconst(I8, 0),
+        };
+        self.b.ins().jump(join, &[BlockArg::Value(ow), BlockArg::Value(f0)]);
         self.b.switch_to_block(slow);
         let cb = self.expr(callback);
         self.hold(cb);
@@ -5814,11 +5942,13 @@ impl Lower {
         self.check_value(gw);
         self.release(cb);
         self.free_v(cb);
-        self.b.ins().jump(join, &[BlockArg::Value(gw)]);
+        let no = self.b.ins().iconst(I8, 0);
+        self.b.ins().jump(join, &[BlockArg::Value(gw), BlockArg::Value(no)]);
         self.b.switch_to_block(join);
         self.release(f);
         self.free_v(f);
         self.drop_operand(obj, owned);
+        self.fresh_of.insert(rw, rf);
         V::Any(rw)
     }
 
