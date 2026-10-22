@@ -415,7 +415,8 @@ pub fn check<'a>(
             // (What functions do with the objects passed to them, before
             // their number fields are speculated on: the same fields.)
             let uses = crate::escape::summaries(&module);
-            crate::spec::speculate_numbers(&mut module);
+            let effects = crate::effects::summaries(&module);
+            crate::spec::speculate_numbers(&mut module, &effects);
             crate::frames::frame_objects(&mut module, &uses);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };

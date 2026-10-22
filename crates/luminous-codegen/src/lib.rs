@@ -872,7 +872,7 @@ impl Codegen {
                 .position(|a| a == "Promise")
                 .zip(m.atoms.iter().position(|a| a == "resolve")),
             json_parse: m.atoms.iter().position(|a| a == "parse"),
-            nothrow: std::rc::Rc::new(m.funcs.iter().map(ir::nothrow_leaf).collect()),
+            nothrow: std::rc::Rc::new(luminous_front::effects::summaries(m).nothrow),
             methods: std::rc::Rc::new(
                 m.atoms.iter().enumerate().filter_map(|(i, a)| lower::Method::named(a).map(|k| (i, k))).collect(),
             ),
@@ -1166,7 +1166,8 @@ impl Codegen {
         if borrowed {
             l.borrow_params(f);
         }
-        // (A leaf adds one frame: the caller's check covers it.)
+        // (A function that cannot throw adds a bounded number of frames:
+        // its caller's check covers them, see `effects::Summaries::nothrow`.)
         if !leaf {
             l.stack_check();
         }

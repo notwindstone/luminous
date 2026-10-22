@@ -349,7 +349,8 @@ pub(crate) struct Env {
     /// Atoms naming the builtins frame objects may be given, and their
     /// originals' `lum_shapes` slots (see `frame_pin`).
     pub frame_pins: std::rc::Rc<HashMap<ir::AtomId, i32>>,
-    /// Per function: it can neither throw nor call (see `nothrow_leaf`).
+    /// Per function: a call of it cannot throw (see
+    /// `effects::Summaries::nothrow`): no exception test after it.
     pub nothrow: std::rc::Rc<Vec<bool>>,
     /// JS entries (`lum_fast_<i>`), by `FuncId`.
     pub fast: Vec<FuncRef>,

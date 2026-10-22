@@ -38,7 +38,8 @@ const MIN_ACCESSES: usize = 2;
 const MIN_WORK: usize = 4;
 const MIN_PURE_WORK: usize = 6;
 
-pub fn speculate_numbers(m: &mut Module) {
+/// `effects`: the module's effect summaries (`effects::summaries`).
+pub fn speculate_numbers(m: &mut Module, effects: &crate::effects::Summaries) {
     let nums: Vec<Vec<bool>> = m.records.iter().map(|r| r.nums.clone()).collect();
     let rets: Vec<Ty> = m.funcs.iter().chain(&m.closures).map(|f| f.ret).collect();
     let methods = Methods {
@@ -47,9 +48,27 @@ pub fn speculate_numbers(m: &mut Module) {
         records: m.class_records.clone(),
         fields: m.records.iter().map(|r| r.fields.clone()).collect(),
     };
-    // Native functions a region may call: they can neither throw nor call.
-    let leaves: Vec<Option<(Vec<Ty>, Ty)>> =
-        m.funcs.iter().map(|f| nothrow_leaf(f).then(|| (f.params.clone(), f.ret))).collect();
+    // Native functions a region may call: they cannot throw, and neither
+    // read nor write anything (but their arguments), so they see nothing
+    // the region defers.
+    let leaves: Vec<Option<(Vec<Ty>, Ty)>> = m
+        .funcs
+        .iter()
+        .chain(&m.closures)
+        .enumerate()
+        .map(|(g, f)| {
+            let e = &effects.funcs[g];
+            let numbers = |t: &Ty| matches!(t, Ty::F64 | Ty::I32 | Ty::Bool);
+            (effects.nothrow[g]
+                && e.quiet()
+                && e.reads.is_empty()
+                && e.writes.is_empty()
+                && !e.allocates
+                && f.params.iter().all(numbers)
+                && (numbers(&f.ret) || f.ret == Ty::Void))
+                .then(|| (f.params.clone(), f.ret))
+        })
+        .collect();
     let atoms = std::mem::take(&mut m.atoms);
     for f in m.funcs.iter_mut().chain(m.closures.iter_mut()) {
         if f.is_async || f.is_generator {
@@ -208,8 +227,8 @@ struct Cx<'a> {
     /// Whether the statements being made into regions may read `this`
     /// (a method's, or a predicted call's receiver in its body).
     this: bool,
-    /// Per module function: its parameter and return types if it is a
-    /// leaf (see `nothrow_leaf`).
+    /// Per function: its parameter and return types if a region may call
+    /// it (see `speculate_numbers`).
     leaves: &'a [Option<(Vec<Ty>, Ty)>],
     next_loop: LoopId,
     /// Whether regions made now may allocate (`RegionPush`): in the
