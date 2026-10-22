@@ -110,7 +110,10 @@ JSValue lum_await(JSContext *ctx, JSValue *slots, JSValue value, int state);
 /* Object.values, Object.entries (what frame objects may be given). */
 #define LUM_PIN_OBJECT_VALUES 51
 #define LUM_PIN_OBJECT_ENTRIES 52
-#define LUM_PINS 53
+/* Array.prototype.reduce, slice (array method chains, see lum_chain_ok). */
+#define LUM_PIN_ARRAY_REDUCE 53
+#define LUM_PIN_ARRAY_SLICE 54
+#define LUM_PINS 55
 /* The properties a new empty object (`{}`, Object.create) has room for in
  * its cell: up to as many are added without moving them. */
 #define LUM_OBJECT_ROOM 4
@@ -226,6 +229,7 @@ JSValue lum_new_closure(JSContext *ctx, LumFnCache *c, JSCFunctionFast *fast, JS
                           const char *name, int length, int magic, int n, JSValue *data, int kind);
 JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 JSValue lum_ic_peek(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
+int lum_chain_ok(JSContext *ctx, JSValue arr, int methods);
 int lum_instanceof(JSContext *ctx, JSValue v, JSValue ctor, LumIC *ic);
 JSValue lum_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 void lum_record_learn(JSContext *ctx, JSValue obj, int r);

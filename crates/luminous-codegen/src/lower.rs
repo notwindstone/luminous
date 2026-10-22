@@ -453,6 +453,8 @@ pub(crate) struct Lower {
     temps: Vec<Value>,
     /// Innermost-last exception handler blocks.
     handlers: Vec<Block>,
+    /// Where an `ArrayChain`'s loop stops (`Sure`), innermost last.
+    chain_bail: Vec<Block>,
     scopes: Vec<Scope>,
     /// Exception edges: (block, temporaries to free, handler).
     pending: Vec<ExceptionEdge>,
@@ -622,6 +624,7 @@ impl Lower {
             poly_site: false,
             temps: Vec::new(),
             handlers: Vec::new(),
+            chain_bail: Vec::new(),
             scopes: Vec::new(),
             pending: Vec::new(),
             exc_exit,
@@ -2716,6 +2719,28 @@ impl Lower {
                 self.array_loop(*kind, recv, *method, callback, *func, body, locals)
             }
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
+            ExprKind::ArrayChain { recv, stages, end, whole } => self.array_chain(*recv, stages, end, whole),
+            ExprKind::Sure(x, sure) => {
+                let bail = *self.chain_bail.last().expect("`Sure` in an `ArrayChain`'s stage");
+                let w = self.expr(x).any();
+                // (A number boxed here: that number.)
+                if *sure == ir::Sure::Number
+                    && let Some(&d) = self.num_shadow.get(&w)
+                {
+                    return V::Num(d);
+                }
+                let ok = match sure {
+                    ir::Sure::Peeked => self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNINITIALIZED, 0)),
+                    ir::Sure::Number => self.is_number(w),
+                };
+                let cont = self.b.create_block();
+                self.b.ins().brif(ok, cont, &[], bail, &[]);
+                self.b.switch_to_block(cont);
+                match sure {
+                    ir::Sure::Peeked => V::Any(w),
+                    ir::Sure::Number => V::Num(self.number_of(w)),
+                }
+            }
             ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
             ExprKind::CallEpoch => {
                 let i = self.call_epoch();
@@ -5580,6 +5605,166 @@ impl Lower {
         self.release(f);
         self.free_v(f);
         self.drop_operand(obj, owned);
+        V::Any(rw)
+    }
+
+    /// `ArrayChain`: the stages over each element of the array in `recv`
+    /// in one loop, while it is an array without holes whose methods are
+    /// the original builtins and whose species is `Array`
+    /// (`lum_chain_ok`), and while the stages' values need no code to run
+    /// (`Sure`); else `whole` from the start (nothing the loop did could be
+    /// seen: its result is not kept).
+    fn array_chain(&mut self, recv: ir::LocalId, stages: &[ir::ChainStage], end: &ir::ChainEnd, whole: &Expr) -> V {
+        let ow = self.use_local(recv).any();
+        let ctx = self.ctx;
+        let join = self.b.create_block();
+        let rw = self.b.append_block_param(join, I64);
+        let slow = self.b.create_block();
+        self.b.set_cold_block(slow);
+        // The methods: by `LoopKind` (bits 0-6), `reduce` (bit 8).
+        let mut methods = stages.iter().fold(0i64, |m, s| m | (1 << s.kind as i64));
+        if let ir::ChainEnd::Reduce { .. } = end {
+            methods |= 1 << 8;
+        }
+        let methods = self.b.ins().iconst(I32, methods);
+        let ok = self.helper("lum_chain_ok", &[ctx, ow, methods])[0];
+        let ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, ok, 0);
+        let array = self.b.create_block();
+        self.b.ins().brif(ok, array, &[], slow, &[]);
+        self.b.switch_to_block(array);
+        // (Its class and shape checked: an array without own properties
+        // but `length`.)
+        let p = self.val_ptr(ow);
+        let len = self.b.ins().uload32(M_HEADER, p, layout::OBJ_ARRAY_COUNT);
+        let length = self.array_length(p);
+        let dense = self.b.ins().icmp(IntCC::Equal, len, length);
+        let fast = self.b.create_block();
+        self.b.ins().brif(dense, fast, &[], slow, &[]);
+        self.b.switch_to_block(fast);
+        // The result array: with room for every element without a filter.
+        let out = match end {
+            ir::ChainEnd::Array => {
+                let all = stages.iter().all(|s| s.kind == LoopKind::Map);
+                let n = if all { len } else { self.b.ins().iconst(I64, -1) };
+                let slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+                let addr = self.b.ins().stack_addr(self.ptr, slot, 0);
+                let r = self.helper("JS_ArraySpeciesCreateRoom", &[ctx, ow, n, addr]);
+                self.check_value(r[0]);
+                Some(r[0])
+            }
+            _ => None,
+        };
+        // The accumulator: a number throughout where `init` and the
+        // callback's value are numbers (then kept as one), else a JS value.
+        let boxed_number = |x: &Expr| matches!(&x.kind, ExprKind::Box(n) if n.ty == Ty::F64);
+        let numeric = matches!(end, ir::ChainEnd::Reduce { value, init, .. }
+            if boxed_number(value) && (init.ty == Ty::F64 || boxed_number(init)));
+        let acc_ty = if numeric { F64 } else { I64 };
+        let acc0 = match end {
+            ir::ChainEnd::Reduce { init, .. } => {
+                let v = self.expr(init);
+                if numeric {
+                    match v {
+                        V::Num(d) => d,
+                        V::Any(w) => self.number_of(w),
+                        _ => unreachable!("a number"),
+                    }
+                } else {
+                    self.boxed(v)
+                }
+            }
+            _ => self.konst(0, TAG_UNDEFINED).any(),
+        };
+        let head = self.b.create_block();
+        let k = self.b.append_block_param(head, I64);
+        let n = self.b.append_block_param(head, I64);
+        let acc = self.b.append_block_param(head, acc_ty);
+        let zero = self.b.ins().iconst(I64, 0);
+        self.b.ins().jump(head, &[BlockArg::Value(zero), BlockArg::Value(zero), BlockArg::Value(acc0)]);
+        self.b.switch_to_block(head);
+        let done = self.b.create_block();
+        let step = self.b.create_block();
+        let more = self.b.ins().icmp(IntCC::SignedLessThan, k, len);
+        self.b.ins().brif(more, step, &[], done, &[]);
+        self.b.switch_to_block(step);
+        let k1 = self.b.ins().iadd_imm_s(k, 1);
+        let at = self.array_slot(p, k);
+        let mut v = self.b.ins().load(I64, M_SLOT, at, 0);
+        self.chain_bail.push(slow);
+        for s in stages {
+            if let Some(l) = s.param {
+                self.init_local(l, V::Any(v));
+            }
+            let r = self.expr(&s.value);
+            match s.kind {
+                LoopKind::Filter => {
+                    let keep = match r {
+                        V::Bool(b) => b,
+                        other => {
+                            let w = self.boxed(other);
+                            self.truthy_any(w)
+                        }
+                    };
+                    let kept = self.b.create_block();
+                    self.b.ins().brif(
+                        keep,
+                        kept,
+                        &[],
+                        head,
+                        &[BlockArg::Value(k1), BlockArg::Value(n), BlockArg::Value(acc)],
+                    );
+                    self.b.switch_to_block(kept);
+                }
+                _ => v = self.boxed(r),
+            }
+        }
+        let n1 = self.b.ins().iadd_imm_s(n, 1);
+        match end {
+            ir::ChainEnd::Array => {
+                let aw = out.unwrap();
+                let next = self.b.create_block();
+                let define = self.b.create_block();
+                self.b.set_cold_block(define);
+                let yes = self.b.ins().iconst(I8, 1);
+                self.append_fresh(yes, aw, n, v, true, next, &[]);
+                self.append_inline(aw, Some(n), v, true, define);
+                self.b.ins().jump(next, &[]);
+                self.b.switch_to_block(define);
+                let r = self.helper("JS_DefineElement", &[ctx, aw, n, v]);
+                self.check_int(r[0]);
+                self.b.ins().jump(next, &[]);
+                self.b.switch_to_block(next);
+                self.b.ins().jump(head, &[BlockArg::Value(k1), BlockArg::Value(n1), BlockArg::Value(acc)]);
+            }
+            ir::ChainEnd::Length => {
+                self.b.ins().jump(head, &[BlockArg::Value(k1), BlockArg::Value(n1), BlockArg::Value(acc)]);
+            }
+            ir::ChainEnd::Reduce { acc: al, elem, value, .. } => {
+                if let Some(l) = *al {
+                    let w = if numeric { self.box_number(acc) } else { acc };
+                    self.init_local(l, V::Any(w));
+                }
+                if let Some(l) = *elem {
+                    self.init_local(l, V::Any(v));
+                }
+                let r = self.expr(value);
+                let a1 = if numeric { self.number_of(r.any()) } else { self.boxed(r) };
+                self.b.ins().jump(head, &[BlockArg::Value(k1), BlockArg::Value(n), BlockArg::Value(a1)]);
+            }
+        }
+        self.chain_bail.pop();
+        self.b.switch_to_block(done);
+        let result = match end {
+            ir::ChainEnd::Array => out.unwrap(),
+            ir::ChainEnd::Length => self.mk_int(n),
+            ir::ChainEnd::Reduce { .. } if numeric => self.box_number(acc),
+            ir::ChainEnd::Reduce { .. } => acc,
+        };
+        self.b.ins().jump(join, &[BlockArg::Value(result)]);
+        self.b.switch_to_block(slow);
+        let w = self.expr(whole).any();
+        self.b.ins().jump(join, &[BlockArg::Value(w)]);
+        self.b.switch_to_block(join);
         V::Any(rw)
     }
 

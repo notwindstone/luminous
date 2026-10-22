@@ -326,7 +326,10 @@ fn node(e: &Expr, cx: &Cx) -> Effects {
         | K::StrCharCode { .. }
         | K::CallEpoch
         // (Its read, a child, when made.)
-        | K::Reuse { .. } => Effects::default(),
+        | K::Reuse { .. }
+        // (Their parts are children.)
+        | K::ArrayChain { .. }
+        | K::Sure(..) => Effects::default(),
         K::Peek { base, atom } => {
             let mut x = Effects::default();
             x.reads.fields.insert(*atom);

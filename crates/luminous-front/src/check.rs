@@ -418,6 +418,7 @@ pub fn check<'a>(
             let effects = crate::effects::summaries(&module);
             crate::spec::speculate_numbers(&mut module, &effects);
             crate::frames::frame_objects(&mut module, &uses);
+            crate::chains::fuse_chains(&mut module);
             // (Of the code as it is now: clones and guards included.)
             let effects = crate::effects::summaries(&module);
             crate::reuse::reuse_reads(&mut module, &effects);

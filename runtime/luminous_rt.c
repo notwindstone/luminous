@@ -366,6 +366,18 @@ static int lum_sarr_init(JSContext *ctx);
 /* `Symbol.iterator` and `next`, made with the pins. */
 static JSAtom lum_atom_iterator = JS_ATOM_NULL, lum_atom_next = JS_ATOM_NULL, lum_atom_string_length = JS_ATOM_NULL,
               lum_atom_char_code_at = JS_ATOM_NULL, lum_atom_push = JS_ATOM_NULL;
+/* The names of the methods of array chains (lum_chain_ok): by LoopKind,
+   then `slice` and `reduce`. */
+#define LUM_CHAIN_METHODS 9
+static const char *const lum_chain_names[LUM_CHAIN_METHODS] = {
+    "forEach", "map", "filter", "some", "every", "find", "findIndex", "slice", "reduce",
+};
+static const int lum_chain_pins[LUM_CHAIN_METHODS] = {
+    LUM_PIN_ARRAY_LOOPS, LUM_PIN_ARRAY_LOOPS + 1, LUM_PIN_ARRAY_LOOPS + 2, LUM_PIN_ARRAY_LOOPS + 3,
+    LUM_PIN_ARRAY_LOOPS + 4, LUM_PIN_ARRAY_LOOPS + 5, LUM_PIN_ARRAY_LOOPS + 6, LUM_PIN_ARRAY_SLICE,
+    LUM_PIN_ARRAY_REDUCE,
+};
+static JSAtom lum_chain_atoms[LUM_CHAIN_METHODS];
 /* `length`, for arrays of `aot type` objects. */
 static JSAtom lum_atom_length = JS_ATOM_NULL;
 
@@ -455,6 +467,10 @@ static void lum_state_finalizer(JSRuntime *rt, JSValueConst val)
     JS_FreeAtomRT(rt, lum_atom_next);
     JS_FreeAtomRT(rt, lum_atom_string_length);
     JS_FreeAtomRT(rt, lum_atom_char_code_at);
+    for (int k = 0; k < LUM_CHAIN_METHODS; k++) {
+        JS_FreeAtomRT(rt, lum_chain_atoms[k]);
+        lum_chain_atoms[k] = JS_ATOM_NULL;
+    }
     JS_FreeAtomRT(rt, lum_atom_push);
     lum_atom_iterator = lum_atom_next = lum_atom_string_length = lum_atom_char_code_at = JS_ATOM_NULL;
     lum_atom_push = JS_ATOM_NULL;
@@ -835,7 +851,8 @@ int lum_lock_builtins(JSContext *ctx)
         "             g.Map.prototype.get, g.Map.prototype.set, g.Map.prototype.has, g.Set.prototype.add,\n"
         "             g.Set.prototype.has, g.JSON.stringify, g.JSON.parse,\n"
         "             g.Object.keys, g.Object.create, g.String.prototype.lastIndexOf,\n"
-        "             g.Object.values, g.Object.entries);\n"
+        "             g.Object.values, g.Object.entries, g.Array.prototype.reduce,\n"
+        "             g.Array.prototype.slice);\n"
         "  fresh.push(protos);\n"
         "  return fresh;\n"
         "})(globalThis);\n";
@@ -872,8 +889,29 @@ int lum_lock_builtins(JSContext *ctx)
     lum_atom_string_length = JS_NewAtom(ctx, "length");
     lum_atom_char_code_at = JS_NewAtom(ctx, "charCodeAt");
     lum_atom_push = JS_NewAtom(ctx, "push");
+    for (i = 0; i < LUM_CHAIN_METHODS; i++)
+        lum_chain_atoms[i] = JS_NewAtom(ctx, lum_chain_names[i]);
     JS_FreeValue(ctx, r);
     return 0;
+}
+
+/* Whether making arrays of the species of `arr` runs no code (an array of
+ * the initial shape, see JS_ArraySpeciesPristine) and the methods
+ * `methods` names (bits, by lum_chain_names) are the original builtins:
+ * those of %Array.prototype%, its prototype, as data properties. Then a
+ * chain of them over it (and over the arrays it makes, of the same shape)
+ * is one loop. */
+int lum_chain_ok(JSContext *ctx, JSValue arr, int methods)
+{
+    int i;
+    if (!JS_ArraySpeciesPristine(ctx, arr))
+        return 0;
+    for (i = 0; i < LUM_CHAIN_METHODS; i++) {
+        if ((methods & (1 << i)) &&
+            !JS_OwnDataIs(ctx, lum_pins[LUM_PIN_ARRAY_PROTO], lum_chain_atoms[i], lum_pins[lum_chain_pins[i]]))
+            return 0;
+    }
+    return 1;
 }
 
 /* ---- inline caches ---- */

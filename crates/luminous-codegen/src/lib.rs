@@ -577,6 +577,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_get_elem_ic", &[P, W, W, P], &[W]),
         ("lum_ic_get", &[P, W, Int, P], &[W]),
         ("lum_ic_peek", &[P, W, Int, P], &[W]),
+        ("lum_chain_ok", &[P, W, Int], &[Int]),
         ("lum_plain_add_ok", &[P, P, Int], &[Int]),
         ("lum_null_object", &[P], &[W]),
         ("JS_GetIteratorObject", &[P, W, Int], &[W]),

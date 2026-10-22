@@ -151,8 +151,9 @@ regular call path's generated code alone.
 `0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
 `0033-symbol-key-fast-paths.patch`,
 `0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch`,
-`0036-proxy-own-shape.patch`, `0037-frame-objects.patch` and
-`0038-call-epoch-and-peek.patch`, each made
+`0036-proxy-own-shape.patch`, `0037-frame-objects.patch`,
+`0038-call-epoch-and-peek.patch` and `0039-array-species-pristine.patch`,
+each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -1356,6 +1357,27 @@ clang, linking).
   constructor made the result itself (no species constructor ran), no
   other code holds it, so an element is stored wherever there is room,
   with no other check.
+  **Chains** of them, `filter` and `map` ending with an array, `.length`
+  or `.reduce(f, init)` (`crates/luminous-front/src/chains.rs`), are one
+  loop that takes each element through every callback and makes no
+  arrays in between (none at all for `.length` and `reduce`, whose
+  accumulator stays an unboxed number when it is one), when the
+  callbacks are made of what cannot run code: their parameter, reads of
+  its properties, arithmetic and comparisons of numbers, constants. The
+  loop runs while the receiver is an array without holes, of the
+  initial shape (no own properties but `length`), whose species is
+  `Array` and whose methods are the original builtins
+  (`lum_chain_ok`: nothing in between could run code), and while each
+  property it reads is a data property it can read without running code
+  (`Peek`) and each value it computes with is a number (`Sure`); at the
+  first one that is not (a getter, a proxy, a string), it stops and the
+  chain as written runs from the start, which nothing can tell from the
+  loop not having run. Callbacks that do anything else (log, write,
+  throw, take the index or the array) keep the chain as written.
+  `bench/chains.ts`'s `filter`→`map`, `map`→`reduce` and
+  `filter`→`map`→`.length` over 2000 records: 1.28G instructions, now
+  0.68G (the engine's `reduce` and its callback calls gone), 67 ms to
+  47.
   `xs.sort((a, b) => ...)` with an arrow that captures nothing is sorted
   by a merge sort compiled per comparator (the engine's stable algorithm:
   insertion sorts of up to 8 elements, halves merged), which runs a copy

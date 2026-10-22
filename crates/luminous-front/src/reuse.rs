@@ -169,6 +169,7 @@ fn walk_always(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) {
         | ExprKind::ArrayLoop { .. }
         | ExprKind::ArraySort { .. }
         | ExprKind::CallChecked { .. }
+        | ExprKind::ArrayChain { .. }
         | ExprKind::Reuse { .. } => return,
         _ => {}
     }

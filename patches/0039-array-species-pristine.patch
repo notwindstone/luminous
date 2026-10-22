@@ -1,0 +1,28 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -48108,6 +48108,13 @@
+            (js_pristine(ctx) & JS_PRISTINE_ARRAY_SPECIES);
+ }
+ 
++/* luminous: js_array_species_pristine, for native code: a chain of array
++   methods over obj makes its arrays in between with no code running. */
++bool JS_ArraySpeciesPristine(JSContext *ctx, JSValueConst obj)
++{
++    return js_array_species_pristine(ctx, obj);
++}
++
+ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
+                                      JSValueConst len_val, bool *fresh)
+ {
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1252,6 +1252,9 @@
+    JS_UNINITIALIZED. */
+ extern uint64_t js_call_epoch;
+ JS_EXTERN JSValue JS_PeekProperty(JSContext *ctx, JSValueConst obj, JSAtom prop);
++/* luminous: whether ArraySpeciesCreate(obj) makes an Array with no code
++   running (obj an array of the initial shape, %Array%'s species pristine). */
++JS_EXTERN bool JS_ArraySpeciesPristine(JSContext *ctx, JSValueConst obj);
+ JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
+ /* luminous: String.prototype methods with a direct entry (JS_CallStringFn). */
+ #define JS_STRING_FN_SLICE 0

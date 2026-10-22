@@ -751,6 +751,23 @@ pub enum ExprKind {
         body: Vec<Stmt>,
         locals: Vec<LocalId>,
     },
+    /// A chain of array methods (`filter`, `map`), ending with an array,
+    /// its `length` or a `reduce`, over the array in local `recv`, run as
+    /// one loop (see `chains`): when `recv` is an array without holes whose
+    /// methods are the original builtins and whose species is `Array` (so
+    /// that making the arrays in between runs no code), each element goes
+    /// through the stages in turn. Their values run no code: where one
+    /// would (`Sure`), the loop stops, and `whole`, the chain as written
+    /// (over `recv`), runs from the start. `Any`.
+    ArrayChain {
+        recv: LocalId,
+        stages: Vec<ChainStage>,
+        end: ChainEnd,
+        whole: Box<Expr>,
+    },
+    /// The value of `expr` (an `Any`) if it is as `sure` says (then of its
+    /// type); else an `ArrayChain`'s loop stops (only in its stages).
+    Sure(Box<Expr>, Sure),
     /// `recv.method(callback)`, `callback` an arrow function (the `Closure`
     /// of global function `func`) whose body is attached (see
     /// `inline_callbacks`): when `recv` is an array without holes and its
@@ -1154,6 +1171,37 @@ pub enum CmpOp {
 }
 
 /// The object `ExprKind::Peek` reads.
+/// A stage of an `ArrayChain`: the callback's value for the element in its
+/// parameter (if any), run with nothing else of the callback (its body was
+/// that value).
+#[derive(Clone, Debug)]
+pub struct ChainStage {
+    pub kind: LoopKind,
+    pub param: Option<LocalId>,
+    pub value: Expr,
+}
+
+/// What an `ArrayChain` makes of the elements its stages give.
+#[derive(Clone, Debug)]
+pub enum ChainEnd {
+    /// The array of them.
+    Array,
+    /// How many there are.
+    Length,
+    /// `reduce(callback, init)`: `value` of the accumulator (`acc`, from
+    /// `init`, which runs no code) and the element (`elem`).
+    Reduce { acc: Option<LocalId>, elem: Option<LocalId>, value: Box<Expr>, init: Box<Expr> },
+}
+
+/// What a `Sure` is sure of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sure {
+    /// A JS value: a `Peek` that found one (`Any`).
+    Peeked,
+    /// A number (`F64`).
+    Number,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeekBase {
     Local(LocalId),
@@ -1340,7 +1388,17 @@ macro_rules! visitor {
                 }
                 ShapeGet { obj, .. } | FrameObject { obj, .. } => $name(obj, f),
                 CallEpoch | Peek { .. } => {}
-                Reuse { read, .. } => $name(read, f),
+                Reuse { read, .. } | Sure(read, _) => $name(read, f),
+                ArrayChain { stages, end, whole, .. } => {
+                    for s in stages {
+                        $name(& $($m)? s.value, f);
+                    }
+                    if let ChainEnd::Reduce { value, init, .. } = end {
+                        $name(value, f);
+                        $name(init, f);
+                    }
+                    $name(whole, f);
+                }
                 SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => $name(value, f),
                 RegionTypedSet { idx, value, .. } => {
                     $name(idx, f);
@@ -1638,7 +1696,17 @@ pub fn children_mut(x: &mut Expr) -> Vec<&mut Expr> {
         }
         ShapeGet { obj, .. } | FrameObject { obj, .. } => push!(obj),
         CallEpoch | Peek { .. } => {}
-        Reuse { read, .. } => push!(read),
+        Reuse { read, .. } | Sure(read, _) => push!(read),
+        ArrayChain { stages, end, whole, .. } => {
+            for s in stages {
+                push!(&mut s.value);
+            }
+            if let ChainEnd::Reduce { value, init, .. } = end {
+                push!(value);
+                push!(init);
+            }
+            push!(whole);
+        }
         SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => push!(value),
         RegionTypedSet { idx, value, .. } => {
             push!(idx);
@@ -2070,6 +2138,13 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
         Reuse { value, epoch, .. } => {
             f(*value);
             epoch.iter().for_each(|&e| f(e));
+        }
+        ArrayChain { recv, stages, end, .. } => {
+            f(*recv);
+            stages.iter().filter_map(|s| s.param).for_each(&mut *f);
+            if let ChainEnd::Reduce { acc, elem, .. } = end {
+                acc.iter().chain(elem.iter()).for_each(|&l| f(l));
+            }
         }
         Inline { locals, body } | Predicted { locals, body, .. } | ArrayLoop { locals, body, .. } => {
             locals.iter().for_each(|&l| f(l));

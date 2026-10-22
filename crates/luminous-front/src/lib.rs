@@ -3,6 +3,7 @@
 
 pub mod builtins;
 pub mod bundle;
+pub mod chains;
 pub mod check;
 pub mod effects;
 pub mod erase;
