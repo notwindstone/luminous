@@ -592,7 +592,8 @@ pub enum ExprKind {
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
     /// The engine's count of calls of code native code does not call
-    /// directly (`js_call_epoch`; see `effects`). `I32`.
+    /// directly (`js_call_epoch`; see `effects`). `I32` (only compared:
+    /// the count is 64 bits).
     CallEpoch,
     /// `base.atom` if reading it runs no code and cannot throw (a data
     /// property of `base` or its prototypes, ordinary objects all, or
@@ -602,11 +603,13 @@ pub enum ExprKind {
         base: PeekBase,
         atom: AtomId,
     },
-    /// The value local `value` holds if it is one (a `Peek`'s), and the
-    /// call count is still in local `epoch` (if any); else `read`. `Any`.
+    /// The value local `value` holds (if `peeked`, a `Peek`'s: if it is
+    /// one) while the call count is still the one in local `epoch` (if
+    /// any); else `read`. Of `read`'s type.
     Reuse {
         value: LocalId,
         epoch: Option<LocalId>,
+        peeked: bool,
         read: Box<Expr>,
     },
     /// `obj` (an `Object` or a `NewInstance`) made in slot `slot` of the
@@ -2064,6 +2067,10 @@ pub(crate) fn expr_locals(e: &Expr, f: &mut impl FnMut(LocalId)) {
             f(*c);
         }
         Closure(_, ls) => ls.iter().for_each(|&l| f(l)),
+        Reuse { value, epoch, .. } => {
+            f(*value);
+            epoch.iter().for_each(|&e| f(e));
+        }
         Inline { locals, body } | Predicted { locals, body, .. } | ArrayLoop { locals, body, .. } => {
             locals.iter().for_each(|&l| f(l));
             stmt_locals(body, f);

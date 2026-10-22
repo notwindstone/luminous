@@ -2758,32 +2758,49 @@ impl Lower {
                 self.b.switch_to_block(join);
                 V::Any(r)
             }
-            ExprKind::Reuse { value, epoch, read } => {
+            ExprKind::Reuse { value, epoch, peeked, read } => {
                 // The value read before, while it was one and no code ran
                 // since that could have changed it; else read again.
                 let join = self.b.create_block();
-                let r = self.b.append_block_param(join, I64);
+                for t in clif_types(e.ty) {
+                    self.b.append_block_param(join, t);
+                }
                 let again = self.b.create_block();
                 self.b.set_cold_block(again);
-                let w = self.use_local(*value).any();
-                let mut ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNINITIALIZED, 0));
-                if let Some(e) = *epoch {
-                    let LVar::Int(var) = self.vars[e] else { unreachable!("an epoch is an int") };
+                let mut ok = None;
+                if *peeked {
+                    let w = self.use_local(*value).any();
+                    ok = Some(self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNINITIALIZED, 0)));
+                }
+                if let Some(ep) = *epoch {
+                    let LVar::Int(var) = self.vars[ep] else { unreachable!("an epoch is an int") };
                     let then = self.b.use_var(var);
                     let now = self.call_epoch();
                     let same = self.b.ins().icmp(IntCC::Equal, now, then);
-                    ok = self.b.ins().band(ok, same);
+                    ok = Some(match ok {
+                        Some(o) => self.b.ins().band(o, same),
+                        None => same,
+                    });
                 }
                 let fast = self.b.create_block();
-                self.b.ins().brif(ok, fast, &[], again, &[]);
+                match ok {
+                    Some(ok) => self.b.ins().brif(ok, fast, &[], again, &[]),
+                    None => self.b.ins().jump(fast, &[]),
+                };
                 self.b.switch_to_block(fast);
-                self.dup(w);
-                self.b.ins().jump(join, &[BlockArg::Value(w)]);
+                let v = self.use_local(*value);
+                if let V::Any(w) = v {
+                    self.dup(w);
+                }
+                let args: Vec<BlockArg> = self.abi(e.ty, v).into_iter().map(BlockArg::Value).collect();
+                self.b.ins().jump(join, &args);
                 self.b.switch_to_block(again);
-                let v = self.expr(read).any();
-                self.b.ins().jump(join, &[BlockArg::Value(v)]);
+                let v = self.expr(read);
+                let args: Vec<BlockArg> = self.abi(e.ty, v).into_iter().map(BlockArg::Value).collect();
+                self.b.ins().jump(join, &args);
                 self.b.switch_to_block(join);
-                V::Any(r)
+                let params = self.b.block_params(join).to_vec();
+                self.unabi(e.ty, &params)
             }
             ExprKind::PlainAddOk(a) => {
                 // Known while no watched prototype changed (Object.prototype

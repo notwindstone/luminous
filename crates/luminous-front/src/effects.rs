@@ -92,6 +92,21 @@ impl Access {
         self.all || self.cells.contains(&c)
     }
 
+    /// Whether it and `o` have something in common (what one writes, the
+    /// other may read).
+    pub fn meets(&self, o: &Access) -> bool {
+        (self.all && !o.is_empty())
+            || (o.all && !self.is_empty())
+            || !self.fields.is_disjoint(&o.fields)
+            || !self.slots.is_disjoint(&o.slots)
+            || !self.cells.is_disjoint(&o.cells)
+            || !self.globals.is_disjoint(&o.globals)
+            || !self.privates.is_disjoint(&o.privates)
+            || (self.elements && o.elements)
+            || (self.collections && o.collections)
+            || (self.boxes && o.boxes)
+    }
+
     fn fields(atoms: impl IntoIterator<Item = AtomId>) -> Access {
         Access { fields: atoms.into_iter().collect(), ..Access::default() }
     }
@@ -219,7 +234,7 @@ pub fn direct_callees(f: &Func) -> Vec<usize> {
 
 /// What a function's code knows about its locals and records, for
 /// `node`.
-struct Cx<'a> {
+pub struct Cx<'a> {
     m: &'a Module,
     table: &'a Summaries,
     f: &'a Func,
@@ -670,7 +685,16 @@ fn stmt(s: &Stmt) -> Effects {
 
 /// The effects of statements `stmts` of function `f` (calls by `table`).
 pub fn of_stmts(m: &Module, table: &Summaries, f: &Func, stmts: &[Stmt]) -> Effects {
-    let cx = context(m, table, f, stmts);
+    of_stmts_in(&context(m, table, f, stmts), stmts)
+}
+
+/// What code of function `f` knows (its guards), for `of_stmts_in`.
+pub fn context_of<'a>(m: &'a Module, table: &'a Summaries, f: &'a Func) -> Cx<'a> {
+    context(m, table, f, &f.body)
+}
+
+/// `of_stmts`, for statements of (or made of) the function of `cx`.
+pub fn of_stmts_in(cx: &Cx, stmts: &[Stmt]) -> Effects {
     let mut out = Effects::default();
     stmt_lists(stmts, &mut |list| {
         for s in list {
@@ -678,7 +702,7 @@ pub fn of_stmts(m: &Module, table: &Summaries, f: &Func, stmts: &[Stmt]) -> Effe
         }
     });
     visit_stmts(stmts, &mut |e| {
-        out.join(&node(e, &cx));
+        out.join(&node(e, cx));
         // Statements in the bodies of inlined calls.
         if let ExprKind::Inline { body, .. } | ExprKind::Predicted { body, .. } | ExprKind::ArrayLoop { body, .. } =
             &e.kind

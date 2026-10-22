@@ -420,7 +420,7 @@ pub fn check<'a>(
             crate::frames::frame_objects(&mut module, &uses);
             // (Of the code as it is now: clones and guards included.)
             let effects = crate::effects::summaries(&module);
-            crate::reuse::hoist_reads(&mut module, &effects);
+            crate::reuse::reuse_reads(&mut module, &effects);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
         }

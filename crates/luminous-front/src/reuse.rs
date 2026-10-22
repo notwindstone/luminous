@@ -1,19 +1,372 @@
-//! Reads that survive calls: a property read in a loop whose object the
-//! loop does not change, and whose property the loop's code (the
-//! functions it calls included, by their effect summaries) writes nowhere,
-//! is made once before the loop, where it can be without running code or
-//! throwing (`ExprKind::Peek`: a data property of ordinary objects). In
-//! the loop the read is then that value (`ExprKind::Reuse`) while the
-//! engine has run no code native code does not call directly since (its
-//! call count, `js_call_epoch`: a getter, a setter, a coercion, a call
-//! through a value, any of which could write it); else the read is made as
-//! before, which also throws, or runs a getter, exactly where it did.
+//! Reads that survive calls, by the effect summaries (`effects`):
+//!
+//! - A property read, or a call of a function that writes nothing and
+//!   allocates nothing, made by a statement and again by later statements
+//!   of the same list that (with the functions they call) write nothing it
+//!   reads, is made once: the later ones use its value (`repeated`).
+//! - A property read in a loop whose object the loop does not change, and
+//!   whose property the loop's code writes nowhere, is made once before
+//!   the loop, where it can be without running code or throwing
+//!   (`ExprKind::Peek`: a data property of ordinary objects; `hoist`).
+//!
+//! The value is used (`ExprKind::Reuse`) while the engine has run no code
+//! native code does not call directly since it was read (its call count,
+//! `js_call_epoch`: a getter, a setter, a coercion, a call through a
+//! value, any of which could write what was read); else the read or call
+//! is made as before, so it also throws, or runs a getter, exactly where
+//! it did.
 
-use crate::effects::{Summaries, of_stmts};
+use crate::effects::{Effects, Summaries, of_stmts, of_stmts_in};
 use crate::ir::*;
 
+/// Reuses the repeated reads and calls of every function of `m`
+/// (`repeated`), then hoists the loop-invariant property reads (`hoist`).
+pub fn reuse_reads(m: &mut Module, table: &Summaries) {
+    let n = m.funcs.len();
+    for g in 0..n + m.closures.len() {
+        let before = if g < n { m.funcs[g].clone() } else { m.closures[g - n].clone() };
+        let mut body = std::mem::take(if g < n { &mut m.funcs[g].body } else { &mut m.closures[g - n].body });
+        let added = {
+            let locals = Locals { base: before.locals.len(), added: Vec::new() };
+            let cx = crate::effects::context_of(m, table, &before);
+            let mut scan = Scan { m, table, f: &before, cx, locals };
+            lists_repeated(&mut body, &mut scan);
+            scan.locals.added
+        };
+        let f = if g < n { &mut m.funcs[g] } else { &mut m.closures[g - n] };
+        f.body = body;
+        for ty in added {
+            f.locals.push(ty);
+            f.boxed.push(false);
+            f.local_names.push(None);
+        }
+    }
+    hoist_reads(m, table);
+}
+
+/// What a statement reads again: a property of a base, or a call.
+#[derive(Clone, PartialEq)]
+enum Key {
+    Read(PeekBase, AtomId),
+    /// A function, and its arguments: locals, `this` or constants; and
+    /// whether the call checks them (`CallChecked`: when a check fails,
+    /// the function object is called, through the engine).
+    Call(FuncId, Vec<Arg>, bool),
+}
+
+#[derive(Clone, PartialEq)]
+enum Arg {
+    Local(LocalId),
+    This,
+    /// (By its bits: `-0` is not `0`.)
+    Num(u64),
+    Bool(bool),
+    Str(StrId),
+    Undefined,
+    Null,
+}
+
+fn arg_of(e: &Expr) -> Option<Arg> {
+    Some(match e.kind {
+        ExprKind::Local(l) if l == THIS_LOCAL => Arg::This,
+        ExprKind::Local(l) => Arg::Local(l),
+        ExprKind::This => Arg::This,
+        ExprKind::Num(v) => Arg::Num(v.to_bits()),
+        ExprKind::Bool(b) => Arg::Bool(b),
+        ExprKind::Str(s) => Arg::Str(s),
+        ExprKind::Undefined => Arg::Undefined,
+        ExprKind::Null => Arg::Null,
+        _ => return None,
+    })
+}
+
+/// The key of `e`, if it is one: a read `read_of` accepts, or a call of a
+/// function that writes nothing, allocates nothing and observes nothing
+/// else (time, randomness), with plain arguments.
+fn key_of(e: &Expr, m: &Module, table: &Summaries) -> Option<Key> {
+    if let Some((b, a)) = read_of(e) {
+        return (!skipped(m, a)).then_some(Key::Read(b, a));
+    }
+    let (k, args, checked) = match &e.kind {
+        ExprKind::Call(k, args) => (*k, args, false),
+        // (The function object: a binding never assigned.)
+        ExprKind::CallChecked { func, callee, args, slow: None, .. } if matches!(callee.kind, ExprKind::Cell(_)) => {
+            (*func, args, true)
+        }
+        _ => return None,
+    };
+    let x = table.funcs.get(k)?;
+    if !x.writes.is_empty() || x.allocates || x.engine || x.suspends || x.nondet || e.ty == Ty::Void {
+        return None;
+    }
+    Some(Key::Call(k, args.iter().map(arg_of).collect::<Option<_>>()?, checked))
+}
+
+/// Whether what `key` gives stays the same across code with effects `x`
+/// that writes the locals `written` (but for code the engine runs).
+fn holds(key: &Key, x: &Effects, written: &[LocalId], f: &Func, table: &Summaries) -> bool {
+    if x.suspends {
+        return false;
+    }
+    match key {
+        Key::Read(b, a) => {
+            !x.writes.field(*a)
+                && match *b {
+                    PeekBase::Local(l) => base_local(f, l) && !written.contains(&l),
+                    PeekBase::Cell(c) => !x.writes.cell(c),
+                    PeekBase::This => f.has_this,
+                }
+        }
+        Key::Call(k, args, _) => {
+            !x.writes.meets(&table.funcs[*k].reads)
+                && args.iter().all(|a| match *a {
+                    Arg::Local(l) => {
+                        l < f.locals.len()
+                            && !f.boxed[l]
+                            && !(f.arguments && l < f.params.len())
+                            && !written.contains(&l)
+                    }
+                    _ => true,
+                })
+        }
+    }
+}
+
+/// Whether local `l` may be the base of a reused read: a JS value only the
+/// function's own code assigns.
+fn base_local(f: &Func, l: LocalId) -> bool {
+    l < f.locals.len() && f.locals[l] == Ty::Any && !f.boxed[l] && !(f.arguments && l < f.params.len())
+}
+
+/// Properties not reused: `__proto__` (an accessor), and `length` (mostly
+/// of arrays and strings, which are not ordinary objects: their own reads
+/// are quick).
+fn skipped(m: &Module, a: AtomId) -> bool {
+    matches!(m.atoms[a].as_str(), "__proto__" | "length")
+}
+
+/// The locals statement `s` writes.
+fn written_by(s: &Stmt) -> Vec<LocalId> {
+    let mut out = Vec::new();
+    let one = std::slice::from_ref(s);
+    deep_stmt_locals(one, &mut |l| out.push(l));
+    visit_stmts(one, &mut |e| written_locals(e, &mut |l| out.push(l)));
+    out
+}
+
+/// Calls `f` on the subexpressions of `e` that are evaluated whenever `e`
+/// is (not in a branch, a short circuit, or an inlined body), `e` first.
+fn walk_always(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) {
+    if !f(e) {
+        return;
+    }
+    match e.kind {
+        ExprKind::Logical(..)
+        | ExprKind::Cond(..)
+        | ExprKind::Lazy(_)
+        | ExprKind::Inline { .. }
+        | ExprKind::Predicted { .. }
+        | ExprKind::ArrayLoop { .. }
+        | ExprKind::ArraySort { .. }
+        | ExprKind::CallChecked { .. }
+        | ExprKind::Reuse { .. } => return,
+        _ => {}
+    }
+    for c in children_mut(e) {
+        walk_always(c, f);
+    }
+}
+
+fn lists_repeated(list: &mut [Stmt], cx: &mut Scan) {
+    repeated(list, cx);
+    for s in list.iter_mut() {
+        match s {
+            Stmt::If(_, a, b) => {
+                lists_repeated(a, cx);
+                lists_repeated(b, cx);
+            }
+            Stmt::Loop { body, .. } | Stmt::Block(body) | Stmt::IterGuard { body, .. } => lists_repeated(body, cx),
+            Stmt::Switch { cases, .. } => cases.iter_mut().for_each(|(_, b)| lists_repeated(b, cx)),
+            Stmt::Try { body, catch, finally, .. } => {
+                lists_repeated(body, cx);
+                catch.iter_mut().for_each(|(_, c)| lists_repeated(c, cx));
+                finally.iter_mut().for_each(|c| lists_repeated(c, cx));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The reads and calls that statements of `list` make (always, when the
+/// statement runs: `walk_always`) and the code after them makes again
+/// (later statements, the branches of the `if` whose test made them),
+/// reused there.
+fn repeated(list: &mut [Stmt], cx: &mut Scan) {
+    if list.is_empty() {
+        return;
+    }
+    let effects: Vec<Effects> = list.iter().map(|s| of_stmts_in(&cx.cx, std::slice::from_ref(s))).collect();
+    for i in 0..list.len() {
+        let Some(own) = own_expr(&mut list[i]) else { continue };
+        let mut keys: Vec<Key> = Vec::new();
+        walk_always(own, &mut |e| {
+            if let Some(k) = key_of(e, cx.m, cx.table)
+                && !keys.contains(&k)
+            {
+                keys.push(k);
+            }
+            true
+        });
+        for key in keys {
+            // Where it is made again (`None`: only counted).
+            let (stmt, rest) = list[i..].split_first_mut().unwrap();
+            let (n, engine, through) = cx.after_own(stmt, &key, None);
+            let (n2, engine2) = if through { cx.scan(rest, Some(&effects[i + 1..]), &key, None).0 } else { (0, false) };
+            if n + n2 == 0 {
+                continue;
+            }
+            // The first time: the value kept (with the call count before).
+            // (A read may run a getter, a checked call the function as
+            // interpreted: then the count moves.)
+            let epoch = (matches!(key, Key::Read(..) | Key::Call(_, _, true)) || engine || engine2)
+                .then(|| cx.locals.add(Ty::I32));
+            let own = own_expr(stmt).expect("as above");
+            let mut value = None;
+            let locals = &mut cx.locals;
+            walk_always(own, &mut |e| {
+                if value.is_some() || key_of(e, cx.m, cx.table).as_ref() != Some(&key) {
+                    return value.is_none();
+                }
+                let v = locals.add(e.ty);
+                value = Some(v);
+                let ty = e.ty;
+                let read = std::mem::replace(e, Expr::new(Ty::Any, ExprKind::Undefined));
+                let mut seq = Vec::new();
+                if let Some(ep) = epoch {
+                    let now = Expr::new(Ty::I32, ExprKind::CallEpoch);
+                    seq.push(Expr::new(Ty::I32, ExprKind::SetLocal(ep, Box::new(now))));
+                }
+                seq.push(Expr::new(ty, ExprKind::SetLocal(v, Box::new(read))));
+                *e = Expr::new(ty, ExprKind::Seq(seq));
+                false
+            });
+            let value = value.expect("found before");
+            if std::env::var_os("LUMINOUS_DEBUG_REUSE").is_some() {
+                let what = match &key {
+                    Key::Read(_, a) => format!(".{}", cx.m.atoms[*a]),
+                    Key::Call(k, ..) => format!("call of {}", func_name(cx.m, *k)),
+                };
+                eprintln!("reuse: {}: {what} made again {} time(s) (epoch: {})", cx.f.name, n + n2, epoch.is_some());
+            }
+            // The next times: that value.
+            let reuse = Some((value, epoch));
+            cx.after_own(stmt, &key, reuse);
+            if through {
+                cx.scan(rest, Some(&effects[i + 1..]), &key, reuse);
+            }
+        }
+    }
+}
+
+/// A function's code, for `repeated`.
+struct Scan<'a> {
+    m: &'a Module,
+    table: &'a Summaries,
+    /// The function as it was.
+    f: &'a Func,
+    cx: crate::effects::Cx<'a>,
+    locals: Locals,
+}
+
+impl Scan<'_> {
+    /// The code statement `s` runs after its own expression (`own_expr`),
+    /// scanned for `key` (see `scan`): the number of times it makes it,
+    /// whether that code may run code the engine runs, and whether `key`
+    /// holds across all of `s`.
+    fn after_own(&mut self, s: &mut Stmt, key: &Key, reuse: Option<(LocalId, Option<LocalId>)>) -> (usize, bool, bool) {
+        match s {
+            Stmt::Expr(_) => {
+                let x = of_stmts_in(&self.cx, std::slice::from_ref(s));
+                (0, x.engine, holds(key, &x, &written_by(s), self.f, self.table))
+            }
+            Stmt::If(c, a, b) => {
+                let x = of_stmts_in(&self.cx, &[Stmt::Expr(c.clone())]);
+                let mut w = Vec::new();
+                visit(c, &mut |e| written_locals(e, &mut |l| w.push(l)));
+                if !holds(key, &x, &w, self.f, self.table) {
+                    return (0, x.engine, false);
+                }
+                let ((na, ea), ta) = self.scan(a, None, key, reuse);
+                let ((nb, eb), tb) = self.scan(b, None, key, reuse);
+                (na + nb, x.engine || ea || eb, ta && tb)
+            }
+            Stmt::Block(b) => {
+                let (first, rest) = b.split_first_mut().expect("own_expr found one");
+                let (n, e, t) = self.after_own(first, key, reuse);
+                if !t {
+                    return (n, e, false);
+                }
+                let ((n2, e2), t2) = self.scan(rest, None, key, reuse);
+                (n + n2, e || e2, t2)
+            }
+            _ => unreachable!("not one own_expr takes"),
+        }
+    }
+
+    /// The times `stmts` make `key` again, in order, while it holds (by
+    /// their `effects`, if known): replaced by its `reuse` if given; with
+    /// whether that code may run code the engine runs, and whether `key`
+    /// holds across all of `stmts`.
+    fn scan(
+        &mut self,
+        stmts: &mut [Stmt],
+        effects: Option<&[Effects]>,
+        key: &Key,
+        reuse: Option<(LocalId, Option<LocalId>)>,
+    ) -> ((usize, bool), bool) {
+        let (mut n, mut engine) = (0, false);
+        for (j, t) in stmts.iter_mut().enumerate() {
+            let x = match effects {
+                Some(e) => e[j].clone(),
+                None => of_stmts_in(&self.cx, std::slice::from_ref(t)),
+            };
+            if !holds(key, &x, &written_by(t), self.f, self.table) {
+                return ((n, engine), false);
+            }
+            engine |= x.engine;
+            walk_stmts(std::slice::from_mut(t), &mut |e| {
+                if key_of(e, self.m, self.table).as_ref() != Some(key) {
+                    return true;
+                }
+                n += 1;
+                if let Some((value, epoch)) = reuse {
+                    let ty = e.ty;
+                    let read = std::mem::replace(e, Expr::new(Ty::Any, ExprKind::Undefined));
+                    *e = Expr::new(ty, ExprKind::Reuse { value, epoch, peeked: false, read: Box::new(read) });
+                }
+                false
+            });
+        }
+        ((n, engine), true)
+    }
+}
+
+/// The expression statement `s` evaluates first, whenever it runs.
+fn own_expr(s: &mut Stmt) -> Option<&mut Expr> {
+    match s {
+        Stmt::Expr(x) | Stmt::If(x, ..) => Some(x),
+        Stmt::Block(b) => own_expr(b.first_mut()?),
+        _ => None,
+    }
+}
+
+fn func_name(m: &Module, k: FuncId) -> &str {
+    let n = m.funcs.len();
+    if k < n { &m.funcs[k].name } else { m.closures.get(k - n).map_or("?", |c| c.name.as_str()) }
+}
+
 /// Hoists the loop-invariant property reads of every function of `m`.
-pub fn hoist_reads(m: &mut Module, table: &Summaries) {
+fn hoist_reads(m: &mut Module, table: &Summaries) {
     let n = m.funcs.len();
     for g in 0..n + m.closures.len() {
         let f = if g < n { &m.funcs[g] } else { &m.closures[g - n] };
@@ -171,21 +524,11 @@ fn hoist(s: &mut Stmt, f: &Func, locals: &mut Locals, m: &Module, table: &Summar
             }
         })
     });
-    // (`length` is mostly of arrays and strings, which are not ordinary
-    // objects: their own reads are quick.)
-    let skip = |a: AtomId| matches!(m.atoms[a].as_str(), "__proto__" | "length");
     let ok = |b: PeekBase, a: AtomId| {
-        !skip(a)
+        !skipped(m, a)
             && !effects.writes.field(a)
             && match b {
-                // (A parameter `arguments` may also assign is left out.)
-                PeekBase::Local(l) => {
-                    l < f.locals.len()
-                        && f.locals[l] == Ty::Any
-                        && !written[l]
-                        && !f.boxed[l]
-                        && !(f.arguments && l < f.params.len())
-                }
+                PeekBase::Local(l) => base_local(f, l) && !written[l],
                 PeekBase::Cell(c) => !effects.writes.cell(c),
                 PeekBase::This => f.has_this,
             }
@@ -243,7 +586,7 @@ fn hoist(s: &mut Stmt, f: &Func, locals: &mut Locals, m: &Module, table: &Summar
             && let Some(k) = reads.iter().position(|x| *x == r)
         {
             let read = std::mem::replace(e, Expr::new(Ty::Any, ExprKind::Undefined));
-            *e = Expr::new(Ty::Any, ExprKind::Reuse { value: values[k], epoch, read: Box::new(read) });
+            *e = Expr::new(Ty::Any, ExprKind::Reuse { value: values[k], epoch, peeked: true, read: Box::new(read) });
             return false;
         }
         true

@@ -1403,6 +1403,20 @@ clang, linking).
     bounded (no recursion, at most 8 calls deep) makes no stack check of
     its own: its caller's check covers it (the native stack keeps a margin
     below the limit for this). `bench/context.ts` sync: 516 ms to 505.
+  - **Reads and calls made again** (`src/reuse.rs`). A property read of a
+    local, `this` or a module binding, or a call of a function whose
+    summary writes nothing, allocates nothing and observes nothing else
+    (with arguments that are locals or constants), that a statement makes
+    whenever it runs and the code after it makes again (later statements
+    of the list, the branches of the `if` whose test made it) is made
+    once, if that code (the functions it calls included) writes nothing
+    the read or the callee reads, nor the variables involved. The value is
+    kept with the call count from before it was made, and used while the
+    count is the same (where code in between, or the read itself, may run
+    code the engine runs: a getter, a call whose argument check failed);
+    else it is made again. `bench/effects.ts`'s orders (objects from
+    `JSON.parse`, a helper too large to inline called in a test and again
+    in its branch): 438 instructions per order, now 304.
   - **Property reads made once before a loop** (`src/reuse.rs`). A read
     `o.k` in a loop, where `o` is a local the loop does not assign (or
     `this`, or a module binding it does not assign) and nothing in the
