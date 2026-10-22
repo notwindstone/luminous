@@ -151,7 +151,8 @@ regular call path's generated code alone.
 `0031-bound-fast-calls.patch`, `0032-promise-thenable-fast.patch`,
 `0033-symbol-key-fast-paths.patch`,
 `0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch`,
-`0036-proxy-own-shape.patch` and `0037-frame-objects.patch`, each made
+`0036-proxy-own-shape.patch`, `0037-frame-objects.patch` and
+`0038-call-epoch-and-peek.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -172,6 +173,10 @@ engine's semantics:
   whenever it changes: a property added, deleted, redefined or written,
   its prototype set. Watching gives it a shape of its own once (and its
   writes are never cached), so no native store bypasses the counter;
+- `js_call_epoch` and `JS_PeekProperty` (patch 0038): a counter of the
+  calls the engine makes (of code native code does not call directly),
+  and a property read that is made only if it runs no code, for effect
+  summaries (see [What compiles natively](#what-compiles-natively));
 - the interpreter's own iteration (`for`-`of`, `for`-`in`, spread,
   destructuring), CopyDataProperties (object spread and rest), property
   access with a receiver (`super`), private field access and brand checks,
@@ -1356,9 +1361,66 @@ clang, linking).
   insertion sorts of up to 8 elements, halves merged), which runs a copy
   of the comparator inline at each comparison; the engine takes the
   elements out of the array and puts them back.
-- **Leaf functions** that can neither throw nor call (only unboxed numbers
-  and booleans) skip the stack check, and their callers the exception
-  check after the call.
+- **Effect summaries** (`crates/luminous-front/src/effects.rs`): for every
+  native function, what it and everything it calls may do, computed bottom
+  up over the call graph's strongly connected components to a fixpoint:
+  - what it reads and writes: properties by name, fields of records and
+    `aot type`s, module bindings (cells), globals, private names, array
+    and typed array elements (and `length`), `Map` / `Set` contents,
+    closure boxes, or anything;
+  - whether it allocates;
+  - what it may throw, by cause: a property of `null` / `undefined`, a
+    `TypeError` (calling a non-function, BigInt mixing), a
+    `ReferenceError` (TDZ), an explicit `throw`, out of memory, the stack
+    overflowing, or anything the engine may throw;
+  - whether it may run code the summary does not describe (`engine`): a
+    getter or setter, a proxy trap, `valueOf` / `toString` /
+    `Symbol.toPrimitive` of a value, a replaced builtin, a call through a
+    value;
+  - whether it may suspend (`await`, `yield`).
+
+  A call of an unknown function writes anything and may throw anything.
+  Builtins that native code runs inline (`push`, `charCodeAt`, `Map.get`,
+  `Math.*`, ...) come from a table, valid while the builtin is the
+  original one (the pins that guard those paths); otherwise the call goes
+  through the engine and counts as one of unknown code. Rather than count
+  every getter and coercion that a slow path might run in every summary
+  (which would make any read of a JS value's property "may write
+  anything"), slow paths are covered by a counter: the engine's
+  `js_call_epoch` (patch 0038) moves on every call it makes
+  (`JS_CallInternal`, constructors, `JS_CallFast`, `JS_CallBuiltin`, a
+  native generator resumed), and native code moves it where it calls a
+  native function's entry it found in a value. A caller that finds it
+  unchanged knows that only what the summary describes ran. (An await is
+  a full barrier: a resumed step runs from a job.) Interpreted code a
+  summary leaves out is code the engine runs, so it moves the counter too.
+  `LUMINOUS_DEBUG_EFFECTS=1` prints the summaries.
+
+  What they are used for:
+  - **No exception test after calls that cannot throw.** A call of a
+    function whose summary throws nothing skips the test of
+    `lum_unwinding` after it; and such a function whose call tree is
+    bounded (no recursion, at most 8 calls deep) makes no stack check of
+    its own: its caller's check covers it (the native stack keeps a margin
+    below the limit for this). `bench/context.ts` sync: 516 ms to 505.
+  - **Property reads made once before a loop** (`src/reuse.rs`). A read
+    `o.k` in a loop, where `o` is a local the loop does not assign (or
+    `this`, or a module binding it does not assign) and nothing in the
+    loop, the functions it calls included, writes a property `k`, is
+    *peeked* before the loop: read inline through a cache of its own when
+    it is an own data property of the cached shape, else by the engine
+    (`JS_PeekProperty`), which reads it only if that runs no code (a data
+    property of ordinary objects, on the object or its prototypes, or
+    none: `undefined`). In the loop, the read is that value while it was
+    one and the call counter is unchanged (where the loop may run unseen
+    code at all); otherwise the read is made as before, so it throws (a
+    property of `null` in a loop that runs at least once), or runs a
+    getter (one a setter added mid-loop), or sees a proxy, exactly where
+    it would have. A loop that may write everything, or awaits, is left
+    alone; reads of record fields, which are one guarded load already,
+    and `length` are not peeked. `bench/effects.ts`'s loop over four
+    configuration fields around a call: 322 instructions per iteration,
+    now 284.
 - **`async` functions and arrows**: `await` anywhere in an expression,
   including `finally` blocks and loop updates. Awaits are hoisted into
   statements while keeping JS evaluation order, so microtask ordering

@@ -1,0 +1,103 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22359,6 +22359,7 @@
+ JSValue JS_CallFast(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                     int argc, JSValueConst *argv)
+ {
++    js_call_epoch++;
+     /* A bound function without bound arguments (f.bind(x)) of a natively
+        compiled one: that one, called on the bound this, as
+        js_call_bound_function would. */
+@@ -22397,6 +22398,7 @@
+     JSValueConst buf[4];
+     JSValue ret;
+     int cproto = p->u.cfunc.cproto, n = p->u.cfunc.length;
++    js_call_epoch++;
+ 
+     /* What JS_CallInternal does for one, before its class's call. */
+     if (js_poll_interrupts(ctx))
+@@ -22441,6 +22443,8 @@
+     JSObject *p;
+     JSFunctionBytecode *b;
+     JSStackFrame sf_s, *sf = &sf_s;
++    /* (luminous: see js_call_epoch) */
++    js_call_epoch++;
+     uint8_t *pc;
+     int opcode, arg_allocated_size, i;
+     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
+@@ -25498,6 +25502,7 @@
+     JSObject *p;
+     JSFunctionBytecode *b;
+ 
++    js_call_epoch++;
+     if (js_poll_interrupts(ctx))
+         return JS_EXCEPTION;
+     flags |= JS_CALL_FLAG_CONSTRUCTOR;
+@@ -25967,6 +25972,7 @@
+     JSGeneratorData *s = JS_GetOpaque(gen, JS_CLASS_GENERATOR);
+     JSValue ret, done;
+     int kind = true; /* left as is when the generator completes */
++    js_call_epoch++;
+     ret = js_native_generator_next(ctx, s, JS_UNDEFINED, &kind, GEN_MAGIC_NEXT);
+     if (JS_IsException(ret) || kind != 2) {
+         *pdone = kind;
+@@ -63662,6 +63668,43 @@
+    every change to an object it watches (JS_WatchPrototype) moves it. */
+ uint64_t js_proto_epoch = 1;
+ 
++/* luminous: moved by every call of code native code does not call
++   directly: through JS_CallInternal (the interpreter, and the class call
++   handlers it dispatches to), JS_CallConstructorInternal, JS_CallFast,
++   JS_CallBuiltin, and a native generator resumed by JS_NativeGeneratorNext
++   (native code moves it too where it calls a function's native entry it
++   found in a value). What runs from there (getters, setters, proxy traps,
++   coercions, replaced builtins, any callback) is what the compiler's
++   effect summaries leave out: a caller that finds it unchanged after a
++   call knows that only the code the summary describes ran. */
++uint64_t js_call_epoch = 1;
++
++JSValue JS_PeekProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
++{
++    JSObject *p;
++    int depth;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return JS_UNINITIALIZED;
++    p = JS_VALUE_GET_OBJ(obj);
++    for (depth = 0; depth < 16; depth++) {
++        JSShapeProperty *prs;
++        JSProperty *pr;
++        /* (ordinary objects only: no exotic behavior, no proxy) */
++        if (p->class_id != JS_CLASS_OBJECT || p->is_exotic)
++            return JS_UNINITIALIZED;
++        prs = find_own_property(&pr, p, prop);
++        if (prs) {
++            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
++                return JS_UNINITIALIZED;
++            return js_dup(pr->u.value);
++        }
++        p = p->shape->proto;
++        if (!p)
++            return JS_UNDEFINED;
++    }
++    return JS_UNINITIALIZED;
++}
++
+ /* Watch `obj` (an object): from now on, a change to its properties, their
+    values or its prototype moves js_proto_epoch. It gets a shape of its
+    own the first time (still shared, so that it can be cached), so that no
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1245,6 +1245,13 @@
+    to the one that has `prop`. */
+ JS_EXTERN void JS_WatchProtoChain(JSContext *ctx, JSValueConst obj, JSAtom prop, int depth);
+ extern uint64_t js_proto_epoch;
++/* luminous: the engine's count of calls of code native code does not call
++   directly (see quickjs.c). JS_PeekProperty: `obj[prop]` if reading it
++   runs no code and cannot throw (a data property of obj or of its
++   prototypes, all ordinary objects, or none: undefined), else
++   JS_UNINITIALIZED. */
++extern uint64_t js_call_epoch;
++JS_EXTERN JSValue JS_PeekProperty(JSContext *ctx, JSValueConst obj, JSAtom prop);
+ JS_EXTERN bool JS_OwnDataIs(JSContext *ctx, JSValueConst obj, JSAtom prop, JSValueConst value);
+ /* luminous: String.prototype methods with a direct entry (JS_CallStringFn). */
+ #define JS_STRING_FN_SLICE 0

@@ -12,6 +12,7 @@ pub mod ints;
 pub mod ir;
 pub mod marker;
 pub mod pretty;
+pub mod reuse;
 pub mod spec;
 pub mod structs;
 

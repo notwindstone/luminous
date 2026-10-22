@@ -154,8 +154,9 @@ pub enum Region {
     Struct,
     /// The inline caches (`lum_ics`), which native code only reads.
     Ic,
-    /// Tables that only the runtime writes while native code runs
-    /// (`lum_privates`, `lum_homes`).
+    /// Tables and counters that only the runtime writes while native code
+    /// runs (`lum_privates`, `lum_homes`, `js_proto_epoch`), and
+    /// `js_call_epoch`, which native code also moves.
     Table,
     /// Tables filled before any native code runs and never written again
     /// (`lum_atoms`, `lum_strings`, `lum_shapes`, the class ids).

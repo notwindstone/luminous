@@ -225,6 +225,7 @@ extern const int32_t lum_nfn_caches __attribute__((weak));
 JSValue lum_new_closure(JSContext *ctx, LumFnCache *c, JSCFunctionFast *fast, JSCFunctionData *slow,
                           const char *name, int length, int magic, int n, JSValue *data, int kind);
 JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
+JSValue lum_ic_peek(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 int lum_instanceof(JSContext *ctx, JSValue v, JSValue ctor, LumIC *ic);
 JSValue lum_ic_own_data(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic);
 void lum_record_learn(JSContext *ctx, JSValue obj, int r);

@@ -591,6 +591,24 @@ pub enum ExprKind {
     NewFromTarget(Box<Expr>),
     /// Object literal with plain data properties, defined in order.
     Object(Vec<(AtomId, Expr)>),
+    /// The engine's count of calls of code native code does not call
+    /// directly (`js_call_epoch`; see `effects`). `I32`.
+    CallEpoch,
+    /// `base.atom` if reading it runs no code and cannot throw (a data
+    /// property of `base` or its prototypes, ordinary objects all, or
+    /// none: `undefined`), else a value no JS value is (see `Reuse`); the
+    /// base read without its TDZ check. `Any`.
+    Peek {
+        base: PeekBase,
+        atom: AtomId,
+    },
+    /// The value local `value` holds if it is one (a `Peek`'s), and the
+    /// call count is still in local `epoch` (if any); else `read`. `Any`.
+    Reuse {
+        value: LocalId,
+        epoch: Option<LocalId>,
+        read: Box<Expr>,
+    },
     /// `obj` (an `Object` or a `NewInstance`) made in slot `slot` of the
     /// function's frame (`Func::frame`) while there is room, else in the
     /// heap: an object that never outlives the call (see `frames`).
@@ -1132,6 +1150,14 @@ pub enum CmpOp {
     Ne,
 }
 
+/// The object `ExprKind::Peek` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeekBase {
+    Local(LocalId),
+    Cell(CellId),
+    This,
+}
+
 /// What `ExprKind::CallChecked` requires of an argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgCheck {
@@ -1310,6 +1336,8 @@ macro_rules! visitor {
                     $name(callback, f);
                 }
                 ShapeGet { obj, .. } | FrameObject { obj, .. } => $name(obj, f),
+                CallEpoch | Peek { .. } => {}
+                Reuse { read, .. } => $name(read, f),
                 SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => $name(value, f),
                 RegionTypedSet { idx, value, .. } => {
                     $name(idx, f);
@@ -1606,6 +1634,8 @@ pub fn children_mut(x: &mut Expr) -> Vec<&mut Expr> {
             push!(callback);
         }
         ShapeGet { obj, .. } | FrameObject { obj, .. } => push!(obj),
+        CallEpoch | Peek { .. } => {}
+        Reuse { read, .. } => push!(read),
         SlotStore { value, .. } | StrCharCode { idx: value, .. } | RegionPush { value, .. } => push!(value),
         RegionTypedSet { idx, value, .. } => {
             push!(idx);

@@ -308,7 +308,18 @@ fn node(e: &Expr, cx: &Cx) -> Effects {
         | K::ProtoIs { .. }
         | K::ProtoMethodIs { .. }
         | K::StrLen { .. }
-        | K::StrCharCode { .. } => Effects::default(),
+        | K::StrCharCode { .. }
+        | K::CallEpoch
+        // (Its read, a child, when made.)
+        | K::Reuse { .. } => Effects::default(),
+        K::Peek { base, atom } => {
+            let mut x = Effects::default();
+            x.reads.fields.insert(*atom);
+            if let PeekBase::Cell(c) = base {
+                x.reads.cells.insert(*c);
+            }
+            x
+        }
         K::NumArith(_, a, b) => {
             if typed(a) && typed(b) {
                 Effects::default()
@@ -659,7 +670,7 @@ fn stmt(s: &Stmt) -> Effects {
 
 /// The effects of statements `stmts` of function `f` (calls by `table`).
 pub fn of_stmts(m: &Module, table: &Summaries, f: &Func, stmts: &[Stmt]) -> Effects {
-    let cx = context(m, table, f);
+    let cx = context(m, table, f, stmts);
     let mut out = Effects::default();
     stmt_lists(stmts, &mut |list| {
         for s in list {
@@ -688,9 +699,11 @@ pub fn of_expr(m: &Module, table: &Summaries, f: &Func, e: &Expr) -> Effects {
     of_stmts(m, table, f, std::slice::from_ref(&Stmt::Expr(e.clone())))
 }
 
-fn context<'a>(m: &'a Module, table: &'a Summaries, f: &'a Func) -> Cx<'a> {
+/// (`stmts`: statements of `f`, or ones made of them, whose guards count
+/// too.)
+fn context<'a>(m: &'a Module, table: &'a Summaries, f: &'a Func, stmts: &[Stmt]) -> Cx<'a> {
     let mut records: std::collections::HashMap<LocalId, Vec<usize>> = Default::default();
-    visit_stmts(&f.body, &mut |e| match &e.kind {
+    let mut add = |e: &Expr| match &e.kind {
         ExprKind::SpecGuard { objs, derived, .. } => {
             for &(l, r) in objs {
                 records.entry(l).or_default().push(r);
@@ -708,7 +721,11 @@ fn context<'a>(m: &'a Module, table: &'a Summaries, f: &'a Func) -> Cx<'a> {
             }
         }
         _ => {}
-    });
+    };
+    visit_stmts(&f.body, &mut add);
+    if !std::ptr::eq(stmts, f.body.as_slice()) {
+        visit_stmts(stmts, &mut add);
+    }
     Cx { m, table, f, records }
 }
 

@@ -333,6 +333,9 @@ pub(crate) struct Env {
     /// `js_proto_epoch`: the engine's count of changes to watched
     /// prototypes (see `LumIC.epoch`).
     pub proto_epoch: GlobalValue,
+    /// `js_call_epoch`: the engine's count of calls of code native code
+    /// does not call directly (see `luminous_front::effects`).
+    pub call_epoch: GlobalValue,
     pub next_ic: std::rc::Rc<std::cell::Cell<usize>>,
     /// `FuncId` of closure 0.
     pub closure_base: usize,
@@ -2148,6 +2151,9 @@ impl Lower {
         {
             return self.b.use_var(var);
         }
+        if let ExprKind::CallEpoch = x.kind {
+            return self.call_epoch();
+        }
         // An int by the checker (an `int` local's value) or by `int_locals`.
         let d = self.expr(x).num();
         self.int_of_num(d)
@@ -2711,6 +2717,74 @@ impl Lower {
             }
             ExprKind::ArraySort { recv, method, callback, func } => self.array_sort(recv, *method, callback, *func),
             ExprKind::ProtoMethodIs { class, method, func } => V::Bool(self.proto_method_is(*class, *method, *func)),
+            ExprKind::CallEpoch => {
+                let i = self.call_epoch();
+                V::Num(self.int_f64(i))
+            }
+            ExprKind::Peek { base, atom } => {
+                let w = match *base {
+                    ir::PeekBase::Local(l) => self.use_local(l).any(),
+                    // (Uninitialized, it is no object: not read.)
+                    ir::PeekBase::Cell(k) => self.raw_cell(k),
+                    ir::PeekBase::This => self.this.expect("`this` in a method"),
+                };
+                // An own data property of the shape cached: read inline.
+                let ic = self.new_ic();
+                let join = self.b.create_block();
+                let r = self.b.append_block_param(join, I64);
+                let miss = self.b.create_block();
+                self.b.set_cold_block(miss);
+                let is_obj = self.val_is(w, TAG_OBJECT);
+                let obj = self.b.create_block();
+                let none = self.konst(0, TAG_UNINITIALIZED).any();
+                self.b.ins().brif(is_obj, obj, &[], join, &[BlockArg::Value(none)]);
+                self.b.switch_to_block(obj);
+                let p = self.val_ptr(w);
+                let shape = self.b.ins().load(I64, M_HEADER, p, layout::OBJ_SHAPE);
+                let cached = self.b.ins().load(I64, M_IC, ic, 0);
+                let same = self.b.ins().icmp(IntCC::Equal, shape, cached);
+                let hit = self.b.create_block();
+                self.b.ins().brif(same, hit, &[], miss, &[]);
+                self.b.switch_to_block(hit);
+                let at = self.ic_slot_addr(p, ic);
+                let vw = self.b.ins().load(I64, M_SLOT, at, 0);
+                self.dup(vw);
+                self.b.ins().jump(join, &[BlockArg::Value(vw)]);
+                self.b.switch_to_block(miss);
+                let ctx = self.ctx;
+                let atom = self.atom(*atom);
+                let v = self.helper("lum_ic_peek", &[ctx, w, atom, ic])[0];
+                self.b.ins().jump(join, &[BlockArg::Value(v)]);
+                self.b.switch_to_block(join);
+                V::Any(r)
+            }
+            ExprKind::Reuse { value, epoch, read } => {
+                // The value read before, while it was one and no code ran
+                // since that could have changed it; else read again.
+                let join = self.b.create_block();
+                let r = self.b.append_block_param(join, I64);
+                let again = self.b.create_block();
+                self.b.set_cold_block(again);
+                let w = self.use_local(*value).any();
+                let mut ok = self.b.ins().icmp_imm_s(IntCC::NotEqual, w, val_const(TAG_UNINITIALIZED, 0));
+                if let Some(e) = *epoch {
+                    let LVar::Int(var) = self.vars[e] else { unreachable!("an epoch is an int") };
+                    let then = self.b.use_var(var);
+                    let now = self.call_epoch();
+                    let same = self.b.ins().icmp(IntCC::Equal, now, then);
+                    ok = self.b.ins().band(ok, same);
+                }
+                let fast = self.b.create_block();
+                self.b.ins().brif(ok, fast, &[], again, &[]);
+                self.b.switch_to_block(fast);
+                self.dup(w);
+                self.b.ins().jump(join, &[BlockArg::Value(w)]);
+                self.b.switch_to_block(again);
+                let v = self.expr(read).any();
+                self.b.ins().jump(join, &[BlockArg::Value(v)]);
+                self.b.switch_to_block(join);
+                V::Any(r)
+            }
             ExprKind::PlainAddOk(a) => {
                 // Known while no watched prototype changed (Object.prototype
                 // is), else asked again.
@@ -6930,6 +7004,11 @@ impl Lower {
         let fdata = self.b.ins().iadd_imm_s(rec, layout::FDATA_DATA as i64);
         let ctx = self.ctx;
         let n = self.b.ins().iconst(I32, argc as i64);
+        // (Code effect summaries do not describe: see `js_call_epoch`.)
+        let epoch = self.b.ins().symbol_value(self.ptr, self.env.call_epoch);
+        let now = self.b.ins().load(I64, M_TABLE, epoch, 0);
+        let next = self.b.ins().iadd_imm_s(now, 1);
+        self.b.ins().store(M_TABLE, next, epoch, 0);
         let sig: SigRef = self.env.fast_sig;
         let inst = self.b.ins().call_indirect(sig, entry, &[ctx, this, n, argv, fdata]);
         let r = self.b.inst_results(inst).to_vec();
@@ -6972,6 +7051,12 @@ impl Lower {
     }
 
     /// A cell's value (borrowed); throws if it is uninitialized.
+    /// `js_call_epoch`.
+    fn call_epoch(&mut self) -> Value {
+        let base = self.b.ins().symbol_value(self.ptr, self.env.call_epoch);
+        self.b.ins().load(I64, M_TABLE, base, 0)
+    }
+
     fn load_cell(&mut self, k: ir::CellId) -> Value {
         let w = self.raw_cell(k);
         let uninit = self.b.ins().icmp_imm_s(IntCC::Equal, w, val_const(TAG_UNINITIALIZED, 0));

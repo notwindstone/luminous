@@ -1538,6 +1538,17 @@ JSValue lum_ic_get(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
     return v;
 }
 
+/* A cache miss peeking at obj.prop (obj borrowed; see JS_PeekProperty):
+ * an own data property is cached for the next peek, which reads it
+ * inline. */
+JSValue lum_ic_peek(JSContext *ctx, JSValue obj, JSAtom prop, LumIC *ic)
+{
+    JSValue v = JS_PeekProperty(ctx, obj, prop);
+    if (!JS_IsUninitialized(v) && !lum_ic_full(ic))
+        lum_ic_fill(ctx, obj, prop, 0, ic);
+    return v;
+}
+
 /* A cache miss writing obj.prop = val (obj borrowed, val consumed). Only
  * writes that find the property are cached: a site that adds it sees the
  * object's shape from before. */

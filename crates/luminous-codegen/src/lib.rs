@@ -576,6 +576,7 @@ const HELPERS: &[(&str, &[Arg], &[Arg])] = {
         ("lum_set_elem_ic", &[P, P, P], &[Int]),
         ("lum_get_elem_ic", &[P, W, W, P], &[W]),
         ("lum_ic_get", &[P, W, Int, P], &[W]),
+        ("lum_ic_peek", &[P, W, Int, P], &[W]),
         ("lum_plain_add_ok", &[P, P, Int], &[Int]),
         ("lum_null_object", &[P], &[W]),
         ("JS_GetIteratorObject", &[P, W, Int], &[W]),
@@ -725,7 +726,7 @@ struct Codegen {
     sorters: HashMap<usize, FuncId>,
     fast_funcs: Vec<FuncId>,
     helpers: HashMap<&'static str, FuncId>,
-    data: [DataId; 14],
+    data: [DataId; 15],
     fast_sig: SigRef,
     /// Inline caches allocated so far (`lum_ics` entries).
     ics: std::rc::Rc<std::cell::Cell<usize>>,
@@ -854,6 +855,9 @@ impl Codegen {
         module.define_data(d, mir::DataInit::Bytes((nrec as i32).to_le_bytes().to_vec()), 4);
         // The engine's counter of changes to watched prototypes (see `LumIC`).
         data.push(module.declare_data("js_proto_epoch", Linkage::Import, true));
+        // Its count of calls of code native code does not call directly
+        // (see `luminous_front::effects`).
+        data.push(module.declare_data("js_call_epoch", Linkage::Import, true));
         Codegen {
             params: std::rc::Rc::new(m.funcs.iter().chain(&m.closures).map(|f| f.params.clone()).collect()),
             value_captures: std::rc::Rc::new(m.closures.iter().map(|f| f.value_captures.clone()).collect()),
@@ -908,6 +912,7 @@ impl Codegen {
             ics,
             record_shapes,
             proto_epoch,
+            call_epoch,
         ] = self.data;
         Env {
             helpers: self.helpers.clone(),
@@ -927,6 +932,7 @@ impl Codegen {
             ics,
             record_shapes,
             proto_epoch,
+            call_epoch,
             next_ic: self.ics.clone(),
             closure_base: self.closure_base,
             params: self.params.clone(),
