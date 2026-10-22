@@ -323,6 +323,91 @@ pub fn print_report(bundle: &Bundle, a: &Analysis) {
         let (file, line) = bundle.line(line);
         println!("{}:{line}: {text}", file.display());
     }
+    print_layouts(bundle, a);
+}
+
+/// Which object literals make objects of stable layouts (see
+/// `luminous_front::layouts`), and why the others do not.
+fn print_layouts(bundle: &Bundle, a: &Analysis) {
+    use luminous_front::layouts::Verdict;
+    let structs: std::collections::HashSet<u32> = a.struct_sites.iter().map(|s| s.0.0).collect();
+    let native: Vec<(u32, u32)> = a.natives.iter().map(|n| n.span).collect();
+    let starts: Vec<u32> =
+        std::iter::once(0).chain(a.source.match_indices('\n').map(|(i, _)| i as u32 + 1)).collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let at = |pos: u32| {
+        let (file, line) = bundle.line(starts.partition_point(|&s| s <= pos) as u32);
+        (file.strip_prefix(&cwd).unwrap_or(file).to_path_buf(), line)
+    };
+    let place = |pos: u32| {
+        let (file, line) = at(pos);
+        format!("{}:{line}", file.display())
+    };
+    if std::env::var_os("LUMINOUS_DEBUG_LAYOUTS").is_some() {
+        eprintln!("layouts: starting ({} bytes of source)", a.source.len());
+    }
+    let report = match luminous_front::layouts::analyze(&a.source, &structs, &native, &place) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("object layouts: not analyzed ({e})");
+            return;
+        }
+    };
+    if report.sites.is_empty() {
+        return;
+    }
+    println!();
+    let mut stable = 0;
+    let mut aot = 0;
+    let mut why: Vec<(&str, usize)> = Vec::new();
+    for s in &report.sites {
+        let (file, line) = at(s.span.0);
+        let mut keys = s.keys.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+        if s.keys.len() > 6 {
+            keys.push_str(", …");
+        }
+        let verdict = match &s.verdict {
+            Verdict::Stable => {
+                stable += 1;
+                "stable layout".to_string()
+            }
+            Verdict::Struct => {
+                aot += 1;
+                "an `aot type`'s".to_string()
+            }
+            Verdict::Unstable { why: text, at: w, category } => {
+                match why.iter_mut().find(|c| c.0 == *category) {
+                    Some(c) => c.1 += 1,
+                    None => why.push((category, 1)),
+                }
+                let (wfile, wline) = at(*w);
+                let place = if wfile == file { format!("line {wline}") } else { format!("{}:{wline}", wfile.display()) };
+                format!("not stable: {text} ({place})")
+            }
+        };
+        println!("{}:{line}: object {{{keys}}}: {verdict}", file.display());
+    }
+    let plain = report.sites.len() - aot;
+    let pct = |n: usize, of: usize| if of == 0 { 0 } else { n * 100 / of };
+    println!(
+        "\nobject literals: {stable} of {plain} make objects of stable layouts ({}%){}",
+        pct(stable, plain),
+        if aot > 0 { format!("; {aot} make `aot type` objects") } else { String::new() }
+    );
+    why.sort_by(|a, b| b.1.cmp(&a.1));
+    if !why.is_empty() {
+        let list: Vec<String> = why.iter().map(|(c, n)| format!("{c} {n}")).collect();
+        println!("why not: {}", list.join(", "));
+    }
+    let r = report.reads;
+    println!(
+        "reads `o.k` of literals' objects: {} of {} at a fixed slot ({}%); in native code: {} of {}",
+        r.fixed,
+        r.literal,
+        pct(r.fixed, r.literal),
+        r.native_fixed,
+        r.native_literal
+    );
 }
 
 pub fn tempdir() -> Result<PathBuf> {

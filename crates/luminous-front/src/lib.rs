@@ -10,6 +10,7 @@ pub mod erase;
 pub mod escape;
 pub mod frames;
 pub mod ints;
+pub mod layouts;
 pub mod ir;
 pub mod marker;
 pub mod pretty;
@@ -54,6 +55,8 @@ pub struct NativeDecl {
     pub name: String,
     pub site: NativeSite,
     pub line: u32,
+    /// Its code's span in the source.
+    pub span: (u32, u32),
 }
 
 /// A class that hands data to native code when it is defined: a static
@@ -272,6 +275,7 @@ fn analyze_in(original: &str, path: &Path, opts: &Options, bundle: Option<&bundl
                 check::Site::Private { class } => NativeSite::Private { class: class.clone() },
             },
             line: line(c.node.span().start),
+            span: (c.node.span().start, c.node.span().end),
         })
         .collect();
 
