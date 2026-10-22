@@ -490,6 +490,19 @@ pub enum ExprKind {
     Call(FuncId, Vec<Expr>),
     /// The same of a native method (a private one), with its `this`.
     CallDirectThis(FuncId, Box<Expr>, Vec<Expr>),
+    /// A call of native function `func` (module functions, then closures)
+    /// through its JS entry, with `this` undefined and these arguments (JS
+    /// values): an `async` function, which returns its promise. The entry
+    /// declines arguments that do not suit its unboxed parameters only where
+    /// `callee` (its function object) is given: that is then called instead,
+    /// with `slow` if given (evaluated only then), else the same arguments.
+    /// `Any`.
+    CallEntry {
+        func: FuncId,
+        args: Vec<Expr>,
+        callee: Option<Box<Expr>>,
+        slow: Option<Vec<Expr>>,
+    },
     /// A `Math` function or `Number` predicate. The arguments are numbers,
     /// or for `Math` functions also JS values, converted with ToNumber in
     /// order once all are evaluated.
@@ -919,6 +932,9 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
         checks: Vec<(usize, ArgCheck)>,
+        /// The arguments of the call of `callee`, if not `args` (evaluated
+        /// only for it).
+        slow: Option<Vec<Expr>>,
     },
     /// An array of objects of layout `k` with the elements of an array
     /// (a literal or `new Array(n)`, see `structs::array_sites`).
@@ -1290,10 +1306,28 @@ macro_rules! visitor {
                     $name(obj, f);
                     $name(value, f);
                 }
-                CallChecked { callee, args, .. } => {
-                    $name(callee, f);
+                CallChecked { callee, args, slow, .. } => {
                     for x in args {
                         $name(x, f);
+                    }
+                    $name(callee, f);
+                    if let Some(xs) = slow {
+                        for x in xs {
+                            $name(x, f);
+                        }
+                    }
+                }
+                CallEntry { args, callee, slow, .. } => {
+                    for x in args {
+                        $name(x, f);
+                    }
+                    if let Some(c) = callee {
+                        $name(c, f);
+                    }
+                    if let Some(xs) = slow {
+                        for x in xs {
+                            $name(x, f);
+                        }
                     }
                 }
                 StructNew { fields, .. } => {
@@ -1568,10 +1602,28 @@ pub fn children_mut(x: &mut Expr) -> Vec<&mut Expr> {
             push!(obj);
             push!(value);
         }
-        CallChecked { callee, args, .. } => {
-            push!(callee);
+        CallChecked { callee, args, slow, .. } => {
             for x in args {
                 push!(x);
+            }
+            push!(callee);
+            if let Some(xs) = slow {
+                for x in xs {
+                    push!(x);
+                }
+            }
+        }
+        CallEntry { args, callee, slow, .. } => {
+            for x in args {
+                push!(x);
+            }
+            if let Some(c) = callee {
+                push!(c);
+            }
+            if let Some(xs) = slow {
+                for x in xs {
+                    push!(x);
+                }
             }
         }
         StructNew { fields, .. } => {
@@ -2137,7 +2189,14 @@ pub(crate) fn top_exprs(stmts: &[Stmt], f: &mut impl FnMut(&Expr)) {
 /// local of its own. (Unboxed locals are only used after their declaration,
 /// which evaluates the literal.) It may be reassigned other literals with
 /// the same keys, in statements.
-pub fn scalar_replace(f: &mut Func) {
+///
+/// With escape summaries (`spec`), the object may also be an argument of a
+/// call of a function that only reads it: it calls a clone of the
+/// function that takes the fields it reads instead (see
+/// `escape::Spec`), so that the caller reads them. (An async callee may
+/// read them after the call: an object written anywhere is then kept.)
+pub fn scalar_replace(f: &mut Func, mut spec: Option<&mut crate::escape::Spec>) {
+    use crate::escape::Field;
     alias_destructuring(f);
     let n = f.locals.len();
     let mut ok: Vec<bool> =
@@ -2157,6 +2216,11 @@ pub fn scalar_replace(f: &mut Func) {
     let mut used: Vec<Vec<AtomId>> = vec![Vec::new(); n];
     let mut as_object = vec![0; n];
     let mut total = vec![0; n];
+    // Property writes, and whether it is passed to a call that may read it
+    // later.
+    let mut writes = vec![0; n];
+    let mut settles = vec![false; n];
+    let awaits = crate::escape::awaited(&f.body);
     stmt_locals(&f.body, &mut |l| ok[l] = false);
     visit_stmts(&f.body, &mut |e| match &e.kind {
         ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) => match &x.kind {
@@ -2219,6 +2283,36 @@ pub fn scalar_replace(f: &mut Func) {
             if let ExprKind::Local(l) = o.kind {
                 as_object[l] += 1;
                 used[l].push(*k);
+                writes[l] += matches!(e.kind, ExprKind::SetProp(..) | ExprKind::ShapeSet { .. }) as usize;
+            }
+        }
+        ExprKind::Call(k, args)
+        | ExprKind::CallEntry { func: k, args, callee: None, .. }
+        | ExprKind::CallDirectThis(k, _, args) => {
+            let Some(spec) = spec.as_deref() else { return };
+            let entry = matches!(e.kind, ExprKind::CallEntry { .. });
+            for (q, a) in args.iter().enumerate() {
+                let ExprKind::Local(l) = a.kind else { continue };
+                let Some((fs, outlives)) = spec.reads(*k, q) else { continue };
+                if !fs.iter().all(|fd| matches!(fd, Field::Prop(_))) {
+                    continue;
+                }
+                as_object[l] += 1;
+                used[l].extend(fs.iter().map(|fd| match fd {
+                    Field::Prop(a) => *a,
+                    Field::Slot(_) => unreachable!(),
+                }));
+                settles[l] |= outlives || (entry && spec.suspends(*k) && !awaits.contains(&(e as *const Expr)));
+                // (The fields are read before the arguments after it are
+                // evaluated: those must not write them.)
+                for later in &args[q + 1..] {
+                    visit(later, &mut |x| match &x.kind {
+                        ExprKind::SetProp(o, ..) | ExprKind::ShapeSet { obj: o, .. } if matches!(o.kind, ExprKind::Local(m) if m == l) => {
+                            ok[l] = false
+                        }
+                        _ => {}
+                    });
+                }
             }
         }
         ExprKind::Local(l) => total[*l] += 1,
@@ -2232,6 +2326,7 @@ pub fn scalar_replace(f: &mut Func) {
             && sets[l] == top_sets[l]
             && total[l] == as_object[l]
             && used[l].iter().all(|k| keys[l].contains(k))
+            && !(settles[l] && (writes[l] > 0 || sets[l] > 0))
         {
             let mut map: Vec<(AtomId, LocalId)> = Vec::new();
             for &k in &keys[l] {
@@ -2245,6 +2340,31 @@ pub fn scalar_replace(f: &mut Func) {
             fields[l] = Some(map);
         }
     }
+    // The clones the calls need (else the objects they pass are kept).
+    if let Some(spec) = spec.as_deref_mut() {
+        loop {
+            let mut dropped = false;
+            visit_stmts(&f.body, &mut |e| {
+                let (ExprKind::Call(k, args)
+                | ExprKind::CallEntry { func: k, args, callee: None, .. }
+                | ExprKind::CallDirectThis(k, _, args)) = &e.kind
+                else {
+                    return;
+                };
+                let objs = replaced_args(spec, *k, args, &|l| fields.get(l).is_some_and(Option::is_some));
+                if !objs.is_empty() && spec.clone_of(*k, &objs).is_none() {
+                    for a in args {
+                        if let ExprKind::Local(l) = a.kind {
+                            dropped |= fields[l].take().is_some();
+                        }
+                    }
+                }
+            });
+            if !dropped {
+                break;
+            }
+        }
+    }
     if fields.iter().all(Option::is_none) {
         return;
     }
@@ -2253,6 +2373,33 @@ pub fn scalar_replace(f: &mut Func) {
     };
     visit_stmts_mut(&mut f.body, &mut |e| {
         let init = matches!(e.kind, ExprKind::InitLocal(..));
+        if let ExprKind::Call(k, args)
+        | ExprKind::CallEntry { func: k, args, callee: None, .. }
+        | ExprKind::CallDirectThis(k, _, args) = &mut e.kind
+            && let Some(spec) = spec.as_deref_mut()
+        {
+            let objs = replaced_args(spec, *k, args, &|l| fields.get(l).is_some_and(Option::is_some));
+            if objs.is_empty() {
+                return;
+            }
+            let clone = spec.clone_of(*k, &objs).expect("made above");
+            let mut out = Vec::new();
+            for (q, a) in std::mem::take(args).into_iter().enumerate() {
+                match a.kind {
+                    ExprKind::Local(l) if objs.iter().any(|(p, _)| *p == q) => {
+                        let (fs, _) = spec.reads(*k, q).unwrap();
+                        for fd in fs {
+                            let Field::Prop(key) = fd else { unreachable!() };
+                            out.push(Expr::new(Ty::Any, ExprKind::Local(field(l, *key).unwrap())));
+                        }
+                    }
+                    _ => out.push(a),
+                }
+            }
+            *args = out;
+            *k = clone;
+            return;
+        }
         let new = match &mut e.kind {
             // (New locals are past `fields`.)
             ExprKind::InitLocal(l, x) | ExprKind::SetLocal(l, x) if fields.get(*l).is_some_and(Option::is_some) => {
@@ -2284,6 +2431,185 @@ pub fn scalar_replace(f: &mut Func) {
         };
         e.kind = new;
     });
+}
+
+/// The arguments of a call of function `k` that are objects `replaced`
+/// accepts and that `k` only reads: (index, the types of the fields it
+/// reads), as `Spec::clone_of` takes them.
+fn replaced_args(
+    spec: &crate::escape::Spec,
+    k: FuncId,
+    args: &[Expr],
+    replaced: &dyn Fn(LocalId) -> bool,
+) -> Vec<(usize, Vec<Ty>)> {
+    let mut out = Vec::new();
+    for (q, a) in args.iter().enumerate() {
+        if let ExprKind::Local(l) = a.kind
+            && replaced(l)
+            && let Some((fs, _)) = spec.reads(k, q)
+        {
+            out.push((q, vec![Ty::Any; fs.len()]));
+        }
+    }
+    out
+}
+
+/// The arguments of call `e` that are object `l` passed to a function
+/// that only reads its fields, all properties among `keys`: (index, the
+/// keys it reads, in the order the clone takes them). A call that may read
+/// them after it returns only if nothing that follows it writes the object
+/// or needs it as an object: `later`, the uses of the object from its
+/// statement on that `non_reads` counts (its own aside); `awaits`: the
+/// values of the `await` statements around.
+pub(crate) fn object_args(
+    spec: &crate::escape::Spec,
+    e: &Expr,
+    l: LocalId,
+    keys: &[AtomId],
+    later: usize,
+    awaits: &HashSet<*const Expr>,
+) -> Vec<(usize, Vec<AtomId>)> {
+    use crate::escape::Field;
+    let (ExprKind::Call(k, args)
+    | ExprKind::CallEntry { func: k, args, .. }
+    | ExprKind::CallDirectThis(k, _, args)
+    | ExprKind::CallChecked { func: k, args, .. }) = &e.kind
+    else {
+        return Vec::new();
+    };
+    let entry = matches!(e.kind, ExprKind::CallEntry { .. });
+    let mut out = Vec::new();
+    for (q, a) in args.iter().enumerate() {
+        if !matches!(a.kind, ExprKind::Local(m) if m == l) {
+            continue;
+        }
+        let Some((fs, outlives)) = spec.reads(*k, q) else { continue };
+        let props: Option<Vec<AtomId>> = fs
+            .iter()
+            .map(|fd| match fd {
+                Field::Prop(a) if keys.contains(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        let Some(props) = props else { continue };
+        let settles = outlives || (entry && spec.suspends(*k) && !awaits.contains(&(e as *const Expr)));
+        if settles && later > own_non_reads(e, l) {
+            continue;
+        }
+        out.push((q, props));
+    }
+    out
+}
+
+/// How many uses of the object in local `l` in `stmts` do more than read
+/// its properties (or compare it with `null`, or pass it to functions that
+/// only read it): writes, and those that need it as an object. Where there
+/// are none after a call that may still read fields it was given, they are
+/// what the object holds.
+fn non_reads(spec: &crate::escape::Spec, stmts: &[Stmt], l: LocalId) -> usize {
+    let mut uses = 0;
+    each_name(stmts, &mut |m| uses += (m == l) as usize);
+    let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
+    let mut reads = 0;
+    visit_stmts(stmts, &mut |e| match &e.kind {
+        _ if nullish_compare(e).is_some_and(|(m, _)| m == l) => reads += 1,
+        // (Its declaration.)
+        ExprKind::InitLocal(m, _) if *m == l => reads += 1,
+        ExprKind::GetProp(o, _) | ExprKind::ShapeGet { obj: o, .. } if is_l(o) => reads += 1,
+        // (Not calls that may need the object itself.)
+        ExprKind::Call(k, args)
+        | ExprKind::CallEntry { func: k, args, callee: None, .. }
+        | ExprKind::CallDirectThis(k, _, args) => {
+            reads += args.iter().enumerate().filter(|(q, a)| is_l(a) && spec.reads(*k, *q).is_some()).count();
+        }
+        _ => {}
+    });
+    uses - reads
+}
+
+/// The uses of the object in local `l` by call `e` that `non_reads` counts.
+fn own_non_reads(e: &Expr, l: LocalId) -> usize {
+    match &e.kind {
+        ExprKind::CallChecked { args, .. } | ExprKind::CallEntry { args, callee: Some(_), .. } => {
+            args.iter().filter(|a| matches!(a.kind, ExprKind::Local(m) if m == l)).count()
+        }
+        _ => 0,
+    }
+}
+
+/// The key of `Spec::clone_of` for `object_args`: the fields are JS values.
+pub(crate) fn clone_key(objs: &[(usize, Vec<AtomId>)]) -> Vec<(usize, Vec<Ty>)> {
+    objs.iter().map(|(q, ks)| (*q, vec![Ty::Any; ks.len()])).collect()
+}
+
+/// The function a direct call calls.
+pub(crate) fn callee_of(e: &Expr) -> FuncId {
+    match &e.kind {
+        ExprKind::Call(k, _)
+        | ExprKind::CallEntry { func: k, .. }
+        | ExprKind::CallDirectThis(k, ..)
+        | ExprKind::CallChecked { func: k, .. } => *k,
+        _ => unreachable!("not a direct call"),
+    }
+}
+
+/// A direct call taken apart (see `take_call`).
+pub(crate) struct CallParts {
+    pub func: FuncId,
+    pub this: Option<Expr>,
+    pub args: Vec<Expr>,
+    /// `CallEntry`, `CallChecked`: the function object called otherwise.
+    pub callee: Option<Expr>,
+    /// `CallChecked`: the checks (by argument).
+    pub checks: Option<Vec<(usize, ArgCheck)>>,
+    /// A `CallEntry`.
+    pub entry: bool,
+}
+
+/// `e`, a direct call, taken apart (`e` itself is then a husk).
+pub(crate) fn take_call(e: &mut Expr) -> CallParts {
+    let kind = std::mem::replace(&mut e.kind, ExprKind::Undefined);
+    match kind {
+        ExprKind::Call(func, args) => CallParts { func, this: None, args, callee: None, checks: None, entry: false },
+        ExprKind::CallEntry { func, args, callee, .. } => {
+            CallParts { func, this: None, args, callee: callee.map(|c| *c), checks: None, entry: true }
+        }
+        ExprKind::CallDirectThis(func, this, args) => {
+            CallParts { func, this: Some(*this), args, callee: None, checks: None, entry: false }
+        }
+        ExprKind::CallChecked { func, callee, args, checks, .. } => {
+            CallParts { func, this: None, args, callee: Some(*callee), checks: Some(checks), entry: false }
+        }
+        _ => unreachable!("not a direct call"),
+    }
+}
+
+impl CallParts {
+    /// The call, of `func` with `args`; `slow`: the arguments `callee` takes
+    /// instead, if it is called. A `CallChecked`'s checks move with the
+    /// arguments: `index` gives each one's new index.
+    pub fn call(
+        &self,
+        func: FuncId,
+        args: Vec<Expr>,
+        slow: Option<Vec<Expr>>,
+        index: &dyn Fn(usize) -> usize,
+    ) -> ExprKind {
+        match (&self.checks, &self.callee, &self.this) {
+            (Some(checks), Some(callee), _) => ExprKind::CallChecked {
+                func,
+                callee: Box::new(callee.clone()),
+                args,
+                checks: checks.iter().map(|&(i, c)| (index(i), c)).collect(),
+                slow,
+            },
+            (None, callee, None) if self.entry => {
+                ExprKind::CallEntry { func, args, callee: callee.clone().map(Box::new), slow }
+            }
+            (None, _, Some(this)) => ExprKind::CallDirectThis(func, Box::new(this.clone()), args),
+            _ => ExprKind::Call(func, args),
+        }
+    }
 }
 
 /// Whether statement `s` is `InitLocal(l, _)`.
@@ -2360,7 +2686,7 @@ pub(crate) fn plain_value(x: &Expr) -> bool {
 /// and every later one work on it. `Object.create(null)` is virtual while
 /// the method is the builtin (else its result is used); a key not added
 /// reads `undefined`.
-pub fn virtualize_objects(f: &mut Func) {
+pub fn virtualize_objects(f: &mut Func, mut spec: Option<&mut crate::escape::Spec>) {
     let n = f.locals.len();
     let mut ok: Vec<bool> =
         (0..n).map(|l| l >= f.params.len() && !f.boxed[l] && f.locals[l] == Ty::Any && f.ret_slot != Some(l)).collect();
@@ -2393,7 +2719,7 @@ pub fn virtualize_objects(f: &mut Func) {
             && ok[l]
             && named[l] == values[l]
         {
-            let done = virtualize_object(f, l, no_proto);
+            let done = virtualize_object(f, l, no_proto, spec.as_deref_mut());
             if debug {
                 eprintln!("virtualize object {} local {l}: {}", f.name, if done { "yes" } else { "no" });
             }
@@ -2538,7 +2864,7 @@ pub(crate) fn find_list_mut<R>(
 /// `no_proto`), if its uses are where it allows them and some are virtual.
 /// (Its declaration may be in an inlined body: what it adds is scoped
 /// there.)
-fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
+fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool, mut spec: Option<&mut crate::escape::Spec>) -> bool {
     let named = names_of(&f.body, l);
     let base = f.locals.len();
     // A `let` / `const` block of the declaration is spliced into its list.
@@ -2553,7 +2879,7 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
     while find_list_mut(&mut f.body, None, &decl_block, &mut |list, _| splice_declaration(list, l)) == Some(true) {}
     let has_decl = |list: &[Stmt]| list.iter().any(|s| is_init_of(s, l));
     let added = find_list_mut(&mut f.body, None, &has_decl, &mut |list, scope| {
-        let added = virtualize_in(list, l, no_proto, named, base)?;
+        let added = virtualize_in(list, l, no_proto, named, base, spec.as_deref_mut())?;
         if let Some(scope) = scope {
             scope.extend(base..base + added.len());
         }
@@ -2572,7 +2898,14 @@ fn virtualize_object(f: &mut Func, l: LocalId, no_proto: bool) -> bool {
 /// `virtualize_object` in `list`, which has the declaration of `l` (named
 /// `named` times in the function); new locals from `base`. Their types, if
 /// it is done.
-fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, base: LocalId) -> Option<Vec<Ty>> {
+fn virtualize_in(
+    list: &mut [Stmt],
+    l: LocalId,
+    no_proto: bool,
+    named: usize,
+    base: LocalId,
+    mut spec: Option<&mut crate::escape::Spec>,
+) -> Option<Vec<Ty>> {
     let i0 = list.iter().position(|s| is_init_of(s, l)).unwrap();
     // Every use after the declaration, in the same block.
     let mut later = 0;
@@ -2581,6 +2914,16 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
         return None;
     }
     let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
+    let awaits = crate::escape::awaited(list);
+    // Per statement after the declaration: the uses from it on that need
+    // more than reads (see `object_args`).
+    let mut later: Vec<usize> = match spec.as_deref() {
+        Some(spec) => list[i0 + 1..].iter().map(|s| non_reads(spec, std::slice::from_ref(s), l)).collect(),
+        None => vec![usize::MAX; list.len() - i0 - 1],
+    };
+    for j in (0..later.len().saturating_sub(1)).rev() {
+        later[j] = later[j].saturating_add(later[j + 1]);
+    }
     // The keys: the literal's, then those added, in order.
     let mut keys: Vec<AtomId> = Vec::new();
     if let Stmt::Expr(Expr { kind: ExprKind::InitLocal(_, x), .. }) = &list[i0]
@@ -2602,7 +2945,7 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
     // that keep the object virtual, and the others (where it is made).
     let mut adds: Vec<Option<AtomId>> = Vec::new();
     let (mut virtual_uses, mut others) = (0, 0);
-    for s in &list[i0 + 1..] {
+    for (j, s) in list[i0 + 1..].iter().enumerate() {
         let add = addition(s, &keys);
         let mut uses = 0;
         each_name(std::slice::from_ref(s), &mut |m| uses += (m == l) as usize);
@@ -2613,6 +2956,10 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
             if nullish_compare(e).is_some_and(|(m, _)| m == l) {
                 kept += 1;
                 return;
+            }
+            // Passed to a function that only reads it: the fields.
+            if let Some(spec) = spec.as_deref() {
+                kept += object_args(spec, e, l, &keys, later[j], &awaits).len();
             }
             let (ExprKind::GetProp(o, k)
             | ExprKind::SetProp(o, k, _)
@@ -2694,9 +3041,10 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
         }
         _ => unreachable!(),
     }
-    // (Assigned before they are read, by their additions.)
+    // (Assigned before they are read, by their additions: a number to
+    // begin with, so that those of numbers can be numbers.)
     for &s in &slots[k0..] {
-        parts.push(any(ExprKind::InitLocal(s, Box::new(any(ExprKind::Undefined)))));
+        parts.push(any(ExprKind::InitLocal(s, Box::new(any(ExprKind::Box(Box::new(Expr::num(0.0))))))));
     }
     parts.push(any(ExprKind::Undefined));
     *init = any(ExprKind::Seq(parts));
@@ -2719,7 +3067,7 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
         cond(Ty::Any, flag_e(), any(ExprKind::Seq(make)), local(ph))
     };
     let mut have: Vec<AtomId> = keys[..k0].to_vec();
-    for (s, add) in list[i0 + 1..].iter_mut().zip(adds) {
+    for (j, (s, add)) in list[i0 + 1..].iter_mut().zip(adds).enumerate() {
         // An addition: the value, then the key (while Object.prototype lets
         // it be the object's own), else the object made and the key added.
         if let Some(k) = add {
@@ -2738,6 +3086,52 @@ fn virtualize_in(list: &mut [Stmt], l: LocalId, no_proto: bool, named: usize, ba
             *e = seq(first, set);
         }
         visit_stmts_mut(std::slice::from_mut(s), &mut |e| {
+            // A call of a function that only reads it: of its clone with the
+            // fields while it is virtual, else with the object. (The other
+            // operands first, once.)
+            if let Some(spec) = spec.as_deref_mut()
+                && let objs = object_args(spec, e, l, &have, later[j], &awaits)
+                && !objs.is_empty()
+                && let Some(clone) = spec.clone_of(callee_of(e), &clone_key(&objs))
+            {
+                let ty = e.ty;
+                let mut parts = take_call(e);
+                let mut first = Vec::new();
+                if let Some(t) = parts.this.take() {
+                    let (f0, v) = once(t);
+                    first.extend(f0);
+                    parts.this = Some(v);
+                }
+                let (mut fast, mut slow, mut index) = (Vec::new(), Vec::new(), Vec::new());
+                for (q, a) in std::mem::take(&mut parts.args).into_iter().enumerate() {
+                    index.push(fast.len());
+                    match objs.iter().find(|(p, _)| *p == q) {
+                        Some((_, ks)) => {
+                            fast.extend(ks.iter().map(|&key| local(slot(key))));
+                            slow.push(materialize(&have));
+                        }
+                        None => {
+                            let (f0, v) = once(a);
+                            first.extend(f0);
+                            fast.push(v.clone());
+                            slow.push(v);
+                        }
+                    }
+                }
+                // (Where the clone's call may go to the function object instead, the
+                // object is made for it.)
+                let made = parts.callee.is_some().then(|| slow.clone());
+                let fast = Expr::new(ty, parts.call(clone, fast, made, &|i| index[i]));
+                let slow = Expr::new(ty, parts.call(parts.func, slow, None, &|i| i));
+                let c = cond(ty, flag_e(), fast, slow);
+                *e = if first.is_empty() {
+                    c
+                } else {
+                    first.push(c);
+                    Expr::new(ty, ExprKind::Seq(first))
+                };
+                return;
+            }
             if let Some((_, right)) = nullish_compare(e) {
                 let ExprKind::AnyCompare(op, a, b) = &mut e.kind else { unreachable!() };
                 let ne = matches!(op, AnyCmpOp::Ne | AnyCmpOp::StrictNe);
@@ -3652,13 +4046,37 @@ pub fn replace_objects(m: &mut Module) {
         forward_inline_args(f);
         flatten_inlines(f);
         forward_copies(f);
-        scalar_replace(f);
-        virtualize_objects(f);
-        scalar_replace_structs(f, &layouts);
-        promote_struct_fields(f, &layouts);
-        number_locals(f);
     }
     m.layouts = layouts;
+    let mut spec = crate::escape::Spec::new(m);
+    let cx = VirtCx::new(m);
+    let layouts = std::mem::take(&mut m.layouts);
+    let objects = |f: &mut Func, spec: &mut crate::escape::Spec| {
+        scalar_replace(f, Some(&mut *spec));
+        virtualize_objects(f, Some(&mut *spec));
+        scalar_replace_structs(f, &layouts, Some(&mut *spec));
+        promote_struct_fields(f, &layouts);
+        number_locals(f);
+        // (Again for the fields of instances kept in locals.)
+        if virtualize_instances(f, &cx, Some(spec)) {
+            number_locals(f);
+        }
+    };
+    for f in m.funcs.iter_mut().chain(m.closures.iter_mut()) {
+        objects(f, &mut spec);
+    }
+    // The clones, as they are made (they may need others).
+    let mut j = 0;
+    while j < spec.clones.len() {
+        let mut f = spec.clones[j].clone();
+        objects(&mut f, &mut spec);
+        spec.clones[j] = f;
+        j += 1;
+    }
+    let (base, fields) = (spec.base, spec.field_params());
+    m.closures.extend(spec.clones);
+    m.layouts = layouts;
+    crate::escape::number_params(m, base, &fields);
 }
 
 /// Inlining, as JIT compilers inline small functions: a direct call of a
@@ -4561,7 +4979,11 @@ pub fn inline_callbacks(m: &mut Module) {
 /// once by a literal and only used for its fields (reads, and writes as
 /// statements) becomes a local per field. Stores keep their conversion
 /// (`StructCoerce`).
-pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
+///
+/// As `scalar_replace` does, with escape summaries (`spec`) the object may
+/// be passed to functions that only read it: their clones take the fields.
+pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout], mut spec: Option<&mut crate::escape::Spec>) {
+    use crate::escape::Field;
     let n = f.locals.len();
     let mut ok: Vec<bool> = (0..n)
         .map(|l| {
@@ -4577,6 +4999,9 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
     let mut sets = vec![0; n];
     let mut top_sets = vec![0; n];
     let mut total = vec![0; n];
+    // Passed to a call that may read it later.
+    let mut settles = vec![false; n];
+    let awaits = crate::escape::awaited(&f.body);
     stmt_locals(&f.body, &mut |l| ok[l] = false);
     top_exprs(&f.body, &mut |e| {
         if let ExprKind::StructSet(_, o, _, _) = &e.kind
@@ -4599,6 +5024,32 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
             }
         }
         ExprKind::Local(l) => total[*l] += 1,
+        ExprKind::Call(k, args)
+        | ExprKind::CallEntry { func: k, args, callee: None, .. }
+        | ExprKind::CallDirectThis(k, _, args)
+            if spec.is_some() =>
+        {
+            let spec = spec.as_deref().unwrap();
+            let entry = matches!(e.kind, ExprKind::CallEntry { .. });
+            for (q, a) in args.iter().enumerate() {
+                let ExprKind::Local(l) = a.kind else { continue };
+                let Some((fs, outlives)) = spec.reads(*k, q) else { continue };
+                if !ok[l] || !fs.iter().all(|fd| matches!(fd, Field::Slot(_))) {
+                    continue;
+                }
+                fields_used[l] += 1;
+                settles[l] |= outlives || (entry && spec.suspends(*k) && !awaits.contains(&(e as *const Expr)));
+                for later in &args[q + 1..] {
+                    visit(later, &mut |x| {
+                        if let ExprKind::StructSet(_, o, ..) = &x.kind
+                            && matches!(o.kind, ExprKind::Local(m) if m == l)
+                        {
+                            ok[l] = false;
+                        }
+                    });
+                }
+            }
+        }
         _ => {
             for (l, ok) in ok.iter_mut().enumerate() {
                 if *ok && local_refs(e, l) != (0, 0) {
@@ -4610,7 +5061,12 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
     // Per replaced local: the locals of its fields.
     let mut fields: Vec<Option<Vec<LocalId>>> = vec![None; n];
     for l in 0..n {
-        if ok[l] && inits[l] == 1 && total[l] == fields_used[l] && sets[l] == top_sets[l] {
+        if ok[l]
+            && inits[l] == 1
+            && total[l] == fields_used[l]
+            && sets[l] == top_sets[l]
+            && !(settles[l] && sets[l] > 0)
+        {
             let Ty::Struct(k) = f.locals[l] else { unreachable!() };
             let mut map = Vec::new();
             for fd in &layouts[k as usize].fields {
@@ -4648,8 +5104,83 @@ pub fn scalar_replace_structs(f: &mut Func, layouts: &[Layout]) {
         }
         Expr::new(want, ExprKind::StructCoerce(k, fi, Box::new(v)))
     };
+    // The clones the calls need (else the objects they pass are kept).
+    let slot_args = |spec: &crate::escape::Spec, k: FuncId, args: &[Expr], fields: &[Option<Vec<LocalId>>]| {
+        let mut out = Vec::new();
+        for (q, a) in args.iter().enumerate() {
+            if let ExprKind::Local(l) = a.kind
+                && let Some(Some(_)) = fields.get(l)
+                && let Some((fs, _)) = spec.reads(k, q)
+            {
+                let Ty::Struct(lay) = f.locals[l] else { unreachable!() };
+                let tys = fs
+                    .iter()
+                    .map(|fd| match fd {
+                        Field::Slot(fi) => field_local_ty(&layouts[lay as usize].fields[*fi as usize]),
+                        Field::Prop(_) => unreachable!(),
+                    })
+                    .collect();
+                out.push((q, tys));
+            }
+        }
+        out
+    };
+    if let Some(spec) = spec.as_deref_mut() {
+        loop {
+            let mut dropped = false;
+            visit_stmts(&f.body, &mut |e| {
+                let (ExprKind::Call(k, args)
+                | ExprKind::CallEntry { func: k, args, callee: None, .. }
+                | ExprKind::CallDirectThis(k, _, args)) = &e.kind
+                else {
+                    return;
+                };
+                let objs = slot_args(spec, *k, args, &fields);
+                if !objs.is_empty() && spec.clone_of(*k, &objs).is_none() {
+                    for a in args {
+                        if let ExprKind::Local(l) = a.kind {
+                            dropped |= fields[l].take().is_some();
+                        }
+                    }
+                }
+            });
+            if !dropped {
+                break;
+            }
+        }
+        if fields.iter().all(Option::is_none) {
+            return;
+        }
+    }
     let field_of = |l: LocalId| fields.get(l).and_then(Option::as_ref);
     visit_stmts_mut(&mut f.body, &mut |e| {
+        if let ExprKind::Call(k, args)
+        | ExprKind::CallEntry { func: k, args, callee: None, .. }
+        | ExprKind::CallDirectThis(k, _, args) = &mut e.kind
+            && let Some(spec) = spec.as_deref_mut()
+        {
+            let objs = slot_args(spec, *k, args, &fields);
+            if objs.is_empty() {
+                return;
+            }
+            let clone = spec.clone_of(*k, &objs).expect("made above");
+            let mut out = Vec::new();
+            for (q, a) in std::mem::take(args).into_iter().enumerate() {
+                match (a.kind, objs.iter().find(|(p, _)| *p == q)) {
+                    (ExprKind::Local(l), Some((_, tys))) => {
+                        let (fs, _) = spec.reads(*k, q).unwrap();
+                        for (fd, &t) in fs.iter().zip(tys) {
+                            let Field::Slot(fi) = fd else { unreachable!() };
+                            out.push(Expr::new(t, ExprKind::Local(field_of(l).unwrap()[*fi as usize])));
+                        }
+                    }
+                    (kind, _) => out.push(Expr { ty: a.ty, kind }),
+                }
+            }
+            *args = out;
+            *k = clone;
+            return;
+        }
         let new = match &mut e.kind {
             ExprKind::InitLocal(l, x) if field_of(*l).is_some() => {
                 let ExprKind::StructNew { layout, fields: values, .. } =
@@ -5060,6 +5591,30 @@ struct VirtCx {
     private_state: Vec<bool>,
 }
 
+impl VirtCx {
+    /// Of the module's functions and classes.
+    fn new(m: &Module) -> VirtCx {
+        let all = || m.funcs.iter().chain(&m.closures);
+        let atom_of: HashMap<&str, AtomId> = m.atoms.iter().enumerate().map(|(i, a)| (a.as_str(), i)).collect();
+        VirtCx {
+            params: all().map(|f| f.params.clone()).collect(),
+            rets: all().map(|f| f.ret).collect(),
+            private_state: m.classes.iter().map(|c| c.private_state).collect(),
+            methods: m
+                .classes
+                .iter()
+                .map(|c| {
+                    c.members
+                        .iter()
+                        .filter(|(_, kind, is_static, _)| *kind == 0 && !is_static)
+                        .filter_map(|(n, _, _, f)| Some((*atom_of.get(n.as_str())?, *f)))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Scalar replacement of class instances, as JIT compilers' escape analysis
 /// does: a local holding a new instance of a class (a `NewInstance`, also
 /// as the value of an inlined or predicted call) that is only used for its
@@ -5070,30 +5625,14 @@ struct VirtCx {
 /// object itself is needed (a method that is not the predicted one, a call
 /// that a prediction declines), it is made first ("materialized", as
 /// deoptimization does), and the uses then work on it.
-pub fn virtualize_instances(m: &mut Module) {
-    let nfuncs = m.funcs.len();
-    let all = || m.funcs.iter().chain(&m.closures);
-    let atom_of: HashMap<&str, AtomId> = m.atoms.iter().enumerate().map(|(i, a)| (a.as_str(), i)).collect();
-    let cx = VirtCx {
-        params: all().map(|f| f.params.clone()).collect(),
-        rets: all().map(|f| f.ret).collect(),
-        private_state: m.classes.iter().map(|c| c.private_state).collect(),
-        methods: m
-            .classes
-            .iter()
-            .map(|c| {
-                c.members
-                    .iter()
-                    .filter(|(_, kind, is_static, _)| *kind == 0 && !is_static)
-                    .filter_map(|(n, _, _, f)| Some((*atom_of.get(n.as_str())?, *f)))
-                    .collect()
-            })
-            .collect(),
-    };
-    for g in 0..nfuncs + m.closures.len() {
-        let f = if g < nfuncs { &mut m.funcs[g] } else { &mut m.closures[g - nfuncs] };
+///
+/// (In `replace_objects`, function by function: with escape summaries, an
+/// instance may be passed to functions that only read it, see
+/// `try_virtualize`.)
+fn virtualize_instances(f: &mut Func, cx: &VirtCx, mut spec: Option<&mut crate::escape::Spec>) -> bool {
+    {
         if f.is_async || f.is_generator {
-            continue;
+            return false;
         }
         hoist_fresh_receivers(f);
         // Locals initialized once (a statement, or a value discarded in a
@@ -5149,9 +5688,11 @@ pub fn virtualize_instances(m: &mut Module) {
                     && discarded.contains(&l)
             })
             .collect();
+        let mut any = false;
         for l in candidates {
-            try_virtualize(f, l, &cx);
+            any |= try_virtualize(f, l, cx, spec.as_deref_mut());
         }
+        any
     }
 }
 
@@ -5196,7 +5737,11 @@ fn local_expr(l: LocalId) -> Expr {
 }
 
 /// `virtualize_instances` for local `l`, if all its uses allow it.
-fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
+///
+/// With escape summaries (`spec`), a call of a function that only reads the
+/// object calls a clone of it with the fields while it is virtual (its
+/// other operands evaluated first), else the function with the object.
+fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut crate::escape::Spec>) -> bool {
     // The producer's class and fields.
     let mut found = None;
     visit_stmts(&f.body, &mut |e| {
@@ -5251,6 +5796,21 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
     let mut reason = String::new();
     let debug = std::env::var_os("LUMINOUS_DEBUG_VIRT").is_some();
     let mut body = f.body.clone();
+    let awaits = crate::escape::awaited(&body);
+    // (Anywhere in the function: see `object_args`.)
+    let later = spec.as_deref().map_or(usize::MAX, |spec| non_reads(spec, &f.body, l));
+    // Temporaries, after the object's locals.
+    let temps = std::cell::Cell::new(0);
+    let once = |v: Expr| -> (Option<Expr>, Expr) {
+        let mut names = false;
+        visit(&v, &mut |x| names |= matches!(x.kind, ExprKind::Local(m) if m == l));
+        if plain_value(&v) && !names {
+            return (None, v);
+        }
+        let t = ph + 1 + temps.get();
+        temps.set(temps.get() + 1);
+        (Some(Expr::new(Ty::Any, ExprKind::InitLocal(t, Box::new(v)))), local(t))
+    };
     visit_stmts_mut(&mut body, &mut |e| {
         if !ok {
             return;
@@ -5260,15 +5820,61 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
         }
         let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
         let ty = e.ty;
+        // A call of a function that only reads it.
+        if let Some(spec) = spec.as_deref_mut()
+            && let objs = object_args(spec, e, l, &fields, later, &awaits)
+            && !objs.is_empty()
+            && let Some(clone) = spec.clone_of(callee_of(e), &clone_key(&objs))
+        {
+            let mut parts = take_call(e);
+            let mut first = Vec::new();
+            if let Some(t) = parts.this.take() {
+                let (f0, v) = once(t);
+                first.extend(f0);
+                parts.this = Some(v);
+            }
+            let (mut fast, mut slow, mut index) = (Vec::new(), Vec::new(), Vec::new());
+            for (q, a) in std::mem::take(&mut parts.args).into_iter().enumerate() {
+                index.push(fast.len());
+                match objs.iter().find(|(p, _)| *p == q) {
+                    Some((_, ks)) => {
+                        fast.extend(ks.iter().map(|&key| local(slots[field(key).unwrap()])));
+                        slow.push(materialize());
+                    }
+                    None => {
+                        let (f0, v) = once(a);
+                        first.extend(f0);
+                        fast.push(v.clone());
+                        slow.push(v);
+                    }
+                }
+            }
+            // (Where the clone's call may go to the function object instead, the
+            // object is made for it.)
+            let made = parts.callee.is_some().then(|| slow.clone());
+            let fast = Expr::new(ty, parts.call(clone, fast, made, &|i| index[i]));
+            let slow = Expr::new(ty, parts.call(parts.func, slow, None, &|i| i));
+            let c = Expr::new(ty, ExprKind::Cond(Box::new(flag_e()), Box::new(fast), Box::new(slow)));
+            *e = if first.is_empty() {
+                c
+            } else {
+                first.push(c);
+                Expr::new(ty, ExprKind::Seq(first))
+            };
+            virtual_uses += 1;
+            return;
+        }
         match &mut e.kind {
             ExprKind::Local(m) | ExprKind::SetLocal(m, _) | ExprKind::Update { local: m, .. } if *m == l => ok = false,
             ExprKind::InitLocal(m, x) if *m == l => {
                 let x = std::mem::replace(&mut **x, Expr::new(Ty::Any, ExprKind::Undefined));
                 let mut seq = vec![Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(bool_(false))))];
+                // (A slot is read only once the instance's field is in it: a
+                // number to begin with, so that number fields' can be numbers.)
                 for &s in &slots {
                     seq.push(Expr::new(
                         Ty::Any,
-                        ExprKind::InitLocal(s, Box::new(Expr::new(Ty::Any, ExprKind::Undefined))),
+                        ExprKind::InitLocal(s, Box::new(Expr::new(Ty::Any, ExprKind::Box(Box::new(Expr::num(0.0)))))),
                     ));
                 }
                 seq.push(Expr::new(Ty::Any, ExprKind::InitLocal(ph, Box::new(virtual_value(x, class, &slots, flag)))));
@@ -5439,8 +6045,8 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx) -> bool {
     });
     f.body = body;
     f.locals.push(Ty::Bool);
-    f.locals.extend(std::iter::repeat_n(Ty::Any, fields.len() + 1));
-    let n = fields.len() + 2;
+    f.locals.extend(std::iter::repeat_n(Ty::Any, fields.len() + 1 + temps.get()));
+    let n = fields.len() + 2 + temps.get();
     f.boxed.extend(std::iter::repeat_n(false, n));
     f.local_names.extend(std::iter::repeat_n(None, n));
     crate::escape::fold_flag(f, flag);

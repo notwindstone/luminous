@@ -222,6 +222,14 @@ impl P<'_> {
             K::Cond(c, a, b) => format!("({} ? {} : {})", self.expr(c, d), self.expr(a, d), self.expr(b, d)),
             K::Truthy(x) => format!("truthy({})", self.expr(x, d)),
             K::Call(k, xs) => format!("fn{k}({})", self.list(xs, d)),
+            K::CallEntry { func, args, callee, slow } => {
+                let alt = match (callee, slow) {
+                    (Some(c), Some(s)) => format!(" else {}({})", self.expr(c, d), self.list(s, d)),
+                    (Some(c), None) => format!(" else {}", self.expr(c, d)),
+                    _ => String::new(),
+                };
+                format!("entry fn{func}({}){alt}", self.list(args, d))
+            }
             K::CallDirectThis(k, t, xs) => format!("fn{k}.call({}, {})", self.expr(t, d), self.list(xs, d)),
             K::Math(f, xs) => format!("Math.{f:?}({})", self.list(xs, d)),
             K::Seq(xs) => format!("({})", self.list(xs, d)),
@@ -288,7 +296,13 @@ impl P<'_> {
             K::ObjectCreate(o, a, x) => format!("{}.{}({})", self.expr(o, d), self.atom(*a), self.expr(x, d)),
             K::HomeValue(k) => format!("home{k}"),
             K::IntOf(x) => format!("int({})", self.expr(x, d)),
-            K::CallChecked { func, args, .. } => format!("checked fn{func}({})", self.list(args, d)),
+            K::CallChecked { func, args, callee, slow, .. } => {
+                let alt = match slow {
+                    Some(s) => format!(" else {}({})", self.expr(callee, d), self.list(s, d)),
+                    None => String::new(),
+                };
+                format!("checked fn{func}({}){alt}", self.list(args, d))
+            }
             K::ToObject(x) => format!("ToObject({})", self.expr(x, d)),
             K::DefineField(o, a, x) => format!("define {}.{} = {}", self.expr(o, d), self.atom(*a), self.expr(x, d)),
             K::DeleteProp(o, a) => format!("delete {}.{}", self.expr(o, d), self.atom(*a)),

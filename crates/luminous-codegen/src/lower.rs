@@ -2859,7 +2859,7 @@ impl Lower {
                 }
                 self.unabi(e.ty, &results)
             }
-            ExprKind::CallChecked { func, callee, args, checks } => {
+            ExprKind::CallChecked { func, callee, args, checks, slow: slow_args } => {
                 let tys = self.env.params.clone();
                 let held: Vec<V> = args
                     .iter()
@@ -2947,17 +2947,25 @@ impl Lower {
                 }
                 let fv = self.expr(callee);
                 self.hold(fv);
+                let given = match slow_args {
+                    Some(xs) => self.held_args(xs),
+                    None => Vec::new(),
+                };
                 let mut vals = vec![fv.any(), self.b.ins().iconst(I64, val_const(TAG_UNDEFINED, 0))];
-                for &v in &held {
+                for &v in if slow_args.is_some() { &given } else { &held } {
                     let b = self.boxed(v);
                     vals.push(b);
                 }
                 let slot = self.values_slot(&vals);
                 let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
-                let argc = self.b.ins().iconst(I32, held.len() as i64);
+                let argc = self.b.ins().iconst(I32, vals.len() as i64 - 2);
                 let ctx = self.ctx;
                 let r = self.helper("lum_call", &[ctx, slot, argc, argv]);
                 self.check_value(r[0]);
+                for v in given.into_iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
                 self.release(fv);
                 self.free_v(fv);
                 for &v in held.iter().rev() {
@@ -3785,6 +3793,63 @@ impl Lower {
                 self.free_v(key);
                 self.free_v(obj);
                 V::Bool(self.b.ins().icmp_imm_s(IntCC::NotEqual, r[0], 0))
+            }
+            ExprKind::CallEntry { func, args, callee, slow } => {
+                // The arguments in a stack slot, after room for the function
+                // and `this` (as `lum_call` takes them).
+                let held = self.held_args(args);
+                let undef = self.konst(0, TAG_UNDEFINED).any();
+                let mut vals = vec![undef, undef];
+                vals.extend(held.iter().map(|v| v.any()));
+                let slot = self.values_slot(&vals);
+                let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+                let argc = self.b.ins().iconst(I32, args.len() as i64);
+                let null = self.b.ins().iconst(self.ptr, 0);
+                let ctx = self.ctx;
+                let call = self.b.ins().call(self.env.fast[*func], &[ctx, undef, argc, argv, null]);
+                let mut rw = self.b.inst_results(call)[0];
+                if let Some(callee) = callee {
+                    // Declined: the function object, called (with `slow`).
+                    let join = self.b.create_block();
+                    let r = self.b.append_block_param(join, I64);
+                    let other = self.b.create_block();
+                    self.b.set_cold_block(other);
+                    let declined = self.b.ins().icmp_imm_s(IntCC::Equal, rw, val_const(TAG_UNINITIALIZED, 0));
+                    self.b.ins().brif(declined, other, &[], join, &[BlockArg::Value(rw)]);
+                    self.b.switch_to_block(other);
+                    let fv = self.expr(callee);
+                    self.hold(fv);
+                    let given = match slow {
+                        Some(xs) => self.held_args(xs),
+                        None => Vec::new(),
+                    };
+                    let mut vals = vec![fv.any(), undef];
+                    if slow.is_some() {
+                        vals.extend(given.iter().map(|v| v.any()));
+                    } else {
+                        vals.extend(held.iter().map(|v| v.any()));
+                    }
+                    let n = vals.len() - 2;
+                    let slot = self.values_slot(&vals);
+                    let argv = self.b.ins().iadd_imm_s(slot, 2 * SIZE as i64);
+                    let argc = self.b.ins().iconst(I32, n as i64);
+                    let gw = self.helper("lum_call", &[ctx, slot, argc, argv])[0];
+                    for v in given.into_iter().rev() {
+                        self.release(v);
+                        self.free_v(v);
+                    }
+                    self.release(fv);
+                    self.free_v(fv);
+                    self.b.ins().jump(join, &[BlockArg::Value(gw)]);
+                    self.b.switch_to_block(join);
+                    rw = r;
+                }
+                self.check_value(rw);
+                for v in held.into_iter().rev() {
+                    self.release(v);
+                    self.free_v(v);
+                }
+                V::Any(rw)
             }
             ExprKind::CallValue(f, args) => {
                 let fv = self.expr(f);

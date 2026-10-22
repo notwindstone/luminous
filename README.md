@@ -1085,7 +1085,48 @@ clang, linking).
   (An `async` callee is not inlined: to keep the order of promise
   reactions, the caller would have to settle a promise of its own
   wherever the callee's would settle, and adopt a returned promise in
-  as many ticks.)
+  as many ticks. Its objects are kept by escape summaries, below.)
+- **Objects passed to functions that are not inlined** (escape
+  summaries, `crates/luminous-front/src/escape.rs`). For each function
+  and each parameter, bottom-up over the call graph (a strongly connected
+  component, recursion, iterated to a fixpoint from "reads nothing"
+  up): what it does with the object the parameter receives. It only reads
+  these fields (properties, or fields of an `aot type`); or writes some;
+  or lets it escape: stored anywhere (a variable, an object, an array, a
+  `Map`), captured by a closure (a callback, a timer's), returned,
+  thrown, yielded (a generator keeps its arguments), compared by
+  identity, passed to a builtin (`Promise.resolve(o)`), to an unknown or
+  indirect callee, or to a function whose own summary says it escapes. A
+  comparison with `null` or `undefined` and a truth test are known for an
+  object. Where a function passes a local's object (an object literal, a
+  new class instance, an `aot type` object) that has not escaped (it is
+  virtual, or never needed as an object) to a function that only reads
+  fields it has, it calls a clone of that function that takes the fields
+  as parameters in its place: the caller reads them, so the object is
+  not made. Clones are made transitively (a clone that passes the object
+  on calls a clone of the next function, recursion included), once per
+  function and set of parameters replaced, at most 8 per function and 256
+  in all; the function itself stays for its other callers. A clone's
+  parameters that every call gives numbers are unboxed numbers.
+
+  The copies are read when the call is made, so they are exact only if
+  nothing writes the fields while the callee may still read them. A
+  synchronous callee reads them before it returns, and nothing else can
+  write an object that has not escaped. An async one may read them after
+  it returns its promise: it gets them where the caller awaits the call
+  directly (`const v = await f(o)`, or `return f(o)` as its last use of
+  the object), or never writes the object nor needs it as an object
+  again; and a callee that passes the object to an async call it does not
+  await counts as reading it later itself. Calls are made through the
+  clone only while the object is virtual (else the function with the
+  object); a call whose arguments are checked as it is made (a JS value
+  for a `number` parameter) calls the function object with the object,
+  made then, if a check fails. Async functions are called through their
+  JS entry directly (`CallEntry`), which declines arguments that do not
+  suit their parameters, as calling the function object would. A context
+  object made per request and passed down a chain of four functions with
+  loops (`bench/context.ts`): 10M objects in 837 ms, now none in 513;
+  `bench/vectors.ts`'s points and segments, 25M objects of 30M.
 - **Predictions from type annotations**: where an annotation names a
   top-level class (`o: Vec3`, `xs: Sphere[]`, a field `center: Vec3`, a
   method or function returning `Vec3`, `Node | null`), calls on those
@@ -1892,9 +1933,11 @@ what would come next:
 - **Float code (nbody, raytracer).** Speculative regions read and write
   `number` fields as doubles, and non-escaping class instances become
   locals: raytracer runs faster than bun, nbody about as fast (its loads follow
-  a decoded reference, see [Values](#values-8-bytes)). Next: scalar replacement through
-  calls that are not inlined (a `Vec` passed to and returned from a
-  method), and SIMD for the pair loop of nbody-like code.
+  a decoded reference, see [Values](#values-8-bytes)). Objects passed to
+  functions that are not inlined and only read them are passed as their
+  fields (escape summaries). Next: objects returned from such calls (a
+  `Vec` returned by a method), and SIMD for the pair loop of nbody-like
+  code.
 - **Numeric regions in methods.** Regions cover `this` fields in methods
   and the bodies of inlined methods. Next: regions that span calls to
   small methods of other objects (predicted and guarded), and regions over

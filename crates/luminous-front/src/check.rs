@@ -412,7 +412,6 @@ pub fn check<'a>(
             ir::predict_calls(&mut module);
             ir::inline_callbacks(&mut module);
             ir::replace_objects(&mut module);
-            ir::virtualize_instances(&mut module);
             crate::spec::speculate_numbers(&mut module);
             let closure_spans = std::mem::take(&mut cx.closure_spans);
             return Outcome { native: candidates, module, cells, closure_spans, rejected, classes, class_uses };
@@ -2667,8 +2666,8 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         };
         func.frameless = func.is_async && !func.is_generator && !ir::has_await(&func.body);
         // (Allocation sinking runs after inlining: see `ir::replace_objects`.)
-        ir::scalar_replace(&mut func);
-        ir::scalar_replace_structs(&mut func, self.m.layouts);
+        ir::scalar_replace(&mut func, None);
+        ir::scalar_replace_structs(&mut func, self.m.layouts, None);
         ir::number_locals(&mut func);
         Ok(func)
     }
@@ -6391,8 +6390,11 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
         // Async functions and generators are called through their JS entry
         // (which returns a promise or a generator object).
         let node = self.m.cands[i].node;
-        if !self.m.cands[i].direct_callable || node.is_async() || node.is_generator() || self.m.uses_arguments(i) {
+        if !self.m.cands[i].direct_callable || node.is_generator() || self.m.uses_arguments(i) {
             return Ok(None);
+        }
+        if node.is_async() {
+            return self.entry_call(i, args, span, this, callee);
         }
         let (params, ret) = self.m.signature(i, span)?;
         // A default constructor passing all its arguments on to an
@@ -6499,10 +6501,65 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
                 return Ok(None);
             }
             let callee = any(self.ident(callee.unwrap())?);
-            let call = ExprKind::CallChecked { func: i, callee: Box::new(callee), args: out, checks };
+            let call = ExprKind::CallChecked { func: i, callee: Box::new(callee), args: out, checks, slow: None };
             return Ok(Some(Expr::new(Ty::Any, call)));
         }
         Ok(Some(Expr::new(ret, call(i, out))))
+    }
+}
+
+impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
+    /// A call of async function `i` through its JS entry, which makes its
+    /// promise (`ExprKind::CallEntry`): where an argument may not suit its
+    /// parameter (a JS value for a `number` one), the entry declines it, and
+    /// the function object (`callee`) is called instead.
+    fn entry_call(
+        &mut self,
+        i: usize,
+        args: &'a [Argument<'a>],
+        span: Span,
+        this: Option<Expr>,
+        callee: Option<&'a IdentifierReference<'a>>,
+    ) -> R<Option<Expr>> {
+        if this.is_some() || self.m.cands[i].has_this || args.iter().any(|a| a.as_expression().is_none()) {
+            return Ok(None);
+        }
+        let (params, _) = self.m.signature(i, span)?;
+        let fixed = params.len() - self.m.cands[i].rest as usize;
+        let start = self.pre.len();
+        let mut out: Vec<Expr> = Vec::with_capacity(args.len());
+        let mut declines = false;
+        for (k, a) in args.iter().enumerate() {
+            let mark = self.pre.len();
+            let x = self.expr(a.as_expression().unwrap())?;
+            self.order(&mut out, mark);
+            let p = if k < fixed { params[k] } else { Ty::Any };
+            let x = match (p, x.ty) {
+                (Ty::Any, _) => any(x),
+                (p, _) if let Some(y) = fit(p, &x) => any(y),
+                // (Checked by the entry.)
+                _ if callee.is_some() && x.ty == Ty::Any => {
+                    declines = true;
+                    x
+                }
+                _ => {
+                    self.pre.truncate(start);
+                    return Ok(None);
+                }
+            };
+            out.push(x);
+        }
+        // (Missing arguments are `undefined`, which only JS-valued
+        // parameters accept.)
+        if params[out.len().min(fixed)..fixed].iter().any(|&p| p != Ty::Any) {
+            if callee.is_none() {
+                self.pre.truncate(start);
+                return Ok(None);
+            }
+            declines = true;
+        }
+        let callee = if declines { Some(Box::new(any(self.ident(callee.unwrap())?))) } else { None };
+        Ok(Some(Expr::new(Ty::Any, ExprKind::CallEntry { func: i, args: out, callee, slow: None })))
     }
 }
 
