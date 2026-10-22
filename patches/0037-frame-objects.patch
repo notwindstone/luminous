@@ -20,7 +20,7 @@
  /* Bytes of cells in a run, at most. */
  #define JS_GC_RUN_MAX (64 * 1024)
  /* A major collection when the old cells (and other memory) have grown
-@@ -492,6 +499,17 @@
+@@ -492,6 +499,20 @@
      void *verify_parent;
      uintptr_t *verify_stack;
      size_t verify_stack_len, verify_stack_size;
@@ -35,10 +35,13 @@
 +       them (JS_GCFramePin) and stay. */
 +    uint8_t *frame_top, *frame_end, *frame_floor;
 +    JSGCChunk *frame_chunk;
++    /* (the end of the region's cells whose bits a collection may have set:
++       the top when the last one began) */
++    uint8_t *frame_bits_end;
  } JSGCHeap;
  
  typedef struct JSGCMarkHook {
-@@ -1602,6 +1620,10 @@
+@@ -1602,6 +1623,10 @@
  static_assert(sizeof(JSGCRun) == JS_LAYOUT_GC_RUN_SIZE, "");
  static_assert(offsetof(JSRuntime, gc_heap.free_cells) == JS_LAYOUT_RT_GC_FREE_CELLS, "");
  static_assert(JS_GC_CELL << 16 == JS_LAYOUT_GC_CELL_WORD, "");
@@ -49,7 +52,7 @@
  #if !defined(__APPLE__)
  static_assert(MALLOC_OVERHEAD == JS_LAYOUT_MALLOC_OVERHEAD, "");
  #endif
-@@ -3073,9 +3095,158 @@
+@@ -3073,9 +3098,173 @@
      rt->mf.js_free(rt->malloc_state.opaque, h->others);
      rt->mf.js_free(rt->malloc_state.opaque, h->remembered);
      rt->mf.js_free(rt->malloc_state.opaque, h->verify_stack);
@@ -90,8 +93,18 @@
 +    init_list_head(&ch->link);
 +    init_list_head(&ch->avail_link);
 +    h->frame_chunk = ch;
-+    h->frame_top = h->frame_floor = (uint8_t *)ch + hdr;
++    h->frame_top = h->frame_floor = h->frame_bits_end = (uint8_t *)ch + hdr;
 +    h->frame_end = (uint8_t *)ch + JS_GC_CHUNK_SIZE;
++}
++
++/* The bitmap words of the frame region's cells below `end`, and of those
++   below the top when the last collection began. */
++static inline uint32_t js_gc_frame_words(JSGCHeap *h, uint8_t *end)
++{
++    JSGCChunk *ch = h->frame_chunk;
++    uint8_t *e = end > h->frame_bits_end ? end : h->frame_bits_end;
++    uint32_t n = (uint32_t)((e - ((uint8_t *)ch + ch->first)) / 8);
++    return min_uint32((n + 63) / 64, ch->n_words);
 +}
 +
 +/* The slot after `s` in the frame region (or an object's), or NULL past
@@ -116,10 +129,15 @@
 +    JSGCHeap *h = &rt->gc_heap;
 +    JSGCChunk *ch = h->frame_chunk;
 +    uint8_t *s, *start;
++    uint32_t words;
 +    if (!ch)
 +        return;
-+    memset(ch->bits, 0, 2 * ch->n_words * sizeof(uint64_t));
-+    memset(JS_GC_AGE(ch), 0, ch->n_words * sizeof(uint64_t));
++    words = js_gc_frame_words(h, h->frame_top);
++    memset(ch->bits, 0, words * sizeof(uint64_t));
++    memset(ch->bits + ch->n_words, 0, words * sizeof(uint64_t));
++    memset(JS_GC_AGE(ch), 0, words * sizeof(uint64_t));
++    memset(ch->bits + 3 * ch->n_words, 0, words * sizeof(uint64_t));
++    h->frame_bits_end = h->frame_top;
 +    start = (uint8_t *)ch + ch->first;
 +    for (s = h->frame_top > start ? start : NULL; s; s = js_gc_frame_next(s, h->frame_top)) {
 +        JSObject *p = js_gc_frame_object(s);
@@ -208,7 +226,7 @@
  /* The native stack's end (highest address), whose frames the collector
     scans; whether to verify the roots, and to collect every n triggers. */
  static void js_gc_init_stack(JSRuntime *rt)
-@@ -3107,6 +3278,7 @@
+@@ -3107,6 +3296,7 @@
      h->major_threshold = JS_GC_MIN_THRESHOLD;
      rt->malloc_gc_threshold = rt->malloc_state.malloc_size + h->young_limit;
      h->stats = getenv("QJS_GC_STATS") != NULL;
@@ -216,7 +234,7 @@
  }
  
  /* The mask of bits [i, j) of the word holding bit i (j within it or at
-@@ -9821,6 +9993,10 @@
+@@ -9821,6 +10011,10 @@
  {
      JSGCHeap *h = &rt->gc_heap;
      JSMallocBlockHeader *b = js_rc(gp);
@@ -227,7 +245,7 @@
      if (likely(b->block_size_idx == JS_GC_CELL)) {
          JSGCChunk *ch = js_gc_chunk_of_cell(b);
          uint32_t i;
-@@ -9887,7 +10063,18 @@
+@@ -9887,7 +10081,18 @@
      JSGCChunk *ch = js_gc_chunk_of_cell(b);
      uint32_t i;
      uint64_t m, *w, *a;
@@ -247,7 +265,7 @@
      m = (uint64_t)1 << (i & 63);
      w = &ch->bits[ch->n_words + (i >> 6)];
      a = &JS_GC_AGE(ch)[i >> 6];
-@@ -10096,8 +10283,20 @@
+@@ -10096,8 +10301,20 @@
  static no_inline void js_gc_remember(JSRuntime *rt, JSMallocBlockHeader *b)
  {
      JSGCHeap *h = &rt->gc_heap;
@@ -268,7 +286,7 @@
      if (h->remembered_len == h->remembered_size &&
          !js_gc_grow(rt, &h->remembered, &h->remembered_size)) {
          /* (out of memory: the next collection traces everything) */
-@@ -10175,6 +10374,7 @@
+@@ -10175,6 +10392,7 @@
      }
      for (hook = h->hooks; hook; hook = hook->next)
          hook->func(rt, hook->opaque, mark_func);
@@ -276,7 +294,7 @@
      js_gc_scan_stack(rt, mark_func);
  }
  
-@@ -10233,6 +10433,12 @@
+@@ -10233,6 +10451,12 @@
                  js_gc_bad_reference(rt, b);
              continue;
          }
@@ -289,7 +307,7 @@
          if (!young)
              b->mark = 1;
          h->young_child = false;
-@@ -10269,8 +10475,10 @@
+@@ -10269,8 +10493,10 @@
              js_rc(h->remembered[i])->gc_remembered = 0;
          h->remembered_len = 0;
      }
@@ -300,7 +318,7 @@
      h->tracing = false;
  }
  
-@@ -10284,8 +10492,11 @@
+@@ -10284,8 +10510,11 @@
      JSGCChunk *ch;
      uint32_t i;
      uint64_t m, *v;
@@ -313,16 +331,15 @@
      ch = js_gc_chunk_of_cell(b);
      i = js_gc_cell_index(ch, b);
      m = (uint64_t)1 << (i & 63);
-@@ -10383,6 +10594,8 @@
+@@ -10383,6 +10612,7 @@
      }
      list_for_each(el, &h->large)
          list_entry(el, JSGCChunk, link)->bits[3] = 0;
-+    if (h->frame_chunk)
-+        memset(h->frame_chunk->bits + 3 * h->frame_chunk->n_words, 0, h->frame_chunk->n_words * sizeof(uint64_t));
++    /* (the frame region's verify bits: cleared by js_gc_frame_prepare) */
      h->tracing = true;
      h->verify_parent = NULL;
      list_for_each(el, &rt->context_list)
-@@ -64198,6 +64411,8 @@
+@@ -64198,6 +64428,8 @@
                  return js_dup(p->prop[slot].u.value);
          }
      }
@@ -331,7 +348,7 @@
      return JS_GetPropertyValue(ctx, obj, js_dup(key));
  }
  
-@@ -64221,6 +64436,7 @@
+@@ -64221,6 +64453,7 @@
                  return js_dup(p->prop[it->slot].u.value);
          }
      }
