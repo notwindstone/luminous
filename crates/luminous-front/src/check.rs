@@ -3500,7 +3500,7 @@ impl<'x, 'm, 'a> FnCx<'x, 'm, 'a> {
     fn native_new(&mut self, n: &'a NewExpression<'a>) -> R<Option<Expr>> {
         let Expression::Identifier(id) = n.callee.without_parentheses() else { return Ok(None) };
         // (Spills for `await` would run before the binding is read.)
-        if self.suspends() || has_spread(&n.arguments) {
+        if (self.suspends() && suspends_in(&n.arguments)) || has_spread(&n.arguments) {
             return Ok(None);
         }
         let Some(sym) = self.resolve(id) else { return Ok(None) };
@@ -7051,6 +7051,28 @@ fn module_uses(program: &Program, scoping: &Scoping) -> HashMap<SymbolId, Vec<u3
     let mut v = V { scoping, uses: HashMap::new() };
     v.visit_program(program);
     v.uses
+}
+
+/// Whether evaluating `args` may suspend (an `await` or `yield` in them, not
+/// in functions they define).
+fn suspends_in(args: &[Argument]) -> bool {
+    use oxc::ast_visit::Visit;
+    struct Suspends(bool);
+    impl<'a> Visit<'a> for Suspends {
+        fn visit_await_expression(&mut self, _: &AwaitExpression<'a>) {
+            self.0 = true;
+        }
+        fn visit_yield_expression(&mut self, _: &YieldExpression<'a>) {
+            self.0 = true;
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: oxc::syntax::scope::ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    }
+    let mut v = Suspends(false);
+    for a in args {
+        v.visit_argument(a);
+    }
+    v.0
 }
 
 /// Whether a module-level statement may be part of native module code: it

@@ -7,8 +7,9 @@
 //! first place that makes the object, false after one that surely ran. The
 //! tests whose answer is known are folded away.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::ir::callee_of;
 use crate::ir::*;
 
 /// What a flag local holds at a point of the code.
@@ -241,6 +242,15 @@ impl Fold {
             }
             ExprKind::Cond(c, a, b) => {
                 let st = self.expr(c, st);
+                // (A test folded to a constant.)
+                if let ExprKind::Bool(v) = c.kind {
+                    let taken = std::mem::replace(
+                        if v { &mut **a } else { &mut **b },
+                        Expr::new(Ty::Void, ExprKind::Undefined),
+                    );
+                    *e = taken;
+                    return self.expr(e, st);
+                }
                 let x = self.expr(a, st);
                 let y = self.expr(b, st);
                 join(x, y)
@@ -399,30 +409,69 @@ fn callees(f: &Func) -> Vec<usize> {
     out
 }
 
-/// What function `g` does with its parameters, given the summaries of the
-/// functions it calls (`table`).
-fn summarize(m: &Module, g: usize, table: &[Vec<Use>]) -> Vec<Use> {
+/// The parameter index that names `this` (of a method), for summaries and
+/// clones (`Spec::reads`, `Spec::clone_of`).
+pub const THIS_PARAM: usize = usize::MAX;
+
+/// What the functions of a module (module functions, then closures) do
+/// with the objects their parameters receive, and methods with `this`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summaries {
+    pub params: Vec<Vec<Use>>,
+    pub this: Vec<Use>,
+}
+
+impl Summaries {
+    /// Of function `k`'s parameter `q` (or `this`: `THIS_PARAM`).
+    pub fn of(&self, k: usize, q: usize) -> Option<&Use> {
+        if q == THIS_PARAM { self.this.get(k) } else { self.params.get(k)?.get(q) }
+    }
+}
+
+/// `f`'s body without the bodies of predicted calls (whose `this` is their
+/// receiver, and which name none of `f`'s parameters).
+fn without_predicted(f: &Func) -> Vec<Stmt> {
+    let mut body = f.body.clone();
+    visit_stmts_mut(&mut body, &mut |e| {
+        if let ExprKind::Predicted { body, .. } = &mut e.kind {
+            body.clear();
+        }
+    });
+    body
+}
+
+/// What function `g` does with its parameters and `this` (if it is one of
+/// the class methods `methods`), given the summaries of the functions it
+/// calls (`table`).
+fn summarize(m: &Module, g: usize, table: &Summaries, methods: &HashSet<usize>) -> (Vec<Use>, Use) {
     let f = func_at(m, g);
     let n = f.params.len();
     let w = written(f);
     let mut out: Vec<Use> =
         (0..n).map(|i| if candidate(f, i, &m.layouts, &w) { Use::none() } else { Use::Escapes }).collect();
+    // `this` is slot `n` here.
+    let this_ok = methods.contains(&g) && f.has_this && !f.is_closure && !f.suspends() && !f.is_async && !f.arguments;
+    out.push(if this_ok { Use::none() } else { Use::Escapes });
     if out.iter().all(|u| *u == Use::Escapes) {
-        return out;
+        let this = out.pop().unwrap();
+        return (out, this);
     }
-    let mut total = vec![0usize; n];
-    each_name(&f.body, &mut |l| {
+    let body = without_predicted(f);
+    let mut total = vec![0usize; n + 1];
+    each_name(&body, &mut |l| {
         if l < n {
             total[l] += 1;
         }
     });
-    let mut seen = vec![0usize; n];
-    let awaits = awaited(&f.body);
+    visit_stmts(&body, &mut |e| total[n] += matches!(e.kind, ExprKind::This) as usize);
+    let mut seen = vec![0usize; n + 1];
+    let awaits = awaited(&body);
     let param = |x: &Expr| match x.kind {
         ExprKind::Local(l) if l < n => Some(l),
+        ExprKind::This => Some(n),
         _ => None,
     };
-    visit_stmts(&f.body, &mut |e| {
+    visit_stmts(&body, &mut |e| {
         if let Some((l, _)) = nullish_compare(e)
             && l < n
         {
@@ -468,10 +517,11 @@ fn summarize(m: &Module, g: usize, table: &[Vec<Use>]) -> Vec<Use> {
                 // (An entry that may decline calls the function object with
                 // the object: the function as interpreted.)
                 let declines = matches!(e.kind, ExprKind::CallEntry { callee: Some(_), .. });
+                let np = table.params.get(*k).map_or(0, Vec::len);
                 for (q, a) in args.iter().enumerate() {
                     let Some(i) = param(a) else { continue };
-                    let u = match table[*k].get(q) {
-                        Some(u) if !declines => u.clone(),
+                    let u = match table.of(*k, q) {
+                        Some(u) if !declines && q < np => u.clone(),
                         _ => Use::Escapes,
                     };
                     // (An async callee not awaited may still run after this
@@ -479,16 +529,23 @@ fn summarize(m: &Module, g: usize, table: &[Vec<Use>]) -> Vec<Use> {
                     let u = if entry && !awaits.contains(&(e as *const Expr)) { u.outliving() } else { u };
                     add(i, u, &mut seen);
                 }
+                // A method given it as `this`.
+                if let ExprKind::CallDirectThis(k, this, _) = &e.kind
+                    && let Some(i) = param(this)
+                {
+                    add(i, table.of(*k, THIS_PARAM).cloned().unwrap_or(Use::Escapes), &mut seen);
+                }
             }
             _ => {}
         }
     });
-    for i in 0..n {
+    for i in 0..=n {
         if seen[i] != total[i] {
             out[i] = Use::Escapes;
         }
     }
-    out
+    let this = out.pop().unwrap();
+    (out, this)
 }
 
 /// The strongly connected components of the call graph, callees first
@@ -554,18 +611,28 @@ fn components(succ: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// objects its parameters receive: bottom-up over the call graph, each
 /// strongly connected component (recursion) to a fixpoint, from "reads
 /// nothing" up.
-pub fn summaries(m: &Module) -> Vec<Vec<Use>> {
+pub fn summaries(m: &Module) -> Summaries {
     let n = m.funcs.len() + m.closures.len();
     let succ: Vec<Vec<usize>> =
         (0..n).map(|g| callees(func_at(m, g)).into_iter().filter(|&k| k < n).collect()).collect();
-    let mut table: Vec<Vec<Use>> = (0..n).map(|g| vec![Use::none(); func_at(m, g).params.len()]).collect();
+    // The classes' instance methods (whose `this` is an instance).
+    let methods: HashSet<usize> = m
+        .classes
+        .iter()
+        .flat_map(|c| c.members.iter().filter(|(_, kind, is_static, _)| *kind == 0 && !is_static).map(|m| m.3))
+        .collect();
+    let mut table = Summaries {
+        params: (0..n).map(|g| vec![Use::none(); func_at(m, g).params.len()]).collect(),
+        this: vec![Use::none(); n],
+    };
     for comp in components(&succ) {
         loop {
             let mut changed = false;
             for &g in &comp {
-                let s = summarize(m, g, &table);
-                if s != table[g] {
-                    table[g] = s;
+                let (p, t) = summarize(m, g, &table, &methods);
+                if p != table.params[g] || t != table.this[g] {
+                    table.params[g] = p;
+                    table.this[g] = t;
                     changed = true;
                 }
             }
@@ -589,16 +656,17 @@ const CLONES: usize = 256;
 /// fields and no object needs to exist. They are added after the closures
 /// (`Module::closures`; not closures themselves), and only called directly.
 pub struct Spec {
-    /// Per function, per parameter: what it does with an object (see
-    /// `summaries`).
-    pub uses: Vec<Vec<Use>>,
+    /// Per function, per parameter and `this`: what it does with an object
+    /// (see `summaries`).
+    pub uses: Summaries,
     /// The functions as they are cloned (module functions only).
     templates: Vec<Option<Func>>,
     memo: HashMap<(usize, Vec<(usize, Vec<Ty>)>), Option<usize>>,
     per_function: Vec<usize>,
     /// The clones made, from `base` on; and per clone, what it is: its
     /// function, its `clone_of` key, and per parameter the function's own
-    /// parameter it is, if it is one (not a field).
+    /// parameter it is, if it is one (not a field; `THIS_PARAM`: its `this`,
+    /// which a clone has where its function's is not replaced).
     pub clones: Vec<Func>,
     pub base: usize,
     origins: Vec<(usize, Vec<(usize, Vec<Ty>)>, Vec<Option<usize>>)>,
@@ -607,12 +675,20 @@ pub struct Spec {
 impl Spec {
     pub fn new(m: &Module) -> Spec {
         let uses = summaries(m);
-        let templates =
-            m.funcs.iter().map(|f| (!f.is_generator && !f.is_closure && !f.arguments).then(|| f.clone())).collect();
+        // (Only those with a parameter, or `this`, worth cloning for.)
+        let templates = m
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(g, f)| {
+                let some = uses.params[g].iter().chain([&uses.this[g]]).any(|u| u.reads().is_some());
+                (some && !f.is_generator && !f.is_closure && !f.arguments).then(|| f.clone())
+            })
+            .collect();
         let n = m.funcs.len() + m.closures.len();
         if std::env::var_os("LUMINOUS_DEBUG_ESCAPE").is_some() {
-            for (g, u) in uses.iter().enumerate().take(m.funcs.len()) {
-                eprintln!("escape {} {}: {u:?}", g, func_at(m, g).name);
+            for g in 0..m.funcs.len() {
+                eprintln!("escape {} {}: {:?} this {:?}", g, func_at(m, g).name, uses.params[g], uses.this[g]);
             }
         }
         Spec {
@@ -632,7 +708,11 @@ impl Spec {
         if k < self.base {
             return Some((k, q));
         }
-        let (t, _, params) = self.origins.get(k - self.base)?;
+        let (t, key, params) = self.origins.get(k - self.base)?;
+        if q == THIS_PARAM {
+            // (Kept where it is not replaced.)
+            return (!key.iter().any(|(p, _)| *p == THIS_PARAM)).then_some((*t, THIS_PARAM));
+        }
         Some((*t, (*params.get(q)?)?))
     }
 
@@ -642,7 +722,7 @@ impl Spec {
     pub fn reads(&self, k: usize, q: usize) -> Option<(&[Field], bool)> {
         let (t, q) = self.origin(k, q)?;
         self.templates.get(t)?.as_ref()?;
-        self.uses.get(t)?.get(q)?.reads()
+        self.uses.of(t, q)?.reads()
     }
 
     /// Whether function `k` suspends (an async callee whose reads may
@@ -683,9 +763,13 @@ impl Spec {
         // (Recursive calls of the same clone find it.)
         self.memo.insert((k, key.clone()), Some(id));
         self.clones.push(Func { name: String::new(), ..self.templates[k].clone()? });
-        // (Its parameters: each kept one in place, the fields of the others.)
+        // (Its parameters: the fields of `this` if replaced, then each kept
+        // one in place, the fields of the others.)
         let np = self.templates[k].as_ref()?.params.len();
         let mut params = Vec::new();
+        if let Some((_, tys)) = key.iter().find(|(p, _)| *p == THIS_PARAM) {
+            params.extend(std::iter::repeat_n(None, tys.len()));
+        }
         for q in 0..np {
             match key.iter().find(|(p, _)| *p == q) {
                 Some((_, tys)) => params.extend(std::iter::repeat_n(None, tys.len())),
@@ -723,10 +807,13 @@ impl Spec {
         let mut kept: Vec<Option<usize>> = vec![None; np];
         let mut fields: HashMap<(usize, Field), (LocalId, Ty)> = HashMap::new();
         let mut temp_index: Vec<usize> = Vec::new();
-        for q in 0..np {
+        // (`this` first, if it is replaced; `nl + j` names it meanwhile.)
+        let this_spec = objs.iter().any(|(p, _)| *p == THIS_PARAM);
+        let order: Vec<usize> = this_spec.then_some(THIS_PARAM).into_iter().chain(0..np).collect();
+        for q in order {
             match objs.iter().find(|(p, _)| *p == q) {
                 Some((_, tys)) => {
-                    let (fs, _) = self.uses[k][q].reads()?;
+                    let (fs, _) = self.uses.of(k, q)?.reads()?;
                     for (&fd, &ty) in fs.iter().zip(tys) {
                         fields.insert((q, fd), (nl + temp_index.len(), ty));
                         temp_index.push(params.len());
@@ -747,13 +834,16 @@ impl Spec {
         }
         let n_new = params.len();
         let spec = |l: LocalId| l < np && kept[l].is_none();
-        let mut body = t.body.clone();
-        let mut ok = true;
-        let field_of = |o: &Expr, fd: Field| match o.kind {
-            ExprKind::Local(q) if spec(q) => fields.get(&(q, fd)).copied(),
+        // A replaced parameter, or `this` (as `THIS_PARAM`).
+        let replaced = |x: &Expr| match x.kind {
+            ExprKind::Local(q) if spec(q) => Some(q),
+            ExprKind::This if this_spec => Some(THIS_PARAM),
             _ => None,
         };
-        visit_stmts_mut(&mut body, &mut |e| {
+        let mut body = t.body.clone();
+        let mut ok = true;
+        let field_of = |o: &Expr, fd: Field| fields.get(&(replaced(o)?, fd)).copied();
+        visit_outside_predicted(&mut body, &mut |e| {
             if !ok {
                 return;
             }
@@ -777,27 +867,56 @@ impl Spec {
                     let Some((l, t)) = field_of(o, Field::Slot(*fi)) else { return };
                     value(l, t, ty)
                 }
-                ExprKind::Truthy(x) if matches!(x.kind, ExprKind::Local(q) if spec(q)) => {
-                    Expr::new(Ty::Bool, ExprKind::Bool(true))
-                }
-                ExprKind::Call(k2, args)
-                | ExprKind::CallEntry { func: k2, args, callee: None, .. }
-                | ExprKind::CallDirectThis(k2, _, args) => {
-                    if !args.iter().any(|a| matches!(a.kind, ExprKind::Local(q) if spec(q))) {
+                ExprKind::Truthy(x) if replaced(x).is_some() => Expr::new(Ty::Bool, ExprKind::Bool(true)),
+                ExprKind::Call(..) | ExprKind::CallEntry { callee: None, .. } | ExprKind::CallDirectThis(..) => {
+                    let k2 = callee_of(e);
+                    let this_q = match &e.kind {
+                        ExprKind::CallDirectThis(_, t, _) => replaced(t),
+                        _ => None,
+                    };
+                    let this_on = this_q.is_some();
+                    let (ExprKind::Call(_, args)
+                    | ExprKind::CallEntry { args, .. }
+                    | ExprKind::CallDirectThis(_, _, args)) = &mut e.kind
+                    else {
+                        unreachable!()
+                    };
+                    if !this_on && !args.iter().any(|a| replaced(a).is_some()) {
                         return;
                     }
                     let mut objs2 = Vec::new();
                     let mut new_args = Vec::new();
+                    // (The method's `this`, first.)
+                    if let Some(q) = this_q {
+                        let Some((fs, _)) = self.uses.of(k2, THIS_PARAM).and_then(Use::reads) else {
+                            ok = false;
+                            return;
+                        };
+                        let mut tys = Vec::new();
+                        for &fd in fs {
+                            let Some(&(l, t)) = fields.get(&(q, fd)) else {
+                                ok = false;
+                                return;
+                            };
+                            tys.push(t);
+                            new_args.push(Expr::new(t, ExprKind::Local(l)));
+                        }
+                        objs2.push((THIS_PARAM, tys));
+                    }
+                    let k2 = &mut k2.clone();
+                    let np2 = self.uses.params.get(*k2).map_or(0, Vec::len);
+                    let (ExprKind::Call(_, args)
+                    | ExprKind::CallEntry { args, .. }
+                    | ExprKind::CallDirectThis(_, _, args)) = &mut e.kind
+                    else {
+                        unreachable!()
+                    };
                     for (r, a) in std::mem::take(args).into_iter().enumerate() {
-                        let ExprKind::Local(q) = a.kind else {
+                        let Some(q) = replaced(&a) else {
                             new_args.push(a);
                             continue;
                         };
-                        if !spec(q) {
-                            new_args.push(a);
-                            continue;
-                        }
-                        let Some((fs, _)) = self.uses.get(*k2).and_then(|u| u.get(r)).and_then(Use::reads) else {
+                        let Some((fs, _)) = self.uses.of(*k2, r).filter(|_| r < np2).and_then(Use::reads) else {
                             ok = false;
                             return;
                         };
@@ -812,12 +931,21 @@ impl Spec {
                         }
                         objs2.push((r, tys));
                     }
-                    *args = new_args;
-                    let Some(c) = self.clone_of(*k2, &objs2) else {
+                    let k2 = *k2;
+                    let Some(c) = self.clone_of(k2, &objs2) else {
                         ok = false;
                         return;
                     };
-                    *k2 = c;
+                    // (A method given its `this` as fields is a function.)
+                    if this_on {
+                        e.kind = ExprKind::Call(c, new_args);
+                    } else if let ExprKind::Call(k2, args)
+                    | ExprKind::CallEntry { func: k2, args, .. }
+                    | ExprKind::CallDirectThis(k2, _, args) = &mut e.kind
+                    {
+                        *args = new_args;
+                        *k2 = c;
+                    }
                     return;
                 }
                 _ => return,
@@ -858,8 +986,8 @@ impl Spec {
             captures: Vec::new(),
             value_captures: Vec::new(),
             is_closure: false,
-            has_this: t.has_this,
-            class: t.class,
+            has_this: t.has_this && !this_spec,
+            class: if this_spec { None } else { t.class },
             is_async: t.is_async,
             frameless: t.frameless,
             source: None,

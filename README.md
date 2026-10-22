@@ -1046,6 +1046,22 @@ clang, linking).
   changed, a prediction that fails, a call that is not inlined) it is made
   then ("materialized", as deoptimization does), and later uses work on
   it, so identity and mutations stay right.
+
+  That is allocation sinking: any other use of the instance (stored,
+  passed on, compared, a property it lacks) makes it where that use is,
+  on the path that reaches it, so that `if (debug) log(v)` leaves the
+  common path without an object; and after that use every other one tests
+  the flag (folded where it is known). Up to 3 such places per instance
+  (each a copy of the code making it). A method of its class that is not
+  inlined (too large, a loop) and only reads `this` runs as a clone over
+  the fields (escape summaries, below), behind the same check of the
+  prototype: the arguments are evaluated after the check, as the method
+  is read before them, and if they made the object the method is called
+  on it. Instances are kept in locals in async functions too, across
+  `await`s, and `new C(...)` constructs natively there where its
+  arguments do not await. `bench/vectors.ts`'s two vectors an iteration,
+  passed to a function and a method: 5M objects in 522 ms, now none in
+  398.
 - **Plain objects that do not escape**: a local holding an object
   literal or `Object.create(null)` whose properties are added after it
   is made (`const o: any = {}; o.a = i; o.b = 2;`), used by the
@@ -1088,7 +1104,8 @@ clang, linking).
   as many ticks. Its objects are kept by escape summaries, below.)
 - **Objects passed to functions that are not inlined** (escape
   summaries, `crates/luminous-front/src/escape.rs`). For each function
-  and each parameter, bottom-up over the call graph (a strongly connected
+  and each parameter (and a class method's `this`), bottom-up over the
+  call graph (a strongly connected
   component, recursion, iterated to a fixpoint from "reads nothing"
   up): what it does with the object the parameter receives. It only reads
   these fields (properties, or fields of an `aot type`); or writes some;

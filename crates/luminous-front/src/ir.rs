@@ -5548,6 +5548,29 @@ fn virtual_value(e: Expr, class: usize, slots: &[LocalId], flag: LocalId) -> Exp
     }
 }
 
+/// `visit_stmts_mut` over `stmts`, but not in the bodies of predicted calls
+/// (whose `this` is their receiver), nor on those calls themselves.
+pub(crate) fn visit_outside_predicted(stmts: &mut Vec<Stmt>, f: &mut dyn FnMut(&mut Expr)) {
+    let mut stash: Vec<Vec<Stmt>> = Vec::new();
+    // (Set aside behind a marker, as `this_to_local` does.)
+    let marker = |i: usize| vec![Stmt::Expr(Expr::new(Ty::Void, ExprKind::Num(i as f64)))];
+    visit_stmts_mut(stmts, &mut |e| match &mut e.kind {
+        ExprKind::Predicted { body, .. } => {
+            let b = std::mem::replace(body, marker(stash.len()));
+            stash.push(b);
+        }
+        _ => f(e),
+    });
+    let mut stash: Vec<Option<Vec<Stmt>>> = stash.into_iter().map(Some).collect();
+    visit_stmts_mut(stmts, &mut |e| {
+        if let ExprKind::Predicted { body, .. } = &mut e.kind
+            && let [Stmt::Expr(Expr { ty: Ty::Void, kind: ExprKind::Num(i) })] = body.as_slice()
+        {
+            *body = stash[*i as usize].take().unwrap();
+        }
+    });
+}
+
 /// Replace `This` in `body` with `Local(l)`, except inside the bodies of
 /// predicted calls (their own `this`).
 fn this_to_local(body: &mut Vec<Stmt>, l: LocalId) {
@@ -5631,7 +5654,7 @@ impl VirtCx {
 /// `try_virtualize`.)
 fn virtualize_instances(f: &mut Func, cx: &VirtCx, mut spec: Option<&mut crate::escape::Spec>) -> bool {
     {
-        if f.is_async || f.is_generator {
+        if f.is_generator {
             return false;
         }
         hoist_fresh_receivers(f);
@@ -5690,7 +5713,12 @@ fn virtualize_instances(f: &mut Func, cx: &VirtCx, mut spec: Option<&mut crate::
             .collect();
         let mut any = false;
         for l in candidates {
-            any |= try_virtualize(f, l, cx, spec.as_deref_mut());
+            // (The parameters of the methods it ran inline read the
+            // arguments' locals: the next instances' uses.)
+            if try_virtualize(f, l, cx, spec.as_deref_mut()) {
+                forward_inline_args(f);
+                any = true;
+            }
         }
         any
     }
@@ -5793,6 +5821,10 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
     let field = |a: AtomId| fields.iter().position(|&b| b == a);
     let mut ok = true;
     let mut virtual_uses = 0;
+    // Where the object itself is used (and made, if virtual).
+    let mut others = 0;
+    // The calls predicted calls make where they do not run inline.
+    let mut wrapped: HashSet<*const Expr> = HashSet::new();
     let mut reason = String::new();
     let debug = std::env::var_os("LUMINOUS_DEBUG_VIRT").is_some();
     let mut body = f.body.clone();
@@ -5818,6 +5850,7 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
         if debug {
             reason = format!("{:?}", e.kind);
         }
+        let here = e as *const Expr;
         let is_l = |x: &Expr| matches!(x.kind, ExprKind::Local(m) if m == l);
         let ty = e.ty;
         // A call of a function that only reads it.
@@ -5865,7 +5898,12 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
             return;
         }
         match &mut e.kind {
-            ExprKind::Local(m) | ExprKind::SetLocal(m, _) | ExprKind::Update { local: m, .. } if *m == l => ok = false,
+            ExprKind::SetLocal(m, _) | ExprKind::Update { local: m, .. } if *m == l => ok = false,
+            // The object itself: made here (if it is still virtual).
+            ExprKind::Local(m) if *m == l => {
+                others += 1;
+                *e = materialize();
+            }
             ExprKind::InitLocal(m, x) if *m == l => {
                 let x = std::mem::replace(&mut **x, Expr::new(Ty::Any, ExprKind::Undefined));
                 let mut seq = vec![Expr::new(Ty::Bool, ExprKind::InitLocal(flag, Box::new(bool_(false))))];
@@ -5881,10 +5919,8 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                 *e = Expr::new(Ty::Any, ExprKind::Seq(seq));
             }
             ExprKind::GetProp(o, a) | ExprKind::ShapeGet { obj: o, atom: a, .. } if is_l(o) => {
-                let Some(i) = field(*a) else {
-                    ok = false;
-                    return;
-                };
+                // (Not a field: read from the object, made.)
+                let Some(i) = field(*a) else { return };
                 virtual_uses += 1;
                 // (The object's read, on the object: `ph`.)
                 let mut real = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
@@ -5895,10 +5931,7 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                 *e = Expr::new(ty, ExprKind::Cond(Box::new(flag_e()), Box::new(local(slots[i])), Box::new(real)));
             }
             ExprKind::SetProp(o, a, _) | ExprKind::ShapeSet { obj: o, atom: a, .. } if is_l(o) => {
-                let Some(i) = field(*a) else {
-                    ok = false;
-                    return;
-                };
+                let Some(i) = field(*a) else { return };
                 let mut real = std::mem::replace(e, Expr::new(Ty::Void, ExprKind::Undefined));
                 let (ExprKind::SetProp(o, _, v) | ExprKind::ShapeSet { obj: o, value: v, .. }) = &mut real.kind else {
                     unreachable!()
@@ -5914,7 +5947,96 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                     ),
                 );
             }
+            // A method of its class not run inline, that only reads `this`:
+            // its clone with the fields while the object is virtual, behind
+            // the check that its class's prototype still has it (the method
+            // read, as a call reads it before the arguments).
+            ExprKind::CallMethod(o, Key::Atom(a), args) if is_l(o) && !wrapped.contains(&here) => {
+                let a = *a;
+                let Some(spec) = spec.as_deref_mut() else { return };
+                let Some(&func) = methods.get(&a) else { return };
+                let Some((fs, false)) = spec.reads(func, crate::escape::THIS_PARAM) else { return };
+                let Some(keys) = fs
+                    .iter()
+                    .map(|fd| match fd {
+                        crate::escape::Field::Prop(k) if field(*k).is_some() => Some(*k),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<AtomId>>>()
+                else {
+                    return;
+                };
+                let params = &cx.params[func];
+                let ret = cx.rets[func];
+                // (A number or boolean parameter takes the value of a plain
+                // boxed one: a constant, a local.)
+                let typed_ok = |i: usize, x: &Expr| match params.get(i) {
+                    Some(Ty::Any) => true,
+                    Some(&t @ (Ty::F64 | Ty::Bool)) => {
+                        matches!(&x.kind, ExprKind::Box(y) if y.ty == t && plain_value(y))
+                    }
+                    _ => false,
+                };
+                if args.len() > params.len()
+                    || !args.iter().enumerate().all(|(i, x)| typed_ok(i, x))
+                    || params[args.len()..].iter().any(|&t| t != Ty::Any)
+                {
+                    return;
+                }
+                let wrap = |x: Expr| match ret {
+                    Ty::Any => Some(x),
+                    Ty::F64 | Ty::Bool => Some(Expr::new(Ty::Any, ExprKind::Box(Box::new(x)))),
+                    Ty::Void => {
+                        Some(Expr::new(Ty::Any, ExprKind::Seq(vec![x, Expr::new(Ty::Any, ExprKind::Undefined)])))
+                    }
+                    _ => None,
+                };
+                let key = [(crate::escape::THIS_PARAM, vec![Ty::Any; keys.len()])];
+                let Some(clone) = spec.clone_of(func, &key) else { return };
+                let mut first = Vec::new();
+                let mut vals = Vec::new();
+                for (i, x) in args.clone().into_iter().enumerate() {
+                    if params[i] != Ty::Any {
+                        vals.push(unboxed(&x).clone());
+                        continue;
+                    }
+                    let (f0, v) = once(x);
+                    first.extend(f0);
+                    vals.push(v);
+                }
+                vals.resize(params.len(), Expr::new(Ty::Any, ExprKind::Undefined));
+                let mut clone_args: Vec<Expr> = keys.iter().map(|&k| local(slots[field(k).unwrap()])).collect();
+                clone_args.extend(vals.iter().cloned());
+                let (Some(fast), Some(direct)) = (
+                    wrap(Expr::new(ret, ExprKind::Call(clone, clone_args))),
+                    wrap(Expr::new(ret, ExprKind::CallDirectThis(func, Box::new(materialize()), vals))),
+                ) else {
+                    return;
+                };
+                // (The arguments may have made it: then the method, checked,
+                // on the object.)
+                first.push(Expr::new(Ty::Any, ExprKind::Cond(Box::new(flag_e()), Box::new(fast), Box::new(direct))));
+                let fast = Expr::new(Ty::Any, ExprKind::Seq(first));
+                let slow = Expr::new(ty, ExprKind::CallMethod(Box::new(materialize()), Key::Atom(a), args.clone()));
+                let check = Expr::new(
+                    Ty::Bool,
+                    ExprKind::Cond(
+                        Box::new(flag_e()),
+                        Box::new(Expr::new(Ty::Bool, ExprKind::ProtoMethodIs { class, method: a, func })),
+                        Box::new(bool_(false)),
+                    ),
+                );
+                virtual_uses += 1;
+                *e = Expr::new(ty, ExprKind::Cond(Box::new(check), Box::new(fast), Box::new(slow)));
+            }
             ExprKind::Predicted { expr, func, body: pbody, locals } => {
+                // (Its call is not made a clone's: see above.)
+                wrapped.insert(&**expr as *const Expr);
+                // One of several predictions of a call (polymorphic): they
+                // all bind its arguments, so the object is made for them.
+                if wrapped.contains(&here) {
+                    return;
+                }
                 let ExprKind::CallMethod(o, Key::Atom(a), args) = &mut expr.kind else { return };
                 if !is_l(o) {
                     // The object passed to a method of another receiver: its
@@ -5931,9 +6053,9 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                         let p = locals[i];
                         let mut assigned = false;
                         visit_stmts(pbody, &mut |x| assigned |= assigns_local(x, p));
+                        // (Else made for the call.)
                         if params.get(i) != Some(&Ty::Any) || assigned {
-                            ok = false;
-                            return;
+                            continue;
                         }
                         visit_stmts_mut(pbody, &mut |y| {
                             if matches!(y.kind, ExprKind::Local(q) if q == p) {
@@ -5951,8 +6073,8 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                 }
                 let (a, func) = (*a, *func);
                 let params = &cx.params[func];
+                // (Else the method called on the object, made.)
                 if methods.get(&a) != Some(&func) || args.len() > params.len() {
-                    ok = false;
                     return;
                 }
                 // The method inline over the fields: parameters bound to the
@@ -5976,18 +6098,12 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                         (Some(x), Ty::Any) if types[p] == Ty::Any => match x.ty {
                             Ty::F64 | Ty::Bool => Expr::new(Ty::Any, ExprKind::Box(Box::new(x.clone()))),
                             Ty::Any => x.clone(),
-                            _ => {
-                                ok = false;
-                                return;
-                            }
+                            _ => return,
                         },
                         // (Arguments are JS values: a number boxed for the call.)
                         (Some(x), Ty::F64 | Ty::Bool) if types[p] == pt && unboxed(x).ty == pt => unboxed(x).clone(),
                         (None, Ty::Any) if types[p] == Ty::Any => Expr::new(Ty::Any, ExprKind::Undefined),
-                        _ => {
-                            ok = false;
-                            return;
-                        }
+                        _ => return,
                     };
                     binds.push(Stmt::Expr(Expr::new(types[p], ExprKind::InitLocal(p, Box::new(v)))));
                 }
@@ -5998,10 +6114,7 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
                 match ret {
                     Ty::Any => {}
                     Ty::F64 | Ty::Bool => inline = Expr::new(Ty::Any, ExprKind::Box(Box::new(inline))),
-                    _ => {
-                        ok = false;
-                        return;
-                    }
+                    _ => return,
                 }
                 // Otherwise the call, on the object (made if virtual).
                 let mut args2 = args.clone();
@@ -6035,7 +6148,7 @@ fn try_virtualize(f: &mut Func, l: LocalId, cx: &VirtCx, mut spec: Option<&mut c
             eprintln!("  at {}", reason.chars().take(300).collect::<String>());
         }
     }
-    if !ok || virtual_uses == 0 {
+    if !ok || virtual_uses == 0 || others > MATERIALIZE_SITES {
         return false;
     }
     // The object local is `l` again.
