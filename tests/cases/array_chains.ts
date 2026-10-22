@@ -1,4 +1,4 @@
-// @native filterMap revenue count doubled logged mutating throwing withArray withIndex fields sorted aliased sliceReplaced speciesMidway
+// @native filterMap revenue count doubled logged mutating throwing withArray withIndex fields sorted aliased sliceReplaced speciesMidway floorReplaced comparing
 // Chains of `filter` and `map` (ending with an array, `.length` or
 // `.reduce`) whose callbacks run no code are one loop (see src/chains.rs):
 // what they give, and what runs, is still what the chain as written gives
@@ -107,6 +107,30 @@ function speciesMidway(xs: Item[]): string {
   return r.join(",");
 }
 
+// A callback that reassigns Math.floor (locked: a TypeError where the
+// assignment is), and a sort comparator that counts and logs.
+const floorKey = ["fl", "oor"].join("");
+function floorReplaced(xs: Item[]): number[] {
+  return xs
+    .filter((x) => x.qty > 0)
+    .map((x) => {
+      if (x.id === 3) (Math as any)[floorKey] = () => 0;
+      return Math.floor(x.price / 3);
+    });
+}
+let comparisons = 0;
+function comparing(xs: Item[]): number[] {
+  return xs
+    .filter((x) => x.qty > 3)
+    .slice()
+    .sort((a, b) => {
+      comparisons++;
+      if (comparisons === 5) log.push("fifth " + a.id + " " + b.id);
+      return a.price - b.price || a.id - b.id;
+    })
+    .map((x) => x.id);
+}
+
 const items: Item[] = [];
 for (let i = 0; i < 12; i++) items.push({ id: i, price: (i * 37) % 101, qty: (i * 13) % 17, tag: i % 5 });
 console.log("plain", filterMap(items).join(","), revenue(items), count(items));
@@ -174,6 +198,12 @@ try {
 }
 console.log("withArray", withArray(items.slice(0, 5)).join(","), "withIndex", withIndex(items.slice(0, 5)).join(","));
 
+try {
+  floorReplaced(items);
+} catch (e) {
+  console.log("floorReplaced", (e as Error).constructor.name, Math.floor(7.5));
+}
+console.log("comparing", comparing(items).join(","), comparisons, log[log.length - 1]);
 console.log("aliased", aliased(items), "sliceReplaced", sliceReplaced(items.slice(0, 4)), log[log.length - 1]);
 
 // Replaced builtins: map, then reduce, then the species.

@@ -152,8 +152,8 @@ regular call path's generated code alone.
 `0033-symbol-key-fast-paths.patch`,
 `0034-typed-array-proto-getters.patch`, `0035-symbol-atom.patch`,
 `0036-proxy-own-shape.patch`, `0037-frame-objects.patch`,
-`0038-call-epoch-and-peek.patch` and `0039-array-species-pristine.patch`,
-each made
+`0038-call-epoch-and-peek.patch`, `0039-array-species-pristine.patch` and
+`0040-sort-merge.patch`, each made
 against the tree the earlier ones give) and builds the engine without
 the stack protector, semantic interposition and CET markers distribution
 compilers default to (it is linked statically: its exported functions
@@ -1390,7 +1390,11 @@ clang, linking).
   by a merge sort compiled per comparator (the engine's stable algorithm:
   insertion sorts of up to 8 elements, halves merged), which runs a copy
   of the comparator inline at each comparison; the engine takes the
-  elements out of the array and puts them back.
+  elements out of the array and puts them back. The engine's own `sort`
+  with a comparator uses the same algorithm (patch 0040; any stable sort
+  is one the specification allows), so a comparator is called with the
+  same values in the same order, and an inconsistent one gives the same
+  order, compiled or not.
 - **Effect summaries** (`crates/luminous-front/src/effects.rs`): for every
   native function, what it and everything it calls may do, computed bottom
   up over the call graph's strongly connected components to a fixpoint:

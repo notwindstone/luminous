@@ -1,0 +1,77 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -49803,6 +49803,56 @@
+     return 0;
+ }
+ 
++/* luminous: with a comparator, the stable merge sort that native code
++   compiles with one (see JS_SortNative): insertion sorts of up to 8
++   values, halves merged through `tmp` (room for n / 2 values) unless
++   already in order. So `sort(cmp)` calls `cmp` with the same values in
++   the same order (as a comparator with effects can tell) and gives the
++   same order (as an inconsistent one can), interpreted or not. Both halves
++   being runs of the original order, js_array_cmp_generic breaking ties
++   by position decides as the native sort does (the left value first).
++   Stops at an exception, every value still in `a`. */
++static void js_array_merge_sort(ValueSlot *a, ValueSlot *tmp, size_t n, struct array_sort_context *asc)
++{
++    size_t i, j, k, m;
++
++    if (n <= 8) {
++        for (i = 1; i < n; i++) {
++            ValueSlot x = a[i];
++            for (j = i; j > 0; j--) {
++                if (js_array_cmp_generic(&a[j - 1], &x, asc) <= 0 || asc->exception)
++                    break;
++                a[j] = a[j - 1];
++            }
++            a[j] = x;
++            if (asc->exception)
++                return;
++        }
++        return;
++    }
++    m = n >> 1;
++    js_array_merge_sort(a, tmp, m, asc);
++    if (asc->exception)
++        return;
++    js_array_merge_sort(a + m, tmp, n - m, asc);
++    if (asc->exception || js_array_cmp_generic(&a[m - 1], &a[m], asc) <= 0 || asc->exception)
++        return;
++    memcpy(tmp, a, m * sizeof(*a));
++    i = 0;
++    j = m;
++    k = 0;
++    while (i < m && j < n) {
++        int c = js_array_cmp_generic(&tmp[i], &a[j], asc);
++        if (asc->exception)
++            break;
++        if (c > 0)
++            a[k++] = a[j++];
++        else
++            a[k++] = tmp[i++];
++    }
++    memcpy(a + k, tmp + i, (m - i) * sizeof(*a));
++}
++
+ /* luminous: `arr.sort(cmp)` with `cmp` a natively compiled comparator, the
+    sort itself compiled with it (see JS_SortNative). */
+ typedef int JSNativeSorter(JSContext *ctx, JSValue *a, JSValue *tmp, int64_t n);
+@@ -49915,7 +49965,16 @@
+     }
+     if (js_sort_fast_entry(ctx, &asc))
+         goto exception;
+-    rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
++    if (asc.has_method) {
++        /* (Traced: during a comparison, values may be only there.) */
++        ValueSlot *tmp = pos > 8 ? js_realloc_traced(ctx, NULL, (pos / 2 + 1) * sizeof(*array)) : NULL;
++        if (pos > 8 && !tmp)
++            goto exception;
++        js_array_merge_sort(array, tmp, pos, &asc);
++        js_free(ctx, tmp);
++    } else {
++        rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
++    }
+     if (asc.exception)
+         goto exception;
+ 
